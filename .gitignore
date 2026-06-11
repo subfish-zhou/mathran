@@ -63,3 +63,6 @@ logs/forum-sync-cron.log
 # Runtime cron logs and local trash
 logs/
 .trash/
+/dist
+*.tgz
+/mathran-out
