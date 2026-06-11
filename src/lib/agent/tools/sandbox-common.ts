@@ -10,9 +10,9 @@
 // Worker A's UserSandboxManager.getOrProvision(userId) returns { id, daemon }.
 
 import type { ToolDefinition, ToolContext } from "./types";
-import { UserSandboxManager } from "@/lib/sandbox/user-sandbox-manager";
-import type { DaemonClient } from "@/lib/sandbox/daemon-client";
-import { checkCodeSafety, checkRateLimit } from "@/lib/sandbox/security";
+// TODO(mathran-v0.1): import { UserSandboxManager } from "@/lib/sandbox/user-sandbox-manager";
+// TODO(mathran-v0.1): import type { DaemonClient } from "@/lib/sandbox/daemon-client";
+// TODO(mathran-v0.1): import { checkCodeSafety, checkRateLimit } from "@/lib/sandbox/security";
 
 type SandboxLanguage = "python" | "sage";
 

@@ -1,4 +1,4 @@
-import type { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import type { getDb } from "@/server/db";
 import type { z } from "zod";
 
 export interface ToolContext {

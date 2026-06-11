@@ -1,6 +1,6 @@
 import type { ToolDefinition } from "./types";
-import { getDb } from "@/server/db";
-import { userPublications } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { userPublications } from "@/server/db/schema";
 import { eq, desc, ilike, or, and } from "drizzle-orm";
 
 export const getUserPublicationsTool: ToolDefinition = {

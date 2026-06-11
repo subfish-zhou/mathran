@@ -20,12 +20,12 @@
  * dead/closed worker no longer takes the summary down with it.
  */
 
-import { getDb } from "@/server/db";
-import {
-  conversations,
-  channelMessages,
-} from "@/server/db/schema";
-import { assistantGoalSummaries } from "@/server/db/schema/assistant_goal";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import {
+// TODO(mathran-v0.1):   conversations,
+// TODO(mathran-v0.1):   channelMessages,
+// TODO(mathran-v0.1): } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { assistantGoalSummaries } from "@/server/db/schema/assistant_goal";
 import { and, eq, gte, lt, asc, desc } from "drizzle-orm";
 import { LLMRouter } from "@/lib/agent/llm-router";
 import type { ChatChunk } from "@/lib/agent/llm-provider";

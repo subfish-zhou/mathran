@@ -1,5 +1,5 @@
-import { getDb } from "@/server/db";
-import { assistantSkills } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { assistantSkills } from "@/server/db/schema";
 import { eq, and, or } from "drizzle-orm";
 
 export interface LoadedSkill {

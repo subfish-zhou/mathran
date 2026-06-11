@@ -1,4 +1,4 @@
-import type { SSEEvent } from './chat-handler';
+// TODO(mathran-v0.1): import type { SSEEvent } from './chat-handler';
 
 export function createSSEResponse(
   events: AsyncIterable<SSEEvent>,

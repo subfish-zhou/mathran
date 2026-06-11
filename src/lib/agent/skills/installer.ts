@@ -1,7 +1,7 @@
 import { readFile, readdir, stat } from "fs/promises";
 import { join } from "path";
-import { getDb } from "@/server/db";
-import { assistantSkills } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { assistantSkills } from "@/server/db/schema";
 import { eq } from "drizzle-orm";
 
 interface SkillFrontmatter {

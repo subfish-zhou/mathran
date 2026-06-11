@@ -3,11 +3,11 @@
  * Separated from dedup-search.ts to avoid bundling server modules in client components.
  */
 
-import { getDb } from "@/server/db";
-import { projects } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { projects } from "@/server/db/schema";
 import { sql } from "drizzle-orm";
 import { searchSimilarProjectsInCorpus } from "./dedup-search";
-import type { SimilarProject } from "@/components/create-project/DuplicateAlert";
+// TODO(mathran-v0.1): import type { SimilarProject } from "@/components/create-project/DuplicateAlert";
 
 function tokenize(text: string): string[] {
   const STOP_WORDS = new Set([

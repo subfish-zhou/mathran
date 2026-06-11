@@ -1,12 +1,12 @@
 import { eq } from "drizzle-orm";
 import { importLeanRepo as importLeanRepoImpl } from "@/lib/lean/lean-repo-importer";
 import { getLeanService } from "@/lib/lean/lean-service";
-import { getDb } from "@/server/db";
-import { projects } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { projects } from "@/server/db/schema";
 import { requirePrincipalScope } from "../scopes";
 import { authorizeResource, ResourceNotFoundError } from "../resource-access";
 import { principalUserId, type AgentPrincipal } from "../principal";
-import { withSpan } from "@/lib/observability/trace";
+// TODO(mathran-v0.1): import { withSpan } from "@/lib/observability/trace";
 
 export async function importLeanRepo(
   principal: AgentPrincipal,

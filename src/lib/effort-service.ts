@@ -2,15 +2,15 @@
  * Unified effort write service.
  * All effort writes (agent / tRPC / patrol / rebuild) should go through these functions.
  */
-import { workspaceEfforts, workspaceEffortVersions } from "@/server/db/schema";
-import { generateEmbedding, buildEffortText } from "@/lib/embedding";
+// TODO(mathran-v0.1): import { workspaceEfforts, workspaceEffortVersions } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { generateEmbedding, buildEffortText } from "@/lib/embedding";
 import { scoreEffortQuality } from "@/lib/effort-quality";
-import { slugify } from "@/lib/utils";
+// TODO(mathran-v0.1): import { slugify } from "@/lib/utils";
 import { eq, and, sql, desc } from "drizzle-orm";
-import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
 import { TRPCError } from "@trpc/server";
 
-import type { Database } from "@/server/db";
+// TODO(mathran-v0.1): import type { Database } from "@/server/db";
 type Db = Pick<Database, "select" | "insert" | "update" | "delete" | "execute">;
 
 export interface EffortServiceCreateInput {

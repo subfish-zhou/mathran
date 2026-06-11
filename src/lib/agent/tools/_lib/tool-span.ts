@@ -7,7 +7,7 @@
  */
 
 import type { AgentPrincipal } from "@/server/agent-gateway/principal";
-import { withSpan } from "@/lib/observability/trace";
+// TODO(mathran-v0.1): import { withSpan } from "@/lib/observability/trace";
 
 export async function withToolSpan<T>(
   toolName: string,

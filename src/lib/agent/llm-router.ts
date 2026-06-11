@@ -27,7 +27,7 @@ import {
   OpenAIProvider,
   AnthropicProvider,
 } from "./llm-provider";
-import { log } from "@/lib/observability/logger";
+// TODO(mathran-v0.1): import { log } from "@/lib/observability/logger";
 
 // ========== Provider singletons ==========
 

@@ -17,8 +17,8 @@
  */
 
 import { and, eq, isNull } from "drizzle-orm";
-import { getDb } from "@/server/db";
-import { users } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { users } from "@/server/db/schema";
 import type { AgentPrincipal } from "@/server/agent-gateway/principal";
 
 export async function userIdToPrincipal(userId: string): Promise<AgentPrincipal | null> {

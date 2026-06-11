@@ -9,8 +9,8 @@
  *  - the summarizer agent → listResumableRuns / run lookup
  */
 
-import { getDb } from "@/server/db";
-import { assistantGoalRuns } from "@/server/db/schema/assistant_goal";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { assistantGoalRuns } from "@/server/db/schema/assistant_goal";
 import { and, eq, lt, sql, desc, inArray } from "drizzle-orm";
 import { seedGoalBudgetForConversation } from "./runtime-budgets";
 import { seedBlockedStateForConversation } from "./runtime-blocked";

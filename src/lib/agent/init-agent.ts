@@ -13,7 +13,7 @@
  */
 
 import { TokenCounter } from "./azure-llm";
-import type { JobContext } from "@/lib/jobs/job-manager";
+// TODO(mathran-v0.1): import type { JobContext } from "@/lib/jobs/job-manager";
 import type {
   InitAgentInput,
   InitAgentEvent,
@@ -26,31 +26,31 @@ import type {
 } from "./init-types";
 import { checkCompleteness } from "./init-spec";
 import { collectWikiWorkspaceRefStats, extractWorkspaceRefs, repairWorkspaceRefs } from "./ref-utils";
-import { slugify } from "@/lib/utils";
+// TODO(mathran-v0.1): import { slugify } from "@/lib/utils";
 import { buildSinglePagePrompt } from "./init-prompts";
 import { extractArxivIdFromUrl, chunkString } from "./init-parsers";
 import { searchArxiv, fetchWikipediaSummary } from "./init-crawlers";
 import { buildConceptExtractionPrompt } from "./init-prompts";
 import { callAzureLLM, extractJSON } from "./azure-llm";
 import { verifyContent, reviewAndRefinePages } from "./shared/review-verify";
-import {
-  explorePaperGraph,
-  buildSpine,
-  generateEffortsFromSpine,
-  generateWikiFromSpine,
-  type SpinePipelineEvent,
-  type NarrativeSpine,
-} from "./spine";
-import {
-  ingestSeedPapersForProject,
-  type PaperNodeInput,
-} from "@/lib/paper-graph";
+// TODO(mathran-v0.1): import {
+// TODO(mathran-v0.1):   explorePaperGraph,
+// TODO(mathran-v0.1):   buildSpine,
+// TODO(mathran-v0.1):   generateEffortsFromSpine,
+// TODO(mathran-v0.1):   generateWikiFromSpine,
+// TODO(mathran-v0.1):   type SpinePipelineEvent,
+// TODO(mathran-v0.1):   type NarrativeSpine,
+// TODO(mathran-v0.1): } from "./spine";
+// TODO(mathran-v0.1): import {
+// TODO(mathran-v0.1):   ingestSeedPapersForProject,
+// TODO(mathran-v0.1):   type PaperNodeInput,
+// TODO(mathran-v0.1): } from "@/lib/paper-graph";
 // FIX [audit-2 M4] hoist paper-graph schema imports to top-level (was:
 // duplicate dynamic imports inside the explore phase). Module cache hits
 // only once now.
-import { paperNodes as paperNodesTable } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { paperNodes as paperNodesTable } from "@/server/db/schema";
 import { inArray, sql } from "drizzle-orm";
-import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
 
 // ========== Configuration ==========
 

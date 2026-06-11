@@ -18,7 +18,7 @@ import type {
   EffortForLean,
   EffortWithRelations,
 } from "./lean-types";
-import { resolveChildPath } from "@/lib/server-safe-paths";
+// TODO(mathran-v0.1): import { resolveChildPath } from "@/lib/server-safe-paths";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);

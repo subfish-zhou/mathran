@@ -12,8 +12,8 @@
  * hiccup must never crash a running sub-agent. All entry points swallow errors
  * (log + continue). The in-memory map remains correct regardless.
  */
-import { getDb } from "@/server/db";
-import { assistantSubagentRuns, assistantSubagentDeadEnds } from "@/server/db/schema/assistant_subagent";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { assistantSubagentRuns, assistantSubagentDeadEnds } from "@/server/db/schema/assistant_subagent";
 import { and, desc, eq, or, isNull, ne } from "drizzle-orm";
 import { createHash } from "crypto";
 import os from "os";

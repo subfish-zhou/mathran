@@ -3,10 +3,10 @@ import { promisify } from "util";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { eq } from "drizzle-orm";
-import { workspaceEfforts, workspaceEffortFiles } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { workspaceEfforts, workspaceEffortFiles } from "@/server/db/schema";
 import { parseLeanFile, parseLakefileVersion } from "./lean-declaration-parser";
 import type { RepoImportResult, LakefileInfo, ParsedDeclaration } from "./lean-types";
-import { resolveChildPath } from "@/lib/server-safe-paths";
+// TODO(mathran-v0.1): import { resolveChildPath } from "@/lib/server-safe-paths";
 
 const execFileAsync = promisify(execFile);
 

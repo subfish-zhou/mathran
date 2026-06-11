@@ -21,9 +21,9 @@
  */
 
 import { and, desc, eq, ilike, inArray, lt, or, sql } from "drizzle-orm";
-import { getDb } from "@/server/db";
-import { userMemories, embeddings } from "@/server/db/schema";
-import { generateEmbedding } from "@/lib/embedding";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { userMemories, embeddings } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { generateEmbedding } from "@/lib/embedding";
 
 export type MemoryKind = "note" | "auto" | "summary";
 

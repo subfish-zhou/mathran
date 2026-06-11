@@ -1,9 +1,9 @@
 import { and, eq, isNull } from "drizzle-orm";
-import { auth } from "@/auth";
-import { authenticateBot } from "@/lib/bot-auth";
-import type { RateLimitKind } from "@/lib/rate-limit";
-import { getDb } from "@/server/db";
-import { users } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { auth } from "@/auth";
+// TODO(mathran-v0.1): import { authenticateBot } from "@/lib/bot-auth";
+// TODO(mathran-v0.1): import type { RateLimitKind } from "@/lib/rate-limit";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { users } from "@/server/db/schema";
 
 /**
  * AgentPrincipal — discriminated union of the three identities that can drive
@@ -185,7 +185,7 @@ export function principalRateLimitKey(
 // ─── IPrincipal bridge ────────────────────────────────────────────────────────────
 //
 // [spec03 service-layer] The unified IPrincipal interface from
-// `@/lib/principal` lets shared services accept either a tRPC SessionPrincipal
+// `@/core/principal` lets shared services accept either a tRPC SessionPrincipal
 // or an AgentPrincipal without caring which auth stack the request came from.
 // This adapter projects the discriminated AgentPrincipal union onto IPrincipal
 // (kind/userId/role/displayName/impersonating) so that:
@@ -202,7 +202,7 @@ export function principalRateLimitKey(
 // less information; agent-gateway code paths should always start from the
 // authenticated AgentPrincipal and adapt downstream.
 
-import type { IPrincipal, PrincipalKind } from "@/lib/principal";
+import type { IPrincipal, PrincipalKind } from "@/core/principal";
 
 export function toIPrincipal(p: AgentPrincipal): IPrincipal {
   switch (p.type) {

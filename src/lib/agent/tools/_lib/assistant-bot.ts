@@ -18,8 +18,8 @@
  * per environment. The lookup result is memoized per-process.
  */
 import { eq } from "drizzle-orm";
-import { getDb } from "@/server/db";
-import { botAccounts } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { botAccounts } from "@/server/db/schema";
 
 export const MATHUB_ASSISTANT_BOT_SLUG = "mathub-assistant";
 

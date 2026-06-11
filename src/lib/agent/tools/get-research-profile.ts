@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "./types";
 import { getResearchProfile } from "../distill/injection";
-import { getDb } from "@/server/db";
-import { researcherProfiles, userPublications } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { researcherProfiles, userPublications } from "@/server/db/schema";
 import { eq, desc } from "drizzle-orm";
 
 export const getResearchProfileTool: ToolDefinition = {

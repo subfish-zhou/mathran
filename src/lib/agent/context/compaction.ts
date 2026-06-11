@@ -30,8 +30,8 @@
  *   - Atomic transaction: mark-isCompacted + insert-summary commit together.
  */
 
-import { getDb } from "@/server/db";
-import { channelMessages } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { channelMessages } from "@/server/db/schema";
 import { eq, and, asc, sql, inArray } from "drizzle-orm";
 import { MESSAGE_CONTENT_SLICE } from "../constants";
 import {

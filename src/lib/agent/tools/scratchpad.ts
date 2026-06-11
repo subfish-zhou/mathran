@@ -9,7 +9,7 @@
 // fails gracefully so the LLM can route around it.
 
 import type { ToolDefinition } from "./types";
-import { agentScratchpads } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { agentScratchpads } from "@/server/db/schema";
 import { and, eq, sql } from "drizzle-orm";
 
 const MAX_CONTENT_BYTES = 256 * 1024; // 256 KB hard cap per scratchpad entry

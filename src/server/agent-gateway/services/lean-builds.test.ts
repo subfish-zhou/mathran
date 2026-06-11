@@ -93,7 +93,7 @@ vi.mock("@/lib/observability/trace", async () => {
 });
 
 // --- mock ObjectStore ---
-import { MemoryObjectStore } from "@/lib/object-store/memory";
+// TODO(mathran-v0.1): import { MemoryObjectStore } from "@/lib/object-store/memory";
 const memoryStore = new MemoryObjectStore();
 vi.mock("@/lib/object-store", () => ({
   getObjectStore: () => memoryStore,

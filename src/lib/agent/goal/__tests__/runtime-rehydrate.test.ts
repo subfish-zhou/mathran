@@ -20,7 +20,7 @@ import {
   _resetBlockedStatesForTest,
 } from "../runtime-blocked";
 import { rehydrateRuntimeFromRun } from "../run-state";
-import type { assistantGoalRuns } from "@/server/db/schema";
+// TODO(mathran-v0.1): import type { assistantGoalRuns } from "@/server/db/schema";
 
 type GoalRunRow = typeof assistantGoalRuns.$inferSelect;
 

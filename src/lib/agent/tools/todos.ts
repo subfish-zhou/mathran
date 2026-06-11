@@ -13,8 +13,8 @@
 // tool result and emits the SSE 'todos' event. See chat-handler.ts.
 
 import type { ToolDefinition } from "./types";
-import type { TodoItem } from "@/server/db/schema";
-import { assistantTodos } from "@/server/db/schema";
+// TODO(mathran-v0.1): import type { TodoItem } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { assistantTodos } from "@/server/db/schema";
 import { eq, sql } from "drizzle-orm";
 
 const VALID_STATUSES = new Set([

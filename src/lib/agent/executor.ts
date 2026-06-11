@@ -27,7 +27,7 @@ import {
   runSubagentStopHooks,
 } from "./hooks/runtime";
 // W7: per-user-tool rate-limit at the executor entry of each tool call.
-import { requireRateLimit, RateLimitExceededError } from "@/lib/rate-limit";
+// TODO(mathran-v0.1): import { requireRateLimit, RateLimitExceededError } from "@/lib/rate-limit";
 // Goal Supervisor: completion gate (opt-in, default disabled = original break).
 import { type AssistantGoalConfig, DEFAULT_GOAL_CONFIG } from "./goal-config";
 import { getActiveRunForConversation } from "./goal/run-state";

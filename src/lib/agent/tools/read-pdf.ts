@@ -6,7 +6,7 @@
 import type { ToolDefinition } from "./types";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { safeFetchBuffer } from "@/lib/safe-fetch";
+// TODO(mathran-v0.1): import { safeFetchBuffer } from "@/lib/safe-fetch";
 import { z } from "zod";
 
 // pdf-parse has no published @types; declare a minimal local typing.

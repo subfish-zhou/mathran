@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
-import type { Database } from "@/server/db";
-import { conversations } from "@/server/db/schema";
+// TODO(mathran-v0.1): import type { Database } from "@/server/db";
+// TODO(mathran-v0.1): import { conversations } from "@/server/db/schema";
 import type { ChatContextType } from "./prompt-builder";
 
 export interface ConversationScope {

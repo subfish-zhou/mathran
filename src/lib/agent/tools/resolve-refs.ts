@@ -1,4 +1,4 @@
-import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
 import { parseMathRefs } from "@/lib/mathref/parse";
 import { resolveMathRefs } from "@/lib/mathref/resolve";
 import type { ToolDefinition } from "./types";

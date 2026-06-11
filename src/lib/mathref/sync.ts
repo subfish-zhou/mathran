@@ -1,7 +1,7 @@
 // MathRef sync — writes cross-reference edges from parsed content.
 import { eq, and } from "drizzle-orm";
-import type { Database } from "@/server/db";
-import { crossReferences } from "@/server/db/schema";
+// TODO(mathran-v0.1): import type { Database } from "@/server/db";
+// TODO(mathran-v0.1): import { crossReferences } from "@/server/db/schema";
 import { parseMathRefs } from "./parse";
 import { resolveMathRefs } from "./resolve";
 

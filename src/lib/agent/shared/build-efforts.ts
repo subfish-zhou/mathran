@@ -9,7 +9,7 @@ import { callAzureLLM, extractJSON, type TokenCounter } from "../azure-llm";
 import { fetchArxivFullText, SURVEY_MAX_CHARS } from "../full-text";
 import { buildWSAnalysisPrompt } from "../init-prompts";
 import { mapWorkspaceEffortType, mapWSStatus } from "../init-parsers";
-import { slugify } from "@/lib/utils";
+// TODO(mathran-v0.1): import { slugify } from "@/lib/utils";
 import type {
   CrawledResource,
   WorkspaceEffortOutput,

@@ -1,6 +1,6 @@
 import type { ToolDefinition } from "./types";
-import { getDb } from "@/server/db";
-import { userKnowledgeBase } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { userKnowledgeBase } from "@/server/db/schema";
 import { eq, and, desc, ilike, or } from "drizzle-orm";
 
 export const getUserKnowledgeTool: ToolDefinition = {

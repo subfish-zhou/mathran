@@ -9,7 +9,7 @@ import { callAzureLLM, extractJSON, type TokenCounter } from "../azure-llm";
 import type { CrawledResource } from "../init-types";
 export { searchArxiv, fetchWikipediaSummary, sleep, ARXIV_RATE_DELAY } from "../init-crawlers";
 import { searchArxiv, sleep, ARXIV_RATE_DELAY } from "../init-crawlers";
-import { log } from "@/lib/observability/logger";
+// TODO(mathran-v0.1): import { log } from "@/lib/observability/logger";
 
 // ========== Config ==========
 

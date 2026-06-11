@@ -67,7 +67,7 @@ vi.mock("@/lib/observability/trace", async () => {
 });
 
 // --- mock ObjectStore via factory ---
-import { MemoryObjectStore } from "@/lib/object-store/memory";
+// TODO(mathran-v0.1): import { MemoryObjectStore } from "@/lib/object-store/memory";
 const memoryStore = new MemoryObjectStore();
 const putSpy = vi.spyOn(memoryStore, "put");
 const deleteSpy = vi.spyOn(memoryStore, "delete");

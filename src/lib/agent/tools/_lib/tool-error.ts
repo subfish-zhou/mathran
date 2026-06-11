@@ -13,8 +13,8 @@
  * at info-level for expected outcomes so tool-error stats can be derived.)
  */
 
-import { log } from "@/lib/observability/logger";
-import { getCurrentPrincipal, getTraceId } from "@/lib/observability/trace";
+// TODO(mathran-v0.1): import { log } from "@/lib/observability/logger";
+// TODO(mathran-v0.1): import { getCurrentPrincipal, getTraceId } from "@/lib/observability/trace";
 import { PrincipalAuthError } from "@/server/agent-gateway/principal";
 import {
   ResourceForbiddenError,

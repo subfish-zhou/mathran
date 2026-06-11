@@ -9,8 +9,8 @@
  * one place.
  */
 import { and, eq, isNull } from "drizzle-orm";
-import { getDb } from "@/server/db";
-import { projects, projectMembers, agentRuns } from "@/server/db/schema";
+// TODO(mathran-v0.1): import { getDb } from "@/server/db";
+// TODO(mathran-v0.1): import { projects, projectMembers, agentRuns } from "@/server/db/schema";
 import type { InitAgentInput } from "@/lib/agent/init-types";
 
 // ── 1. Eager project-row reservation ────────────────────────────────────

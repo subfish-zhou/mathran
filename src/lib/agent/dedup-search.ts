@@ -5,7 +5,7 @@
  * Queries the real `projects` DB table via tRPC or direct DB calls.
  */
 
-import type { SimilarProject } from "@/components/create-project/DuplicateAlert";
+// TODO(mathran-v0.1): import type { SimilarProject } from "@/components/create-project/DuplicateAlert";
 
 const STOP_WORDS = new Set([
   // English
