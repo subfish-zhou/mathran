@@ -11,6 +11,7 @@
   "include": [
     "src/cli/**/*.ts",
     "src/core/**/*.ts",
+    "src/providers/**/*.ts",
     "src/_stubs/**/*.d.ts"
   ],
   "exclude": [
