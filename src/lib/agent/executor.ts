@@ -1087,7 +1087,7 @@ export async function runAgentLoop(options: AgentExecutorOptions): Promise<Agent
       if (userId) {
         try {
           await requireRateLimit("user-tool", userId);
-        } catch (e) {
+        } catch (e: any) {
           if (e instanceof RateLimitExceededError) {
             const retrySec = Math.max(1, Math.ceil((e.decision.resetAt - Date.now()) / 1000));
             const rlResult: ToolResult = {

@@ -47,7 +47,7 @@ async function findLeanFiles(dir: string, base: string): Promise<string[]> {
  */
  
 export async function importLeanRepo(
-  db: import("@/server/db").Database,
+  db: Database,
   projectId: string,
   userId: string,
   repoUrl: string,

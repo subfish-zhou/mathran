@@ -45,5 +45,5 @@ export async function getAssistantBotId(
     console.error("[assistant-bot] getAssistantBotId lookup failed:", err);
     cachedAssistantBotId = null;
   }
-  return cachedAssistantBotId;
+  return cachedAssistantBotId ?? null;
 }
