@@ -4,8 +4,8 @@ import { ToolRegistry } from "./registry";
 // TODO(mathran-v0.1): import { searchForumTool } from "./search-forum";
 import { searchArxivTool } from "./search-arxiv";
 import { searchWebTool } from "./search-web";
-import { searchGithubTool } from "./search-github";
-import { queryDatabaseTool } from "./query-database";
+// TODO(mathran-v0.1): import { searchGithubTool } from "./search-github";
+// TODO(mathran-v0.1): import { queryDatabaseTool } from "./query-database";
 // TODO(mathran-v0.1): import { createEffortTool } from "./create-effort";
 // TODO(mathran-v0.1): import { createForumThreadTool } from "./create-forum-thread";
 // TODO(mathran-v0.1): import { createForumPostTool } from "./create-forum-post";
@@ -36,7 +36,7 @@ import { queryDatabaseTool } from "./query-database";
 // TODO(mathran-v0.1): import { markAllThreadsReadTool } from "./mark-all-threads-read";
 // TODO(mathran-v0.1): import { searchForumPostsTool } from "./search-forum-posts";
 // TODO(mathran-v0.1): import { getPollTool } from "./get-poll";
-import { getScheduledTool } from "./get-scheduled";
+// TODO(mathran-v0.1): import { getScheduledTool } from "./get-scheduled";
 // TODO(mathran-v0.1): import { cancelScheduledTool } from "./cancel-scheduled";
 // TODO(mathran-v0.1): import { createWikiPageTool } from "./create-wiki-page";
 // TODO(mathran-v0.1): import { updateWikiPageTool } from "./update-wiki-page";
@@ -45,7 +45,7 @@ import { runLatexTool } from "./run-latex";
 // TODO(mathran-v0.1): import { readWikiPageTool } from "./read-wiki-page";
 // TODO(mathran-v0.1): import { readEffortTool } from "./read-effort";
 // TODO(mathran-v0.1): import { readThreadTool } from "./read-thread";
-import { deepResearchTool } from "./deep-research";
+// TODO(mathran-v0.1): import { deepResearchTool } from "./deep-research";
 import { checkSubAgentTool, cancelSubAgentTool } from "./manage-sub-agent";
 import { listSubagentsTool } from "./list-subagents";
 import { getSubagentStatusTool } from "./get-subagent-status";
@@ -59,9 +59,9 @@ import {
   memoryReadTool,
   memorySearchTool,
 } from "./memory";
-import { getResearchProfileTool } from "./get-research-profile";
-import { getUserPublicationsTool } from "./get-user-publications";
-import { getUserKnowledgeTool } from "./get-user-knowledge";
+// TODO(mathran-v0.1): import { getResearchProfileTool } from "./get-research-profile";
+// TODO(mathran-v0.1): import { getUserPublicationsTool } from "./get-user-publications";
+// TODO(mathran-v0.1): import { getUserKnowledgeTool } from "./get-user-knowledge";
 import { runPythonTool } from "./run-python";
 // IMPL [pworkspace-mvp] sage interpreter not in MVP image — kept exported but not registered
 import { loadSkillReferenceTool } from "./load-skill-reference";

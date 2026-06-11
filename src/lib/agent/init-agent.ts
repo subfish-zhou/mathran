@@ -33,14 +33,14 @@ import { searchArxiv, fetchWikipediaSummary } from "./init-crawlers";
 import { buildConceptExtractionPrompt } from "./init-prompts";
 import { callAzureLLM, extractJSON } from "./azure-llm";
 import { verifyContent, reviewAndRefinePages } from "./shared/review-verify";
-// TODO(mathran-v0.1): import {
-// TODO(mathran-v0.1):   explorePaperGraph,
-// TODO(mathran-v0.1):   buildSpine,
-// TODO(mathran-v0.1):   generateEffortsFromSpine,
-// TODO(mathran-v0.1):   generateWikiFromSpine,
-// TODO(mathran-v0.1):   type SpinePipelineEvent,
-// TODO(mathran-v0.1):   type NarrativeSpine,
-// TODO(mathran-v0.1): } from "./spine";
+import {
+  explorePaperGraph,
+  buildSpine,
+  generateEffortsFromSpine,
+  generateWikiFromSpine,
+  type SpinePipelineEvent,
+  type NarrativeSpine,
+} from "./spine";
 // TODO(mathran-v0.1): import {
 // TODO(mathran-v0.1):   ingestSeedPapersForProject,
 // TODO(mathran-v0.1):   type PaperNodeInput,
@@ -813,11 +813,11 @@ export async function runInitWithJobContext(
     applyMode?: "none" | "append";
   },
 ): Promise<unknown> {
-  const { applyInitResult } = await import("@/lib/agent/apply-init-result");
-  const { getDb } = await import("@/server/db");
-  const { drafts, projects, programProjects, programs } = await import("@/server/db/schema");
+// TODO(mathran-v0.1):   const { applyInitResult } = await import("@/lib/agent/apply-init-result");
+// TODO(mathran-v0.1):   const { getDb } = await import("@/server/db");
+// TODO(mathran-v0.1):   const { drafts, projects, programProjects, programs } = await import("@/server/db/schema");
   const { eq, and, isNull } = await import("drizzle-orm");
-  const { createNotification } = await import("@/lib/notifications");
+// TODO(mathran-v0.1):   const { createNotification } = await import("@/lib/notifications");
 
   const db = getDb();
   const { projectSlug, userId, resumeCheckpoint, applyMode = "none" } = opts;

@@ -25,31 +25,31 @@ export {
 } from "./build-efforts";
 
 // Wiki generation
-// TODO(mathran-v0.1): export {
-// TODO(mathran-v0.1):   generateWikiContent,
-// TODO(mathran-v0.1):   mergeWikiContent,
-// TODO(mathran-v0.1):   updateWikiIncremental,
-// TODO(mathran-v0.1):   type WikiGeneratorConfig,
-// TODO(mathran-v0.1):   type WikiGeneratorResult,
-// TODO(mathran-v0.1):   type WikiIncrementalConfig,
-// TODO(mathran-v0.1):   type WikiIncrementalResult,
-// TODO(mathran-v0.1): } from "./wiki-generator";
+export {
+  generateWikiContent,
+  mergeWikiContent,
+  updateWikiIncremental,
+  type WikiGeneratorConfig,
+  type WikiGeneratorResult,
+  type WikiIncrementalConfig,
+  type WikiIncrementalResult,
+} from "./wiki-generator";
 
 // Wiki Patrol v2 — Extract → Match → Patch
-// TODO(mathran-v0.1): export {
-// TODO(mathran-v0.1):   extractKnowledgeItems,
-// TODO(mathran-v0.1):   matchKnowledgeToPlacements,
-// TODO(mathran-v0.1):   patchWikiSections,
-// TODO(mathran-v0.1):   classifyDiscoveriesToEfforts,
-// TODO(mathran-v0.1):   type KnowledgeItem,
-// TODO(mathran-v0.1):   type PlacementDecision,
-// TODO(mathran-v0.1):   type WikiPatch,
-// TODO(mathran-v0.1):   type ExtractConfig,
-// TODO(mathran-v0.1):   type MatchConfig,
-// TODO(mathran-v0.1):   type PatchConfig,
-// TODO(mathran-v0.1):   type ClassifyEffortsConfig,
-// TODO(mathran-v0.1):   type ClassifyEffortsResult,
-// TODO(mathran-v0.1): } from "./wiki-patrol-v2";
+export {
+  extractKnowledgeItems,
+  matchKnowledgeToPlacements,
+  patchWikiSections,
+  classifyDiscoveriesToEfforts,
+  type KnowledgeItem,
+  type PlacementDecision,
+  type WikiPatch,
+  type ExtractConfig,
+  type MatchConfig,
+  type PatchConfig,
+  type ClassifyEffortsConfig,
+  type ClassifyEffortsResult,
+} from "./wiki-patrol-v2";
 
 // Review & verify
 export {

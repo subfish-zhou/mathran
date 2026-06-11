@@ -153,7 +153,7 @@ export async function synthesizeExploreCheckpointFromDb(
 ): Promise<{ phase: string; data: Record<string, unknown> } | null> {
   const realDb = db ?? getDb();
   try {
-    const { projectPapers, paperNodes } = await import("@/server/db/schema");
+// TODO(mathran-v0.1):     const { projectPapers, paperNodes } = await import("@/server/db/schema");
     const { sql: sqlFn } = await import("drizzle-orm");
     // Match the live pipeline's relevance threshold (score >= 5 on a 0-10
     // scale → relevance_score >= 0.5 in project_papers). Seeds are stored
