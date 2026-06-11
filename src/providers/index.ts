@@ -8,3 +8,4 @@
 export { LocalLeanProvider, type LocalLeanProviderOptions } from "./lean/local.js";
 export { InMemoryStorage } from "./storage/in-memory.js";
 export { LocalFsArtifactSink } from "./artifact-sink/local-fs.js";
+export { copilotChat, resolveCopilotToken, type CopilotChatRequest, type CopilotChatResponse } from "./llm/copilot.js";

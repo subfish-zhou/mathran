@@ -33,7 +33,7 @@ program
   .description("Prove a single .lean file with the agent loop")
   .argument("<file>", "Path to a .lean source file containing the theorem")
   .option("-o, --output <dir>", "Output directory for artifacts (markdown, lean, logs)", "./mathran-out")
-  .option("-m, --model <model>", "LLM model to use (e.g. azure/gpt-55, anthropic/claude-sonnet-4)", "azure/gpt-55")
+  .option("-m, --model <model>", "LLM model to use (e.g. copilot/gpt-5.5, copilot/claude-opus-4.7, azure/gpt55, openai/gpt-4o)", "copilot/gpt-5.5")
   .option("--max-iterations <n>", "Maximum agent loop iterations", "50")
   .action(async (file: string, opts: { output: string; model: string; maxIterations: string }) => {
     const absPath = path.resolve(file);

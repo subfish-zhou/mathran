@@ -11,6 +11,11 @@
  *   ─→ success?  yes → write artifact + return 0
  *               no  → format errors, append to chat history, loop
  *
+ * Supports three LLM provider prefixes:
+ *   azure/<deployment>     → Azure OpenAI (chat.completions, OpenAI SDK)
+ *   openai/<model>         → OpenAI proper (chat.completions, OpenAI SDK)
+ *   copilot/<model>        → GitHub Copilot proxy (responses or v1/messages)
+ *
  * This deliberately bypasses the full Mathub-era runAgentLoop (which depends
  * on ambient stubs and would throw at runtime). The full agent loop with
  * tool calls / scratchpad / spawn-awaiter lights up in a later milestone
@@ -24,6 +29,8 @@ import {
   LocalLeanProvider,
   InMemoryStorage,
   LocalFsArtifactSink,
+  copilotChat,
+  type CopilotChatRequest,
 } from "../../providers/index.js";
 
 export interface RunProveOptions {
@@ -57,12 +64,28 @@ After your code block you may add a short prose explanation, but the lean code
 block is what matters.
 `;
 
-function buildLLMClient(model: string): { client: OpenAI; modelId: string } {
-  // Routing convention matches existing src/lib/agent/llm-router.ts:
-  //   "azure/<id>"     → Azure OpenAI deployment
-  //   "openai/<id>"    → OpenAI proper
-  //   "anthropic/<id>" → Anthropic (TODO; not yet wired in v0.1)
-  //   bare             → fallback OPENAI_API_KEY
+// ─── LLM router ────────────────────────────────────────────────────────────
+type LlmCaller = (history: ChatMsg[]) => Promise<{ text: string; usageIn: number; usageOut: number }>;
+
+function buildLlmCaller(model: string): LlmCaller {
+  if (model.startsWith("copilot/")) {
+    const modelId = model.slice("copilot/".length);
+    return async (history) => {
+      // copilotChat takes a separate system prompt + user/assistant turns.
+      let systemPrompt: string | undefined;
+      const turns: CopilotChatRequest["messages"] = [];
+      for (const m of history) {
+        if (m.role === "system") {
+          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + m.content : m.content;
+        } else {
+          turns.push({ role: m.role, content: m.content });
+        }
+      }
+      const r = await copilotChat({ model: modelId, systemPrompt, messages: turns, maxTokens: 8192 });
+      return { text: r.text, usageIn: r.usage.input, usageOut: r.usage.output };
+    };
+  }
+
   if (model.startsWith("azure/")) {
     const modelId = model.slice("azure/".length);
     const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
@@ -79,28 +102,53 @@ function buildLLMClient(model: string): { client: OpenAI; modelId: string } {
       defaultQuery: { "api-version": apiVersion },
       defaultHeaders: { "api-key": apiKey },
     });
-    return { client, modelId };
+    return async (history) => {
+      const r = await client.chat.completions.create({
+        model: modelId,
+        messages: history as OpenAI.Chat.ChatCompletionMessageParam[],
+        temperature: 0.2,
+      });
+      return {
+        text: r.choices?.[0]?.message?.content ?? "",
+        usageIn: r.usage?.prompt_tokens ?? 0,
+        usageOut: r.usage?.completion_tokens ?? 0,
+      };
+    };
   }
 
   if (model.startsWith("anthropic/")) {
     throw new Error(
-      "anthropic/* not yet wired in v0.1-alpha; use azure/* or openai/* for now",
+      "anthropic/* not yet wired in v0.1-alpha; use copilot/claude-* if you want Claude via Copilot",
     );
   }
 
+  // openai/* or bare model id
   const modelId = model.startsWith("openai/") ? model.slice("openai/".length) : model;
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    throw new Error("openai/* model requires OPENAI_API_KEY");
+    throw new Error(
+      "openai/* model requires OPENAI_API_KEY (or use copilot/* / azure/*)",
+    );
   }
-  return { client: new OpenAI({ apiKey }), modelId };
+  const client = new OpenAI({ apiKey });
+  return async (history) => {
+    const r = await client.chat.completions.create({
+      model: modelId,
+      messages: history as OpenAI.Chat.ChatCompletionMessageParam[],
+      temperature: 0.2,
+    });
+    return {
+      text: r.choices?.[0]?.message?.content ?? "",
+      usageIn: r.usage?.prompt_tokens ?? 0,
+      usageOut: r.usage?.completion_tokens ?? 0,
+    };
+  };
 }
 
+// ─── Helpers ───────────────────────────────────────────────────────────────
 function extractLeanBlock(text: string, fallback: string): { code: string; found: boolean } {
   const fence = /```(?:lean|lean4)?\s*\n([\s\S]*?)```/i.exec(text);
   if (fence) return { code: fence[1].trim() + "\n", found: true };
-  // Fallback: if the message has no fence but starts with import/theorem/def,
-  // accept the whole message as code.
   if (/^\s*(import|theorem|lemma|def|example)\b/m.test(text)) {
     return { code: text.trim() + "\n", found: true };
   }
@@ -116,6 +164,7 @@ function formatErrors(messages: Array<{ severity: string; message: string; line?
     .join("\n");
 }
 
+// ─── Main entry ────────────────────────────────────────────────────────────
 export async function runProve(opts: RunProveOptions): Promise<number> {
   const startedAt = Date.now();
   console.log(`mathran prove — v0.1-alpha (minimal loop)`);
@@ -125,7 +174,6 @@ export async function runProve(opts: RunProveOptions): Promise<number> {
   console.log(`  max iterations:  ${opts.maxIterations}`);
   console.log("");
 
-  // ─── Bootstrap providers ─────────────────────────────────────────────────
   const lean = new LocalLeanProvider();
   const storage = new InMemoryStorage();
   const sink = new LocalFsArtifactSink(opts.outputDir);
@@ -138,23 +186,20 @@ export async function runProve(opts: RunProveOptions): Promise<number> {
   console.log(`[sink] ${(await sink.describe()).name}`);
   console.log("");
 
-  // ─── LLM client ──────────────────────────────────────────────────────────
-  let llm: ReturnType<typeof buildLLMClient>;
+  let callLlm: LlmCaller;
   try {
-    llm = buildLLMClient(opts.model);
+    callLlm = buildLlmCaller(opts.model);
   } catch (err: any) {
     console.error(`[mathran prove] ${err.message}`);
     return 3;
   }
 
-  // ─── Load source ─────────────────────────────────────────────────────────
   const source = await fs.readFile(opts.leanFile, "utf-8");
   if (source.trim().length === 0) {
     console.error("mathran prove: source file is empty");
     return 2;
   }
 
-  // ─── Initial baseline check ──────────────────────────────────────────────
   console.log("[check] running lean on baseline...");
   const baselineCheck = await lean.check({ filePath: opts.leanFile });
   if (baselineCheck.ok) {
@@ -166,7 +211,6 @@ export async function runProve(opts: RunProveOptions): Promise<number> {
   );
   console.log("");
 
-  // ─── Persistent state ────────────────────────────────────────────────────
   const candidateFile = path.join(opts.outputDir, "candidate.lean");
   const chat: ChatMsg[] = [
     { role: "system", content: SYSTEM_PROMPT },
@@ -186,28 +230,24 @@ export async function runProve(opts: RunProveOptions): Promise<number> {
   let lastCandidate = source;
   let lastErrors = "";
 
-  // ─── The fix-it loop ─────────────────────────────────────────────────────
   for (let iter = 1; iter <= opts.maxIterations; iter++) {
     console.log(`── iteration ${iter}/${opts.maxIterations} ──`);
 
-    let response: OpenAI.Chat.ChatCompletion;
+    let reply: string;
+    let tokensIn = 0;
+    let tokensOut = 0;
     try {
-      response = await llm.client.chat.completions.create({
-        model: llm.modelId,
-        messages: chat as OpenAI.Chat.ChatCompletionMessageParam[],
-        temperature: 0.2,
-      });
+      const r = await callLlm(chat);
+      reply = r.text;
+      tokensIn = r.usageIn;
+      tokensOut = r.usageOut;
     } catch (err: any) {
       console.error(`[llm] error: ${err?.message ?? err}`);
       await storage.updateRun(run.id, { status: "failed", payload: { error: String(err) } });
       return 4;
     }
 
-    const reply = response.choices?.[0]?.message?.content ?? "";
-    const tokensIn = response.usage?.prompt_tokens ?? 0;
-    const tokensOut = response.usage?.completion_tokens ?? 0;
     console.log(`[llm] reply ${reply.length} chars (${tokensIn} in, ${tokensOut} out)`);
-
     chat.push({ role: "assistant", content: reply });
 
     const extracted = extractLeanBlock(reply, lastCandidate);
@@ -276,7 +316,6 @@ export async function runProve(opts: RunProveOptions): Promise<number> {
     });
   }
 
-  // ─── Out of iterations ───────────────────────────────────────────────────
   const totalMs = Date.now() - startedAt;
   await storage.updateRun(run.id, {
     status: "failed",
