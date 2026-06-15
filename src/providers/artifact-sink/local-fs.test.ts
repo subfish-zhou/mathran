@@ -6,7 +6,11 @@ import { describe, it, expect, beforeEach } from "vitest";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { LocalFsArtifactSink } from "./local-fs.js";
+
+const execFileAsync = promisify(execFile);
 
 let tmpDir: string;
 let sink: LocalFsArtifactSink;
@@ -82,5 +86,90 @@ describe("LocalFsArtifactSink", () => {
     });
     const content = await fs.readFile(path.join(tmpDir, "activity.jsonl"), "utf-8");
     expect(JSON.parse(content.trim()).verb).toBe("created");
+  });
+});
+
+describe("LocalFsArtifactSink (wiki mode)", () => {
+  let dir: string;
+  let wikiSink: LocalFsArtifactSink;
+
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-test-wiki-"));
+    wikiSink = new LocalFsArtifactSink({ rootDir: dir, mode: "wiki" });
+  });
+
+  it("createPage writes to wiki/<slug>.md with frontmatter", async () => {
+    const p = await wikiSink.createPage({
+      title: "Wiki Page",
+      body: "wiki body",
+      authorId: "u1",
+      tags: ["t"],
+    });
+    expect(p.slug).toBe("wiki-page");
+    const file = await fs.readFile(path.join(dir, "wiki", "wiki-page.md"), "utf-8");
+    expect(file).toMatch(/^---/);
+    expect(file).toContain('title: "Wiki Page"');
+    expect(file).toContain("wiki body");
+  });
+
+  it("uses hidden index file and not pages/ dir", async () => {
+    await wikiSink.createPage({ title: "X", body: "b", authorId: "u1" });
+    const idx = JSON.parse(
+      await fs.readFile(path.join(dir, ".mathran-pages.index.json"), "utf-8"),
+    );
+    expect(Object.keys(idx)).toHaveLength(1);
+    await expect(fs.access(path.join(dir, "pages"))).rejects.toBeTruthy();
+  });
+
+  it("describe reports wiki mode", async () => {
+    expect((await wikiSink.describe()).name).toMatch(/wiki:/);
+  });
+});
+
+describe("LocalFsArtifactSink (git mode)", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-test-git-"));
+  });
+
+  it("commit produces a real git commit equal to HEAD", async () => {
+    const gitSink = new LocalFsArtifactSink({ rootDir: dir, git: true });
+    const p = await gitSink.createPage({ title: "G", body: "v1", authorId: "u1" });
+    const c = await gitSink.commit({
+      pageId: p.id,
+      body: "v2",
+      authorId: "u1",
+      message: "real commit",
+    });
+    expect(c.commitSha).toMatch(/^[0-9a-f]{40}$/);
+    const { stdout: head } = await execFileAsync("git", ["-C", dir, "rev-parse", "HEAD"]);
+    expect(head.trim()).toBe(c.commitSha);
+    const { stdout: log } = await execFileAsync("git", ["-C", dir, "log", "--oneline"]);
+    expect(log).toContain("real commit");
+  });
+
+  it("git mode works with wiki layout", async () => {
+    const gitWiki = new LocalFsArtifactSink({ rootDir: dir, mode: "wiki", git: true });
+    const p = await gitWiki.createPage({ title: "GW", body: "v1", authorId: "u1" });
+    const c = await gitWiki.commit({ pageId: p.id, body: "v2", authorId: "u1" });
+    expect(c.commitSha).toMatch(/^[0-9a-f]{40}$/);
+    const { stdout } = await execFileAsync("git", ["-C", dir, "ls-files"]);
+    expect(stdout).toContain("wiki/gw.md");
+  });
+
+  it("degrades to sha1 placeholder when git fails", async () => {
+    // Point git at a bogus binary via PATH so spawning git throws.
+    const gitSink = new LocalFsArtifactSink({ rootDir: dir, git: true });
+    const origPath = process.env.PATH;
+    process.env.PATH = "/nonexistent-path-for-test";
+    try {
+      const p = await gitSink.createPage({ title: "D", body: "v1", authorId: "u1" });
+      const c = await gitSink.commit({ pageId: p.id, body: "v2", authorId: "u1" });
+      expect(c.commitSha).toMatch(/^[0-9a-f]{40}$/);
+      expect((c as { degraded?: boolean }).degraded).toBe(true);
+    } finally {
+      process.env.PATH = origPath;
+    }
   });
 });
