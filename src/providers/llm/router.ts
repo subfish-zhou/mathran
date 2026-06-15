@@ -1,0 +1,162 @@
+/**
+ * ModelRouter — a single LLMProvider that fans out to per-provider adapters
+ * based on a "provider/model" routing string.
+ *
+ * Routing:
+ *   - `req.model` containing "/"  → "<providerKey>/<realModel>"
+ *   - `req.model` without "/"     → resolve provider from `defaultModel`'s
+ *                                    prefix (if any) or the first provider key;
+ *                                    the bare string is the real model.
+ *
+ * API-key resolution priority: explicit ProviderConfig.apiKey > process.env >
+ * (config file value, which *is* ProviderConfig.apiKey). Adapters are
+ * instantiated lazily (on first use) and cached, so a missing key for an
+ * unused provider never crashes the router.
+ */
+
+import type { LLMProvider, LLMRequest, LLMResponse } from "../../core/providers/llm.js";
+import { OpenAIAdapter } from "./openai.js";
+import { AnthropicAdapter } from "./anthropic.js";
+import { AzureOpenAIAdapter } from "./azure.js";
+import { OllamaAdapter } from "./ollama.js";
+import { CopilotAdapter } from "./copilot-adapter.js";
+
+export type ProviderKind = "openai" | "anthropic" | "azure" | "copilot" | "ollama";
+
+export interface ProviderConfig {
+  kind: ProviderKind;
+  apiKey?: string;
+  baseUrl?: string;
+  endpoint?: string;
+  deployment?: string;
+  apiVersion?: string;
+  /** Optional default model for this provider when none is supplied. */
+  defaultModel?: string;
+}
+
+export interface MathranConfig {
+  defaultModel?: string;
+  providers: Record<string, ProviderConfig>;
+}
+
+export type AdapterFactory = (
+  providerKey: string,
+  cfg: ProviderConfig,
+) => LLMProvider;
+
+export interface ModelRouterOptions {
+  /** Injection seam for tests; defaults to building real adapters. */
+  adapterFactory?: AdapterFactory;
+  /** Environment source (defaults to process.env). */
+  env?: Record<string, string | undefined>;
+}
+
+const ENV_KEY: Record<ProviderKind, string> = {
+  openai: "OPENAI_API_KEY",
+  anthropic: "ANTHROPIC_API_KEY",
+  azure: "AZURE_OPENAI_API_KEY",
+  copilot: "COPILOT_TOKEN",
+  ollama: "OLLAMA_API_KEY",
+};
+
+/** Resolve an API key: explicit config value wins, then the env var. */
+export function resolveApiKey(
+  cfg: ProviderConfig,
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  if (cfg.apiKey && cfg.apiKey.length > 0) return cfg.apiKey;
+  const envName = ENV_KEY[cfg.kind];
+  return envName ? env[envName] : undefined;
+}
+
+export class ModelRouter implements LLMProvider {
+  private cfg: MathranConfig;
+  private env: Record<string, string | undefined>;
+  private factory: AdapterFactory;
+  private cache = new Map<string, LLMProvider>();
+
+  constructor(cfg: MathranConfig, opts: ModelRouterOptions = {}) {
+    this.cfg = cfg;
+    this.env = opts.env ?? process.env;
+    this.factory = opts.adapterFactory ?? ((key, c) => this.defaultFactory(key, c));
+  }
+
+  async describe(): Promise<{ name: string; defaultModel?: string }> {
+    return { name: "model-router", defaultModel: this.cfg.defaultModel };
+  }
+
+  async chat(req: LLMRequest): Promise<LLMResponse> {
+    const { providerKey, model } = this.resolve(req.model);
+    const adapter = this.getAdapter(providerKey);
+    return adapter.chat({ ...req, model });
+  }
+
+  /** Parse a routing string into a provider key + real model name. */
+  resolve(modelString: string): { providerKey: string; model: string } {
+    const raw = modelString ?? "";
+    if (raw.includes("/")) {
+      const slash = raw.indexOf("/");
+      const providerKey = raw.slice(0, slash);
+      const model = raw.slice(slash + 1);
+      return { providerKey, model };
+    }
+    // No prefix: resolve the provider from defaultModel or the first provider.
+    const def = this.cfg.defaultModel;
+    if (def && def.includes("/")) {
+      const slash = def.indexOf("/");
+      const providerKey = def.slice(0, slash);
+      const model = raw.length > 0 ? raw : def.slice(slash + 1);
+      return { providerKey, model };
+    }
+    const firstKey = Object.keys(this.cfg.providers)[0];
+    if (!firstKey) {
+      throw new Error("ModelRouter: no providers configured");
+    }
+    const model = raw.length > 0 ? raw : (def ?? this.cfg.providers[firstKey].defaultModel ?? "");
+    return { providerKey: firstKey, model };
+  }
+
+  private getAdapter(providerKey: string): LLMProvider {
+    const existing = this.cache.get(providerKey);
+    if (existing) return existing;
+    const cfg = this.cfg.providers[providerKey];
+    if (!cfg) {
+      throw new Error(
+        `ModelRouter: unknown provider "${providerKey}" (known: ${Object.keys(this.cfg.providers).join(", ") || "none"})`,
+      );
+    }
+    const adapter = this.factory(providerKey, cfg);
+    this.cache.set(providerKey, adapter);
+    return adapter;
+  }
+
+  private defaultFactory(_providerKey: string, cfg: ProviderConfig): LLMProvider {
+    const apiKey = resolveApiKey(cfg, this.env);
+    switch (cfg.kind) {
+      case "openai":
+        if (!apiKey) throw new Error("OpenAI provider requires an API key (config.apiKey or OPENAI_API_KEY)");
+        return new OpenAIAdapter({ apiKey, baseUrl: cfg.baseUrl, defaultModel: cfg.defaultModel });
+      case "anthropic":
+        if (!apiKey) throw new Error("Anthropic provider requires an API key (config.apiKey or ANTHROPIC_API_KEY)");
+        return new AnthropicAdapter({ apiKey, baseUrl: cfg.baseUrl, defaultModel: cfg.defaultModel });
+      case "azure":
+        if (!apiKey) throw new Error("Azure provider requires an API key (config.apiKey or AZURE_OPENAI_API_KEY)");
+        if (!cfg.endpoint || !cfg.deployment || !cfg.apiVersion) {
+          throw new Error("Azure provider requires endpoint, deployment and apiVersion");
+        }
+        return new AzureOpenAIAdapter({
+          apiKey,
+          endpoint: cfg.endpoint,
+          deployment: cfg.deployment,
+          apiVersion: cfg.apiVersion,
+          defaultModel: cfg.defaultModel,
+        });
+      case "ollama":
+        return new OllamaAdapter({ baseUrl: cfg.baseUrl, apiKey, defaultModel: cfg.defaultModel });
+      case "copilot":
+        return new CopilotAdapter({ defaultModel: cfg.defaultModel });
+      default:
+        throw new Error(`ModelRouter: unsupported provider kind "${(cfg as ProviderConfig).kind}"`);
+    }
+  }
+}
