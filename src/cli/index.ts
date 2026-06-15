@@ -82,9 +82,10 @@ projectCmd
 program
   .command("doctor")
   .description("Check environment (LLM keys, lean toolchain, etc.)")
-  .action(async () => {
+  .option("--probe", "Send a minimal request to each provider to test reachability", false)
+  .action(async (opts: { probe?: boolean }) => {
     const { runDoctor } = await import("./commands/doctor.js");
-    process.exit(await runDoctor());
+    process.exit(await runDoctor({ probe: opts.probe }));
   });
 
 program.parseAsync(process.argv).catch((err) => {

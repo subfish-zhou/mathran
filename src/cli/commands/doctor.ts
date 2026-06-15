@@ -6,11 +6,164 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { loadConfig } from "../../core/config.js";
+import { ModelRouter, resolveApiKey } from "../../providers/llm/router.js";
+import type { MathranConfig, ProviderConfig, ProviderKind } from "../../providers/llm/router.js";
 
 interface Check {
   name: string;
   pass: boolean;
   detail: string;
+}
+
+/** Status of a single configured provider. ℹ = no key needed (local). */
+export type ProviderStatus = "ok" | "missing" | "incomplete" | "no-key-needed";
+
+export interface ProviderReport {
+  key: string;
+  kind: ProviderKind;
+  status: ProviderStatus;
+  /** Where the key came from. */
+  source: "config" | "env" | "none";
+  detail: string;
+  model?: string;
+}
+
+const ENV_KEY_NAME: Record<ProviderKind, string> = {
+  openai: "OPENAI_API_KEY",
+  anthropic: "ANTHROPIC_API_KEY",
+  azure: "AZURE_OPENAI_API_KEY",
+  copilot: "COPILOT_TOKEN",
+  ollama: "OLLAMA_API_KEY",
+};
+
+/** Mask a secret, showing only its last 4 characters. */
+function maskKey(key: string): string {
+  if (key.length <= 4) return "****";
+  return `…${key.slice(-4)}`;
+}
+
+/**
+ * Inspect a single configured provider's key/config status without contacting
+ * any API. `ollama` is treated as a local provider that needs no key.
+ */
+export function inspectProvider(
+  key: string,
+  cfg: ProviderConfig,
+  env: Record<string, string | undefined> = process.env,
+): ProviderReport {
+  const base: ProviderReport = {
+    key,
+    kind: cfg.kind,
+    status: "missing",
+    source: "none",
+    detail: "",
+    model: cfg.defaultModel,
+  };
+
+  // Resolve key source: explicit config value wins over env.
+  const hasConfigKey = !!cfg.apiKey && cfg.apiKey.length > 0;
+  const envName = ENV_KEY_NAME[cfg.kind];
+  const envVal = envName ? env[envName] : undefined;
+  const resolved = resolveApiKey(cfg, env);
+  const source: ProviderReport["source"] = hasConfigKey
+    ? "config"
+    : envVal && envVal.length > 0
+      ? "env"
+      : "none";
+
+  if (cfg.kind === "ollama") {
+    // Local provider: no key required; just note the base URL if present.
+    return {
+      ...base,
+      status: "no-key-needed",
+      source,
+      detail: `local (no key needed)${cfg.baseUrl ? `, baseUrl=${cfg.baseUrl}` : ""}`,
+    };
+  }
+
+  if (cfg.kind === "azure") {
+    // Azure needs key + endpoint + deployment to be "complete".
+    const missing: string[] = [];
+    if (!resolved) missing.push("key");
+    if (!cfg.endpoint) missing.push("endpoint");
+    if (!cfg.deployment) missing.push("deployment");
+    if (missing.length > 0) {
+      return {
+        ...base,
+        status: resolved ? "incomplete" : "missing",
+        source,
+        detail: `missing ${missing.join(" + ")}`,
+      };
+    }
+    return {
+      ...base,
+      status: "ok",
+      source,
+      detail: `key ${source === "config" ? "(config)" : "(env)"} ${maskKey(resolved!)}, endpoint + deployment set`,
+    };
+  }
+
+  // Generic key-based providers (openai, anthropic, copilot).
+  if (resolved && resolved.length > 0) {
+    return {
+      ...base,
+      status: "ok",
+      source,
+      detail: `key ${source === "config" ? "(config)" : `(env ${envName})`} ${maskKey(resolved)}`,
+    };
+  }
+  return {
+    ...base,
+    status: "missing",
+    source: "none",
+    detail: `no key (set ${envName} or providers.${key}.apiKey)`,
+  };
+}
+
+function statusIcon(status: ProviderStatus): string {
+  switch (status) {
+    case "ok":
+      return "✅";
+    case "no-key-needed":
+      return "ℹ️";
+    default:
+      return "⚠️";
+  }
+}
+
+/** Build the per-provider report lines for the doctor output. */
+export function buildProviderReports(
+  cfg: MathranConfig,
+  env: Record<string, string | undefined> = process.env,
+): ProviderReport[] {
+  return Object.entries(cfg.providers).map(([key, pc]) => inspectProvider(key, pc, env));
+}
+
+/**
+ * Send a single minimal chat request to verify reachability. Only invoked
+ * under `--probe`. Returns false on any error (kept offline-safe by default).
+ */
+async function probeProvider(
+  cfg: ProviderConfig,
+  key: string,
+  env: Record<string, string | undefined>,
+): Promise<boolean> {
+  try {
+    const router = new ModelRouter({ providers: { [key]: cfg } }, { env });
+    const model = cfg.defaultModel ?? "";
+    const resp = await router.chat({
+      model: `${key}/${model}`,
+      messages: [{ role: "user", content: "ping" }],
+      maxTokens: 1,
+    });
+    for await (const _ of resp.stream()) {
+      break;
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function checkEnvVar(varName: string): Check {
@@ -75,7 +228,16 @@ function checkCopilotToken(): Check {
   }
 }
 
-export async function runDoctor(): Promise<number> {
+export interface DoctorOptions {
+  /** Actually send a minimal request to test reachability (default: false). */
+  probe?: boolean;
+  /** Injected config (defaults to loadConfig()). */
+  config?: MathranConfig;
+  /** Environment source (defaults to process.env). */
+  env?: Record<string, string | undefined>;
+}
+
+export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
   console.log("mathran doctor — environment health check");
   console.log("");
 
@@ -115,6 +277,44 @@ export async function runDoctor(): Promise<number> {
       const sym = c.pass ? "✓" : "✗";
       console.log(`  ${sym}  ${c.name.padEnd(28)} ${c.detail}`);
       if (!c.pass) allPass = false;
+    }
+    console.log("");
+  }
+
+  // Per-provider key/config status from config.toml (PRD AC2).
+  const env = opts.env ?? process.env;
+  let cfg: MathranConfig;
+  try {
+    cfg = opts.config ?? loadConfig();
+  } catch (err: any) {
+    cfg = { providers: {} };
+    console.log("── Configured providers (config.toml)");
+    console.log(`  ✗  failed to load config: ${err?.message ?? err}`);
+    console.log("");
+  }
+  const reports = buildProviderReports(cfg!, env);
+  console.log("── Configured providers (config.toml)");
+  if (reports.length === 0) {
+    console.log("  ℹ️  no providers configured in config.toml");
+  } else {
+    for (const r of reports) {
+      const icon = statusIcon(r.status);
+      const label = `${r.key} [${r.kind}]${r.model ? ` ${r.model}` : ""}`;
+      console.log(`  ${icon}  ${label.padEnd(34)} ${r.detail}`);
+    }
+  }
+  console.log("");
+
+  if (opts.probe && reports.length > 0) {
+    console.log("── Provider reachability (--probe)");
+    for (const r of reports) {
+      if (r.status === "missing" || r.status === "incomplete") {
+        console.log(`  ⚠️  ${r.key.padEnd(20)} skipped (${r.detail})`);
+        continue;
+      }
+      const ok = await probeProvider(cfg!.providers[r.key], r.key, env);
+      console.log(`  ${ok ? "✅" : "✗"}  ${r.key.padEnd(20)} ${ok ? "reachable" : "unreachable"}`);
+      if (!ok) allPass = false;
     }
     console.log("");
   }
