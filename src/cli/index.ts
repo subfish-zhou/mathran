@@ -3,13 +3,17 @@
  * mathran CLI — entry point.
  *
  * Usage:
- *   mathran prove <file>        Prove a single .lean theorem with the agent loop
+ *   mathran                     Start the conversational REPL
+ *   mathran chat                Start the conversational REPL
+ *   mathran -p "<prompt>"       One-shot conversation, then exit
+ *   echo "..." | mathran        One-shot from piped stdin
+ *   mathran prove <file>        (deprecated) prove a single .lean file
  *   mathran version             Print version
  *   mathran --help              Show help
  *
- * v0.1 scope: minimal CLI shell. `prove` is wired but the agent loop currently
- * depends on stubbed Mathub-platform bindings (see src/_stubs/v0.1-globals.d.ts)
- * — actual runtime integration lands in the provider-impl phase (D2).
+ * The conversational CLI (PRD §2.1/§5.4) is the primary entry point. Lean is
+ * just one tool the conversation may call (`lean_check`); `prove` is retained
+ * for compatibility but deprecated.
  */
 
 import { Command } from "commander";
@@ -21,21 +25,79 @@ async function loadProveCommand() {
   return import("./commands/prove.js");
 }
 
+interface TopLevelOpts {
+  prompt?: string;
+  model?: string;
+}
+
+/**
+ * Resolve a one-shot prompt from the `-p` option and/or piped stdin, or `null`
+ * to fall through to the interactive REPL.
+ *   - `-p "text"`           → that text
+ *   - `-p -` / `-p ""`      → read stdin
+ *   - no `-p`, piped stdin  → read stdin
+ *   - no `-p`, TTY          → null (REPL)
+ */
+async function resolvePrompt(opts: TopLevelOpts): Promise<string | null> {
+  const { readStdin } = await import("./commands/chat.js");
+  const piped = !process.stdin.isTTY;
+  if (opts.prompt !== undefined) {
+    const p = opts.prompt;
+    if (p === "-" || (p.trim() === "" && piped)) {
+      return (await readStdin()).trim();
+    }
+    return p;
+  }
+  if (piped) {
+    return (await readStdin()).trim();
+  }
+  return null;
+}
+
+/** Dispatch the conversational entry point: one-shot when a prompt is present, else REPL. */
+async function runChatEntry(opts: TopLevelOpts): Promise<never> {
+  const { runOneShot, runRepl } = await import("./commands/chat.js");
+  const prompt = await resolvePrompt(opts);
+  const code =
+    prompt !== null
+      ? await runOneShot({ prompt, model: opts.model })
+      : await runRepl({ model: opts.model });
+  process.exit(code);
+}
+
 const program = new Command();
 
 program
   .name("mathran")
-  .description("Standalone agent runtime for mathematical reasoning + Lean theorem proving")
-  .version("0.1.0-alpha.0", "-v, --version", "Print version and exit");
+  .description("Conversational workstation for mathematical reasoning + Lean theorem proving")
+  .version("0.1.0-alpha.0", "-v, --version", "Print version and exit")
+  .option("-p, --prompt <text>", 'One-shot prompt (use "-" or pipe stdin to read from stdin), then exit')
+  .option("-m, --model <model>", "LLM model to use (e.g. copilot/gpt-5.5); defaults to config.defaultModel")
+  .action(async (opts: TopLevelOpts) => {
+    await runChatEntry(opts);
+  });
+
+program
+  .command("chat")
+  .description("Start the conversational REPL (or one-shot with -p)")
+  .option("-p, --prompt <text>", 'One-shot prompt (use "-" or pipe stdin to read from stdin), then exit')
+  .option("-m, --model <model>", "LLM model to use (e.g. copilot/gpt-5.5); defaults to config.defaultModel")
+  .action(async (opts: TopLevelOpts) => {
+    await runChatEntry(opts);
+  });
 
 program
   .command("prove")
-  .description("Prove a single .lean file with the agent loop")
+  .description("(deprecated) Prove a single .lean file — use `mathran -p \"prove the lemma in foo.lean\"` instead")
   .argument("<file>", "Path to a .lean source file containing the theorem")
   .option("-o, --output <dir>", "Output directory for artifacts (markdown, lean, logs)", "./mathran-out")
   .option("-m, --model <model>", "LLM model to use (e.g. copilot/gpt-5.5, copilot/claude-opus-4.7, azure/gpt55, openai/gpt-4o)", "copilot/gpt-5.5")
   .option("--max-iterations <n>", "Maximum agent loop iterations", "50")
   .action(async (file: string, opts: { output: string; model: string; maxIterations: string }) => {
+    console.error(
+      'mathran: `prove` is deprecated; use the conversational CLI instead, e.g.\n' +
+        '  mathran -p "prove the lemma in ' + file + '"\n',
+    );
     const absPath = path.resolve(file);
     try {
       await fs.access(absPath);
