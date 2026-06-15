@@ -64,6 +64,21 @@ program
     }
   });
 
+const projectCmd = program
+  .command("project")
+  .description("Manage mathran projects in the workspace");
+
+projectCmd
+  .command("init")
+  .description("Scaffold a new project (dir skeleton + project.toml + wiki/index.md)")
+  .argument("<name>", "Human-readable project name")
+  .option("--workspace <dir>", "Workspace root (overrides MATHRAN_WORKSPACE and the default)")
+  .option("--force", "Overwrite an existing project directory", false)
+  .action(async (name: string, opts: { workspace?: string; force?: boolean }) => {
+    const { runProjectInit } = await import("./commands/project.js");
+    process.exit(await runProjectInit(name, { workspace: opts.workspace, force: opts.force }));
+  });
+
 program
   .command("doctor")
   .description("Check environment (LLM keys, lean toolchain, etc.)")
