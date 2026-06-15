@@ -1,0 +1,373 @@
+# Mathran PRD — 从 Mathub 提取出的本地数学家工作站
+
+**版本**: v0.1-draft
+**作者**: 芙莉莲（受子鱼之托起草）
+**起草日期**: 2026-06-12
+**对应代码**: `~/mathran` (commit @ 2026-06-11), `~/Mathub` 基准 `3d20973`
+**先行依据**:
+- `~/.openclaw/workspace/_tasks/mathub-extract/dep-scan.md`（依赖扫描）
+- `~/.openclaw/workspace/_tasks/mathub-decoupling-debt/`（6 spec 解耦冲刺，已全部 merge）
+- `~/mathran/_tasks/v0.1-cut-list.md`（v0.1 砍除清单）
+- `~/mathran/_tasks/sweep-{1,2,3}-*.md`（三轮砍除实施日志）
+
+---
+
+## 0. TL;DR
+
+**Mathran = Mathub 减去公共服务层后的本地数学家工作站。**
+
+Mathub 是面向社区的开源数学协作平台（Forum + Wiki + Channels + Workspace + AI Agent + Lean 形式化）。Mathran 是把其中 **prover 内核 + AI agent + Lean/Sage/LaTeX 沙箱 + 工作区抽象** 这套"一个数学家自己解题用得着的东西"剥出来，重新打包成可以 `npm i -g mathran` 装在自己笔记本上、不需要数据库不需要登录系统不需要 Web 服务就能跑的 CLI 工作站。
+
+> **一句话产品定位**: Mathub 的内核拆出来给你私人用。BYO LLM key、BYO Lean 工具链、所有数据落本地。
+
+---
+
+## 1. 为什么要做 mathran
+
+### 1.1 Mathub 的两副面孔
+
+Mathub 长出来后实际上同时承担了两个角色：
+
+| 角色 A：**社区平台** | 角色 B：**数学家私人工作站** |
+|---|---|
+| Forum 讨论 / Wiki 知识库 / Channels IM | AI Assistant 私聊 + 工作区文件 + Lean prove |
+| 多租户 / 用户系统 / 权限 / 声望 | 单租户 / 本地 / 无登录 |
+| 服务端 Next.js + Postgres + 多 worker | 单进程 CLI / 单文件 sqlite |
+| 开源给社区跑公共服务 | 装在数学家自己机器上 |
+
+这两套**共用同一份 agent 内核（`src/lib/agent/*` + `src/server/agent-gateway/services/*`）**，但围绕它捆绑了非常多 Mathub-only 的胶水（Wiki sink、Notification、ActivityFeed、ForumStream...）。
+
+### 1.2 为什么不直接装一份 Mathub 就完了
+
+子鱼明确表达：**数学家想要的是"我自己用的助手"，不是"一个社区平台 + 我恰好是唯一用户"。** 装一份 Mathub 来私用至少有四个反向负担：
+
+1. **Postgres 依赖**：本地装 PG + 跑迁移 + drizzle-kit，门槛过高。
+2. **Next.js 全栈**：要 build、要 nginx、要 :3000，CLI 用户会被劝退。
+3. **Forum/Wiki/Channels schema** 完全用不到，但 type-check / build / 启动全要带着。
+4. **登录鉴权**：本地单机没有"另一个用户"，但代码到处假设 `ctx.session.userId`，调用链经常拐到 NextAuth。
+
+### 1.3 为什么不是把 mathran 做成 Mathub 的另一个分支
+
+Fork 会立刻面临 **双仓库同步漂移** 问题。子鱼的真实诉求是 **代码物理上共享 prover 内核，只是把它切到一个 reusable package**，让 Mathub 主站和 mathran CLI 都依赖它：
+
+```
+packages/prover-core/        ← 共享内核（新增）
+  agent/                       ← 从 Mathub src/lib/agent 搬来
+  agent-gateway/services/      ← 从 Mathub 同名目录搬来（仅 prover 部分）
+  lib/{workspace,jobs,sandbox,observability,embedding,...}
+  sinks/                       ← 新增接口层，下面讲
+
+apps/mathub/                 ← Next.js + Forum + Wiki + Channels（现 Mathub 主站）
+  实现 MathubWikiSink: ArtifactSink
+
+apps/mathran-cli/            ← 新 CLI（即现 ~/mathran 仓库的最终归宿）
+  实现 LocalFsSink: ArtifactSink
+  sqlite 单文件存储
+```
+
+**长期形态是 monorepo**，但短期（v0.1）允许 mathran 仓库先用 git subtree / 手动拷贝走在前面，等 Mathub 这边 decoupling 全清完再合并成正式 monorepo（见 §7 路线图）。
+
+---
+
+## 2. 产品边界
+
+### 2.1 In Scope（mathran 提供）
+
+**核心能力**：
+
+- **`mathran prove <file.lean>`** — 单文件证明：读 Lean 源文件 → agent loop 尝试补全 sorry → 写产物到 `./out/`
+- **`mathran chat`**（v0.2+）— 交互式数学助手 REPL，自动调度 Lean/Sage/Python/LaTeX/PDF 工具
+- **`mathran doctor`** — 环境健康检查（elan/lake/lean、Python、SageMath、LaTeX、LLM key）
+- **`mathran workspace <ls|read|write>`** — 工作区文件操作（CLI 友好的 `~/mathran-workspace/` 视图）
+
+**保留的 agent 工具集**（来自 `_tasks/v0.1-cut-list.md`「留」清单）：
+
+| 类别 | 工具 |
+|---|---|
+| 工作区 | `workspace-{read,write,list,delete}`, `scratchpad`, `memory`, `todos` |
+| 任务管理 | `update-{goal,plan,step-status}`, `get-goal` |
+| 子代理 | `manage-sub-agent`, `spawn-awaiter`, `list-subagents`, `get-subagent-status` |
+| 引用 | `peek-ref`, `resolve-refs` |
+| 检索 | `search-arxiv`, `search-web`, `read-pdf` |
+| 沙箱 | `run-{latex,python,sage}`, `sandbox-common`, `install-package` |
+| 元 | `load-skill-reference`, `types`, `registry` |
+
+**保留的服务层**（来自 `mathub-extract/dep-scan.md`「进 prover-core」）：
+
+- `efforts.ts` / `effort-doc-pages.ts` / `effort-relations.ts` / `effort-review.ts` / `effort-structure.ts` / `_common.ts`
+- `lean.ts` / `lean-artifacts.ts` / `lean-builds.ts`
+- `programs.ts` / `projects.ts` / `search.ts` / `threads.ts` / `blueprint.ts`
+
+### 2.2 Out of Scope（明确不做）
+
+| 不做 | 原因 |
+|---|---|
+| Web UI / Next.js 服务 | mathran 是 CLI，不是网站 |
+| Forum / Wiki / Channels / IM | 这些是公共服务，单机用不到 |
+| 多用户 / NextAuth / 权限 / 声望 | 单机无概念 |
+| Postgres / drizzle 迁移系统 | 用 sqlite 单文件 |
+| Activity Feed / Notification | 单机不需要异步推送 |
+| Paper crawler / arxiv 全库 sync | 太重，按需在 `search-arxiv` 工具里临时拉 |
+| Bot token / public bot API | 不对外暴露 API |
+
+### 2.3 灰色地带（v0.1 阶段决策）
+
+| 模块 | v0.1 决策 | 备注 |
+|---|---|---|
+| Goal mode（goal/objective/budget） | **保留** | agent 思考的核心机制 |
+| chat-handler 多模态注入（PDF/图片） | **保留** | CLI 也需要附件输入 |
+| spine/patrol（巡查 agent） | **砍** | 是社区"自动巡 Forum"用的，单机无意义 |
+| init-agent（自动建项目） | **砍** | 强依赖 wiki/notification，且单机用户手动 `mkdir project` 就够 |
+| `tools/list-backrefs.ts` | **保留** | 需要从 API route 下沉到 lib（见 dep-scan §Open Q4） |
+
+---
+
+## 3. 架构契约：四个 Provider 接口
+
+mathran 内核必须**对底层基础设施零假设**。所有"会变环境"的能力都通过 4 个 Provider 接口注入：
+
+```ts
+// 1. Lean 工具链
+interface LeanProvider {
+  build(workspacePath: string): Promise<BuildResult>;
+  check(file: string): Promise<CheckResult>;
+  // mathran 默认实现：shell 出 elan/lake/lean
+  // Mathub 平台实现：调度到远程 lean-prover-agent VM
+}
+
+// 2. LLM 推理
+interface LLMProvider {
+  complete(messages, opts): Promise<string>;
+  stream(messages, opts): AsyncIterable<Chunk>;
+  // mathran 默认实现：直连 OpenAI / Anthropic / Azure
+  // Mathub 平台实现：通过 LiteLLM 网关 + 多租户路由
+}
+
+// 3. 状态持久化
+interface Storage {
+  // agent run state、scratchpad、memory、goal 历史
+  // mathran 默认：sqlite（单文件 ~/.mathran/state.db）
+  // Mathub 平台：Postgres
+}
+
+// 4. 产物落地（关键！）
+interface ArtifactSink {
+  createPage(input: PageInput): Promise<{id: string; slug: string}>;
+  updatePage(id, input): Promise<void>;
+  commit(input: CommitInput): Promise<{commitSha: string}>;
+  notify(userId, payload): Promise<void>;
+  postActivity(entry): Promise<void>;
+  // mathran 默认：LocalFsSink — 写本地 markdown + 可选 git commit
+  // Mathub 平台：MathubWikiSink — 写 wiki page + 发 notification + activity feed
+}
+```
+
+**这是 mathran 提取的核心契约。** Mathub `src/lib/agent/*` 现在有 12 处直接 `import "@/lib/wiki-service"` / `"@/lib/notifications"`（dep-scan §A），这些必须**全部改成 `inject(ArtifactSink)`**，才能让同一份 agent 内核既在 Mathub 跑也在 mathran 跑。
+
+---
+
+## 4. 提取策略：5 个阶段
+
+### Phase 0 — Decoupling Debt（✅ 已完成）
+
+来自 `_tasks/mathub-decoupling-debt/`，6 个 spec 全 merge：
+
+- spec01 workspace 改 polymorphic（去掉对 forum schema 的硬 FK）
+- spec02 引入 `IPrincipal` 抽象（替代 `ctx.session.userId` 的 ~475 处使用，骨架已落，codemod 待跑）
+- spec03 service-layer toIPrincipal adapter bridge
+- spec04 chat-handler.ts 1442 行按章节切 7 文件
+- spec05 route-manifest codegen
+- spec06 test mock helper
+
+**这一步把 Mathub 主站本身的反向耦合先压平**，剥离才有可能机械化。
+
+### Phase 1 — prover-core 包提取（in Mathub repo, 10-13 天）
+
+来自 `mathub-extract/dep-scan.md`：
+
+| 任务 | 工作量 | 内容 |
+|---|---|---|
+| A | 3-4 天 | 定义 `ArtifactSink` 接口；agent 8 处 wiki/notification import 全改为 sink 注入；Mathub 写 `MathubWikiSink` |
+| B | 2 天 | `src/lib/agent/` + 25 个 `lib/*` 子目录搬到 `packages/prover-core/` |
+| C | 3-4 天 | `agent-gateway/services/` 15 个 prover 文件搬入；14 个 Mathub-only 文件留原位 |
+| D | 2-3 天 | drizzle schema 拆 `prover-core-schema` + `mathub-schema`，migration 切两组 |
+
+Phase 1 退出条件：Mathub 主站 1449 测试全过，prover-core 单独 build 通过，DB schema 双源 migration 可切换。
+
+### Phase 2 — mathran v0.1 CLI 完成（in mathran repo, 1-2 周）
+
+当前 `~/mathran` 已完成（见 sweep 1-3 + tsc-pass 9 轮日志）：
+
+- ✅ A. Skeleton from Mathub
+- ✅ B. Provider 接口骨架
+- ✅ C. CLI scaffolding（`prove` / `doctor` / `--version` / `--help`）
+- ✅ D. Type system passes（tsc clean）
+- ⏳ **D2. 真 Provider 实现**（关键阻塞，下面展开）
+- ⏳ E. npm publish
+
+**D2 待做清单**（这才是 mathran 本身的实质工作）：
+
+1. **LeanProvider 真实现** — `LocalLeanProvider`：spawn `lake build` + 解析输出
+2. **LLMProvider 真实现** — `OpenAIProvider` / `AnthropicProvider` / `AzureProvider`
+3. **Storage 真实现** — `SqliteStorage`（better-sqlite3 + drizzle-orm 的 sqlite dialect）
+4. **ArtifactSink 真实现** — `LocalFsSink`：page 落 `./out/pages/<slug>.md`，commit 走本地 git
+5. **删 stub**：sweep 1-3 后还残留的 `_stubs/` 目录全部用真实现替换
+
+### Phase 3 — Monorepo 合并（2 周）
+
+Mathub 仓改成 npm workspaces / pnpm workspaces：
+
+```
+mathub-mono/
+├── packages/
+│   └── prover-core/      ← Phase 1 产物
+├── apps/
+│   ├── mathub/           ← 原 Mathub Next.js
+│   └── mathran-cli/      ← 把 ~/mathran 内容合并进来
+└── package.json
+```
+
+mathran 独立仓库归档/删除。版本协调：prover-core 走独立 semver，mathub 与 mathran-cli 各自 pin 一个版本。
+
+### Phase 4 — 发布与对外（持续）
+
+- npm publish `@mathub/prover-core` + `mathran`
+- mathran README 加完整 quickstart
+- 提供 3 个示例项目（single-file prove、project-level prove、math chat）
+- 文档迁移到 `docs.mathub.org/mathran`
+
+---
+
+## 5. 关键设计原则
+
+### 5.1 BYO 一切
+
+mathran **不携带**任何 API key、不预设 LLM 端点、不绑定 Lean 版本。用户：
+
+- `export OPENAI_API_KEY=...` 或 `export AZURE_OPENAI_API_KEY=...` + `AZURE_OPENAI_ENDPOINT=...` 或 `export ANTHROPIC_API_KEY=...`
+- 自己装 elan/lake/lean，`mathran doctor` 检查 PATH
+
+这保证 mathran 不掌握用户数据，也不替用户付任何费用。
+
+### 5.2 单文件 / 本地优先
+
+| 资源 | 位置 |
+|---|---|
+| 状态 DB | `~/.mathran/state.db`（sqlite） |
+| 工作区 | `./out/`（每次 `prove` 的当前目录） |
+| Skill 库 | `~/.mathran/skills/` |
+| 日志 | `~/.mathran/logs/<run-id>/` |
+| 配置 | `~/.mathran/config.toml` |
+
+**没有任何东西写到云端。**
+
+### 5.3 内核与 UI 严格分离
+
+prover-core **只暴露 TS API**。CLI 是 mathran-cli 这个包的事。未来如果有人想给 mathran 写个 TUI 或者 VS Code 插件，他们应当依赖 prover-core 而非 fork mathran-cli。
+
+### 5.4 与 Mathub 主站功能对等承诺
+
+凡是 Mathub `/assistant` 聊天里能用的 prover 能力，mathran CLI 都必须能用。**反过来不成立**（mathran 不需要支持 forum 自动回帖之类的平台能力）。
+
+---
+
+## 6. 验收标准
+
+### 6.1 mathran v0.1.0 GA 验收
+
+| 编号 | 验收项 | 通过方式 |
+|---|---|---|
+| AC1 | `npm i -g mathran` 在干净 Ubuntu/macOS 装得上 | CI matrix 测试 |
+| AC2 | `mathran doctor` 准确报告 elan/lake/lean/python/sage/latex 与 LLM key 状态 | 单元测试 + 手测 |
+| AC3 | `mathran prove path/to/file.lean -o ./out` 成功完成至少一个 LRC mini lemma | E2E 录屏 |
+| AC4 | 失败案例（缺 key、缺 lean、文件不存在）友好报错 | 单元测试覆盖 |
+| AC5 | 在断网状态下，本地 lean check / sqlite 读写仍正常（只 LLM 调用失败） | 手测 |
+| AC6 | 一次 `prove` 跑完所有产物落到 `./out/`，无任何文件写出 `./out/` 之外 | strace 验证 |
+| AC7 | npm 包 < 30 MB（不含 node_modules） | `npm publish --dry-run` |
+| AC8 | 文档 README 5 分钟读完即可上手 | 用户测试 |
+
+### 6.2 提取质量验收
+
+| 编号 | 验收项 | 通过方式 |
+|---|---|---|
+| EX1 | Mathub 主站 1449 测试在 Phase 1 完成后仍全过 | CI |
+| EX2 | `apps/mathub` 不再 import `packages/prover-core` 之外的 prover 代码 | madge 反向依赖图 |
+| EX3 | `packages/prover-core` 0 处 import `next` / `next-auth` / `@/components/*` / `@/app/*` | grep + tsc strict |
+| EX4 | `LocalFsSink` 与 `MathubWikiSink` 通过同一份接口契约测试套件 | vitest 契约测试 |
+| EX5 | `mathran prove` 与 Mathub `/assistant` 同样输入得到等价结构产物 | 配对回归测试 |
+
+---
+
+## 7. 路线图
+
+```
+2026-06-10  Phase 0 完成（decoupling debt 6 spec 清零）              ✅
+2026-06-11  ~/mathran 仓库初始化，A-D 阶段完成（CLI 骨架 + tsc 绿）  ✅
+2026-06-12  本 PRD 起草                                              👈 你在这里
+─────────────────────────────────────────────────────────────────────
+2026-06-15  Phase 1.A 完成（ArtifactSink 接口 + 双实现）
+2026-06-20  Phase 1.B/C 完成（agent + services 搬入 prover-core）
+2026-06-25  Phase 1.D 完成（schema 拆分）→ Mathub 主站全绿
+2026-06-30  Phase 2.D2 完成（mathran 4 个 Provider 真实现）
+2026-07-05  Phase 2 完成 → mathran v0.1.0 npm publish
+2026-07-15  Phase 3 完成（monorepo 合并）→ mathran 独立仓归档
+2026-07-31  Phase 4 第一波文档与示例完成 → 正式对外宣传
+```
+
+总周期 ~7 周（从 Phase 1 开始算 ~5 周）。
+
+---
+
+## 8. 风险与缓解
+
+| 风险 | 概率 | 影响 | 缓解 |
+|---|---|---|---|
+| Mathub 主站测试在 Phase 1 期间间歇性挂掉 | 中 | 高 | 每个 spec 独立 commit，CI 红了立刻 revert，绝不批量推 |
+| ArtifactSink 接口设计漏抽象，后期回炉 | 中 | 中 | Phase 1.A 完成后强制做契约测试 EX4，提前发现 |
+| sqlite 与 Postgres schema 不等价（drizzle dialect 差异） | 中 | 高 | Storage 接口做最薄抽象，agent 只用 KV + JSON blob，避免依赖 SQL 特性 |
+| 用户装 mathran 时 native sqlite 编译失败（better-sqlite3） | 中 | 中 | 提供预编译二进制；fallback 到 `sql.js` 纯 JS 版本 |
+| LLM 调用费用对个人用户太高 | 高 | 中 | 文档明确写预算预估；优先支持 local LLM（Ollama / vLLM） |
+| Lean 版本漂移（mathlib 升 toolchain） | 高 | 低 | BYO 工具链，mathran 不固定版本；doctor 显示当前版本 |
+| 抽包后 type-only import 形成新的循环依赖 | 低 | 中 | madge -c 在 CI 强制检查 |
+
+---
+
+## 9. 开放问题
+
+1. **Goal mode 是不是默认开**？Mathub 里 goal 模式当前默认关，需要用户在 UI 里勾。CLI 里默认行为是什么？建议默认开（CLI 用户大多是想跑长任务的），但 `--no-goal` 可关。
+2. **子代理（subagent）支持到什么程度**？mathran CLI 里 `manage-sub-agent` 工具如果被调用，意味着要 spawn 一个 mathran 进程的子进程。这在单机上是否合理？还是 v0.1 直接禁用子代理？倾向 v0.1 禁用，v0.2 再开。
+3. **Skill 系统怎么分发**？Mathub 内嵌的 skill 库 ~30 个 skill 是否全部打进 mathran 包？还是 mathran 启动时按需从 npm `@mathub/skills-*` 拉？倾向 v0.1 打包 core 10 个 skill，其余按需 install。
+4. **付费层？** Mathran 本体 MIT。是否在未来考虑可选托管服务（用户不想自己配 LLM key 时可以付月费用 mathub.org 代理的 LLM 端点）？本 PRD 不解决，留待 v0.2 之后讨论。
+5. **mathran 与 OpenClaw 的关系**？OpenClaw 也是个 agent runtime，mathran 是否应该作为 OpenClaw 的一个 plugin/skill 存在，而不是独立 CLI？倾向独立 CLI（OpenClaw 是通用助手 runtime，mathran 是数学专用栈，受众不一样），但保留 mathran-as-openclaw-plugin 作为未来发行通道。
+
+---
+
+## 10. 附录
+
+### 10.1 名词
+
+- **prover-core**：本 PRD 提议的 npm 包名，承载 Mathub 与 mathran 共享的 agent / prover 内核
+- **ArtifactSink**：产物落地接口，4 个 Provider 中最关键的一个
+- **IPrincipal**：调用主体抽象（替代 `ctx.session.userId`），在 Mathub 内是登录用户，在 mathran 内是固定的 `localhost`
+- **Decoupling Debt**：Mathub 主站内为剥离做准备的 6 个 spec（已清）
+
+### 10.2 引用清单
+
+| 文档 | 路径 | 作用 |
+|---|---|---|
+| Decoupling Sprint | `~/.openclaw/workspace/_tasks/mathub-decoupling-debt/README.md` | Phase 0 落地证据 |
+| 依赖扫描 | `~/.openclaw/workspace/_tasks/mathub-extract/dep-scan.md` | Phase 1 工作量依据 |
+| v0.1 砍除清单 | `~/mathran/_tasks/v0.1-cut-list.md` | Phase 2 In/Out scope 依据 |
+| Sweep 实施日志 | `~/mathran/_tasks/sweep-{1,2,3}-*.md` | Phase 2 已完成证据 |
+| mathran README | `~/mathran/README.md` | 当前对外文案 |
+| Mathub WorkspacePRD | `~/Mathub/docs/prd/WorkspacePRD.md` | 借用其 workspace 抽象设计 |
+
+### 10.3 与 Mathub 现有 PRD 的关系
+
+Mathub 已有 11 份 PRD（`~/Mathub/docs/prd/*.md`），全是**功能模块 PRD**（Forum/Wiki/User/Workspace/AI/...）。本 PRD 是**产品提取战略 PRD**，定位不同，不冲突。
+
+Mathran 不需要自己的 Forum/Wiki/User PRD（这些功能不做）。Mathran 后续如需要功能 PRD，参照 Mathub `AIAssistantPRD.md` + `WorkspacePRD.md` 的子集即可。
+
+### 10.4 变更日志
+
+- **2026-06-12 v0.1-draft** 芙莉莲首版起草，待子鱼 review
