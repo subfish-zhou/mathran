@@ -15,9 +15,13 @@ import {
   type BuiltinEffortType,
   type EffortMetadata,
   type EffortStatus,
+  type StatusHistoryEntry,
   defaultMetadata,
   isBuiltinEffortType,
   isEffortStatus,
+  isValidTransition,
+  STATUS_REQUIRES_REASON,
+  VALID_TRANSITIONS,
 } from "./types.js";
 
 const PROJECTS_DIR = "projects";
@@ -105,8 +109,26 @@ export async function readEffortMetadata(
 
 /** Coerce/validate a parsed toml object back into an `EffortMetadata`. */
 function normalizeMetadata(raw: any, slug: string): EffortMetadata {
-  const type = isBuiltinEffortType(raw.type) ? raw.type : "AUXILIARY";
-  const status = isEffortStatus(raw.status) ? raw.status : "DRAFT";
+  // Pre-GAP-#9 compat: effort.toml written before this commit may have
+  // type="REFERENCE". Migrate that to type=AUXILIARY + status=REFERENCE
+  // (mathub semantics) so the file still loads cleanly.
+  let rawType: string | undefined = typeof raw.type === "string" ? raw.type : undefined;
+  let rawStatus: string | undefined = typeof raw.status === "string" ? raw.status : undefined;
+  if (rawType === "REFERENCE") {
+    rawType = "AUXILIARY";
+    if (!rawStatus) rawStatus = "REFERENCE";
+  }
+  const type = rawType && isBuiltinEffortType(rawType) ? rawType : "AUXILIARY";
+  const status = rawStatus && isEffortStatus(rawStatus) ? rawStatus : "DRAFT";
+  const createdAt = typeof raw.createdAt === "string" ? raw.createdAt : new Date().toISOString();
+  const rawHistory = Array.isArray(raw.statusHistory) ? raw.statusHistory : null;
+  const statusHistory =
+    rawHistory && rawHistory.length > 0
+      ? (rawHistory.filter(
+          (e: any) =>
+            e && typeof e === "object" && typeof e.at === "string" && typeof e.to === "string",
+        ) as EffortMetadata["statusHistory"])
+      : [{ at: createdAt, to: status }];
   return {
     id: typeof raw.id === "string" ? raw.id : randomUUID(),
     slug: typeof raw.slug === "string" ? raw.slug : slug,
@@ -115,8 +137,9 @@ function normalizeMetadata(raw: any, slug: string): EffortMetadata {
     status,
     description: typeof raw.description === "string" ? raw.description : "",
     currentVersion: typeof raw.currentVersion === "number" ? raw.currentVersion : 0,
-    createdAt: typeof raw.createdAt === "string" ? raw.createdAt : new Date().toISOString(),
+    createdAt,
     updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : new Date().toISOString(),
+    statusHistory,
   };
 }
 
@@ -416,4 +439,250 @@ export async function listSnapshots(
   }
   out.sort((a, b) => a - b);
   return out;
+}
+
+// ─── GAP #9: status state-machine + dependency graph ───────────────────────
+
+/** Result of a guarded status transition attempt. */
+export type TransitionResult =
+  | { ok: true; metadata: EffortMetadata; entry: StatusHistoryEntry }
+  | { ok: false; reason: "invalid-transition"; from: EffortStatus; allowed: readonly EffortStatus[] }
+  | { ok: false; reason: "missing-reason"; field: "reason" | "supersededBy" }
+  | { ok: false; reason: "supersedes-self" }
+  | { ok: false; reason: "supersededBy-not-found"; slug: string }
+  | { ok: false; reason: "not-found" };
+
+export interface TransitionInput {
+  to: EffortStatus;
+  /** Required for DEAD_END / ERRATUM. */
+  reason?: string;
+  /** Required for SUPERSEDED — slug of the superseding effort in the same project. */
+  supersededBy?: string;
+}
+
+/**
+ * Apply a guarded status transition (GAP #9).
+ *
+ *   - Rejects transitions not allowed by VALID_TRANSITIONS.
+ *   - Rejects DEAD_END / ERRATUM without a `reason`.
+ *   - Rejects SUPERSEDED without `supersededBy`, with self-reference, or
+ *     when the target effort does not exist in the same project.
+ *   - On success, appends a {at, from, to, reason?, supersededBy?} entry to
+ *     `statusHistory` and bumps `status` + `updatedAt`.
+ */
+export async function transitionEffortStatus(
+  workspace: string,
+  project: string,
+  effort: string,
+  input: TransitionInput,
+): Promise<TransitionResult> {
+  const meta = await readEffortMetadata(workspace, project, effort);
+  if (!meta) return { ok: false, reason: "not-found" };
+  if (!isValidTransition(meta.status, input.to)) {
+    return {
+      ok: false,
+      reason: "invalid-transition",
+      from: meta.status,
+      allowed: VALID_TRANSITIONS[meta.status] ?? [],
+    };
+  }
+  const requires = STATUS_REQUIRES_REASON[input.to];
+  if (requires === "reason" && !input.reason?.trim()) {
+    return { ok: false, reason: "missing-reason", field: "reason" };
+  }
+  if (requires === "supersededBy") {
+    if (!input.supersededBy?.trim()) {
+      return { ok: false, reason: "missing-reason", field: "supersededBy" };
+    }
+    if (input.supersededBy === effort) {
+      return { ok: false, reason: "supersedes-self" };
+    }
+    const target = await readEffortMetadata(workspace, project, input.supersededBy);
+    if (!target) return { ok: false, reason: "supersededBy-not-found", slug: input.supersededBy };
+  }
+
+  const now = new Date().toISOString();
+  const entry: StatusHistoryEntry = {
+    at: now,
+    from: meta.status,
+    to: input.to,
+    ...(requires === "reason" ? { reason: input.reason } : {}),
+    ...(requires === "supersededBy" ? { supersededBy: input.supersededBy } : {}),
+  };
+  const history = meta.statusHistory ? [...meta.statusHistory, entry] : [entry];
+  const next: EffortMetadata = {
+    ...meta,
+    status: input.to,
+    updatedAt: now,
+    statusHistory: history,
+  };
+  await writeEffortMetadata(workspace, project, effort, next);
+
+  // SUPERSEDED auto-wires a `supersedes` relation edge (from→to).
+  if (input.to === "SUPERSEDED" && input.supersededBy) {
+    await addRelation(workspace, project, {
+      from: effort,
+      to: input.supersededBy,
+      type: "supersedes",
+      source: "user",
+      confidence: 1.0,
+      description: input.reason,
+    });
+  }
+  return { ok: true, metadata: next, entry };
+}
+
+// ─── Effort relations (project-scoped jsonl) ────────────────────────────────
+
+/**
+ * Valid relation edge types — verbatim copy of mathub's
+ * `VALID_RELATION_TYPES` (src/app/api/bot/v1/efforts/[id]/relations/route.ts).
+ */
+export const VALID_RELATION_TYPES = [
+  "depends_on",
+  "extends",
+  "uses",
+  "related",
+  "supersedes",
+  "contradicts",
+] as const;
+export type RelationType = (typeof VALID_RELATION_TYPES)[number];
+
+export interface EffortRelation {
+  /** UUID. Stable for delete/lookup. */
+  id: string;
+  /** Effort slug (same project). */
+  from: string;
+  /** Effort slug (same project). */
+  to: string;
+  type: RelationType;
+  description?: string;
+  /** 0..1. */
+  confidence?: number;
+  /** Provenance — \"user\" | \"llm\" | \"spine\". */
+  source?: "user" | "llm" | "spine";
+  /** ISO timestamp. */
+  createdAt: string;
+}
+
+const RELATIONS_FILE = ".relations.jsonl";
+
+function relationsFileFor(workspace: string, project: string): string {
+  if (!isSafeSlug(project)) {
+    throw new Error("invalid project slug");
+  }
+  return path.join(workspace, PROJECTS_DIR, project, EFFORTS_DIR, RELATIONS_FILE);
+}
+
+/**
+ * Append one relation edge. Returns the persisted edge (with id + createdAt).
+ *
+ * Does NOT verify the from/to efforts exist in the project — callers (the
+ * REST endpoint) check that before calling here. The store is purely
+ * append-only; `removeRelation` rewrites the file end-to-end without the
+ * targeted line.
+ */
+export async function addRelation(
+  workspace: string,
+  project: string,
+  input: {
+    from: string;
+    to: string;
+    type: RelationType;
+    description?: string;
+    confidence?: number;
+    source?: "user" | "llm" | "spine";
+  },
+): Promise<EffortRelation> {
+  if (!isSafeSlug(project) || !isSafeSlug(input.from) || !isSafeSlug(input.to)) {
+    throw new Error("invalid project or effort slug");
+  }
+  if (!(VALID_RELATION_TYPES as readonly string[]).includes(input.type)) {
+    throw new Error(`invalid relation type: ${input.type}`);
+  }
+  const file = relationsFileFor(workspace, project);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const edge: EffortRelation = {
+    id: randomUUID(),
+    from: input.from,
+    to: input.to,
+    type: input.type,
+    description: input.description,
+    confidence: input.confidence ?? 0.8,
+    source: input.source ?? "user",
+    createdAt: new Date().toISOString(),
+  };
+  await fs.appendFile(file, JSON.stringify(edge) + "\n", "utf-8");
+  return edge;
+}
+
+/** Read every edge in the project (in disk order). Missing file → []. */
+export async function listAllRelations(
+  workspace: string,
+  project: string,
+): Promise<EffortRelation[]> {
+  if (!isSafeSlug(project)) throw new Error("invalid project slug");
+  const file = relationsFileFor(workspace, project);
+  let raw: string;
+  try {
+    raw = await fs.readFile(file, "utf-8");
+  } catch {
+    return [];
+  }
+  const out: EffortRelation[] = [];
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const v = JSON.parse(t);
+      if (v && typeof v === "object" && v.id && v.from && v.to && v.type) {
+        out.push(v as EffortRelation);
+      }
+    } catch {
+      /* skip malformed lines */
+    }
+  }
+  return out;
+}
+
+/** Edges where `from === effort`. */
+export async function listEffortRelations(
+  workspace: string,
+  project: string,
+  effort: string,
+): Promise<EffortRelation[]> {
+  if (!isSafeSlug(effort)) throw new Error("invalid effort slug");
+  const all = await listAllRelations(workspace, project);
+  return all.filter((e) => e.from === effort);
+}
+
+/** Edges where `to === effort` (\"who depends on me?\"). */
+export async function listEffortDependents(
+  workspace: string,
+  project: string,
+  effort: string,
+): Promise<EffortRelation[]> {
+  if (!isSafeSlug(effort)) throw new Error("invalid effort slug");
+  const all = await listAllRelations(workspace, project);
+  return all.filter((e) => e.to === effort);
+}
+
+/**
+ * Remove an edge by id. Rewrites the jsonl end-to-end without that line.
+ * Returns true if removed, false if not found.
+ */
+export async function removeRelation(
+  workspace: string,
+  project: string,
+  relationId: string,
+): Promise<boolean> {
+  const all = await listAllRelations(workspace, project);
+  const before = all.length;
+  const after = all.filter((e) => e.id !== relationId);
+  if (after.length === before) return false;
+  const file = relationsFileFor(workspace, project);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const body = after.map((e) => JSON.stringify(e)).join("\n");
+  await fs.writeFile(file, body + (body ? "\n" : ""), "utf-8");
+  return true;
 }

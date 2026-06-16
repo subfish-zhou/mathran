@@ -692,6 +692,186 @@ describe("effort REST (T1-B)", () => {
   });
 });
 
+describe("effort status state-machine + relations (GAP #9)", () => {
+  let effSlug: string;
+  let targetSlug: string;
+
+  beforeAll(async () => {
+    // Create two efforts we can drive transitions / edges on.
+    const r1 = await fetch(`${base}/api/projects/my-first-project/efforts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "Gap9 Source", type: "PROOF_ATTEMPT" }),
+    });
+    const j1 = await r1.json();
+    effSlug = j1.slug;
+    const r2 = await fetch(`${base}/api/projects/my-first-project/efforts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "Gap9 Target", type: "FORMALIZATION" }),
+    });
+    const j2 = await r2.json();
+    targetSlug = j2.slug;
+  });
+
+  it("valid transition DRAFT → PROPOSED writes statusHistory", async () => {
+    const r = await fetch(`${base}/api/projects/my-first-project/effort/${effSlug}/status`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to: "PROPOSED" }),
+    });
+    expect(r.status).toBe(200);
+    const body = await r.json();
+    expect(body.metadata.status).toBe("PROPOSED");
+    expect(body.entry.from).toBe("DRAFT");
+    expect(body.entry.to).toBe("PROPOSED");
+  });
+
+  it("invalid transition returns 400 with the allowed list", async () => {
+    const r = await fetch(`${base}/api/projects/my-first-project/effort/${effSlug}/status`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to: "VERIFIED" }),
+    });
+    expect(r.status).toBe(400);
+    const body = await r.json();
+    expect(body.allowed).toBeDefined();
+    expect(body.error).toMatch(/invalid transition/);
+  });
+
+  it("bogus 'to' returns 400 with the EFFORT_STATUSES list", async () => {
+    const r = await fetch(`${base}/api/projects/my-first-project/effort/${effSlug}/status`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to: "NOPE" }),
+    });
+    expect(r.status).toBe(400);
+    const body = await r.json();
+    expect(body.error).toMatch(/'to' must be one of/);
+  });
+
+  it("DEAD_END requires reason", async () => {
+    // Drive a fresh effort through PROPOSED then DEAD_END w/o reason.
+    const create = await fetch(`${base}/api/projects/my-first-project/efforts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "DeadEnd Source", type: "PROOF_ATTEMPT" }),
+    });
+    const { slug } = await create.json();
+    const fail = await fetch(`${base}/api/projects/my-first-project/effort/${slug}/status`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to: "DEAD_END" }),
+    });
+    expect(fail.status).toBe(400);
+    const ok = await fetch(`${base}/api/projects/my-first-project/effort/${slug}/status`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to: "DEAD_END", reason: "hits a wall" }),
+    });
+    expect(ok.status).toBe(200);
+  });
+
+  it("add + list + delete a depends_on edge", async () => {
+    const add = await fetch(
+      `${base}/api/projects/my-first-project/effort/${effSlug}/relations`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ to: targetSlug, type: "depends_on", description: "smoke" }),
+      },
+    );
+    expect(add.status).toBe(201);
+    const { relation } = await add.json();
+    expect(relation.id).toBeTruthy();
+
+    const list = await fetch(
+      `${base}/api/projects/my-first-project/effort/${effSlug}/relations`,
+    );
+    const j = await list.json();
+    expect(j.relations.some((e: any) => e.id === relation.id)).toBe(true);
+
+    const incoming = await fetch(
+      `${base}/api/projects/my-first-project/effort/${targetSlug}/dependents`,
+    );
+    const ji = await incoming.json();
+    expect(ji.dependents.some((e: any) => e.id === relation.id)).toBe(true);
+
+    const graph = await fetch(`${base}/api/projects/my-first-project/efforts/graph`);
+    const jg = await graph.json();
+    expect(jg.edges.some((e: any) => e.id === relation.id)).toBe(true);
+
+    const del = await fetch(
+      `${base}/api/projects/my-first-project/effort/${effSlug}/relations/${relation.id}`,
+      { method: "DELETE" },
+    );
+    expect(del.status).toBe(204);
+  });
+
+  it("rejects an invalid relation type", async () => {
+    const r = await fetch(
+      `${base}/api/projects/my-first-project/effort/${effSlug}/relations`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ to: targetSlug, type: "bogus" }),
+      },
+    );
+    expect(r.status).toBe(400);
+  });
+
+  it("rejects self-relation", async () => {
+    const r = await fetch(
+      `${base}/api/projects/my-first-project/effort/${effSlug}/relations`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ to: effSlug, type: "depends_on" }),
+      },
+    );
+    expect(r.status).toBe(400);
+  });
+
+  it("404s a relation against a missing target effort", async () => {
+    const r = await fetch(
+      `${base}/api/projects/my-first-project/effort/${effSlug}/relations`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ to: "no-such-effort", type: "depends_on" }),
+      },
+    );
+    expect(r.status).toBe(404);
+  });
+
+  it("SUPERSEDED auto-wires a supersedes relation", async () => {
+    // Fresh source effort + target so this test is self-contained.
+    const s1 = await (await fetch(`${base}/api/projects/my-first-project/efforts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "Supr Source", type: "PROOF_ATTEMPT" }),
+    })).json();
+    const s2 = await (await fetch(`${base}/api/projects/my-first-project/efforts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "Supr Target", type: "PROOF_ATTEMPT" }),
+    })).json();
+    const tr = await fetch(
+      `${base}/api/projects/my-first-project/effort/${s1.slug}/status`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ to: "SUPERSEDED", supersededBy: s2.slug, reason: "v2" }),
+      },
+    );
+    expect(tr.status).toBe(200);
+    const edges = await (await fetch(
+      `${base}/api/projects/my-first-project/effort/${s1.slug}/relations`,
+    )).json();
+    expect(edges.relations.some((e: any) => e.to === s2.slug && e.type === "supersedes")).toBe(true);
+  });
+});
+
 
 describe("scoped chat (T1-C)", () => {
   /** Drive the SSE stream and return the parsed `data:` payloads. */

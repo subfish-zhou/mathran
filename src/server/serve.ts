@@ -35,7 +35,10 @@ import { resolveWorkspaceRoot, initProject } from "../cli/commands/project.js";
 import { loadConfig } from "../core/config.js";
 import {
   BUILTIN_EFFORT_TYPES,
+  EFFORT_STATUSES,
+  VALID_TRANSITIONS,
   isBuiltinEffortType,
+  isEffortStatus,
 } from "../core/effort/types.js";
 import {
   initEffort,
@@ -49,6 +52,14 @@ import {
   writeEffortFile,
   snapshotEffort,
   listSnapshots,
+  transitionEffortStatus,
+  addRelation,
+  listAllRelations,
+  listEffortRelations,
+  listEffortDependents,
+  removeRelation,
+  VALID_RELATION_TYPES,
+  type RelationType,
 } from "../core/effort/store.js";
 import {
   ChatSession,
@@ -1112,6 +1123,149 @@ function buildApp(workspace: string, factory: ChatSessionFactory): Hono {
     } catch (err: any) {
       return c.json({ error: err?.message ?? String(err) }, 400);
     }
+  });
+
+  // ─── GAP #9: status state-machine + dependency graph ────────────────────
+
+  /**
+   * POST /api/projects/<slug>/effort/<eff>/status
+   *   body: { to: <EffortStatus>, reason?: string, supersededBy?: string }
+   *
+   * Guarded transition (VALID_TRANSITIONS in src/core/effort/types.ts).
+   * On invalid transition returns 400 with the allowed list. DEAD_END /
+   * ERRATUM need `reason`; SUPERSEDED needs `supersededBy` (must exist in
+   * the same project, not self). On SUPERSEDED a `supersedes` edge is auto-
+   * added to the project's effort-relations log.
+   */
+  app.post("/api/projects/:slug/effort/:effortSlug/status", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const to = typeof body?.to === "string" ? body.to : "";
+    if (!isEffortStatus(to)) {
+      return c.json(
+        { error: `'to' must be one of: ${EFFORT_STATUSES.join(", ")}` },
+        400,
+      );
+    }
+    const reason = typeof body?.reason === "string" ? body.reason : undefined;
+    const supersededBy = typeof body?.supersededBy === "string" ? body.supersededBy : undefined;
+    if (supersededBy && !isSafeSlug(supersededBy)) {
+      return c.json({ error: "invalid 'supersededBy' slug" }, 400);
+    }
+    const r = await transitionEffortStatus(workspace, slug, eff, { to, reason, supersededBy });
+    if (r.ok) return c.json({ metadata: r.metadata, entry: r.entry });
+    if (r.reason === "not-found") return c.json({ error: "effort not found" }, 404);
+    if (r.reason === "invalid-transition") {
+      return c.json(
+        {
+          error: `invalid transition: ${r.from} → ${to}`,
+          from: r.from,
+          to,
+          allowed: r.allowed,
+        },
+        400,
+      );
+    }
+    if (r.reason === "missing-reason") {
+      return c.json({ error: `'${r.field}' is required for transition to ${to}` }, 400);
+    }
+    if (r.reason === "supersedes-self") {
+      return c.json({ error: "an effort cannot supersede itself" }, 400);
+    }
+    if (r.reason === "supersededBy-not-found") {
+      return c.json({ error: `supersededBy effort not found in project: ${r.slug}` }, 404);
+    }
+    return c.json({ error: "unknown transition error" }, 400);
+  });
+
+  /**
+   * POST /api/projects/<slug>/effort/<eff>/relations
+   *   body: { to: <effortSlug>, type: RelationType,
+   *           description?: string, confidence?: number,
+   *           source?: "user"|"llm"|"spine" }
+   *
+   * Appends one edge to the project's `efforts/.relations.jsonl`. The from-
+   * side is taken from the URL. Both endpoints must exist; the type must be
+   * one of VALID_RELATION_TYPES.
+   */
+  app.post("/api/projects/:slug/effort/:effortSlug/relations", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const to = typeof body?.to === "string" ? body.to : "";
+    const type = typeof body?.type === "string" ? body.type : "";
+    if (!isSafeSlug(to)) return c.json({ error: "'to' must be a valid effort slug" }, 400);
+    if (!(VALID_RELATION_TYPES as readonly string[]).includes(type)) {
+      return c.json({ error: `'type' must be one of: ${VALID_RELATION_TYPES.join(", ")}` }, 400);
+    }
+    if (to === eff) {
+      return c.json({ error: "an effort cannot relate to itself" }, 400);
+    }
+    // Both endpoints must exist.
+    if (!(await readEffortMetadata(workspace, slug, eff))) {
+      return c.json({ error: "effort not found" }, 404);
+    }
+    if (!(await readEffortMetadata(workspace, slug, to))) {
+      return c.json({ error: `target effort not found: ${to}` }, 404);
+    }
+    const description = typeof body?.description === "string" ? body.description : undefined;
+    const confidence = typeof body?.confidence === "number" ? body.confidence : undefined;
+    const source =
+      body?.source === "user" || body?.source === "llm" || body?.source === "spine"
+        ? body.source
+        : undefined;
+    const edge = await addRelation(workspace, slug, {
+      from: eff,
+      to,
+      type: type as RelationType,
+      description,
+      confidence,
+      source,
+    });
+    return c.json({ relation: edge }, 201);
+  });
+
+  /** GET edges where from=<eff>. */
+  app.get("/api/projects/:slug/effort/:effortSlug/relations", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    const out = await listEffortRelations(workspace, slug, eff);
+    return c.json({ relations: out });
+  });
+
+  /** GET edges where to=<eff> ("who depends on me?"). */
+  app.get("/api/projects/:slug/effort/:effortSlug/dependents", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    const out = await listEffortDependents(workspace, slug, eff);
+    return c.json({ dependents: out });
+  });
+
+  /** GET every edge in the project (for graph rendering). */
+  app.get("/api/projects/:slug/efforts/graph", async (c) => {
+    const slug = c.req.param("slug");
+    if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);
+    const edges = await listAllRelations(workspace, slug);
+    return c.json({ edges });
+  });
+
+  /** DELETE one edge by id. */
+  app.delete("/api/projects/:slug/effort/:effortSlug/relations/:relationId", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    const relationId = c.req.param("relationId");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    if (!relationId) return c.json({ error: "relation id required" }, 400);
+    const removed = await removeRelation(workspace, slug, relationId);
+    if (!removed) return c.json({ error: "relation not found" }, 404);
+    return c.body(null, 204);
   });
 
   app.get("/api/providers", (c) => c.json(maskProviders(workspace)));

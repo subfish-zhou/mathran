@@ -163,6 +163,68 @@ effortCmd
     process.exit(await runEffortList(project, { workspace: opts.workspace, json: opts.json }));
   });
 
+effortCmd
+  .command("status")
+  .description("Transition an effort to a new lifecycle status (guarded state machine)")
+  .argument("<project>", "Project slug")
+  .argument("<effort>", "Effort slug")
+  .requiredOption("--to <STATUS>", "Target status (DRAFT, PROPOSED, UNDER_REVIEW, ...)")
+  .option("--reason <text>", "Required for DEAD_END / ERRATUM")
+  .option("--superseded-by <effortSlug>", "Required for SUPERSEDED (must exist in same project)")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (project: string, effort: string, opts: any) => {
+    const { runEffortStatus } = await import("./commands/effort.js");
+    process.exit(
+      await runEffortStatus(project, effort, {
+        workspace: opts.workspace,
+        to: opts.to,
+        reason: opts.reason,
+        supersededBy: opts.supersededBy,
+      }),
+    );
+  });
+
+effortCmd
+  .command("relate")
+  .description("Add a typed edge (depends_on / extends / uses / related / supersedes / contradicts)")
+  .argument("<project>", "Project slug")
+  .argument("<from>", "From-effort slug")
+  .argument("<to>", "To-effort slug")
+  .requiredOption("--type <T>", "Relation type")
+  .option("--description <text>", "Edge description")
+  .option("--confidence <n>", "Confidence 0..1", parseFloat)
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (project: string, from: string, to: string, opts: any) => {
+    const { runEffortRelate } = await import("./commands/effort.js");
+    process.exit(
+      await runEffortRelate(project, from, to, {
+        workspace: opts.workspace,
+        type: opts.type,
+        description: opts.description,
+        confidence: opts.confidence,
+      }),
+    );
+  });
+
+effortCmd
+  .command("relations")
+  .description("List relations for an effort (outgoing by default; --incoming for reverse)")
+  .argument("<project>", "Project slug")
+  .argument("<effort>", "Effort slug")
+  .option("--incoming", "Show edges arriving AT this effort (who depends on me)", false)
+  .option("--workspace <dir>", "Workspace root")
+  .option("--json", "Emit JSON", false)
+  .action(async (project: string, effort: string, opts: any) => {
+    const { runEffortRelations } = await import("./commands/effort.js");
+    process.exit(
+      await runEffortRelations(project, effort, {
+        workspace: opts.workspace,
+        incoming: opts.incoming,
+        json: opts.json,
+      }),
+    );
+  });
+
 const configCmd = program
   .command("config")
   .description("Inspect or edit config.toml from the CLI (avoid hand-editing TOML)");

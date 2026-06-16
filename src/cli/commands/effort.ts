@@ -100,3 +100,158 @@ export async function runEffortList(
     return 1;
   }
 }
+
+// ─── GAP #9: status transitions + relations CLI ────────────────────────────
+
+export interface EffortStatusOptions {
+  workspace?: string;
+  to: string;
+  reason?: string;
+  supersededBy?: string;
+}
+
+/**
+ * `mathran effort status <project> <effort> --to <STATUS> [--reason …]
+ * [--superseded-by <effortSlug>]` — guarded status transition.
+ */
+export async function runEffortStatus(
+  projectSlug: string,
+  effortSlug: string,
+  opts: EffortStatusOptions,
+): Promise<number> {
+  const workspace = resolveWorkspaceRoot(opts.workspace);
+  const { transitionEffortStatus } = await import("../../core/effort/store.js");
+  const { isEffortStatus, EFFORT_STATUSES } = await import("../../core/effort/types.js");
+  const to = opts.to?.toUpperCase();
+  if (!isEffortStatus(to)) {
+    console.error(
+      `mathran effort status: invalid --to "${opts.to}". Must be one of: ${EFFORT_STATUSES.join(", ")}`,
+    );
+    return 2;
+  }
+  const r = await transitionEffortStatus(workspace, projectSlug, effortSlug, {
+    to,
+    reason: opts.reason,
+    supersededBy: opts.supersededBy,
+  });
+  if (r.ok) {
+    console.log(`mathran: ${effortSlug} → ${to}`);
+    return 0;
+  }
+  if (r.reason === "not-found") {
+    console.error(`mathran: effort not found: ${effortSlug}`);
+    return 1;
+  }
+  if (r.reason === "invalid-transition") {
+    console.error(
+      `mathran: invalid transition ${r.from} → ${to}. Allowed: ${r.allowed.join(", ") || "(none — terminal status)"}`,
+    );
+    return 1;
+  }
+  if (r.reason === "missing-reason") {
+    console.error(`mathran: '${r.field}' is required for transition to ${to}`);
+    return 2;
+  }
+  if (r.reason === "supersedes-self") {
+    console.error(`mathran: an effort cannot supersede itself`);
+    return 2;
+  }
+  if (r.reason === "supersededBy-not-found") {
+    console.error(`mathran: supersededBy effort not found: ${r.slug}`);
+    return 1;
+  }
+  console.error(`mathran: unknown error`);
+  return 1;
+}
+
+export interface EffortRelationAddOptions {
+  workspace?: string;
+  type: string;
+  description?: string;
+  confidence?: number;
+}
+
+/**
+ * `mathran effort relate <project> <from> <to> --type <T>` — add a typed
+ * edge to the project's effort-relations log.
+ */
+export async function runEffortRelate(
+  projectSlug: string,
+  fromEffort: string,
+  toEffort: string,
+  opts: EffortRelationAddOptions,
+): Promise<number> {
+  const workspace = resolveWorkspaceRoot(opts.workspace);
+  const { addRelation, VALID_RELATION_TYPES, readEffortMetadata } = await import(
+    "../../core/effort/store.js"
+  );
+  const type = opts.type?.toLowerCase();
+  if (!(VALID_RELATION_TYPES as readonly string[]).includes(type)) {
+    console.error(
+      `mathran effort relate: invalid --type "${opts.type}". Must be one of: ${VALID_RELATION_TYPES.join(", ")}`,
+    );
+    return 2;
+  }
+  if (fromEffort === toEffort) {
+    console.error(`mathran: an effort cannot relate to itself`);
+    return 2;
+  }
+  if (!(await readEffortMetadata(workspace, projectSlug, fromEffort))) {
+    console.error(`mathran: from-effort not found: ${fromEffort}`);
+    return 1;
+  }
+  if (!(await readEffortMetadata(workspace, projectSlug, toEffort))) {
+    console.error(`mathran: to-effort not found: ${toEffort}`);
+    return 1;
+  }
+  const edge = await addRelation(workspace, projectSlug, {
+    from: fromEffort,
+    to: toEffort,
+    type: type as any,
+    description: opts.description,
+    confidence: opts.confidence,
+    source: "user",
+  });
+  console.log(`mathran: relation ${edge.id}: ${fromEffort} -[${type}]-> ${toEffort}`);
+  return 0;
+}
+
+export interface EffortRelationsListOptions {
+  workspace?: string;
+  json?: boolean;
+  /** If true, list edges arriving AT this effort (\"who depends on me\"). */
+  incoming?: boolean;
+}
+
+/** `mathran effort relations <project> <effort>` */
+export async function runEffortRelations(
+  projectSlug: string,
+  effortSlug: string,
+  opts: EffortRelationsListOptions,
+): Promise<number> {
+  const workspace = resolveWorkspaceRoot(opts.workspace);
+  const { listEffortRelations, listEffortDependents } = await import(
+    "../../core/effort/store.js"
+  );
+  const edges = opts.incoming
+    ? await listEffortDependents(workspace, projectSlug, effortSlug)
+    : await listEffortRelations(workspace, projectSlug, effortSlug);
+  if (opts.json) {
+    console.log(JSON.stringify({ effort: effortSlug, direction: opts.incoming ? "incoming" : "outgoing", edges }, null, 2));
+    return 0;
+  }
+  if (edges.length === 0) {
+    console.log(
+      `No ${opts.incoming ? "incoming" : "outgoing"} relations for ${effortSlug}.`,
+    );
+    return 0;
+  }
+  console.log(
+    `${opts.incoming ? "Incoming" : "Outgoing"} relations for ${effortSlug}:`,
+  );
+  for (const e of edges) {
+    const arrow = opts.incoming ? `${e.from} -[${e.type}]-> ${e.to}` : `${e.from} -[${e.type}]-> ${e.to}`;
+    console.log(`  ${arrow}` + (e.description ? `   (${e.description})` : ""));
+  }
+  return 0;
+}
