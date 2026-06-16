@@ -225,6 +225,96 @@ effortCmd
     );
   });
 
+const goalCmd = program
+  .command("goal")
+  .description("Long-running, state-tracked agent runs (GAP #11)");
+
+goalCmd
+  .command("start")
+  .description("Create a goal record and drive the first round of work")
+  .argument("<objective>", "What you want the assistant to achieve (quoted)")
+  .option("--scope <scope>", "global (default) | project:<slug> | effort:<p>/<e>")
+  .option("--budget-tokens <n>", "Hard cap on estimated tokens spent", (v) => parseInt(v, 10))
+  .option("--max-rounds <n>", "Hard cap on rounds (one ChatSession.send each)", (v) => parseInt(v, 10))
+  .option("--model <m>", "Model id, e.g. copilot/gpt-5.5")
+  .option("--config <path>", "Path to mathran config.toml")
+  .option("--no-run", "Create the record but do not run the first round")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (objective: string, opts: any) => {
+    const { runGoalStart } = await import("./commands/goal.js");
+    process.exit(
+      await runGoalStart(objective, {
+        workspace: opts.workspace,
+        scope: opts.scope,
+        budgetTokens: opts.budgetTokens,
+        maxRounds: opts.maxRounds,
+        model: opts.model,
+        configPath: opts.config,
+        noRun: !opts.run, // commander negates --no-run → opts.run === false
+      }),
+    );
+  });
+
+goalCmd
+  .command("resume")
+  .description("Drive another round on an active goal")
+  .argument("<goalId>", "Goal id (or its 8-char prefix)")
+  .option("-m, --message <text>", "User-style prompt for this round (default: continue)")
+  .option("--config <path>", "Path to mathran config.toml")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (goalId: string, opts: any) => {
+    const { runGoalResume } = await import("./commands/goal.js");
+    process.exit(
+      await runGoalResume(goalId, {
+        workspace: opts.workspace,
+        configPath: opts.config,
+        message: opts.message,
+      }),
+    );
+  });
+
+goalCmd
+  .command("status")
+  .description("Show a goal's current status, stats, and last 5 audit steps")
+  .argument("<goalId>", "Goal id (or its 8-char prefix)")
+  .option("--json", "Emit the full JSON record", false)
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (goalId: string, opts: any) => {
+    const { runGoalStatus } = await import("./commands/goal.js");
+    process.exit(await runGoalStatus(goalId, { workspace: opts.workspace, json: opts.json }));
+  });
+
+goalCmd
+  .command("list")
+  .description("List goals (active + paused by default)")
+  .option("--all", "Include ended goals (complete / failed / cancelled / exhausted)", false)
+  .option("--json", "Emit JSON", false)
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (opts: any) => {
+    const { runGoalList } = await import("./commands/goal.js");
+    process.exit(await runGoalList({ workspace: opts.workspace, json: opts.json, all: opts.all }));
+  });
+
+goalCmd
+  .command("pause")
+  .description("Mark an active goal as paused (resume to continue)")
+  .argument("<goalId>", "Goal id")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (goalId: string, opts: any) => {
+    const { runGoalPause } = await import("./commands/goal.js");
+    process.exit(await runGoalPause(goalId, { workspace: opts.workspace }));
+  });
+
+goalCmd
+  .command("cancel")
+  .description("Cancel a goal (terminal state)")
+  .argument("<goalId>", "Goal id")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (goalId: string, opts: any) => {
+    const { runGoalCancel } = await import("./commands/goal.js");
+    process.exit(await runGoalCancel(goalId, { workspace: opts.workspace }));
+  });
+
 const configCmd = program
   .command("config")
   .description("Inspect or edit config.toml from the CLI (avoid hand-editing TOML)");

@@ -997,3 +997,134 @@ describe("scoped chat (T1-C)", () => {
     expect(events.find((e) => e.type === "done")).toBeTruthy();
   });
 });
+
+describe("goal REST (GAP #11)", () => {
+  it("POST /api/goals creates a goal record", async () => {
+    const res = await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        objective: "test goal",
+        budgetTokens: 5000,
+        maxRounds: 3,
+      }),
+    });
+    expect(res.status).toBe(201);
+    const { goal } = await res.json();
+    expect(goal.id).toBeTruthy();
+    expect(goal.objective).toBe("test goal");
+    expect(goal.scope).toEqual({ kind: "global" });
+    expect(goal.budget.tokensMax).toBe(5000);
+    expect(goal.budget.roundsMax).toBe(3);
+    expect(goal.status).toBe("active");
+  });
+
+  it("POST /api/goals 400s on missing objective", async () => {
+    const res = await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /api/goals 400s on bad scope shape", async () => {
+    const res = await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "x", scope: { kind: "effort", projectSlug: "p" } }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /api/goals 400s on traversal slug in scope", async () => {
+    const res = await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "x", scope: { kind: "project", projectSlug: "../escape" } }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("GET /api/goals lists active+paused by default; ?all=1 shows ended", async () => {
+    // Make two goals, cancel one.
+    const r1 = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "alive" }),
+    })).json();
+    const r2 = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "cancelme" }),
+    })).json();
+    await fetch(`${base}/api/goals/${r2.goal.id}/cancel`, { method: "POST" });
+
+    const defaultList = await (await fetch(`${base}/api/goals`)).json();
+    const ids = defaultList.goals.map((g: any) => g.id);
+    expect(ids).toContain(r1.goal.id);
+    expect(ids).not.toContain(r2.goal.id);
+
+    const allList = await (await fetch(`${base}/api/goals?all=1`)).json();
+    const allIds = allList.goals.map((g: any) => g.id);
+    expect(allIds).toContain(r1.goal.id);
+    expect(allIds).toContain(r2.goal.id);
+  });
+
+  it("GET /api/goals/:id round-trips", async () => {
+    const { goal } = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "round-trip" }),
+    })).json();
+    const r = await (await fetch(`${base}/api/goals/${goal.id}`)).json();
+    expect(r.goal.id).toBe(goal.id);
+  });
+
+  it("GET /api/goals/:id 404s missing goal", async () => {
+    const res = await fetch(`${base}/api/goals/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`);
+    expect(res.status).toBe(404);
+  });
+
+  it("pause + cancel happy path; double-cancel rejected", async () => {
+    const { goal } = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "pause-me" }),
+    })).json();
+
+    const paused = await (await fetch(`${base}/api/goals/${goal.id}/pause`, {
+      method: "POST",
+    })).json();
+    expect(paused.goal.status).toBe("paused");
+
+    // Re-pausing rejected.
+    const rePause = await fetch(`${base}/api/goals/${goal.id}/pause`, { method: "POST" });
+    expect(rePause.status).toBe(400);
+
+    // Cancel a different goal (cancel of paused is rejected by "already-ended" guard? no — only ended states.)
+    // Our guard: cancel is allowed on active and paused, rejected on complete/failed/cancelled/exhausted.
+    const cancelled = await (await fetch(`${base}/api/goals/${goal.id}/cancel`, {
+      method: "POST",
+    })).json();
+    expect(cancelled.goal.status).toBe("cancelled");
+
+    const reCancel = await fetch(`${base}/api/goals/${goal.id}/cancel`, { method: "POST" });
+    expect(reCancel.status).toBe(400);
+  });
+
+  it("POST /api/goals/:id/run rejects an ended goal", async () => {
+    const { goal } = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "ended" }),
+    })).json();
+    await fetch(`${base}/api/goals/${goal.id}/cancel`, { method: "POST" });
+    const res = await fetch(`${base}/api/goals/${goal.id}/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+  });
+});

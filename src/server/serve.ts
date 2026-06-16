@@ -71,6 +71,15 @@ import {
   type ChatScope,
   type ScopedChatSessionFactory,
 } from "../core/chat/store.js";
+import {
+  createGoal,
+  endGoal,
+  listGoals,
+  readGoal,
+  writeGoal,
+  type Goal,
+} from "../core/goal/store.js";
+import { runGoalRound } from "../core/goal/runner.js";
 import { randomUUID } from "node:crypto";
 import {
   ModelRouter,
@@ -1266,6 +1275,171 @@ function buildApp(workspace: string, factory: ChatSessionFactory): Hono {
     const removed = await removeRelation(workspace, slug, relationId);
     if (!removed) return c.json({ error: "relation not found" }, 404);
     return c.body(null, 204);
+  });
+
+  // ─── GAP #11: long-running goal runs ──────────────────────────────
+
+  /**
+   * Validate a scope object coming over the wire. Returns the parsed scope
+   * or `null` (with an error message) on failure. We require *all* slugs to
+   * pass `isSafeSlug` to keep the BUG #5 traversal defence intact.
+   */
+  function parseGoalScope(raw: any): { ok: true; scope: ChatScope } | { ok: false; error: string } {
+    if (!raw || raw === "global") return { ok: true, scope: { kind: "global" } };
+    if (typeof raw === "string") {
+      if (raw === "global") return { ok: true, scope: { kind: "global" } };
+      return { ok: false, error: "scope must be an object or 'global'" };
+    }
+    if (typeof raw !== "object") return { ok: false, error: "scope must be an object" };
+    const kind = raw.kind;
+    if (kind === "global") return { ok: true, scope: { kind: "global" } };
+    if (kind === "project") {
+      const projectSlug = String(raw.projectSlug ?? "");
+      if (!isSafeSlug(projectSlug)) return { ok: false, error: "invalid projectSlug" };
+      return { ok: true, scope: { kind: "project", projectSlug } };
+    }
+    if (kind === "effort") {
+      const projectSlug = String(raw.projectSlug ?? "");
+      const effortSlug = String(raw.effortSlug ?? "");
+      if (!isSafeSlug(projectSlug) || !isSafeSlug(effortSlug)) {
+        return { ok: false, error: "invalid projectSlug or effortSlug" };
+      }
+      return { ok: true, scope: { kind: "effort", projectSlug, effortSlug } };
+    }
+    return { ok: false, error: `unknown scope kind: ${String(kind)}` };
+  }
+
+  /** Loose UUID-ish id check for goal ids over the wire. */
+  function isSafeGoalId(s: string): boolean {
+    return /^[a-zA-Z0-9_\-]{8,64}$/.test(s);
+  }
+
+  /**
+   * POST /api/goals
+   *   body: { objective, scope?, model?, budgetTokens?, maxRounds? }
+   *
+   * Creates the goal record on disk and returns it. Does *not* drive the
+   * first round (clients post to /api/goals/:id/run for that, so they can
+   * stream events the same way as plain chat).
+   */
+  app.post("/api/goals", async (c) => {
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const objective = typeof body?.objective === "string" ? body.objective : "";
+    if (!objective.trim()) return c.json({ error: "'objective' is required" }, 400);
+    const parsed = parseGoalScope(body?.scope);
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    const cfg = loadConfig(configPathFor(workspace));
+    const model = typeof body?.model === "string" ? body.model : cfg.defaultModel ?? DEFAULT_MODEL;
+    const goal = await createGoal(workspace, {
+      objective,
+      scope: parsed.scope,
+      model,
+      budgetTokensMax:
+        typeof body?.budgetTokens === "number" && body.budgetTokens > 0 ? body.budgetTokens : null,
+      budgetRoundsMax:
+        typeof body?.maxRounds === "number" && body.maxRounds > 0 ? body.maxRounds : null,
+    });
+    return c.json({ goal }, 201);
+  });
+
+  /** GET /api/goals?all=1 — default lists active+paused only. */
+  app.get("/api/goals", async (c) => {
+    const all = c.req.query("all") === "1" || c.req.query("all") === "true";
+    const goals = await listGoals(workspace);
+    const filtered = all
+      ? goals
+      : goals.filter((g: Goal) => g.status === "active" || g.status === "paused");
+    return c.json({ goals: filtered });
+  });
+
+  app.get("/api/goals/:goalId", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const g = await readGoal(workspace, goalId);
+    if (!g) return c.json({ error: "not found" }, 404);
+    return c.json({ goal: g });
+  });
+
+  /**
+   * POST /api/goals/:id/run
+   *   body: { message?: string }
+   *
+   * Drive exactly one round of work. The request blocks until the round
+   * finishes (or budget trips, or DONE: / GIVE_UP: marker fires). Tools
+   * available are the same ones the chat surface gets (currently just
+   * `lean_check`).
+   */
+  app.post("/api/goals/:goalId/run", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const g = await readGoal(workspace, goalId);
+    if (!g) return c.json({ error: "not found" }, 404);
+    if (g.status !== "active") {
+      return c.json({ error: `goal is ${g.status}; not runnable` }, 400);
+    }
+    let body: any = {};
+    try { body = await c.req.json(); } catch { /* empty body is fine */ }
+    const userMessage =
+      typeof body?.message === "string" && body.message.trim().length > 0
+        ? body.message
+        : "Continue with the current objective.";
+
+    const cfg = loadConfig(configPathFor(workspace));
+    const router = new ModelRouter(cfg);
+    const lean = new LocalLeanProvider();
+    const tools = [createLeanCheckTool(lean)];
+    try {
+      const r = await runGoalRound({
+        workspace,
+        goalId,
+        userMessage,
+        llm: router,
+        tools,
+        toolContext: { workspace, scope: g.scope },
+      });
+      return c.json({
+        goal: r.goal,
+        text: r.text,
+        completed: r.completed,
+        failed: r.failed,
+        exhausted: r.exhausted,
+        endReason: r.endReason,
+      });
+    } catch (err: any) {
+      await endGoal(workspace, goalId, "failed", String(err?.message ?? err));
+      return c.json({ error: String(err?.message ?? err) }, 500);
+    }
+  });
+
+  app.post("/api/goals/:goalId/pause", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const g = await readGoal(workspace, goalId);
+    if (!g) return c.json({ error: "not found" }, 404);
+    if (g.status !== "active") {
+      return c.json({ error: `goal is ${g.status}; can only pause active goals` }, 400);
+    }
+    g.status = "paused";
+    g.steps.push({
+      at: new Date().toISOString(),
+      kind: "status",
+      payload: { to: "paused", reason: "user pause" },
+    });
+    await writeGoal(workspace, g);
+    return c.json({ goal: g });
+  });
+
+  app.post("/api/goals/:goalId/cancel", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const g = await readGoal(workspace, goalId);
+    if (!g) return c.json({ error: "not found" }, 404);
+    if (g.status === "complete" || g.status === "failed" || g.status === "cancelled" || g.status === "exhausted") {
+      return c.json({ error: `goal already ${g.status}` }, 400);
+    }
+    const ended = await endGoal(workspace, goalId, "cancelled", "user cancelled");
+    return c.json({ goal: ended });
   });
 
   app.get("/api/providers", (c) => c.json(maskProviders(workspace)));
