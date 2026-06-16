@@ -18,6 +18,7 @@
     "node_modules",
     "dist",
     "_tasks",
+    "web",
     "**/*.test.ts",
     "**/__tests__/**"
   ]

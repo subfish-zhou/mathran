@@ -1,0 +1,72 @@
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}
+
+/* Minimal markdown rendering styles for the wiki/chat panels. */
+.md :where(h1) {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 0.75rem 0 0.5rem;
+}
+.md :where(h2) {
+  font-size: 1.25rem;
+  font-weight: 700;
+  margin: 0.75rem 0 0.5rem;
+}
+.md :where(h3) {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 0.5rem 0;
+}
+.md :where(p) {
+  margin: 0.5rem 0;
+  line-height: 1.6;
+}
+.md :where(ul) {
+  list-style: disc;
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+.md :where(ol) {
+  list-style: decimal;
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+.md :where(a) {
+  color: #2563eb;
+  text-decoration: underline;
+}
+.md :where(code) {
+  background: #f1f5f9;
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.25rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85em;
+}
+.md :where(pre) {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  margin: 0.5rem 0;
+}
+.md :where(pre code) {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+.md :where(blockquote) {
+  border-left: 3px solid #cbd5e1;
+  padding-left: 0.75rem;
+  color: #475569;
+  margin: 0.5rem 0;
+}
