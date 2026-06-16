@@ -465,6 +465,10 @@ function maskProviders(workspace: string): Record<string, unknown> {
     providers[key] = {
       kind: cfg.kind,
       model: cfg.defaultModel ?? null,
+      baseUrl: cfg.baseUrl ?? null,
+      endpoint: cfg.endpoint ?? null,
+      deployment: cfg.deployment ?? null,
+      apiVersion: cfg.apiVersion ?? null,
       // NEVER return the raw key — only whether one is resolvable.
       key: resolveApiKey(cfg) ? "set" : "missing",
     };

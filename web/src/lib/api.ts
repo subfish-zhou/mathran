@@ -38,6 +38,10 @@ export interface WikiHistoryEntry {
 export interface ProviderInfo {
   kind: string;
   model: string | null;
+  baseUrl?: string | null;
+  endpoint?: string | null;
+  deployment?: string | null;
+  apiVersion?: string | null;
   key: "set" | "missing";
 }
 

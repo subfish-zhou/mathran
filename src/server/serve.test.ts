@@ -216,6 +216,68 @@ describe("providers + config (key masking)", () => {
     expect(raw).toContain("sk-ant-xyz");
     expect(raw).toContain("sk-secret-should-never-leak");
   });
+
+  it("GET /api/providers exposes baseUrl/endpoint/deployment/apiVersion (no secrets)", async () => {
+    // Seed an azure entry + an openai entry with baseUrl so the form has
+    // something to render.
+    await fetch(`${base}/api/providers`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        providers: {
+          "azure-prod": {
+            kind: "azure",
+            apiKey: "sk-secret-azure",
+            endpoint: "https://example.openai.azure.com",
+            deployment: "gpt55",
+            apiVersion: "2024-12-01-preview",
+            defaultModel: "gpt55",
+          },
+        },
+      }),
+    });
+    const res = await fetch(`${base}/api/providers`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const azure = body.providers["azure-prod"];
+    expect(azure.kind).toBe("azure");
+    expect(azure.endpoint).toBe("https://example.openai.azure.com");
+    expect(azure.deployment).toBe("gpt55");
+    expect(azure.apiVersion).toBe("2024-12-01-preview");
+    expect(azure.key).toBe("set");
+    // Never leak the secret.
+    expect(azure).not.toHaveProperty("apiKey");
+    expect(JSON.stringify(body)).not.toContain("sk-secret-azure");
+  });
+
+  it("PUT /api/providers can create a brand-new provider entry", async () => {
+    const res = await fetch(`${base}/api/providers`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        providers: {
+          "copilot-new": { kind: "copilot", defaultModel: "gpt-5.5" },
+        },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.providers["copilot-new"].kind).toBe("copilot");
+    expect(body.providers["copilot-new"].model).toBe("gpt-5.5");
+  });
+
+  it("PUT /api/providers rejects an unknown provider kind", async () => {
+    const res = await fetch(`${base}/api/providers`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        providers: { weirdo: { kind: "not-a-real-kind" } },
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/kind/);
+  });
 });
 
 describe("POST /api/chat (SSE)", () => {
