@@ -164,4 +164,48 @@ describe("ScopedChatSessionStore", () => {
     const list = await store.listConversations({ kind: "global" });
     expect(list[0].title).toBe("What is twin primes?");
   });
+
+  it("writes a Markdown transcript next to the jsonl on flush (GAP #13)", async () => {
+    const store = new ScopedChatSessionStore(workspace, makeFactory());
+    const scope: ChatScope = {
+      kind: "effort",
+      projectSlug: "twin-primes",
+      effortSlug: "sieve",
+    };
+    await send(store, scope, "abc123", "is 3 a twin prime?");
+
+    const transcript = path.join(
+      workspace,
+      "projects",
+      "twin-primes",
+      "efforts",
+      "sieve",
+      "chat",
+      "transcripts",
+      "abc123.md",
+    );
+    const md = await fs.readFile(transcript, "utf-8");
+    expect(md).toContain("# is 3 a twin prime?");
+    expect(md).toContain("**Scope:** effort / twin-primes / sieve");
+    expect(md).toContain("## user");
+    expect(md).toContain("is 3 a twin prime?");
+    expect(md).toContain("## assistant");
+    expect(md).toContain("ack:is 3 a twin prime?");
+  });
+
+  it("transcript is rewritten end-to-end on every flush", async () => {
+    const store = new ScopedChatSessionStore(workspace, makeFactory());
+    const scope: ChatScope = { kind: "global" };
+    await send(store, scope, "c1", "first turn");
+    await send(store, scope, "c1", "second turn");
+
+    const md = await fs.readFile(
+      path.join(workspace, ".mathran", "global-chat", "transcripts", "c1.md"),
+      "utf-8",
+    );
+    expect(md).toContain("first turn");
+    expect(md).toContain("second turn");
+    expect(md).toContain("ack:first turn");
+    expect(md).toContain("ack:second turn");
+  });
 });

@@ -110,6 +110,97 @@ async function flushSession(dir: string, conversationId: string, history: LLMMes
   await fs.writeFile(conversationFile(dir, conversationId), lines + (lines.length > 0 ? "\n" : ""), "utf-8");
 }
 
+/**
+ * Render a chat history as a human-readable Markdown transcript and write it
+ * next to the jsonl file under a `transcripts/` subdirectory (GAP #13).
+ *
+ * Why a separate file: jsonl is the source of truth for replay (lossless,
+ * parseable), but users want a readable thread artifact too — to skim later,
+ * paste into wiki by hand, or git-track. Each `flush()` rewrites the same
+ * transcript file end-to-end so it always matches the underlying jsonl.
+ *
+ * The format is intentionally plain: `## role` headers, then content. Tool
+ * calls and tool results are surfaced as fenced code blocks so the file is
+ * still useful when you want to debug what a tool returned.
+ */
+function renderTranscriptMarkdown(
+  history: LLMMessage[],
+  meta: { scope: ChatScope; conversationId: string; title?: string },
+): string {
+  const out: string[] = [];
+  const scopeLabel =
+    meta.scope.kind === "global"
+      ? "global"
+      : meta.scope.kind === "project"
+      ? `project / ${meta.scope.projectSlug}`
+      : `effort / ${meta.scope.projectSlug} / ${meta.scope.effortSlug}`;
+  out.push(`# ${meta.title?.trim() || `Chat ${meta.conversationId}`}`);
+  out.push("");
+  out.push(`> **Scope:** ${scopeLabel}`);
+  out.push(`> **Conversation id:** \`${meta.conversationId}\``);
+  out.push(`> **Saved at:** ${new Date().toISOString()}`);
+  out.push("");
+  out.push("---");
+  out.push("");
+  for (const m of history) {
+    const role = m.role;
+    if (role === "system") {
+      out.push(`## system`);
+      out.push("");
+      out.push("<details><summary>system prompt</summary>");
+      out.push("");
+      out.push("```");
+      out.push(m.content ?? "");
+      out.push("```");
+      out.push("");
+      out.push("</details>");
+      out.push("");
+      continue;
+    }
+    out.push(`## ${role}`);
+    out.push("");
+    if (m.content && m.content.trim().length > 0) {
+      out.push(m.content);
+      out.push("");
+    }
+    if (Array.isArray(m.toolCalls) && m.toolCalls.length > 0) {
+      for (const call of m.toolCalls) {
+        out.push(`**tool call:** \`${call.name}\` (id \`${call.id}\`)`);
+        out.push("");
+        out.push("```json");
+        out.push(call.arguments);
+        out.push("```");
+        out.push("");
+      }
+    }
+    if (role === "tool" && m.toolCallId) {
+      out.push(`_tool result for \`${m.name ?? "?"}\` (id \`${m.toolCallId}\`)_`);
+      out.push("");
+    }
+  }
+  return out.join("\n");
+}
+
+async function flushTranscript(
+  dir: string,
+  conversationId: string,
+  history: LLMMessage[],
+  meta: { scope: ChatScope; title?: string },
+): Promise<void> {
+  const transcriptsDir = path.join(dir, "transcripts");
+  await fs.mkdir(transcriptsDir, { recursive: true });
+  const md = renderTranscriptMarkdown(history, {
+    scope: meta.scope,
+    conversationId,
+    title: meta.title,
+  });
+  await fs.writeFile(
+    path.join(transcriptsDir, `${conversationId}.md`),
+    md + (md.endsWith("\n") ? "" : "\n"),
+    "utf-8",
+  );
+}
+
 /** Lazy-load a conversation's history from disk. Returns null if no file. */
 async function loadHistory(dir: string, conversationId: string): Promise<LLMMessage[] | null> {
   let raw: string;
@@ -208,25 +299,38 @@ export class ScopedChatSessionStore {
   /**
    * Persist a session's full history to disk + update the scope index entry.
    * Call this after each `send()` completes.
+   *
+   * Side effect (GAP #13): also rewrites a human-readable Markdown transcript
+   * to `transcripts/<conversationId>.md` next to the jsonl file. The Markdown
+   * is a derived view — always overwritten end-to-end, never read back.
    */
   async flush(scope: ChatScope, conversationId: string, title?: string): Promise<void> {
     const key = this.cacheKey(scope, conversationId);
     const entry = this.entries.get(key);
     if (!entry) return;
     const dir = scopeDir(this.workspace, scope);
-    await flushSession(dir, conversationId, entry.session.history());
+    const history = entry.session.history();
+    await flushSession(dir, conversationId, history);
 
     const idx = await readIndex(dir);
     const now = new Date().toISOString();
     const existing = idx.conversations[conversationId];
+    const resolvedTitle = existing?.title ?? title ?? deriveTitle(history);
     idx.conversations[conversationId] = {
       id: conversationId,
-      title: existing?.title ?? title ?? deriveTitle(entry.session.history()),
+      title: resolvedTitle,
       createdAt: existing?.createdAt ?? now,
       lastUsedAt: now,
-      messageCount: entry.session.history().length,
+      messageCount: history.length,
     };
     await writeIndex(dir, idx);
+
+    // GAP #13: keep a Markdown transcript view next to the jsonl.
+    try {
+      await flushTranscript(dir, conversationId, history, { scope, title: resolvedTitle });
+    } catch {
+      // Transcript is a convenience; never fail flush() on it.
+    }
   }
 
   /** Drop a conversation: cache + disk file + index entry. */
