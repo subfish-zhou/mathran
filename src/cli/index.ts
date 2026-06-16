@@ -7,13 +7,13 @@
  *   mathran chat                Start the conversational REPL
  *   mathran -p "<prompt>"       One-shot conversation, then exit
  *   echo "..." | mathran        One-shot from piped stdin
- *   mathran prove <file>        (deprecated) prove a single .lean file
  *   mathran version             Print version
  *   mathran --help              Show help
  *
- * The conversational CLI (PRD §2.1/§5.4) is the primary entry point. Lean is
- * just one tool the conversation may call (`lean_check`); `prove` is retained
- * for compatibility but deprecated.
+ * The conversational CLI (PRD §2.1/§5.4) is the only entry point. Lean is
+ * just one tool the conversation may call (`lean_check`); the v0.1-alpha
+ * `mathran prove` non-conversational front-end was removed in v0.1.0-rc.1
+ * — use `mathran -p "prove the lemma in foo.lean"` instead.
  */
 
 import { Command } from "commander";
@@ -21,11 +21,6 @@ import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import * as fssync from "node:fs";
 import { fileURLToPath } from "node:url";
-
-// Lazy-loaded so `mathran --help` / `mathran version` don't pull in the agent.
-async function loadProveCommand() {
-  return import("./commands/prove.js");
-}
 
 /**
  * Read the version from package.json at startup. Synchronous + best-effort:
@@ -108,46 +103,6 @@ program
   .option("-m, --model <model>", "LLM model to use (e.g. copilot/gpt-5.5); defaults to config.defaultModel")
   .action(async (opts: TopLevelOpts) => {
     await runChatEntry(opts);
-  });
-
-program
-  .command("prove")
-  .description("(deprecated) Prove a single .lean file — use `mathran -p \"prove the lemma in foo.lean\"` instead")
-  .argument("<file>", "Path to a .lean source file containing the theorem")
-  .option("-o, --output <dir>", "Output directory for artifacts (markdown, lean, logs)", "./mathran-out")
-  .option("-m, --model <model>", "LLM model to use (e.g. copilot/gpt-5.5, copilot/claude-opus-4.7, azure/gpt55, openai/gpt-4o)", "copilot/gpt-5.5")
-  .option("--max-iterations <n>", "Maximum agent loop iterations", "50")
-  .action(async (file: string, opts: { output: string; model: string; maxIterations: string }) => {
-    console.error(
-      'mathran: `prove` is deprecated; use the conversational CLI instead, e.g.\n' +
-        '  mathran -p "prove the lemma in ' + file + '"\n',
-    );
-    const absPath = path.resolve(file);
-    try {
-      await fs.access(absPath);
-    } catch {
-      console.error(`mathran: file not found: ${absPath}`);
-      process.exit(2);
-    }
-    if (!absPath.endsWith(".lean")) {
-      console.error(`mathran: expected a .lean file, got: ${file}`);
-      process.exit(2);
-    }
-
-    const { runProve } = await loadProveCommand();
-    try {
-      const exitCode = await runProve({
-        leanFile: absPath,
-        outputDir: path.resolve(opts.output),
-        model: opts.model,
-        maxIterations: parseInt(opts.maxIterations, 10),
-      });
-      process.exit(exitCode);
-    } catch (err: any) {
-      console.error(`mathran prove: ${err?.message ?? err}`);
-      if (process.env.MATHRAN_DEBUG) console.error(err?.stack);
-      process.exit(1);
-    }
   });
 
 const projectCmd = program
