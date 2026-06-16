@@ -35,6 +35,21 @@ export interface WikiHistoryEntry {
   savedAt: string;
 }
 
+export interface WikiDiffSide {
+  /** Either a positive integer (history) or the literal string "current". */
+  version: number | "current";
+  /** Human-readable label like "v1" or "current (v3)". */
+  label: string;
+}
+
+export interface WikiDiffResponse {
+  page: string;
+  from: WikiDiffSide;
+  to: WikiDiffSide;
+  /** Unified-diff text produced by jsdiff's createTwoFilesPatch. */
+  patch: string;
+}
+
 export interface ProviderInfo {
   kind: string;
   model: string | null;
@@ -141,6 +156,25 @@ export const api = {
   async wikiHistoryVersion(slug: string, page: string, version: number): Promise<WikiPage> {
     return jsonOrThrow(
       await fetch(`/api/projects/${enc(slug)}/wiki/${enc(page)}/history/${version}`),
+    );
+  },
+  /**
+   * Fetch a unified diff between two versions of a wiki page (GAP #10).
+   * `from` / `to` accept a positive integer (a snapshot in `.history/`) or the
+   * literal string `"current"`. Defaults: from=latest history snapshot,
+   * to=current.
+   */
+  async wikiDiff(
+    slug: string,
+    page: string,
+    opts: { from?: number | "current"; to?: number | "current" } = {},
+  ): Promise<WikiDiffResponse> {
+    const params = new URLSearchParams();
+    if (opts.from !== undefined) params.set("from", String(opts.from));
+    if (opts.to !== undefined) params.set("to", String(opts.to));
+    const qs = params.toString();
+    return jsonOrThrow(
+      await fetch(`/api/projects/${enc(slug)}/wiki/${enc(page)}/diff${qs ? `?${qs}` : ""}`),
     );
   },
 

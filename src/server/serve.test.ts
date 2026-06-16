@@ -486,6 +486,102 @@ describe("wiki versioning (T1-A)", () => {
   });
 });
 
+describe("wiki diff (GAP #10)", () => {
+  beforeAll(async () => {
+    // Build up a page with 3 distinct bodies so we can diff v1↔v2, v2↔current,
+    // and v1↔current.
+    await fetch(`${base}/api/projects/my-first-project/wiki/diff-target`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "line a\nline b\nline c\n" }),
+    });
+    await fetch(`${base}/api/projects/my-first-project/wiki/diff-target`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "line a\nline b changed\nline c\n" }),
+    });
+    await fetch(`${base}/api/projects/my-first-project/wiki/diff-target`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "line a\nline b changed\nline c\nline d added\n" }),
+    });
+  });
+
+  it("defaults to diffing latest history version against current", async () => {
+    const res = await fetch(`${base}/api/projects/my-first-project/wiki/diff-target/diff`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.page).toBe("diff-target");
+    // Latest history snapshot is v2 (current=v3 was just written, v2 is in .history).
+    expect(body.from.version).toBe(2);
+    expect(body.to.version).toBe("current");
+    expect(body.patch).toMatch(/\+line d added/);
+    expect(body.patch).not.toMatch(/-line b changed/);
+  });
+
+  it("diffs two explicit history versions", async () => {
+    const res = await fetch(
+      `${base}/api/projects/my-first-project/wiki/diff-target/diff?from=1&to=2`,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.from.label).toBe("v1");
+    expect(body.to.label).toBe("v2");
+    expect(body.patch).toMatch(/-line b/);
+    expect(body.patch).toMatch(/\+line b changed/);
+  });
+
+  it("accepts to=current explicitly", async () => {
+    const res = await fetch(
+      `${base}/api/projects/my-first-project/wiki/diff-target/diff?from=1&to=current`,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.from.version).toBe(1);
+    expect(body.to.version).toBe("current");
+    expect(body.patch).toMatch(/\+line b changed/);
+    expect(body.patch).toMatch(/\+line d added/);
+  });
+
+  it("returns an empty patch when from==to", async () => {
+    const res = await fetch(
+      `${base}/api/projects/my-first-project/wiki/diff-target/diff?from=current&to=current`,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // createTwoFilesPatch with identical inputs still returns header lines but
+    // no +/- body lines.
+    expect(body.patch).not.toMatch(/^\+[^+]/m);
+    expect(body.patch).not.toMatch(/^-[^-]/m);
+  });
+
+  it("404s when the page does not exist", async () => {
+    const res = await fetch(`${base}/api/projects/my-first-project/wiki/no-such-page/diff`);
+    expect(res.status).toBe(404);
+  });
+
+  it("404s when a referenced version does not exist", async () => {
+    const res = await fetch(
+      `${base}/api/projects/my-first-project/wiki/diff-target/diff?from=999&to=current`,
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("rejects malformed version params", async () => {
+    const res = await fetch(
+      `${base}/api/projects/my-first-project/wiki/diff-target/diff?from=abc&to=current`,
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects traversal-style page slug", async () => {
+    const res = await fetch(
+      `${base}/api/projects/my-first-project/wiki/${encodeURIComponent("../etc/passwd")}/diff`,
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
 
 describe("effort REST (T1-B)", () => {
   it("starts with no efforts", async () => {

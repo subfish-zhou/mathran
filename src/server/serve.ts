@@ -29,6 +29,7 @@ import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import YAML from "yaml";
+import { createTwoFilesPatch } from "diff";
 
 import { resolveWorkspaceRoot, initProject } from "../cli/commands/project.js";
 import { loadConfig } from "../core/config.js";
@@ -452,6 +453,30 @@ async function readWikiPageVersion(
   };
 }
 
+/**
+ * Read the body of one wiki version. `version` is either a positive integer
+ * (read from `.history/<page>/v<N>.md`) or the string "current" (read the
+ * live page file). Returns `null` when the version does not exist.
+ *
+ * Used by the wiki diff endpoint (GAP #10).
+ */
+async function readWikiVersionBody(
+  workspace: string,
+  slug: string,
+  page: string,
+  version: number | "current",
+): Promise<{ version: number | "current"; body: string; label: string } | null> {
+  if (version === "current") {
+    const current = await readWikiPage(workspace, slug, page);
+    if (!current) return null;
+    const liveVersion = (current.version as number | undefined) ?? 1;
+    return { version: "current", body: String(current.body ?? ""), label: `current (v${liveVersion})` };
+  }
+  const past = await readWikiPageVersion(workspace, slug, page, version);
+  if (!past) return null;
+  return { version, body: String(past.body ?? ""), label: `v${version}` };
+}
+
 // ─── Provider / config handlers (key-masked) ─────────────────────────────────
 
 function configPathFor(workspace: string): string {
@@ -864,6 +889,72 @@ function buildApp(workspace: string, factory: ChatSessionFactory): Hono {
     const result = await readWikiPageVersion(workspace, slug, page, version);
     if (!result) return c.json({ error: "version not found" }, 404);
     return c.json(result);
+  });
+
+  /**
+   * GAP #10: unified diff between two versions of a wiki page.
+   *
+   *   GET /api/projects/<slug>/wiki/<page>/diff?from=<v|current>&to=<v|current>
+   *
+   * Defaults: from=v(latest-history), to=current. Both `from` and `to` accept
+   * either a positive integer (a history version) or the literal string
+   * "current" (the live page body).
+   *
+   * Response: { page, from: {version, label}, to: {version, label}, patch }
+   *   patch is a unified-diff string produced by `createTwoFilesPatch`. The
+   *   client renders this with simple CSS highlighting.
+   *
+   * If either version cannot be resolved -> 404.
+   */
+  app.get("/api/projects/:slug/wiki/:page/diff", async (c) => {
+    const slug = c.req.param("slug");
+    const page = c.req.param("page");
+    if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);
+    if (!isSafeSlug(page)) return c.json({ error: "invalid wiki page slug" }, 400);
+
+    function parseVersionParam(raw: string | undefined): number | "current" | null {
+      if (raw === undefined || raw === "" || raw === "current") return "current";
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1) return null;
+      return n;
+    }
+
+    const fromParam = c.req.query("from");
+    const toParam = c.req.query("to");
+    const to = parseVersionParam(toParam);
+    if (to === null) return c.json({ error: "invalid 'to' version" }, 400);
+
+    // For `from`, default to the most recent .history snapshot (if any).
+    let from: number | "current" | null;
+    if (fromParam !== undefined && fromParam !== "") {
+      from = parseVersionParam(fromParam);
+      if (from === null) return c.json({ error: "invalid 'from' version" }, 400);
+    } else {
+      const history = await listWikiHistory(workspace, slug, page);
+      if (history === null) return c.json({ error: "page not found" }, 404);
+      from = history.length > 0 ? (history[0].version as number) : "current";
+    }
+
+    const left = await readWikiVersionBody(workspace, slug, page, from);
+    if (!left) return c.json({ error: `version not found: ${from}` }, 404);
+    const right = await readWikiVersionBody(workspace, slug, page, to);
+    if (!right) return c.json({ error: `version not found: ${to}` }, 404);
+
+    const patch = createTwoFilesPatch(
+      left.label,
+      right.label,
+      left.body,
+      right.body,
+      "",
+      "",
+      { context: 3 },
+    );
+    return c.json({
+      page,
+      from: { version: left.version, label: left.label },
+      to: { version: right.version, label: right.label },
+      patch,
+    });
   });
 
   // ─── Effort REST (T1-B) ──────────────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { marked } from "marked";
 import {
   api,
+  type WikiDiffResponse,
   type WikiHistoryEntry,
   type WikiPage,
   type WikiPageSummary,
@@ -34,6 +35,9 @@ export default function WikiPanel({
   const [status, setStatus] = useState<string | null>(null);
   const [creatingName, setCreatingName] = useState("");
   const [history, setHistory] = useState<WikiHistoryEntry[] | null>(null);
+  const [diff, setDiff] = useState<WikiDiffResponse | null>(null);
+  const [diffFrom, setDiffFrom] = useState<string>("");
+  const [diffTo, setDiffTo] = useState<string>("current");
   const navigate = useNavigate();
 
   // Refresh index whenever the project changes or after a save/delete.
@@ -56,6 +60,7 @@ export default function WikiPanel({
     setDraft("");
     setEditing(false);
     setHistory(null);
+    setDiff(null);
     if (!currentPage) return;
     setError(null);
     api
@@ -88,9 +93,33 @@ export default function WikiPanel({
     if (!page) return;
     setError(null);
     try {
-      setHistory(await api.wikiHistory(projectSlug, page.page));
+      const h = await api.wikiHistory(projectSlug, page.page);
+      setHistory(h);
+      // Default the "from" selector to the latest history version so a single
+      // click on "Compare" gives the most useful diff (latest snapshot vs current).
+      if (h.length > 0 && !diffFrom) setDiffFrom(String(h[0].version));
     } catch (e) {
       setError((e as Error).message);
+    }
+  }
+
+  /**
+   * GAP #10: load a unified diff between two versions and render it inline.
+   * "" / "current" map to the live page body; positive integers map to
+   * `.history/<page>/v<N>.md`.
+   */
+  async function showDiff() {
+    if (!page) return;
+    setError(null);
+    try {
+      const from =
+        diffFrom === "" || diffFrom === "current" ? "current" : Number(diffFrom);
+      const to = diffTo === "current" ? "current" : Number(diffTo);
+      const d = await api.wikiDiff(projectSlug, page.page, { from, to });
+      setDiff(d);
+    } catch (e) {
+      setError((e as Error).message);
+      setDiff(null);
     }
   }
 
@@ -230,6 +259,59 @@ export default function WikiPanel({
                     </span>
                   </span>
                 ))}
+                <div className="mt-2 flex items-center gap-2">
+                  <span className="font-semibold text-amber-800">Compare:</span>
+                  <select
+                    value={diffFrom}
+                    onChange={(e) => setDiffFrom(e.target.value)}
+                    className="rounded border border-amber-300 bg-white px-2 py-0.5 text-xs"
+                  >
+                    <option value="">(latest history)</option>
+                    {history.map((h) => (
+                      <option key={h.version} value={String(h.version)}>
+                        v{h.version}
+                      </option>
+                    ))}
+                    <option value="current">current</option>
+                  </select>
+                  <span className="text-amber-700">→</span>
+                  <select
+                    value={diffTo}
+                    onChange={(e) => setDiffTo(e.target.value)}
+                    className="rounded border border-amber-300 bg-white px-2 py-0.5 text-xs"
+                  >
+                    <option value="current">current</option>
+                    {history.map((h) => (
+                      <option key={h.version} value={String(h.version)}>
+                        v{h.version}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={showDiff}
+                    className="rounded-md border border-amber-400 bg-white px-2 py-0.5 text-xs hover:bg-amber-100"
+                  >
+                    Show diff
+                  </button>
+                  {diff && (
+                    <button
+                      onClick={() => setDiff(null)}
+                      className="rounded-md border border-amber-300 px-2 py-0.5 text-xs hover:bg-amber-100"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+            {diff && (
+              <div className="border-b border-slate-200 bg-slate-50 px-6 py-3">
+                <div className="mb-1 text-xs text-slate-500">
+                  Diff: {diff.from.label} → {diff.to.label}
+                </div>
+                <pre className="max-h-72 overflow-auto rounded-md border border-slate-200 bg-white p-3 font-mono text-xs leading-relaxed">
+                  {renderUnifiedDiff(diff.patch)}
+                </pre>
               </div>
             )}
             <div className="flex-1 overflow-y-auto p-6">
@@ -248,4 +330,27 @@ export default function WikiPanel({
       </div>
     </div>
   );
+}
+
+/**
+ * Colorize a unified-diff string for inline display: `+` lines green, `-`
+ * lines red, `@@` hunks blue, everything else default. Renders into a single
+ * `<>...</>` fragment of `<span>` nodes for use inside a `<pre>`.
+ */
+function renderUnifiedDiff(patch: string): JSX.Element[] {
+  const out: JSX.Element[] = [];
+  const lines = patch.split("\n");
+  lines.forEach((line, i) => {
+    let cls = "";
+    if (line.startsWith("+++") || line.startsWith("---")) cls = "text-slate-500";
+    else if (line.startsWith("@@")) cls = "text-sky-700";
+    else if (line.startsWith("+")) cls = "bg-green-50 text-green-800";
+    else if (line.startsWith("-")) cls = "bg-red-50 text-red-800";
+    out.push(
+      <span key={i} className={`block whitespace-pre-wrap ${cls}`}>
+        {line || "\u00a0"}
+      </span>,
+    );
+  });
+  return out;
 }
