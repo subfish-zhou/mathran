@@ -142,6 +142,17 @@ projectCmd
   });
 
 program
+  .command("serve")
+  .description("Start the local-only workstation server (Hono REST + SSE on 127.0.0.1)")
+  .option("--port <port>", "Port to listen on (default 7878)")
+  .option("--host <host>", "Host/address to bind (default 127.0.0.1; do not expose publicly)")
+  .option("--workspace <dir>", "Workspace root (overrides MATHRAN_WORKSPACE and the default)")
+  .action(async (opts: { port?: string; host?: string; workspace?: string }) => {
+    const { runServe } = await import("./commands/serve.js");
+    process.exit(await runServe({ port: opts.port, host: opts.host, workspace: opts.workspace }));
+  });
+
+program
   .command("doctor")
   .description("Check environment (LLM keys, lean toolchain, etc.)")
   .option("--probe", "Send a minimal request to each provider to test reachability", false)
