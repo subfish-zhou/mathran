@@ -33,14 +33,36 @@ import YAML from "yaml";
 import { resolveWorkspaceRoot, initProject } from "../cli/commands/project.js";
 import { loadConfig } from "../core/config.js";
 import {
+  BUILTIN_EFFORT_TYPES,
+  isBuiltinEffortType,
+} from "../core/effort/types.js";
+import {
+  initEffort,
+  listEfforts,
+  readEffortMetadata,
+  updateEffortMetadata,
+  readEffortDocument,
+  writeEffortDocument,
+  listEffortFiles,
+  readEffortFile,
+  writeEffortFile,
+  snapshotEffort,
+  listSnapshots,
+} from "../core/effort/store.js";
+import {
   ChatSession,
   createLeanCheckTool,
   type ChatEvent,
 } from "../core/chat/index.js";
 import {
+  ScopedChatSessionStore,
+  type ChatScope,
+  type ScopedChatSessionFactory,
+} from "../core/chat/store.js";
+import { randomUUID } from "node:crypto";
+import {
   ModelRouter,
   LocalLeanProvider,
-  LocalFsArtifactSink,
   resolveApiKey,
 } from "../providers/index.js";
 
@@ -54,8 +76,17 @@ You help with mathematical reasoning and Lean 4 formalization. When you want to
 verify a Lean 4 snippet compiles, call the \`lean_check\` tool with the complete
 source; read its messages and iterate. Keep prose concise.`;
 
-/** Factory the chat endpoint uses to build a session. Injectable for tests. */
-export type ChatSessionFactory = (opts: { model?: string }) => ChatSession;
+/**
+ * Factory the chat endpoints use to build a session.
+ *
+ * `scope` lets handlers thread the parent context (global / project / effort)
+ * through to the kernel — T1-D will hook this into tool ctx (BUG #7 fix).
+ * Injectable for tests; default factory ignores scope for now.
+ */
+export type ChatSessionFactory = (opts: {
+  model?: string;
+  scope?: ChatScope;
+}) => ChatSession;
 
 export interface StartServerOptions {
   host?: string;
@@ -124,20 +155,71 @@ function parseFrontMatter(raw: string): FrontMatter {
 
 const PROJECTS_DIR = "projects";
 const WIKI_DIR = "wiki";
+const WIKI_HISTORY_DIR = ".history";
+
+/**
+ * Wiki frontmatter shape (canonical). Backward compatible with the legacy
+ * `LocalFsArtifactSink` frontmatter (id/slug/title/authorId/createdAt/updatedAt).
+ *
+ * Extra v0.1.0 fields:
+ *   parent?: string     — slug of parent page (for tree-style navigation)
+ *   sortOrder?: number  — stable display order within parent
+ *   version: number     — monotonically increasing, starts at 1
+ */
+interface WikiFrontmatter {
+  id?: string;
+  title?: string;
+  slug?: string;
+  authorId?: string;
+  tags?: string[];
+  createdAt?: string;
+  updatedAt?: string;
+  parent?: string;
+  sortOrder?: number;
+  version?: number;
+}
+
+/** Serialize a frontmatter object to YAML between `---` fences. */
+function stringifyFrontmatter(fm: WikiFrontmatter): string {
+  const lines: string[] = ["---"];
+  if (fm.id !== undefined) lines.push(`id: ${fm.id}`);
+  if (fm.title !== undefined) lines.push(`title: ${JSON.stringify(fm.title)}`);
+  if (fm.slug !== undefined) lines.push(`slug: ${fm.slug}`);
+  if (fm.parent !== undefined) lines.push(`parent: ${fm.parent}`);
+  if (fm.sortOrder !== undefined) lines.push(`sortOrder: ${fm.sortOrder}`);
+  if (fm.authorId !== undefined) lines.push(`authorId: ${fm.authorId}`);
+  if (fm.tags && fm.tags.length > 0) {
+    lines.push(`tags: [${fm.tags.map((t) => JSON.stringify(t)).join(", ")}]`);
+  }
+  if (fm.createdAt !== undefined) lines.push(`createdAt: ${fm.createdAt}`);
+  if (fm.updatedAt !== undefined) lines.push(`updatedAt: ${fm.updatedAt}`);
+  if (fm.version !== undefined) lines.push(`version: ${fm.version}`);
+  lines.push("---", "");
+  return lines.join("\n");
+}
+
+/**
+ * Slug allow-list. Project slugs and wiki page slugs are restricted to
+ * lowercase alphanumerics + `-`/`_`/`.` so a malicious caller cannot smuggle
+ * `..` segments or path separators through `/api/projects/:slug/wiki/:page`.
+ *
+ * `path.join` does NOT prevent traversal when the caller controls one of the
+ * inputs; we must validate before joining.
+ */
+const SAFE_SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/i;
+const MAX_SLUG_LENGTH = 128;
+
+function isSafeSlug(value: string): boolean {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_SLUG_LENGTH &&
+    SAFE_SLUG_PATTERN.test(value)
+  );
+}
 
 function projectDirFor(workspace: string, slug: string): string {
   return path.join(workspace, PROJECTS_DIR, slug);
-}
-
-/** Read the hidden wiki page index written by LocalFsArtifactSink (wiki mode). */
-async function readWikiIndex(projectDir: string): Promise<Record<string, any>> {
-  try {
-    const raw = await fs.readFile(path.join(projectDir, ".mathran-pages.index.json"), "utf-8");
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
 }
 
 // ─── REST handlers (workspace-bound) ─────────────────────────────────────────
@@ -206,10 +288,10 @@ async function listWiki(workspace: string, slug: string): Promise<Array<Record<s
   const pages: Array<Record<string, unknown>> = [];
   for (const file of files.sort()) {
     const page = file.replace(/\.md$/, "");
-    let data: Record<string, unknown> = {};
+    let data: WikiFrontmatter = {};
     try {
       const fm = parseFrontMatter(await fs.readFile(path.join(wikiDir, file), "utf-8"));
-      data = fm.data;
+      data = fm.data as WikiFrontmatter;
     } catch {
       data = {};
     }
@@ -217,10 +299,21 @@ async function listWiki(workspace: string, slug: string): Promise<Array<Record<s
       page,
       title: data.title ?? page,
       tags: data.tags ?? [],
-      ...(data.created_at !== undefined ? { created_at: data.created_at } : {}),
+      // v0.1.0: surface tree + version metadata so the UI can render a sidebar tree.
+      ...(data.parent !== undefined ? { parent: data.parent } : {}),
+      ...(data.sortOrder !== undefined ? { sortOrder: data.sortOrder } : {}),
+      version: data.version ?? 1,
+      ...(data.createdAt !== undefined ? { created_at: data.createdAt } : {}),
       ...(data.updatedAt !== undefined ? { updated_at: data.updatedAt } : {}),
     });
   }
+  // Stable order: sortOrder if present, then slug.
+  pages.sort((a, b) => {
+    const sa = typeof a.sortOrder === "number" ? a.sortOrder : 0;
+    const sb = typeof b.sortOrder === "number" ? b.sortOrder : 0;
+    if (sa !== sb) return sa - sb;
+    return String(a.page).localeCompare(String(b.page));
+  });
   return pages;
 }
 
@@ -237,27 +330,126 @@ async function readWikiPage(
     return null;
   }
   const fm = parseFrontMatter(raw);
-  return { page, frontmatter: fm.data, body: fm.body, raw };
+  const data = fm.data as WikiFrontmatter;
+  return {
+    page,
+    frontmatter: data,
+    body: fm.body,
+    raw,
+    version: data.version ?? 1,
+  };
 }
 
-/** Write a wiki page through LocalFsArtifactSink (wiki mode). */
+/** Write a wiki page; v0.1.0 adds versioning + parent/sortOrder, keeps history on disk. */
 async function writeWikiPage(
   workspace: string,
   slug: string,
   page: string,
   body: string,
+  opts: { parent?: string; sortOrder?: number; title?: string } = {},
 ): Promise<Record<string, unknown>> {
   const projectDir = projectDirFor(workspace, slug);
-  const sink = new LocalFsArtifactSink({ rootDir: projectDir, mode: "wiki" });
-  const index = await readWikiIndex(projectDir);
-  const existing = Object.values(index).find((e: any) => e?.slug === page) as any;
-  if (existing) {
-    await sink.updatePage(existing.id, { body });
-  } else {
-    await sink.createPage({ title: page, body, authorId: "user", tags: ["wiki"] });
+  const wikiDir = path.join(projectDir, WIKI_DIR);
+  await fs.mkdir(wikiDir, { recursive: true });
+  const file = path.join(wikiDir, `${page}.md`);
+
+  // Snapshot existing version (if any) into `.history/<page>/v<N>.md`.
+  let existingFm: WikiFrontmatter = {};
+  let existingRaw: string | null = null;
+  try {
+    existingRaw = await fs.readFile(file, "utf-8");
+    existingFm = parseFrontMatter(existingRaw).data as WikiFrontmatter;
+  } catch {
+    /* page is new — nothing to snapshot. */
   }
+  const oldVersion = existingFm.version ?? (existingRaw ? 1 : 0);
+  if (existingRaw && oldVersion > 0) {
+    const histDir = path.join(wikiDir, WIKI_HISTORY_DIR, page);
+    await fs.mkdir(histDir, { recursive: true });
+    await fs.writeFile(path.join(histDir, `v${oldVersion}.md`), existingRaw, "utf-8");
+  }
+
+  const now = new Date().toISOString();
+  const next: WikiFrontmatter = {
+    // Preserve id / createdAt / authorId across writes.
+    id: existingFm.id ?? randomUUID(),
+    title: opts.title ?? existingFm.title ?? page,
+    slug: page,
+    parent: opts.parent ?? existingFm.parent,
+    sortOrder: opts.sortOrder ?? existingFm.sortOrder,
+    authorId: existingFm.authorId ?? "user",
+    tags: existingFm.tags ?? ["wiki"],
+    createdAt: existingFm.createdAt ?? now,
+    updatedAt: now,
+    version: oldVersion + 1,
+  };
+  await fs.writeFile(file, stringifyFrontmatter(next) + body, "utf-8");
   const result = await readWikiPage(workspace, slug, page);
   return result ?? { page, body };
+}
+
+/** List all historical versions of a wiki page. */
+async function listWikiHistory(
+  workspace: string,
+  slug: string,
+  page: string,
+): Promise<Array<Record<string, unknown>> | null> {
+  const histDir = path.join(projectDirFor(workspace, slug), WIKI_DIR, WIKI_HISTORY_DIR, page);
+  let files: string[];
+  try {
+    files = (await fs.readdir(histDir)).filter((f) => /^v\d+\.md$/.test(f));
+  } catch {
+    return [];
+  }
+  const versions: Array<Record<string, unknown>> = [];
+  for (const file of files) {
+    const m = /^v(\d+)\.md$/.exec(file);
+    if (!m) continue;
+    const version = Number(m[1]);
+    try {
+      const fm = parseFrontMatter(await fs.readFile(path.join(histDir, file), "utf-8"));
+      const data = fm.data as WikiFrontmatter;
+      versions.push({
+        version,
+        updated_at: data.updatedAt ?? null,
+        title: data.title ?? page,
+      });
+    } catch {
+      versions.push({ version, updated_at: null });
+    }
+  }
+  versions.sort((a, b) => (b.version as number) - (a.version as number));
+  return versions;
+}
+
+/** Read a specific historical version of a wiki page. */
+async function readWikiPageVersion(
+  workspace: string,
+  slug: string,
+  page: string,
+  version: number,
+): Promise<Record<string, unknown> | null> {
+  const file = path.join(
+    projectDirFor(workspace, slug),
+    WIKI_DIR,
+    WIKI_HISTORY_DIR,
+    page,
+    `v${version}.md`,
+  );
+  let raw: string;
+  try {
+    raw = await fs.readFile(file, "utf-8");
+  } catch {
+    return null;
+  }
+  const fm = parseFrontMatter(raw);
+  return {
+    page,
+    version,
+    frontmatter: fm.data,
+    body: fm.body,
+    raw,
+  };
 }
 
 // ─── Provider / config handlers (key-masked) ─────────────────────────────────
@@ -354,7 +546,7 @@ async function writeProviders(workspace: string, payload: any): Promise<Record<s
 // ─── Chat (SSE) ──────────────────────────────────────────────────────────────
 
 function defaultSessionFactory(workspace: string): ChatSessionFactory {
-  return ({ model }) => {
+  return ({ model, scope }) => {
     const config = loadConfig(configPathFor(workspace));
     const resolvedModel = model ?? config.defaultModel ?? DEFAULT_MODEL;
     const router = new ModelRouter(config);
@@ -362,11 +554,25 @@ function defaultSessionFactory(workspace: string): ChatSessionFactory {
     return new ChatSession({
       llm: router,
       model: resolvedModel,
-      systemPrompt: SYSTEM_PROMPT,
+      // T1-D: thread workspace + scope into tools so lean_check (and future
+      // wiki/effort tools) can resolve project-relative paths. BUG #7 fix.
+      toolContext: { workspace, scope },
+      systemPrompt: buildScopedSystemPrompt(scope),
       tools: [createLeanCheckTool(lean)],
     });
   };
 }
+
+/** Append a short scope hint to the system prompt so the model knows where it is. */
+function buildScopedSystemPrompt(scope: ChatScope | undefined): string {
+  if (!scope || scope.kind === "global") return SYSTEM_PROMPT;
+  if (scope.kind === "project") {
+    return `${SYSTEM_PROMPT}\n\nYou are chatting inside project "${scope.projectSlug}".`;
+  }
+  return `${SYSTEM_PROMPT}\n\nYou are chatting inside effort "${scope.effortSlug}" of project "${scope.projectSlug}".`;
+}
+
+// ─── Chat session store (disk-backed; see src/core/chat/store.ts) ────────────
 
 // ─── App assembly ────────────────────────────────────────────────────────────
 
@@ -381,8 +587,169 @@ const PLACEHOLDER_HTML = `<!doctype html>
 </html>
 `;
 
+// ─── Chat route helpers ───────────────────────────────────────────────────────────
+
+/**
+ * Wire one chat scope (global / project / effort) into the Hono app.
+ *
+ * `basePath` is the URL prefix for the scope (e.g. `/api/global-chat`,
+ * `/api/projects/:slug/chat`, or `/api/projects/:slug/effort/:effortSlug/chat`).
+ * `getScope` derives the `ChatScope` from the request context (and is the
+ * place we run slug-safety / project-exists checks).
+ */
+function registerChatScope(
+  app: Hono,
+  store: ScopedChatSessionStore,
+  basePath: string,
+  getScope: (c: any) => { scope?: ChatScope; error?: string; status?: 400 | 404 },
+): void {
+  // POST <base>  — send a message (SSE)
+  app.post(basePath, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const message = typeof body?.message === "string" ? body.message : "";
+    if (!message) return c.json({ error: "message is required" }, 400);
+    const model = typeof body?.model === "string" ? body.model : undefined;
+    // sessionId / conversationId aliases for back-compat.
+    const requested = typeof body?.conversationId === "string" && body.conversationId.length > 0
+      ? body.conversationId
+      : typeof body?.sessionId === "string" && body.sessionId.length > 0
+        ? body.sessionId
+        : null;
+    const conversationId = requested ?? ScopedChatSessionStore.newConversationId();
+
+    let session: ChatSession;
+    try {
+      session = await store.getOrCreate(scope, conversationId, model);
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 500);
+    }
+
+    return streamSSE(c, async (stream) => {
+      try {
+        await stream.writeSSE({
+          event: "session",
+          data: JSON.stringify({ sessionId: conversationId, conversationId, scope }),
+        });
+        for await (const ev of session.send(message) as AsyncIterable<ChatEvent>) {
+          await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
+        }
+        // Flush the freshly-augmented history to disk before closing the stream.
+        await store.flush(scope, conversationId);
+      } catch (err: any) {
+        await stream.writeSSE({
+          event: "error",
+          data: JSON.stringify({ message: err?.message ?? String(err) }),
+        });
+      }
+    });
+  });
+
+  // GET <base>  — list conversations in this scope
+  app.get(basePath, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const conversations = await store.listConversations(resolved.scope!);
+    return c.json({ conversations });
+  });
+
+  // GET <base>/:conversationId  — read history of one conversation
+  app.get(`${basePath}/:conversationId`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+    const history = await store.readHistory(resolved.scope!, id);
+    if (history === null) return c.json({ error: "conversation not found" }, 404);
+    return c.json({ conversationId: id, history });
+  });
+
+  // DELETE <base>/:conversationId  — drop a conversation
+  app.delete(`${basePath}/:conversationId`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+    const ok = await store.drop(resolved.scope!, id);
+    return c.json({ dropped: ok });
+  });
+}
+
+/** Register all three chat scopes + the legacy `/api/chat` alias. */
+function registerChatRoutes(
+  app: Hono,
+  workspace: string,
+  store: ScopedChatSessionStore,
+): void {
+  // global
+  registerChatScope(app, store, "/api/global-chat", () => ({
+    scope: { kind: "global" } as ChatScope,
+  }));
+
+  // project
+  registerChatScope(app, store, "/api/projects/:slug/chat", (c) => {
+    const slug = c.req.param("slug");
+    if (!isSafeSlug(slug)) return { error: "invalid project slug" };
+    if (!fssync.existsSync(projectDirFor(workspace, slug))) {
+      return { error: "project not found", status: 404 };
+    }
+    return { scope: { kind: "project", projectSlug: slug } as ChatScope };
+  });
+
+  // effort
+  registerChatScope(app, store, "/api/projects/:slug/effort/:effortSlug/chat", (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug)) return { error: "invalid project slug" };
+    if (!isSafeSlug(eff)) return { error: "invalid effort slug" };
+    if (!fssync.existsSync(projectDirFor(workspace, slug))) {
+      return { error: "project not found", status: 404 };
+    }
+    return {
+      scope: { kind: "effort", projectSlug: slug, effortSlug: eff } as ChatScope,
+    };
+  });
+
+  // ─── Legacy alias /api/chat ──→ redirected to /api/global-chat semantics.
+  // We keep the SSE behavior wholesale to preserve v0.1.0-alpha SPA clients.
+  registerChatScope(app, store, "/api/chat", () => ({
+    scope: { kind: "global" } as ChatScope,
+  }));
+  // `/api/chat-sessions` alias too — returns global conversations.
+  app.get("/api/chat-sessions", async (c) => {
+    const conversations = await store.listConversations({ kind: "global" });
+    return c.json({
+      conversations,
+      sessions: conversations.map((cv) => ({
+        id: cv.id,
+        lastUsedMs: Date.parse(cv.lastUsedAt),
+        messageCount: cv.messageCount,
+      })),
+    });
+  });
+  app.delete("/api/chat-sessions/:id", async (c) => {
+    const ok = await store.drop({ kind: "global" }, c.req.param("id"));
+    return c.json({ dropped: ok });
+  });
+}
+
 function buildApp(workspace: string, factory: ChatSessionFactory): Hono {
   const app = new Hono();
+  // Adapt the test-friendly `ChatSessionFactory(opts)` to the store's
+  // `ScopedChatSessionFactory({ scope, model })` signature.
+  const scopedFactory: ScopedChatSessionFactory = ({ scope, model }) => factory({ scope, model });
+  const sessions = new ScopedChatSessionStore(workspace, scopedFactory);
 
   app.get("/api/health", async (c) => {
     return c.json({ ok: true, version: await readPackageVersion(), workspace });
@@ -411,26 +778,36 @@ function buildApp(workspace: string, factory: ChatSessionFactory): Hono {
   });
 
   app.get("/api/projects/:slug", async (c) => {
-    const project = await readProject(workspace, c.req.param("slug"));
+    const slug = c.req.param("slug");
+    if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);
+    const project = await readProject(workspace, slug);
     if (!project) return c.json({ error: "project not found" }, 404);
     return c.json(project);
   });
 
   app.get("/api/projects/:slug/wiki", async (c) => {
-    const pages = await listWiki(workspace, c.req.param("slug"));
+    const slug = c.req.param("slug");
+    if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);
+    const pages = await listWiki(workspace, slug);
     if (pages === null) return c.json({ error: "project not found" }, 404);
     return c.json({ pages });
   });
 
   app.get("/api/projects/:slug/wiki/:page", async (c) => {
-    const page = await readWikiPage(workspace, c.req.param("slug"), c.req.param("page"));
-    if (!page) return c.json({ error: "page not found" }, 404);
-    return c.json(page);
+    const slug = c.req.param("slug");
+    const page = c.req.param("page");
+    if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);
+    if (!isSafeSlug(page)) return c.json({ error: "invalid wiki page slug" }, 400);
+    const result = await readWikiPage(workspace, slug, page);
+    if (!result) return c.json({ error: "page not found" }, 404);
+    return c.json(result);
   });
 
   app.put("/api/projects/:slug/wiki/:page", async (c) => {
     const slug = c.req.param("slug");
     const page = c.req.param("page");
+    if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);
+    if (!isSafeSlug(page)) return c.json({ error: "invalid wiki page slug" }, 400);
     if (!(await pathExists(projectDirFor(workspace, slug)))) {
       return c.json({ error: "project not found" }, 404);
     }
@@ -443,9 +820,200 @@ function buildApp(workspace: string, factory: ChatSessionFactory): Hono {
     if (typeof body?.body !== "string") {
       return c.json({ error: "body (string) is required" }, 400);
     }
+    // Optional v0.1.0 fields. Validate `parent` is a safe slug (no traversal).
+    const parent = typeof body?.parent === "string" && body.parent.length > 0 ? body.parent : undefined;
+    if (parent !== undefined && !isSafeSlug(parent)) {
+      return c.json({ error: "invalid parent slug" }, 400);
+    }
+    const sortOrder = typeof body?.sortOrder === "number" && Number.isFinite(body.sortOrder)
+      ? body.sortOrder
+      : undefined;
+    const title = typeof body?.title === "string" && body.title.length > 0 ? body.title : undefined;
     try {
-      const result = await writeWikiPage(workspace, slug, page, body.body);
+      const result = await writeWikiPage(workspace, slug, page, body.body, { parent, sortOrder, title });
       return c.json(result);
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 400);
+    }
+  });
+
+  app.get("/api/projects/:slug/wiki/:page/history", async (c) => {
+    const slug = c.req.param("slug");
+    const page = c.req.param("page");
+    if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);
+    if (!isSafeSlug(page)) return c.json({ error: "invalid wiki page slug" }, 400);
+    const versions = await listWikiHistory(workspace, slug, page);
+    if (versions === null) return c.json({ error: "page not found" }, 404);
+    return c.json({ page, versions });
+  });
+
+  app.get("/api/projects/:slug/wiki/:page/history/:version", async (c) => {
+    const slug = c.req.param("slug");
+    const page = c.req.param("page");
+    const versionStr = c.req.param("version");
+    const version = Number(versionStr);
+    if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);
+    if (!isSafeSlug(page)) return c.json({ error: "invalid wiki page slug" }, 400);
+    if (!Number.isInteger(version) || version < 1) {
+      return c.json({ error: "invalid version (must be positive integer)" }, 400);
+    }
+    const result = await readWikiPageVersion(workspace, slug, page, version);
+    if (!result) return c.json({ error: "version not found" }, 404);
+    return c.json(result);
+  });
+
+  // ─── Effort REST (T1-B) ──────────────────────────────────────────────────────────────────
+  app.get("/api/projects/:slug/efforts", async (c) => {
+    const slug = c.req.param("slug");
+    if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);
+    if (!(await pathExists(projectDirFor(workspace, slug)))) {
+      return c.json({ error: "project not found" }, 404);
+    }
+    const efforts = await listEfforts(workspace, slug);
+    return c.json({ efforts });
+  });
+
+  app.post("/api/projects/:slug/efforts", async (c) => {
+    const slug = c.req.param("slug");
+    if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const title = typeof body?.title === "string" ? body.title : "";
+    const type = typeof body?.type === "string" ? body.type : "";
+    if (!title) return c.json({ error: "title is required" }, 400);
+    if (!isBuiltinEffortType(type)) {
+      return c.json({ error: `type must be one of ${BUILTIN_EFFORT_TYPES.join(", ")}` }, 400);
+    }
+    const effortSlug = typeof body?.slug === "string" && body.slug.length > 0 ? body.slug : undefined;
+    const description = typeof body?.description === "string" ? body.description : undefined;
+    const force = body?.force === true;
+    try {
+      const result = await initEffort(workspace, slug, { title, type, slug: effortSlug, description, force });
+      return c.json(result);
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 400);
+    }
+  });
+
+  app.get("/api/projects/:slug/effort/:effortSlug", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    const meta = await readEffortMetadata(workspace, slug, eff);
+    if (!meta) return c.json({ error: "effort not found" }, 404);
+    return c.json({ effort: meta });
+  });
+
+  app.patch("/api/projects/:slug/effort/:effortSlug", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const patch: any = {};
+    if (typeof body?.title === "string") patch.title = body.title;
+    if (typeof body?.description === "string") patch.description = body.description;
+    if (typeof body?.status === "string") patch.status = body.status;
+    if (typeof body?.type === "string") patch.type = body.type;
+    try {
+      const updated = await updateEffortMetadata(workspace, slug, eff, patch);
+      return c.json({ effort: updated });
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 400);
+    }
+  });
+
+  app.get("/api/projects/:slug/effort/:effortSlug/document", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    const doc = await readEffortDocument(workspace, slug, eff);
+    if (doc === null) return c.json({ error: "effort not found" }, 404);
+    return c.json({ effort: eff, document: doc });
+  });
+
+  app.put("/api/projects/:slug/effort/:effortSlug/document", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    if (typeof body?.document !== "string") return c.json({ error: "document (string) is required" }, 400);
+    try {
+      await writeEffortDocument(workspace, slug, eff, body.document);
+      return c.json({ ok: true });
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 400);
+    }
+  });
+
+  app.get("/api/projects/:slug/effort/:effortSlug/files", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    try {
+      const files = await listEffortFiles(workspace, slug, eff);
+      return c.json({ files });
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 400);
+    }
+  });
+
+  // file path uses a wildcard segment (`{ rest: "*" }` style) so we can capture
+  // multi-segment relative paths like `proofs/lemma1.lean`.
+  app.get("/api/projects/:slug/effort/:effortSlug/files/*", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    const url = new URL(c.req.url);
+    const prefix = `/api/projects/${slug}/effort/${eff}/files/`;
+    const relPath = decodeURIComponent(url.pathname.slice(prefix.length));
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    try {
+      const content = await readEffortFile(workspace, slug, eff, relPath);
+      if (content === null) return c.json({ error: "file not found" }, 404);
+      return c.json({ path: relPath, content });
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 400);
+    }
+  });
+
+  app.put("/api/projects/:slug/effort/:effortSlug/files/*", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    const url = new URL(c.req.url);
+    const prefix = `/api/projects/${slug}/effort/${eff}/files/`;
+    const relPath = decodeURIComponent(url.pathname.slice(prefix.length));
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    if (typeof body?.content !== "string") return c.json({ error: "content (string) is required" }, 400);
+    try {
+      await writeEffortFile(workspace, slug, eff, relPath, body.content);
+      return c.json({ ok: true });
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 400);
+    }
+  });
+
+  app.post("/api/projects/:slug/effort/:effortSlug/snapshot", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    try {
+      const version = await snapshotEffort(workspace, slug, eff);
+      return c.json({ version });
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 400);
+    }
+  });
+
+  app.get("/api/projects/:slug/effort/:effortSlug/versions", async (c) => {
+    const slug = c.req.param("slug");
+    const eff = c.req.param("effortSlug");
+    if (!isSafeSlug(slug) || !isSafeSlug(eff)) return c.json({ error: "invalid slug" }, 400);
+    try {
+      const versions = await listSnapshots(workspace, slug, eff);
+      return c.json({ versions });
     } catch (err: any) {
       return c.json({ error: err?.message ?? String(err) }, 400);
     }
@@ -469,40 +1037,8 @@ function buildApp(workspace: string, factory: ChatSessionFactory): Hono {
 
   app.get("/api/config", (c) => c.json(safeConfig(workspace)));
 
-  app.post("/api/chat", async (c) => {
-    let body: any;
-    try {
-      body = await c.req.json();
-    } catch {
-      return c.json({ error: "invalid JSON body" }, 400);
-    }
-    const message = typeof body?.message === "string" ? body.message : "";
-    if (!message) return c.json({ error: "message is required" }, 400);
-    const model = typeof body?.model === "string" ? body.model : undefined;
-
-    return streamSSE(c, async (stream) => {
-      let session: ChatSession;
-      try {
-        session = factory({ model });
-      } catch (err: any) {
-        await stream.writeSSE({
-          event: "error",
-          data: JSON.stringify({ message: err?.message ?? String(err) }),
-        });
-        return;
-      }
-      try {
-        for await (const ev of session.send(message) as AsyncIterable<ChatEvent>) {
-          await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
-        }
-      } catch (err: any) {
-        await stream.writeSSE({
-          event: "error",
-          data: JSON.stringify({ message: err?.message ?? String(err) }),
-        });
-      }
-    });
-  });
+  // ─── Chat (T1-C) ────────────────────────────────────────────────────────────────────────
+  registerChatRoutes(app, workspace, sessions);
 
   // ─── Static hosting / placeholder ──────────────────────────────────────────
   const webDir = path.join(repoRoot(), "dist", "web");
@@ -510,6 +1046,23 @@ function buildApp(workspace: string, factory: ChatSessionFactory): Hono {
     const rel = path.relative(process.cwd(), webDir) || ".";
     app.use("/*", serveStatic({ root: rel }));
     app.get("/", serveStatic({ root: rel, path: "index.html" }));
+    // SPA fallback: any non-API GET that didn't match a static file should
+    // serve `index.html` so the React app's client-side routing survives a
+    // hard refresh on a deep URL (PRD §3a).
+    const indexPath = path.join(webDir, "index.html");
+    app.notFound(async (c) => {
+      if (c.req.method !== "GET") return c.json({ error: "not found" }, 404);
+      const url = new URL(c.req.url);
+      if (url.pathname.startsWith("/api/")) {
+        return c.json({ error: "not found" }, 404);
+      }
+      try {
+        const html = await fs.readFile(indexPath, "utf-8");
+        return c.html(html);
+      } catch {
+        return c.json({ error: "not found" }, 404);
+      }
+    });
   } else {
     app.get("/", (c) => c.html(PLACEHOLDER_HTML));
   }

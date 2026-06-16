@@ -19,10 +19,34 @@
 import { Command } from "commander";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
+import * as fssync from "node:fs";
+import { fileURLToPath } from "node:url";
 
 // Lazy-loaded so `mathran --help` / `mathran version` don't pull in the agent.
 async function loadProveCommand() {
   return import("./commands/prove.js");
+}
+
+/**
+ * Read the version from package.json at startup. Synchronous + best-effort:
+ * if the file is missing for any reason we fall back to the literal
+ * "0.0.0". Avoids the BUG #9 risk of a hard-coded string drifting from
+ * package.json on every release.
+ */
+function readMathranVersion(): string {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    // dist/cli/index.js → ../../package.json
+    const pkgPath = path.resolve(here, "..", "..", "package.json");
+    const raw = fssync.readFileSync(pkgPath, "utf-8");
+    const pkg = JSON.parse(raw);
+    if (typeof pkg.version === "string" && pkg.version.length > 0) {
+      return pkg.version;
+    }
+  } catch {
+    // fall through
+  }
+  return "0.0.0";
 }
 
 interface TopLevelOpts {
@@ -70,7 +94,7 @@ const program = new Command();
 program
   .name("mathran")
   .description("Conversational workstation for mathematical reasoning + Lean theorem proving")
-  .version("0.1.0-alpha.0", "-v, --version", "Print version and exit")
+  .version(readMathranVersion(), "-v, --version", "Print version and exit")
   .option("-p, --prompt <text>", 'One-shot prompt (use "-" or pipe stdin to read from stdin), then exit')
   .option("-m, --model <model>", "LLM model to use (e.g. copilot/gpt-5.5); defaults to config.defaultModel")
   .action(async (opts: TopLevelOpts) => {
@@ -139,6 +163,49 @@ projectCmd
   .action(async (name: string, opts: { workspace?: string; force?: boolean }) => {
     const { runProjectInit } = await import("./commands/project.js");
     process.exit(await runProjectInit(name, { workspace: opts.workspace, force: opts.force }));
+  });
+
+projectCmd
+  .command("list")
+  .description("List projects in the workspace")
+  .option("--workspace <dir>", "Workspace root (overrides MATHRAN_WORKSPACE and the default)")
+  .option("--json", "Emit JSON instead of a human-readable list", false)
+  .action(async (opts: { workspace?: string; json?: boolean }) => {
+    const { runProjectList } = await import("./commands/project.js");
+    process.exit(await runProjectList({ workspace: opts.workspace, json: opts.json }));
+  });
+
+const effortCmd = program
+  .command("effort")
+  .description("Manage workspace efforts inside a project");
+
+effortCmd
+  .command("init")
+  .description("Scaffold a new effort (effort.toml + document.md + files/)")
+  .argument("<project>", "Project slug")
+  .argument("<title>", "Human-readable effort title")
+  .option("--workspace <dir>", "Workspace root")
+  .option("--type <type>", "Effort type (one of the builtins)", "PROOF_ATTEMPT")
+  .option("--slug <slug>", "Override the auto-generated slug")
+  .option("--description <text>", "Short description / abstract")
+  .option("--force", "Overwrite an existing effort directory", false)
+  .action(async (project: string, title: string, opts: any) => {
+    const { runEffortInit } = await import("./commands/effort.js");
+    process.exit(await runEffortInit(project, title, {
+      workspace: opts.workspace, type: opts.type, slug: opts.slug,
+      description: opts.description, force: opts.force,
+    }));
+  });
+
+effortCmd
+  .command("list")
+  .description("List efforts in a project, grouped by type")
+  .argument("<project>", "Project slug")
+  .option("--workspace <dir>", "Workspace root")
+  .option("--json", "Emit JSON", false)
+  .action(async (project: string, opts: any) => {
+    const { runEffortList } = await import("./commands/effort.js");
+    process.exit(await runEffortList(project, { workspace: opts.workspace, json: opts.json }));
   });
 
 program

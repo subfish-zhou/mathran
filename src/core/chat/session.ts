@@ -22,6 +22,26 @@ import type {
   LLMStreamChunk,
 } from "../providers/llm.js";
 
+/**
+ * Per-invocation context the kernel threads into a tool's `execute()`.
+ *
+ * `scope` lets tools resolve project/effort-relative paths (T1-D / BUG #7
+ * fix): lean_check can `cd` into an effort's `files/` directory, wiki tools
+ * can read pages in the current project, etc. When the host doesn't know its
+ * scope (CLI one-shots, isolated test harnesses), this is `undefined` and
+ * tools must default to a non-project sandbox.
+ */
+export interface ToolExecuteContext {
+  /** Workspace root (absolute). */
+  workspace?: string;
+  /** Chat scope this invocation belongs to. */
+  scope?: {
+    kind: "global" | "project" | "effort";
+    projectSlug?: string;
+    effortSlug?: string;
+  };
+}
+
 /** A tool the model can invoke. Parameters are a JSON-schema object. */
 export interface ToolSpec {
   name: string;
@@ -29,10 +49,12 @@ export interface ToolSpec {
   parameters: Record<string, unknown>;
   /**
    * Execute the tool. `args` is the parsed JSON arguments object (or `{}` if
-   * the model emitted no/invalid JSON). Returns the textual result that is fed
-   * back to the model plus an `ok` flag for callers/loggers.
+   * the model emitted no/invalid JSON). `ctx` carries optional workspace/scope
+   * hints — tools should treat it as advisory and fall back to safe defaults
+   * when it's not set. Returns the textual result that is fed back to the
+   * model plus an `ok` flag for callers/loggers.
    */
-  execute(args: Record<string, unknown>): Promise<{ ok: boolean; content: string }>;
+  execute(args: Record<string, unknown>, ctx?: ToolExecuteContext): Promise<{ ok: boolean; content: string }>;
 }
 
 /**
@@ -57,6 +79,12 @@ export interface ChatSessionOptions {
   maxTokens?: number;
   /** Safety cap on tool-call round-trips per `send()`. Default 8. */
   maxToolRounds?: number;
+  /**
+   * Per-session context threaded into every `tool.execute()` call. The host
+   * (the `serve` route or CLI) supplies this so tools resolve relative paths
+   * inside the right project/effort directory (T1-D / BUG #7 fix).
+   */
+  toolContext?: ToolExecuteContext;
 }
 
 interface PendingToolCall {
@@ -73,6 +101,7 @@ export class ChatSession {
   readonly model?: string;
   private temperature?: number;
   private maxTokens?: number;
+  private readonly toolContext?: ToolExecuteContext;
   private messages: LLMMessage[] = [];
 
   constructor(opts: ChatSessionOptions) {
@@ -83,6 +112,7 @@ export class ChatSession {
     this.maxToolRounds = opts.maxToolRounds ?? 8;
     this.temperature = opts.temperature;
     this.maxTokens = opts.maxTokens;
+    this.toolContext = opts.toolContext;
     if (opts.systemPrompt && opts.systemPrompt.trim().length > 0) {
       this.messages.push({ role: "system", content: opts.systemPrompt });
     }
@@ -97,6 +127,27 @@ export class ChatSession {
   reset(): void {
     const system = this.messages.find((m) => m.role === "system");
     this.messages = system ? [{ ...system }] : [];
+  }
+
+  /**
+   * Replace the in-memory history with a hydrated copy (used by the disk-
+   * backed `ScopedChatSessionStore` during session re-hydration on first
+   * access after a process restart).
+   *
+   * Behavior:
+   *   - If `next` contains a leading `system` message, it is used verbatim.
+   *   - Otherwise the session's existing system prompt (if any) is preserved
+   *     and `next` is appended after it.
+   */
+  replaceHistory(next: LLMMessage[]): void {
+    if (next.length > 0 && next[0].role === "system") {
+      this.messages = next.map((m) => ({ ...m }));
+      return;
+    }
+    const system = this.messages.find((m) => m.role === "system");
+    this.messages = system
+      ? [{ ...system }, ...next.map((m) => ({ ...m }))]
+      : next.map((m) => ({ ...m }));
   }
 
   /**
@@ -154,8 +205,20 @@ export class ChatSession {
         .map((k) => calls.get(k)!)
         .filter((c) => c.name && c.name.length > 0);
 
-      // Record the assistant turn (text content, possibly empty alongside calls).
-      this.messages.push({ role: "assistant", content: text });
+      // Record the assistant turn. We must persist `toolCalls` alongside the
+      // text so the next request to the LLM can echo them back in the
+      // provider-specific shape (OpenAI `tool_calls`, Anthropic `tool_use`,
+      // …). Without this the assistant message paired with the tool result
+      // looks malformed and OpenAI / Anthropic / Azure will reject it.
+      const assistantMessage: LLMMessage = { role: "assistant", content: text };
+      if (toolCalls.length > 0) {
+        assistantMessage.toolCalls = toolCalls.map((c) => ({
+          id: c.id,
+          name: c.name,
+          arguments: c.args,
+        }));
+      }
+      this.messages.push(assistantMessage);
 
       if (toolCalls.length === 0) {
         yield { type: "done", finishReason };
@@ -163,9 +226,27 @@ export class ChatSession {
       }
 
       if (round === this.maxToolRounds) {
-        // Out of tool budget: surface the calls but stop the loop.
+        // Out of tool budget: emit the calls + a synthetic tool result for
+        // each so the conversation history stays well-formed (every assistant
+        // tool_call must be paired with a tool message). This way a future
+        // `send()` on the same session will not blow up provider validation.
         for (const call of toolCalls) {
           yield { type: "tool-call", id: call.id, name: call.name, args: call.args };
+          const message =
+            "error: tool-call budget exhausted (maxToolRounds=" + this.maxToolRounds + ")";
+          this.messages.push({
+            role: "tool",
+            content: message,
+            toolCallId: call.id,
+            name: call.name,
+          });
+          yield {
+            type: "tool-result",
+            id: call.id,
+            name: call.name,
+            ok: false,
+            content: message,
+          };
         }
         yield { type: "done", finishReason };
         return;
@@ -192,7 +273,7 @@ export class ChatSession {
           }
           if (!parseFailed) {
             try {
-              result = await tool.execute(parsed);
+              result = await tool.execute(parsed, this.toolContext);
             } catch (err: any) {
               result = { ok: false, content: `error: ${err?.message ?? String(err)}` };
             }

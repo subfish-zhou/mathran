@@ -7,4 +7,13 @@ export default defineConfig({
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
   },
+  test: {
+    include: ["src/**/*.{test,spec}.{js,ts,tsx}"],
+    exclude: [
+      "**/node_modules/**",
+      "_tasks/**",
+      "web/**",
+      "dist/**",
+    ],
+  },
 });

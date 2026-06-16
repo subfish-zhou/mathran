@@ -176,6 +176,12 @@ export interface CopilotChatMessage {
   content: string;
   toolCallId?: string;
   name?: string;
+  /**
+   * Assistant tool-call invocations from the previous turn. Mirrors
+   * `LLMMessage.toolCalls`; lets the Responses-API builder replay the exact
+   * arguments the model emitted instead of substituting `{}`.
+   */
+  toolCalls?: Array<{ id: string; name: string; arguments: string }>;
 }
 
 export interface CopilotChatRequest {
@@ -276,21 +282,47 @@ function extractMessagesText(raw: any): { text: string; input: number; output: n
 export function buildResponsesInput(req: CopilotChatRequest): unknown[] {
   const input: unknown[] = [];
   if (req.systemPrompt) input.push({ role: "system", content: req.systemPrompt });
+  // Track tool-call ids that have already been echoed as `function_call`
+  // items (either from a paired assistant.toolCalls turn or the legacy
+  // tool-message-only path) so we don't double-emit.
+  const echoed = new Set<string>();
   for (const m of req.messages) {
+    if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
+      // Preferred path: the kernel preserved the actual `tool_calls` from the
+      // previous assistant turn. Replay each as a function_call item with the
+      // exact arguments string the model emitted.
+      if (m.content.length > 0) {
+        input.push({ role: "assistant", content: m.content });
+      }
+      for (const c of m.toolCalls) {
+        input.push({
+          type: "function_call",
+          call_id: c.id,
+          name: c.name,
+          arguments: c.arguments && c.arguments.length > 0 ? c.arguments : "{}",
+        });
+        echoed.add(c.id);
+      }
+      continue;
+    }
     if (m.role === "tool") {
-      // The assistant's call itself must be echoed back as a function_call item
-      // (reconstructed from the tool message's id/name; the original arguments
-      // are not threaded through the kernel, so an empty object is used — the
-      // API only replays this as history, it is not re-validated).
-      input.push({
-        type: "function_call",
-        call_id: m.toolCallId ?? "",
-        name: m.name ?? "",
-        arguments: "{}",
-      });
+      // Legacy fallback: the assistant turn upstream did NOT carry toolCalls
+      // (e.g. a session built from raw history without LLMMessage.toolCalls
+      // populated). Reconstruct the function_call item with an empty
+      // arguments object — the Responses API only replays this as history,
+      // it is not re-validated.
+      const callId = m.toolCallId ?? "";
+      if (!echoed.has(callId)) {
+        input.push({
+          type: "function_call",
+          call_id: callId,
+          name: m.name ?? "",
+          arguments: "{}",
+        });
+      }
       input.push({
         type: "function_call_output",
-        call_id: m.toolCallId ?? "",
+        call_id: callId,
         output: m.content,
       });
       continue;

@@ -135,3 +135,86 @@ export async function runProjectInit(name: string, opts: ProjectInitOptions): Pr
     return 1;
   }
 }
+
+/** Project metadata as displayed by `mathran project list`. */
+export interface ProjectSummary {
+  slug: string;
+  name: string;
+  createdAt: string | null;
+  mathranVersion: string | null;
+  projectDir: string;
+}
+
+/** Enumerate projects in `<workspace>/projects/`. */
+export async function listProjects(workspaceRoot: string): Promise<ProjectSummary[]> {
+  const dir = path.join(workspaceRoot, "projects");
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const summaries: ProjectSummary[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const slug = entry.name;
+    const projectDir = path.join(dir, slug);
+    const summary: ProjectSummary = {
+      slug,
+      name: slug,
+      createdAt: null,
+      mathranVersion: null,
+      projectDir,
+    };
+    try {
+      const raw = await fs.readFile(path.join(projectDir, "project.toml"), "utf-8");
+      const { parse: tomlParse } = await import("smol-toml");
+      const parsed: any = tomlParse(raw);
+      const proj = parsed?.project;
+      if (proj && typeof proj === "object") {
+        if (typeof proj.name === "string" && proj.name.length > 0) summary.name = proj.name;
+        if (typeof proj.created_at === "string") summary.createdAt = proj.created_at;
+        if (typeof proj.mathran_version === "string") summary.mathranVersion = proj.mathran_version;
+      }
+    } catch {
+      // No project.toml — still surface the directory as a project.
+    }
+    summaries.push(summary);
+  }
+  summaries.sort((a, b) => a.slug.localeCompare(b.slug));
+  return summaries;
+}
+
+export interface ProjectListOptions {
+  workspace?: string;
+  /** Emit JSON instead of a human-readable list. */
+  json?: boolean;
+}
+
+/** CLI action handler for `mathran project list`. Returns a process exit code. */
+export async function runProjectList(opts: ProjectListOptions): Promise<number> {
+  const workspaceRoot = resolveWorkspaceRoot(opts.workspace);
+  try {
+    const projects = await listProjects(workspaceRoot);
+    if (opts.json) {
+      console.log(JSON.stringify({ workspaceRoot, projects }, null, 2));
+      return 0;
+    }
+    if (projects.length === 0) {
+      console.log(`No projects in ${workspaceRoot}/projects/.`);
+      console.log(`Create one with: mathran project init <name>`);
+      return 0;
+    }
+    console.log(`Projects in ${workspaceRoot}/projects/:`);
+    for (const p of projects) {
+      const created = p.createdAt ? `  (${p.createdAt.slice(0, 10)})` : "";
+      const ver = p.mathranVersion ? `  [v${p.mathranVersion}]` : "";
+      console.log(`  ${p.slug.padEnd(32)}${ver}${created}`);
+      if (p.name !== p.slug) console.log(`    name: ${p.name}`);
+    }
+    return 0;
+  } catch (err: any) {
+    console.error(`mathran project list: ${err?.message ?? err}`);
+    return 1;
+  }
+}

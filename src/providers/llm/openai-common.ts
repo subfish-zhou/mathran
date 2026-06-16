@@ -32,6 +32,24 @@ export function buildOpenAIParams(req: LLMRequest, model: string): any {
     if (m.role === "tool") {
       return { role: "tool", content: m.content, tool_call_id: m.toolCallId ?? "" };
     }
+    if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
+      // Replay the assistant's tool_calls so the trailing tool messages have
+      // a valid parent. OpenAI / Azure reject sequences where a tool message
+      // appears without an immediately preceding assistant `tool_calls`.
+      const out: any = {
+        role: "assistant",
+        // OpenAI accepts `null` content for pure tool-call turns; non-empty
+        // text is still allowed and shown.
+        content: m.content && m.content.length > 0 ? m.content : null,
+        tool_calls: m.toolCalls.map((c) => ({
+          id: c.id,
+          type: "function",
+          function: { name: c.name, arguments: c.arguments },
+        })),
+      };
+      if (m.name) out.name = m.name;
+      return out;
+    }
     const base: any = { role: m.role, content: m.content };
     if (m.name) base.name = m.name;
     return base;

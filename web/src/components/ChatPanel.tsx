@@ -1,7 +1,19 @@
+/**
+ * Scoped chat panel: drives one conversation inside a given `ChatScopeSpec`
+ * (global / project / effort). The parent route component picks the scope and
+ * passes it in.
+ *
+ * Multi-turn support: we read the `session` event from the first SSE response
+ * and remember the `conversationId`, so subsequent messages in this UI session
+ * append to the same on-disk conversation (BUG #6).
+ *
+ * A `scopeKey` prop is used to force a state reset when the route switches
+ * between scopes (otherwise React reuses our state across routes).
+ */
 import { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
 import { streamChat, type ChatEvent } from "../lib/chat.ts";
-import { api } from "../lib/api.ts";
+import { api, type ChatScopeSpec } from "../lib/api.ts";
 
 interface ToolBubble {
   kind: "tool";
@@ -19,13 +31,29 @@ interface TextBubble {
 
 type Bubble = ToolBubble | TextBubble;
 
-export default function ChatPanel() {
+export default function ChatPanel({
+  scope,
+  scopeLabel,
+}: {
+  scope: ChatScopeSpec;
+  /** Short label for the header (e.g. "global", "project: foo", "effort: bar"). */
+  scopeLabel: string;
+}) {
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState("");
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Reset everything when the active scope changes.
+  useEffect(() => {
+    setBubbles([]);
+    setConversationId(null);
+    setError(null);
+    setInput("");
+  }, [scope.kind, (scope as any).projectSlug, (scope as any).effortSlug]);
 
   useEffect(() => {
     api
@@ -50,10 +78,13 @@ export default function ChatPanel() {
     setBubbles((b) => [...b, { kind: "user", text }, { kind: "assistant", text: "" }]);
 
     const onEvent = (ev: ChatEvent) => {
+      if (ev.type === "session") {
+        setConversationId(ev.conversationId);
+        return;
+      }
       setBubbles((prev) => {
         const next = [...prev];
         if (ev.type === "text") {
-          // Append into the trailing assistant bubble (create one if needed).
           const last = next[next.length - 1];
           if (last && last.kind === "assistant") {
             next[next.length - 1] = { ...last, text: last.text + ev.delta };
@@ -71,7 +102,6 @@ export default function ChatPanel() {
           } else {
             next.push({ kind: "tool", id: ev.id, name: ev.name, result: ev.content, ok: ev.ok });
           }
-          // Start a fresh assistant bubble for any follow-up text.
           next.push({ kind: "assistant", text: "" });
         } else if (ev.type === "error") {
           setError(ev.message);
@@ -81,12 +111,11 @@ export default function ChatPanel() {
     };
 
     try {
-      await streamChat(text, model || undefined, onEvent);
+      await streamChat(scope, text, conversationId ?? undefined, model || undefined, onEvent);
     } catch (err) {
       setError((err as Error).message);
     } finally {
       setBusy(false);
-      // Drop any trailing empty assistant bubble.
       setBubbles((prev) => {
         const last = prev[prev.length - 1];
         if (last && last.kind === "assistant" && last.text === "") return prev.slice(0, -1);
@@ -98,7 +127,13 @@ export default function ChatPanel() {
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Chat</h2>
+        <div>
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Chat</h2>
+          <p className="text-xs text-slate-400">
+            {scopeLabel}
+            {conversationId && <> · <span className="font-mono">{conversationId}</span></>}
+          </p>
+        </div>
         <input
           value={model}
           onChange={(e) => setModel(e.target.value)}

@@ -1,69 +1,122 @@
+/**
+ * WikiPanel — list + view/edit wiki pages of one project.
+ *
+ * Now route-driven (T1-E):
+ *   /projects/:slug/wiki              → page index + welcome panel
+ *   /projects/:slug/wiki/:page        → that page
+ *
+ * `currentPage` is null on the index route; non-null on a specific page route.
+ * Wiki versioning surfaces as a "History" button that lists snapshots
+ * (T1-A backend feature).
+ */
 import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import { marked } from "marked";
 import {
   api,
-  type ProjectSummary,
-  type WikiPageSummary,
+  type WikiHistoryEntry,
   type WikiPage,
+  type WikiPageSummary,
 } from "../lib/api.ts";
 
 export default function WikiPanel({
-  activeProject,
-  onSelectProject,
+  projectSlug,
+  currentPage,
 }: {
-  activeProject: string | null;
-  onSelectProject: (slug: string) => void;
+  projectSlug: string;
+  currentPage: string | null;
 }) {
-  const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [pages, setPages] = useState<WikiPageSummary[]>([]);
   const [page, setPage] = useState<WikiPage | null>(null);
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
+  const [creatingName, setCreatingName] = useState("");
+  const [history, setHistory] = useState<WikiHistoryEntry[] | null>(null);
+  const navigate = useNavigate();
 
-  useEffect(() => {
-    void api.listProjects().then(setProjects).catch((e) => setError((e as Error).message));
-  }, []);
-
-  useEffect(() => {
-    setPage(null);
-    setPages([]);
-    if (!activeProject) return;
+  // Refresh index whenever the project changes or after a save/delete.
+  async function refreshIndex() {
     setError(null);
-    api
-      .listWiki(activeProject)
-      .then(setPages)
-      .catch((e) => setError((e as Error).message));
-  }, [activeProject]);
-
-  async function openPage(name: string) {
-    if (!activeProject) return;
-    setError(null);
-    setEditing(false);
-    setStatus(null);
     try {
-      const p = await api.getWikiPage(activeProject, name);
-      setPage(p);
-      setDraft(p.body);
+      setPages(await api.listWiki(projectSlug));
     } catch (e) {
       setError((e as Error).message);
     }
   }
 
+  useEffect(() => {
+    void refreshIndex();
+  }, [projectSlug]);
+
+  // Load the requested page (or clear it when on the index).
+  useEffect(() => {
+    setPage(null);
+    setDraft("");
+    setEditing(false);
+    setHistory(null);
+    if (!currentPage) return;
+    setError(null);
+    api
+      .getWikiPage(projectSlug, currentPage)
+      .then((p) => {
+        setPage(p);
+        setDraft(p.body);
+      })
+      .catch((e) => setError((e as Error).message));
+  }, [projectSlug, currentPage]);
+
   async function save() {
-    if (!activeProject || !page) return;
+    if (!page) return;
     setError(null);
     setStatus("Saving…");
     try {
-      const saved = await api.saveWikiPage(activeProject, page.page, draft);
+      const saved = await api.saveWikiPage(projectSlug, page.page, draft);
       setPage(saved);
       setDraft(saved.body);
       setEditing(false);
       setStatus("Saved.");
+      await refreshIndex();
     } catch (e) {
       setError((e as Error).message);
       setStatus(null);
+    }
+  }
+
+  async function showHistory() {
+    if (!page) return;
+    setError(null);
+    try {
+      setHistory(await api.wikiHistory(projectSlug, page.page));
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function viewHistoryVersion(v: number) {
+    if (!page) return;
+    try {
+      const old = await api.wikiHistoryVersion(projectSlug, page.page, v);
+      setDraft(old.body);
+      setEditing(true);
+      setStatus(`Loaded v${v} into editor (save to make it the new head)`);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function createPage(e: React.FormEvent) {
+    e.preventDefault();
+    const name = creatingName.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+    if (!name) return;
+    try {
+      await api.saveWikiPage(projectSlug, name, "# New page\n\n");
+      setCreatingName("");
+      await refreshIndex();
+      navigate(`/projects/${projectSlug}/wiki/${name}`);
+    } catch (e) {
+      setError((e as Error).message);
     }
   }
 
@@ -73,49 +126,52 @@ export default function WikiPanel({
     <div className="grid h-full grid-cols-[16rem_1fr] overflow-hidden">
       <div className="flex flex-col overflow-hidden border-r border-slate-200 bg-white">
         <div className="border-b border-slate-200 p-4">
-          <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">
-            Project
-          </label>
-          <select
-            value={activeProject ?? ""}
-            onChange={(e) => onSelectProject(e.target.value || "")}
-            className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-          >
-            <option value="">Select…</option>
-            {projects.map((p) => (
-              <option key={p.slug} value={p.slug}>
-                {p.name ?? p.slug}
-              </option>
-            ))}
-          </select>
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Wiki pages
+          </h3>
         </div>
         <ul className="flex-1 overflow-y-auto p-2">
-          {activeProject && pages.length === 0 && (
-            <li className="px-3 py-2 text-sm text-slate-400">No wiki pages.</li>
+          {pages.length === 0 && (
+            <li className="px-3 py-2 text-sm text-slate-400">No wiki pages yet.</li>
           )}
           {pages.map((p) => (
             <li key={p.page}>
-              <button
-                onClick={() => openPage(p.page)}
-                className={`w-full rounded-md px-3 py-2 text-left text-sm ${
-                  page?.page === p.page ? "bg-slate-100 font-medium" : "hover:bg-slate-50"
+              <Link
+                to={`/projects/${projectSlug}/wiki/${p.page}`}
+                className={`block rounded-md px-3 py-2 text-left text-sm ${
+                  currentPage === p.page ? "bg-slate-100 font-medium" : "hover:bg-slate-50"
                 }`}
               >
                 {p.title ?? p.page}
-              </button>
+              </Link>
             </li>
           ))}
         </ul>
+        <form onSubmit={createPage} className="border-t border-slate-200 p-3">
+          <input
+            value={creatingName}
+            onChange={(e) => setCreatingName(e.target.value)}
+            placeholder="new-page-name"
+            className="mb-2 w-full rounded-md border border-slate-300 px-2 py-1 text-xs"
+          />
+          <button
+            type="submit"
+            disabled={!creatingName.trim()}
+            className="w-full rounded-md bg-slate-900 px-2 py-1 text-xs text-white disabled:opacity-50"
+          >
+            + New page
+          </button>
+        </form>
       </div>
 
       <div className="flex flex-col overflow-hidden">
         {error && (
           <div className="m-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
         )}
-        {!page && !error && (
-          <p className="p-6 text-sm text-slate-400">
-            {activeProject ? "Select a wiki page." : "Select a project first."}
-          </p>
+        {!currentPage && !error && (
+          <div className="p-6 text-sm text-slate-400">
+            <p>Pick a wiki page on the left, or create a new one.</p>
+          </div>
         )}
         {page && (
           <>
@@ -123,6 +179,12 @@ export default function WikiPanel({
               <h1 className="font-mono text-sm font-semibold">{page.page}.md</h1>
               <div className="flex items-center gap-3">
                 {status && <span className="text-xs text-slate-400">{status}</span>}
+                <button
+                  onClick={showHistory}
+                  className="rounded-md border border-slate-300 px-3 py-1.5 text-xs hover:bg-slate-100"
+                >
+                  History
+                </button>
                 {editing ? (
                   <>
                     <button
@@ -151,6 +213,25 @@ export default function WikiPanel({
                 )}
               </div>
             </div>
+            {history && history.length > 0 && (
+              <div className="border-b border-slate-200 bg-amber-50 px-6 py-2 text-xs">
+                <span className="font-semibold text-amber-800">History:</span>{" "}
+                {history.map((h, i) => (
+                  <span key={h.version}>
+                    {i > 0 && " · "}
+                    <button
+                      onClick={() => viewHistoryVersion(h.version)}
+                      className="underline hover:text-amber-900"
+                    >
+                      v{h.version}
+                    </button>{" "}
+                    <span className="text-amber-700">
+                      ({new Date(h.savedAt).toLocaleString()})
+                    </span>
+                  </span>
+                ))}
+              </div>
+            )}
             <div className="flex-1 overflow-y-auto p-6">
               {editing ? (
                 <textarea
@@ -159,7 +240,7 @@ export default function WikiPanel({
                   className="h-full min-h-[24rem] w-full resize-none rounded-md border border-slate-300 p-4 font-mono text-sm outline-none focus:border-slate-500"
                 />
               ) : (
-                <div className="md max-w-3xl" dangerouslySetInnerHTML={{ __html: rendered }} />
+                <div className="md max-w-3xl" dangerouslySetInnerHTML={{ __html: rendered as string }} />
               )}
             </div>
           </>

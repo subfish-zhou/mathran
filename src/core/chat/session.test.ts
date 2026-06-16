@@ -205,4 +205,87 @@ describe("ChatSession", () => {
     const h = session.history();
     expect(h).toEqual([{ role: "system", content: "SYS" }]);
   });
+
+  it("persists toolCalls on assistant turns so multi-turn replay works (BUG #3)", async () => {
+    // Round 1: model emits a tool_call for lean_check.
+    // Round 2: model returns plain text after seeing the tool result.
+    const llm = new ScriptedLLM([
+      [
+        { type: "tool-call", id: "call_1", name: "lean_check", argsDelta: '{"leanSource":"theorem t : 1 = 1 := by rfl"}' },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "verified" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const lean = new FakeLean({ ok: true, durationMs: 12, messages: [] });
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      systemPrompt: "SYS",
+      tools: [createLeanCheckTool(lean)],
+    });
+    await collect(session.send("please verify"));
+
+    const history = session.history();
+    // Find the assistant turn that issued the tool_call.
+    const assistantWithCall = history.find(
+      (m) => m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0,
+    );
+    expect(assistantWithCall, "assistant turn must persist toolCalls").toBeDefined();
+    expect(assistantWithCall!.toolCalls).toEqual([
+      {
+        id: "call_1",
+        name: "lean_check",
+        arguments: '{"leanSource":"theorem t : 1 = 1 := by rfl"}',
+      },
+    ]);
+
+    // The second LLM request must include the assistant.toolCalls so
+    // OpenAI/Anthropic adapters can echo `tool_calls` / `tool_use` blocks.
+    const secondReq = llm.requests[1];
+    const replayed = secondReq.messages.find(
+      (m) => m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0,
+    );
+    expect(replayed, "adapter must see toolCalls on the assistant message").toBeDefined();
+  });
+
+  it("emits synthetic tool results when the tool-call budget is exhausted (BUG #1)", async () => {
+    // First (and only) round: model emits a tool_call but maxToolRounds is 0,
+    // so we should NOT execute the tool but MUST keep history well-formed by
+    // pushing a synthetic tool message.
+    const llm = new ScriptedLLM([
+      [
+        { type: "tool-call", id: "call_x", name: "lean_check", argsDelta: '{"leanSource":""}' },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+    ]);
+    const lean = new FakeLean({ ok: true, durationMs: 1, messages: [] });
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      systemPrompt: "SYS",
+      tools: [createLeanCheckTool(lean)],
+      maxToolRounds: 0,
+    });
+    const events = await collect(session.send("go"));
+
+    // Both events are surfaced even when tool execution is skipped.
+    expect(events.find((e) => e.type === "tool-call")).toBeTruthy();
+    expect(events.find((e) => e.type === "tool-result" && e.id === "call_x")).toBeTruthy();
+
+    // Tool was NOT actually invoked.
+    expect(lean.seen.length).toBe(0);
+
+    // History stays well-formed: assistant.toolCalls + a tool message.
+    const history = session.history();
+    const lastAssistant = [...history].reverse().find((m) => m.role === "assistant")!;
+    expect(lastAssistant.toolCalls).toEqual([
+      { id: "call_x", name: "lean_check", arguments: '{"leanSource":""}' },
+    ]);
+    const toolMsg = history.find((m) => m.role === "tool" && m.toolCallId === "call_x");
+    expect(toolMsg, "a synthetic tool message must close the call").toBeDefined();
+    expect(toolMsg!.content).toMatch(/budget/);
+  });
 });

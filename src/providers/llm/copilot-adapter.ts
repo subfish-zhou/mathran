@@ -34,7 +34,18 @@ export class CopilotAdapter implements LLMProvider {
       if (m.role === "system") {
         systemParts.push(m.content);
       } else if (m.role === "user" || m.role === "assistant") {
-        messages.push({ role: m.role, content: m.content });
+        const out: CopilotChatRequest["messages"][number] = {
+          role: m.role,
+          content: m.content,
+        };
+        if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
+          out.toolCalls = m.toolCalls.map((c) => ({
+            id: c.id,
+            name: c.name,
+            arguments: c.arguments,
+          }));
+        }
+        messages.push(out);
       } else if (m.role === "tool") {
         messages.push({
           role: "tool",

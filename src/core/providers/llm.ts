@@ -16,6 +16,16 @@ export interface LLMMessage {
   /** Tool-call metadata, when role === "tool" or role === "assistant" with tool calls. */
   toolCallId?: string;
   name?: string;
+  /**
+   * Assistant tool-call invocations from the previous turn. Populated only on
+   * `role === "assistant"` messages that asked the model to call one or more
+   * tools, so the next request can replay them in the provider-specific
+   * protocol shape (OpenAI `tool_calls`, Anthropic `tool_use`, etc.).
+   *
+   * Each call records the unprefixed JSON arguments string the LLM emitted —
+   * never `undefined`, never an object — to make the round-trip lossless.
+   */
+  toolCalls?: Array<{ id: string; name: string; arguments: string }>;
 }
 
 export interface LLMRequest {

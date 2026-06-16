@@ -1,24 +1,40 @@
-// SSE client for POST /api/chat. EventSource only supports GET, so we read the
-// streamed response body manually and parse the `event:` / `data:` frames that
-// Hono's streamSSE emits.
+// SSE client for the scoped chat endpoints. EventSource only supports GET, so
+// we read the streamed response body manually and parse the `event:` / `data:`
+// frames that Hono's streamSSE emits.
+
+import { chatScopeBase, type ChatScopeSpec } from "./api.ts";
 
 export type ChatEvent =
+  | { type: "session"; sessionId: string; conversationId: string }
   | { type: "text"; delta: string }
   | { type: "tool-call"; id: string; name: string; args: string }
   | { type: "tool-result"; id: string; name: string; ok: boolean; content: string }
   | { type: "done"; finishReason: string }
   | { type: "error"; message: string };
 
+/**
+ * Stream a single user message through one of the three chat scopes.
+ *
+ * `conversationId` is optional — the backend mints one when omitted, and the
+ * caller can pick it up from the first `session` event so subsequent turns can
+ * reuse it (BUG #6 multi-turn fix).
+ */
 export async function streamChat(
+  scope: ChatScopeSpec,
   message: string,
+  conversationId: string | undefined,
   model: string | undefined,
   onEvent: (ev: ChatEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const res = await fetch("/api/chat", {
+  const body: Record<string, unknown> = { message };
+  if (conversationId) body.conversationId = conversationId;
+  if (model) body.model = model;
+
+  const res = await fetch(chatScopeBase(scope), {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(model ? { message, model } : { message }),
+    body: JSON.stringify(body),
     signal,
   });
 

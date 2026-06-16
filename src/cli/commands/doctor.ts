@@ -24,7 +24,7 @@ export interface ProviderReport {
   kind: ProviderKind;
   status: ProviderStatus;
   /** Where the key came from. */
-  source: "config" | "env" | "none";
+  source: "config" | "env" | "session" | "none";
   detail: string;
   model?: string;
 }
@@ -79,6 +79,35 @@ export function inspectProvider(
       status: "no-key-needed",
       source,
       detail: `local (no key needed)${cfg.baseUrl ? `, baseUrl=${cfg.baseUrl}` : ""}`,
+    };
+  }
+
+  if (cfg.kind === "copilot") {
+    // Copilot also reads ~/.config/github-copilot/token.json (the VS Code
+    // session token) at runtime. Either an explicit COPILOT_TOKEN env, an
+    // explicit `apiKey` in config.toml, or that on-disk session is enough —
+    // doctor would otherwise report ⚠️ even when chat works fine (BUG #8).
+    if (resolved && resolved.length > 0) {
+      return {
+        ...base,
+        status: "ok",
+        source,
+        detail: `key ${source === "config" ? "(config)" : `(env ${envName})`} ${maskKey(resolved)}`,
+      };
+    }
+    if (hasCopilotSessionToken(env)) {
+      return {
+        ...base,
+        status: "ok",
+        source: "session",
+        detail: "github-copilot session token (~/.config/github-copilot/token.json)",
+      };
+    }
+    return {
+      ...base,
+      status: "missing",
+      source: "none",
+      detail: "no COPILOT_TOKEN, no providers.copilot.apiKey, and no ~/.config/github-copilot/token.json",
     };
   }
 
@@ -226,6 +255,26 @@ function checkCopilotToken(): Check {
       detail: "no session token cache and no ~/.copilot/config.json; run `copilot` to log in",
     };
   }
+}
+
+/** Lightweight test: does a usable copilot session token exist on disk? */
+export function hasCopilotSessionToken(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const root = env.OPENCLAW_STATE_DIR ?? path.join(os.homedir(), ".openclaw");
+  const candidates = [path.join(root, "credentials", "github-copilot.token.json")];
+  for (const p of candidates) {
+    try {
+      const stat = fs.statSync(p);
+      if (!stat.isFile()) continue;
+      const j = JSON.parse(fs.readFileSync(p, "utf-8"));
+      const expiresAt = typeof j.expiresAt === "number" ? j.expiresAt : 0;
+      if (expiresAt - Date.now() > 5 * 60_000) return true;
+    } catch {
+      continue;
+    }
+  }
+  return false;
 }
 
 export interface DoctorOptions {

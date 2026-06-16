@@ -38,7 +38,13 @@ function mapStopReason(reason: string | null | undefined): FinishReason {
   }
 }
 
-function toAnthropicMessages(messages: LLMMessage[]): {
+/**
+ * Translate the kernel's neutral `LLMMessage[]` into Anthropic's protocol
+ * shape (`{system, messages: [{role, content: text|blocks}]}`).
+ *
+ * Exported for tests; consumers should call `AnthropicAdapter.chat()` instead.
+ */
+export function toAnthropicMessages(messages: LLMMessage[]): {
   system: string | undefined;
   messages: any[];
 } {
@@ -56,6 +62,28 @@ function toAnthropicMessages(messages: LLMMessage[]): {
           { type: "tool_result", tool_use_id: m.toolCallId ?? "", content: m.content },
         ],
       });
+      continue;
+    }
+    if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
+      // Replay the assistant tool-call turn as a content array of
+      // text + tool_use blocks. Anthropic rejects assistant turns that have
+      // a trailing tool_result without a matching tool_use.
+      const blocks: any[] = [];
+      if (m.content && m.content.length > 0) {
+        blocks.push({ type: "text", text: m.content });
+      }
+      for (const c of m.toolCalls) {
+        let parsed: unknown = {};
+        try {
+          parsed = c.arguments && c.arguments.trim().length > 0 ? JSON.parse(c.arguments) : {};
+        } catch {
+          // Anthropic requires `input` to be a valid JSON object; fall back
+          // to empty when the LLM emitted malformed JSON.
+          parsed = {};
+        }
+        blocks.push({ type: "tool_use", id: c.id, name: c.name, input: parsed });
+      }
+      out.push({ role: "assistant", content: blocks });
       continue;
     }
     out.push({ role: m.role, content: m.content });

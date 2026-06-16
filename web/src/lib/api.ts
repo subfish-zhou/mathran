@@ -16,6 +16,8 @@ export interface ProjectDetail {
 export interface WikiPageSummary {
   page: string;
   title?: string;
+  parent?: string;
+  sortOrder?: number;
   tags?: string[];
   created_at?: string;
   updated_at?: string;
@@ -28,6 +30,11 @@ export interface WikiPage {
   raw: string;
 }
 
+export interface WikiHistoryEntry {
+  version: number;
+  savedAt: string;
+}
+
 export interface ProviderInfo {
   kind: string;
   model: string | null;
@@ -37,6 +44,24 @@ export interface ProviderInfo {
 export interface ProvidersResponse {
   providers: Record<string, ProviderInfo>;
   defaultModel: string | null;
+}
+
+export interface EffortSummary {
+  slug: string;
+  title: string;
+  type: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  currentVersion: number;
+}
+
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  createdAt: string;
+  lastUsedAt: string;
+  messageCount: number;
 }
 
 async function jsonOrThrow<T>(res: Response): Promise<T> {
@@ -54,16 +79,18 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
   return data as T;
 }
 
+const enc = encodeURIComponent;
+
 export const api = {
   async health(): Promise<{ ok: boolean; version: string; workspace: string }> {
     return jsonOrThrow(await fetch("/api/health"));
   },
 
+  // ─── Projects ─────────────────────────────────────────────────────────────
   async listProjects(): Promise<ProjectSummary[]> {
     const data = await jsonOrThrow<{ projects: ProjectSummary[] }>(await fetch("/api/projects"));
     return data.projects;
   },
-
   async createProject(name: string): Promise<ProjectDetail> {
     return jsonOrThrow(
       await fetch("/api/projects", {
@@ -73,38 +100,163 @@ export const api = {
       }),
     );
   },
-
   async getProject(slug: string): Promise<ProjectDetail> {
-    return jsonOrThrow(await fetch(`/api/projects/${encodeURIComponent(slug)}`));
+    return jsonOrThrow(await fetch(`/api/projects/${enc(slug)}`));
   },
 
+  // ─── Wiki (multi-page + versioned) ───────────────────────────────────────
   async listWiki(slug: string): Promise<WikiPageSummary[]> {
     const data = await jsonOrThrow<{ pages: WikiPageSummary[] }>(
-      await fetch(`/api/projects/${encodeURIComponent(slug)}/wiki`),
+      await fetch(`/api/projects/${enc(slug)}/wiki`),
     );
     return data.pages;
   },
-
   async getWikiPage(slug: string, page: string): Promise<WikiPage> {
-    return jsonOrThrow(
-      await fetch(`/api/projects/${encodeURIComponent(slug)}/wiki/${encodeURIComponent(page)}`),
-    );
+    return jsonOrThrow(await fetch(`/api/projects/${enc(slug)}/wiki/${enc(page)}`));
   },
-
-  async saveWikiPage(slug: string, page: string, body: string): Promise<WikiPage> {
+  async saveWikiPage(
+    slug: string,
+    page: string,
+    body: string,
+    extra: { title?: string; parent?: string; sortOrder?: number } = {},
+  ): Promise<WikiPage> {
     return jsonOrThrow(
-      await fetch(`/api/projects/${encodeURIComponent(slug)}/wiki/${encodeURIComponent(page)}`, {
+      await fetch(`/api/projects/${enc(slug)}/wiki/${enc(page)}`, {
         method: "PUT",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ body }),
+        body: JSON.stringify({ body, ...extra }),
       }),
     );
   },
+  async wikiHistory(slug: string, page: string): Promise<WikiHistoryEntry[]> {
+    const data = await jsonOrThrow<{ versions: WikiHistoryEntry[] }>(
+      await fetch(`/api/projects/${enc(slug)}/wiki/${enc(page)}/history`),
+    );
+    return data.versions;
+  },
+  async wikiHistoryVersion(slug: string, page: string, version: number): Promise<WikiPage> {
+    return jsonOrThrow(
+      await fetch(`/api/projects/${enc(slug)}/wiki/${enc(page)}/history/${version}`),
+    );
+  },
 
+  // ─── Efforts ──────────────────────────────────────────────────────────────
+  async listEfforts(slug: string): Promise<EffortSummary[]> {
+    const data = await jsonOrThrow<{ efforts: EffortSummary[] }>(
+      await fetch(`/api/projects/${enc(slug)}/efforts`),
+    );
+    return data.efforts;
+  },
+  async createEffort(
+    slug: string,
+    payload: { title: string; type: string; description?: string },
+  ): Promise<{ slug: string; metadata: EffortSummary }> {
+    return jsonOrThrow(
+      await fetch(`/api/projects/${enc(slug)}/efforts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+    );
+  },
+  async getEffort(slug: string, effortSlug: string): Promise<{ effort: EffortSummary }> {
+    return jsonOrThrow(await fetch(`/api/projects/${enc(slug)}/effort/${enc(effortSlug)}`));
+  },
+  async patchEffort(
+    slug: string,
+    effortSlug: string,
+    patch: Partial<{ title: string; status: string; description: string }>,
+  ): Promise<{ effort: EffortSummary }> {
+    return jsonOrThrow(
+      await fetch(`/api/projects/${enc(slug)}/effort/${enc(effortSlug)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(patch),
+      }),
+    );
+  },
+  async getEffortDocument(slug: string, effortSlug: string): Promise<{ document: string }> {
+    return jsonOrThrow(
+      await fetch(`/api/projects/${enc(slug)}/effort/${enc(effortSlug)}/document`),
+    );
+  },
+  async saveEffortDocument(slug: string, effortSlug: string, document: string): Promise<{ document: string }> {
+    return jsonOrThrow(
+      await fetch(`/api/projects/${enc(slug)}/effort/${enc(effortSlug)}/document`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ document }),
+      }),
+    );
+  },
+  async listEffortFiles(slug: string, effortSlug: string): Promise<string[]> {
+    const data = await jsonOrThrow<{ files: string[] }>(
+      await fetch(`/api/projects/${enc(slug)}/effort/${enc(effortSlug)}/files`),
+    );
+    return data.files;
+  },
+  async getEffortFile(slug: string, effortSlug: string, filePath: string): Promise<{ content: string }> {
+    return jsonOrThrow(
+      await fetch(
+        `/api/projects/${enc(slug)}/effort/${enc(effortSlug)}/files/${filePath.split("/").map(enc).join("/")}`,
+      ),
+    );
+  },
+  async saveEffortFile(slug: string, effortSlug: string, filePath: string, content: string): Promise<void> {
+    await jsonOrThrow(
+      await fetch(
+        `/api/projects/${enc(slug)}/effort/${enc(effortSlug)}/files/${filePath.split("/").map(enc).join("/")}`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ content }),
+        },
+      ),
+    );
+  },
+  async snapshotEffort(slug: string, effortSlug: string): Promise<{ version: number }> {
+    return jsonOrThrow(
+      await fetch(`/api/projects/${enc(slug)}/effort/${enc(effortSlug)}/snapshot`, {
+        method: "POST",
+      }),
+    );
+  },
+  async listEffortVersions(slug: string, effortSlug: string): Promise<number[]> {
+    const data = await jsonOrThrow<{ versions: number[] }>(
+      await fetch(`/api/projects/${enc(slug)}/effort/${enc(effortSlug)}/versions`),
+    );
+    return data.versions;
+  },
+
+  // ─── Chat (scoped) ────────────────────────────────────────────────────────
+  async listGlobalChats(): Promise<ConversationSummary[]> {
+    const data = await jsonOrThrow<{ conversations: ConversationSummary[] }>(
+      await fetch("/api/global-chat"),
+    );
+    return data.conversations;
+  },
+  async listProjectChats(slug: string): Promise<ConversationSummary[]> {
+    const data = await jsonOrThrow<{ conversations: ConversationSummary[] }>(
+      await fetch(`/api/projects/${enc(slug)}/chat`),
+    );
+    return data.conversations;
+  },
+  async listEffortChats(slug: string, effortSlug: string): Promise<ConversationSummary[]> {
+    const data = await jsonOrThrow<{ conversations: ConversationSummary[] }>(
+      await fetch(`/api/projects/${enc(slug)}/effort/${enc(effortSlug)}/chat`),
+    );
+    return data.conversations;
+  },
+  async dropChat(scope: ChatScopeSpec, conversationId: string): Promise<void> {
+    await jsonOrThrow(
+      await fetch(`${chatScopeBase(scope)}/${enc(conversationId)}`, { method: "DELETE" }),
+    );
+  },
+
+  // ─── Providers ────────────────────────────────────────────────────────────
   async getProviders(): Promise<ProvidersResponse> {
     return jsonOrThrow(await fetch("/api/providers"));
   },
-
   async saveProviders(payload: {
     providers?: Record<string, Record<string, unknown>>;
     defaultModel?: string;
@@ -118,3 +270,20 @@ export const api = {
     );
   },
 };
+
+export type ChatScopeSpec =
+  | { kind: "global" }
+  | { kind: "project"; projectSlug: string }
+  | { kind: "effort"; projectSlug: string; effortSlug: string };
+
+/** Map a `ChatScopeSpec` to its `/api/...` base URL. */
+export function chatScopeBase(scope: ChatScopeSpec): string {
+  switch (scope.kind) {
+    case "global":
+      return "/api/global-chat";
+    case "project":
+      return `/api/projects/${enc(scope.projectSlug)}/chat`;
+    case "effort":
+      return `/api/projects/${enc(scope.projectSlug)}/effort/${enc(scope.effortSlug)}/chat`;
+  }
+}
