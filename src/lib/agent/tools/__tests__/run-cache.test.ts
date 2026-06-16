@@ -17,14 +17,14 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentPrincipal } from "@/server/agent-gateway/principal";
-// TODO(mathran-v0.1): import { getEffort, getEffortDetails, searchEfforts } from "@/server/agent-gateway/services/efforts";
-// TODO(mathran-v0.1): import { getProjectIndex } from "@/server/agent-gateway/services/projects";
+import { getEffort, getEffortDetails, searchEfforts } from "@/server/agent-gateway/services/efforts";
+import { getProjectIndex } from "@/server/agent-gateway/services/projects";
 import { userIdToPrincipal } from "../_lib/user-principal";
-// TODO(mathran-v0.1): import { readEffortTool } from "../read-effort";
-// TODO(mathran-v0.1): import { readEffortDetailsTool } from "../read-effort-details";
-// TODO(mathran-v0.1): import { readEffortGraphTool } from "../read-effort-graph";
-// TODO(mathran-v0.1): import { searchEffortsTool } from "../search-efforts";
-// TODO(mathran-v0.1): import { getProjectIndexTool } from "../get-project-index";
+import { readEffortTool } from "../read-effort";
+import { readEffortDetailsTool } from "../read-effort-details";
+import { readEffortGraphTool } from "../read-effort-graph";
+import { searchEffortsTool } from "../search-efforts";
+import { getProjectIndexTool } from "../get-project-index";
 import type { ToolContext } from "../types";
 
 vi.mock("../_lib/user-principal", () => ({

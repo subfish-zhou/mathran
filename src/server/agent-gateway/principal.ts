@@ -1,9 +1,9 @@
 import { and, eq, isNull } from "drizzle-orm";
-// TODO(mathran-v0.1): import { auth } from "@/auth";
-// TODO(mathran-v0.1): import { authenticateBot } from "@/lib/bot-auth";
-// TODO(mathran-v0.1): import type { RateLimitKind } from "@/lib/rate-limit";
-// TODO(mathran-v0.1): import { getDb } from "@/server/db";
-// TODO(mathran-v0.1): import { users } from "@/server/db/schema";
+import { auth } from "@/auth";
+import { authenticateBot } from "@/lib/bot-auth";
+import type { RateLimitKind } from "@/lib/rate-limit";
+import { getDb } from "@/server/db";
+import { users } from "@/server/db/schema";
 
 /**
  * AgentPrincipal — discriminated union of the three identities that can drive

@@ -1,23 +1,23 @@
 import { and, eq } from "drizzle-orm";
-// TODO(mathran-v0.1): import { getDb } from "@/server/db";
-// TODO(mathran-v0.1): import {
-// TODO(mathran-v0.1):   projects,
-// TODO(mathran-v0.1):   projectMembers,
-// TODO(mathran-v0.1):   programs,
-// TODO(mathran-v0.1):   programMembers,
-// TODO(mathran-v0.1):   workspaceEfforts,
-// TODO(mathran-v0.1):   threads,
-// TODO(mathran-v0.1):   posts,
-// TODO(mathran-v0.1):   wikiPages,
-// TODO(mathran-v0.1):   channels,
-// TODO(mathran-v0.1): } from "@/server/db/schema";
-// TODO(mathran-v0.1): import {
-// TODO(mathran-v0.1):   getUserProjectRole,
-// TODO(mathran-v0.1):   isAtLeastContributor,
-// TODO(mathran-v0.1):   isAtLeastMaintainer,
-// TODO(mathran-v0.1):   type ProjectRole,
-// TODO(mathran-v0.1): } from "@/lib/permissions";
-// TODO(mathran-v0.1): import { canAccessProject, canAccessProgram } from "@/server/api/helpers/visibility";
+import { getDb } from "@/server/db";
+import {
+  projects,
+  projectMembers,
+  programs,
+  programMembers,
+  workspaceEfforts,
+  threads,
+  posts,
+  wikiPages,
+  channels,
+} from "@/server/db/schema";
+import {
+  getUserProjectRole,
+  isAtLeastContributor,
+  isAtLeastMaintainer,
+  type ProjectRole,
+} from "@/lib/permissions";
+import { canAccessProject, canAccessProgram } from "@/server/api/helpers/visibility";
 import type { AgentPrincipal } from "./principal";
 import { effectiveUserRole, isBuiltinAssistant, principalUserId } from "./principal";
 import { deriveActingUserPrincipal } from "./builtin-assistant-principal";

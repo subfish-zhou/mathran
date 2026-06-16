@@ -4,7 +4,7 @@
  * Supports: PDF, TeX/LaTeX, Markdown
  */
 
-// TODO(mathran-v0.1): import { extractTextFromPdfBuffer } from "./full-text";
+import { extractTextFromPdfBuffer } from "./full-text";
 
 export interface ParsedFileResult {
   title?: string;

@@ -18,8 +18,8 @@
  */
 
 import { eq } from "drizzle-orm";
-// TODO(mathran-v0.1): import { getDb } from "@/server/db";
-// TODO(mathran-v0.1): import { assistantGoalRuns } from "@/server/db/schema";
+import { getDb } from "@/server/db";
+import { assistantGoalRuns } from "@/server/db/schema";
 import { getActiveRunForConversation, type GoalRunStatus } from "../goal/run-state";
 import { getBlockedStateForConversation } from "../goal/runtime-blocked";
 import { getGoalBudgetForConversation } from "../goal/runtime-budgets";

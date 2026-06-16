@@ -12,7 +12,7 @@ import { inArray } from "drizzle-orm";
 // TODO(mathran-v0.1): import { paperNodes } from "@/server/db/schema";
 import { callAzureLLM, type TokenCounter } from "../azure-llm";
 // TODO(mathran-v0.1): import { fetchArxivFullText } from "../full-text";
-// TODO(mathran-v0.1): import { slugify } from "@/lib/utils";
+import { slugify } from "@/lib/slug";
 import { buildEffortDocumentPrompt, buildThreadDocumentPrompt } from "./prompts";
 import type {
   NarrativeSpine,

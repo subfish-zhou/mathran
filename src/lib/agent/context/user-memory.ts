@@ -5,10 +5,10 @@
  * Injects relevant memories into system prompt for new conversations.
  */
 
-// TODO(mathran-v0.1): import { getDb } from "@/server/db";
-// TODO(mathran-v0.1): import { channelMessages, embeddings, userMemories } from "@/server/db/schema";
+import { getDb } from "@/server/db";
+import { channelMessages, embeddings, userMemories } from "@/server/db/schema";
 import { asc, desc, eq, and, sql } from "drizzle-orm";
-// TODO(mathran-v0.1): import { generateEmbedding as getEmbedding } from "@/lib/embedding";
+import { generateEmbedding as getEmbedding } from "@/lib/embedding";
 import { getAzureClient, DEFAULT_AZURE_MODEL, logLLMUsage } from "../azure-llm";
 
 export type MemoryCategory = "preference" | "expertise" | "project_context" | "research_interest";
