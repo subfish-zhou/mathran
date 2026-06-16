@@ -35,8 +35,14 @@ export class CopilotAdapter implements LLMProvider {
         systemParts.push(m.content);
       } else if (m.role === "user" || m.role === "assistant") {
         messages.push({ role: m.role, content: m.content });
+      } else if (m.role === "tool") {
+        messages.push({
+          role: "tool",
+          content: m.content,
+          ...(m.toolCallId !== undefined ? { toolCallId: m.toolCallId } : {}),
+          ...(m.name !== undefined ? { name: m.name } : {}),
+        });
       }
-      // tool messages are not supported by the copilot helper; skip.
     }
 
     const chatFn = this.chatFn;
@@ -45,6 +51,7 @@ export class CopilotAdapter implements LLMProvider {
       messages,
       ...(systemParts.length ? { systemPrompt: systemParts.join("\n\n") } : {}),
       ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),
+      ...(req.tools && req.tools.length > 0 ? { tools: req.tools } : {}),
     };
 
     return {
@@ -53,9 +60,12 @@ export class CopilotAdapter implements LLMProvider {
         if (res.text) {
           yield { type: "text", delta: res.text };
         }
+        for (const call of res.toolCalls) {
+          yield { type: "tool-call", id: call.id, name: call.name, argsDelta: call.arguments };
+        }
         yield {
           type: "done",
-          finishReason: "stop",
+          finishReason: res.finishReason,
           usage: { promptTokens: res.usage.input, completionTokens: res.usage.output },
         };
       },

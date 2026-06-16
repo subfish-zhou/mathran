@@ -24,6 +24,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 
+import type { LLMStreamChunk } from "../../core/providers/llm.js";
+
+type FinishReason = Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
+
 const COPILOT_HEADERS = {
   "Copilot-Integration-Id": "vscode-chat",
   "Editor-Version": "vscode/1.107.0",
@@ -154,15 +158,47 @@ export async function resolveCopilotToken(): Promise<ResolvedToken> {
 }
 
 // ─── Request/response abstraction ─────────────────────────────────────────
+
+/** A tool definition (OpenAI-style JSON-schema), provider-neutral. */
+export interface CopilotToolDef {
+  name: string;
+  description?: string;
+  parameters: Record<string, unknown>;
+}
+
+/**
+ * A single conversation message. `tool` messages carry the result of a tool
+ * invocation; `toolCallId`/`name` thread the call metadata so the GPT/Claude
+ * builders can reconstruct the provider-native function_call / tool_use pairs.
+ */
+export interface CopilotChatMessage {
+  role: "user" | "assistant" | "tool";
+  content: string;
+  toolCallId?: string;
+  name?: string;
+}
+
 export interface CopilotChatRequest {
   model: string;
   systemPrompt?: string;
-  messages: Array<{ role: "user" | "assistant"; content: string }>;
+  messages: CopilotChatMessage[];
   maxTokens?: number;
+  /** JSON-schema tool definitions the model may call. */
+  tools?: CopilotToolDef[];
+}
+
+/** A function/tool call parsed out of a model response. */
+export interface CopilotToolCall {
+  id: string;
+  name: string;
+  /** Complete JSON arguments string (ready for `JSON.parse`). */
+  arguments: string;
 }
 
 export interface CopilotChatResponse {
   text: string;
+  toolCalls: CopilotToolCall[];
+  finishReason: FinishReason;
   usage: { input: number; output: number };
   raw: unknown;
 }
@@ -233,53 +269,203 @@ function extractMessagesText(raw: any): { text: string; input: number; output: n
   };
 }
 
+// ─── GPT (Responses API) tool wiring ──────────────────────────────────────
+
+/** Build the Responses `input[]` list, translating tool turns into the
+ * function_call / function_call_output item pair the Responses API expects. */
+export function buildResponsesInput(req: CopilotChatRequest): unknown[] {
+  const input: unknown[] = [];
+  if (req.systemPrompt) input.push({ role: "system", content: req.systemPrompt });
+  for (const m of req.messages) {
+    if (m.role === "tool") {
+      // The assistant's call itself must be echoed back as a function_call item
+      // (reconstructed from the tool message's id/name; the original arguments
+      // are not threaded through the kernel, so an empty object is used — the
+      // API only replays this as history, it is not re-validated).
+      input.push({
+        type: "function_call",
+        call_id: m.toolCallId ?? "",
+        name: m.name ?? "",
+        arguments: "{}",
+      });
+      input.push({
+        type: "function_call_output",
+        call_id: m.toolCallId ?? "",
+        output: m.content,
+      });
+      continue;
+    }
+    // Skip empty assistant turns (e.g. a turn that was only a tool call): the
+    // Responses API rejects messages with empty content.
+    if (m.role === "assistant" && m.content.length === 0) continue;
+    input.push({ role: m.role, content: m.content });
+  }
+  return input;
+}
+
+/** Responses API uses the FLAT function tool shape. */
+export function buildResponsesTools(tools: CopilotToolDef[]): unknown[] {
+  return tools.map((t) => ({
+    type: "function",
+    name: t.name,
+    ...(t.description ? { description: t.description } : {}),
+    parameters: t.parameters,
+  }));
+}
+
+/** Parse `output[]` items of type "function_call" into tool calls. */
+export function extractResponsesToolCalls(raw: any): CopilotToolCall[] {
+  const calls: CopilotToolCall[] = [];
+  if (Array.isArray(raw?.output)) {
+    for (const o of raw.output) {
+      if (o?.type !== "function_call") continue;
+      calls.push({
+        id: o.call_id ?? o.id ?? "",
+        name: o.name ?? "",
+        arguments: typeof o.arguments === "string" ? o.arguments : JSON.stringify(o.arguments ?? {}),
+      });
+    }
+  }
+  return calls;
+}
+
+// ─── Claude (Anthropic Messages API) tool wiring ──────────────────────────
+
+/** Build Anthropic `messages[]`, reconstructing tool_use blocks on the
+ * assistant turn and tool_result blocks on a following user turn. */
+export function buildMessagesInput(req: CopilotChatMessage[]): any[] {
+  const out: any[] = [];
+  let lastAssistantIdx = -1;
+  for (const m of req) {
+    if (m.role === "assistant") {
+      out.push({ role: "assistant", content: m.content });
+      lastAssistantIdx = out.length - 1;
+      continue;
+    }
+    if (m.role === "tool") {
+      // Attach a tool_use block to the most recent assistant message.
+      if (lastAssistantIdx < 0) {
+        out.push({ role: "assistant", content: [] });
+        lastAssistantIdx = out.length - 1;
+      }
+      const a = out[lastAssistantIdx];
+      if (typeof a.content === "string") {
+        a.content = a.content.length > 0 ? [{ type: "text", text: a.content }] : [];
+      }
+      a.content.push({
+        type: "tool_use",
+        id: m.toolCallId ?? "",
+        name: m.name ?? "",
+        input: {},
+      });
+      // Batch the tool_result onto the user message immediately following the
+      // assistant turn (so multiple tool calls share one user message).
+      const last = out[out.length - 1];
+      const resultBlock = { type: "tool_result", tool_use_id: m.toolCallId ?? "", content: m.content };
+      if (last && last !== a && last.role === "user" && Array.isArray(last.content)) {
+        last.content.push(resultBlock);
+      } else {
+        out.push({ role: "user", content: [resultBlock] });
+      }
+      continue;
+    }
+    out.push({ role: "user", content: m.content });
+  }
+  return out;
+}
+
+/** Anthropic tool shape: `{ name, description, input_schema }`. */
+export function buildMessagesTools(tools: CopilotToolDef[]): unknown[] {
+  return tools.map((t) => ({
+    name: t.name,
+    ...(t.description ? { description: t.description } : {}),
+    input_schema: t.parameters,
+  }));
+}
+
+/** Parse `content[]` blocks of type "tool_use" into tool calls. */
+export function extractMessagesToolCalls(raw: any): CopilotToolCall[] {
+  const calls: CopilotToolCall[] = [];
+  if (Array.isArray(raw?.content)) {
+    for (const c of raw.content) {
+      if (c?.type !== "tool_use") continue;
+      calls.push({
+        id: c.id ?? "",
+        name: c.name ?? "",
+        arguments: JSON.stringify(c.input ?? {}),
+      });
+    }
+  }
+  return calls;
+}
+
+function mapClaudeStopReason(reason: unknown, hasToolCalls: boolean): FinishReason {
+  if (hasToolCalls || reason === "tool_use") return "tool_calls";
+  if (reason === "max_tokens") return "length";
+  return "stop";
+}
+
 export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatResponse> {
   const { token, baseUrl } = await resolveCopilotToken();
   const maxTokens = req.maxTokens ?? 4096;
+  const hasTools = !!req.tools && req.tools.length > 0;
 
   if (isGpt(req.model)) {
     // /responses uses Responses API; we coerce our (system+messages) shape
-    // into an `input` list of typed messages.
-    const input: Array<unknown> = [];
-    if (req.systemPrompt) {
-      input.push({ role: "system", content: req.systemPrompt });
-    }
-    for (const m of req.messages) {
-      input.push({ role: m.role, content: m.content });
-    }
+    // into an `input` list of typed messages + function_call(_output) items.
     const raw = await postJson(
       `${baseUrl}/responses`,
       {
         model: req.model,
-        input,
+        input: buildResponsesInput(req),
         max_output_tokens: maxTokens,
+        ...(hasTools ? { tools: buildResponsesTools(req.tools!) } : {}),
         // GPT-5.5 rejects `temperature` so we deliberately omit it.
       },
       token,
     );
     const { text, input: inT, output: outT } = extractResponsesText(raw);
-    return { text, usage: { input: inT, output: outT }, raw };
+    const toolCalls = extractResponsesToolCalls(raw);
+    return {
+      text,
+      toolCalls,
+      finishReason: toolCalls.length > 0 ? "tool_calls" : "stop",
+      usage: { input: inT, output: outT },
+      raw,
+    };
   }
 
   if (isClaude(req.model)) {
-    const raw = await postJson(
+    const raw: any = await postJson(
       `${baseUrl}/v1/messages`,
       {
         model: req.model,
         max_tokens: maxTokens,
         ...(req.systemPrompt ? { system: req.systemPrompt } : {}),
-        messages: req.messages,
+        messages: buildMessagesInput(req.messages),
+        ...(hasTools ? { tools: buildMessagesTools(req.tools!) } : {}),
       },
       token,
     );
     const { text, input: inT, output: outT } = extractMessagesText(raw);
-    return { text, usage: { input: inT, output: outT }, raw };
+    const toolCalls = extractMessagesToolCalls(raw);
+    return {
+      text,
+      toolCalls,
+      finishReason: mapClaudeStopReason(raw?.stop_reason, toolCalls.length > 0),
+      usage: { input: inT, output: outT },
+      raw,
+    };
   }
 
   // Fallback: try chat completions (Gemini and unknown models)
   const messages: Array<{ role: string; content: string }> = [];
   if (req.systemPrompt) messages.push({ role: "system", content: req.systemPrompt });
-  for (const m of req.messages) messages.push(m);
+  for (const m of req.messages) {
+    if (m.role === "user" || m.role === "assistant") {
+      messages.push({ role: m.role, content: m.content });
+    }
+  }
   const raw = await postJson(
     `${baseUrl}/chat/completions`,
     {
@@ -293,6 +479,8 @@ export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatR
   const usage = raw?.usage ?? {};
   return {
     text,
+    toolCalls: [],
+    finishReason: "stop",
     usage: { input: usage.prompt_tokens ?? 0, output: usage.completion_tokens ?? 0 },
     raw,
   };
