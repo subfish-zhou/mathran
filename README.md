@@ -10,7 +10,7 @@ your own `elan` toolchain, and your own filesystem — no database required.
 It is extracted from the [Mathub](https://github.com/subfish-zhou/Mathub)
 research platform as a reusable building block.
 
-> **Status: v0.1.0** — first acceptance-grade release. Conversational CLI,
+> **Status: v0.1.0-rc.1** — release-candidate cut. Conversational CLI,
 > multi-provider model router, file-system project workspace, local web UI
 > (Hono + React/Vite SPA), and a real Lean check tool are all wired up. See
 > the [Status](#status) table at the bottom.

@@ -1,6 +1,6 @@
 {
   "name": "mathran",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-rc.1",
   "description": "Standalone agent runtime for mathematical reasoning + Lean theorem proving",
   "type": "module",
   "main": "dist/cli/index.js",
@@ -11,6 +11,7 @@
     "dist",
     "docs/screenshots",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {
