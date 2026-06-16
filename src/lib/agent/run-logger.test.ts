@@ -1,101 +1,113 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { AgentRunLogger } from "./run-logger";
+import { InMemoryStorage } from "../../providers/storage/in-memory";
 
-// Mock DB and schema
-const mockInsert = vi.fn();
-const mockUpdate = vi.fn();
-const mockExecute = vi.fn();
-const mockWhere = vi.fn();
-const mockSet = vi.fn();
-const mockValues = vi.fn();
-const mockReturning = vi.fn();
+type Payload = Record<string, unknown>;
 
-const mockDb = {
-  insert: mockInsert,
-  update: mockUpdate,
-  execute: mockExecute,
-} as any;
-
-vi.mock("@/server/db/schema", () => ({
-  agentRuns: { id: "id" },
-}));
-
-vi.mock("drizzle-orm", () => ({
-  eq: vi.fn(),
-  sql: vi.fn((...args: any[]) => args),
-}));
+let storage: InMemoryStorage;
 
 beforeEach(() => {
-  vi.clearAllMocks();
-  mockInsert.mockReturnValue({ values: mockValues });
-  mockValues.mockReturnValue({ returning: mockReturning });
-  mockReturning.mockResolvedValue([{ id: "run-123" }]);
-  mockUpdate.mockReturnValue({ set: mockSet });
-  mockSet.mockReturnValue({ where: mockWhere });
-  mockWhere.mockResolvedValue(undefined);
-  mockExecute.mockResolvedValue(undefined);
+  storage = new InMemoryStorage();
 });
+
+async function payloadOf(runId: string): Promise<Payload> {
+  const rec = await storage.getRun(runId);
+  expect(rec).not.toBeNull();
+  return rec!.payload as Payload;
+}
 
 describe("AgentRunLogger", () => {
   it("creates a run record on start", async () => {
-    const logger = await AgentRunLogger.start(mockDb, { agentType: "init", userId: "u1" });
-    expect(logger.runId).toBe("run-123");
-    expect(mockInsert).toHaveBeenCalled();
+    const logger = await AgentRunLogger.start(storage, { agentType: "init", userId: "u1" });
+    expect(logger.runId).toBeTruthy();
+    const rec = await storage.getRun(logger.runId);
+    expect(rec?.status).toBe("running");
+    expect((rec?.payload as Payload).agentType).toBe("init");
+    expect((rec?.payload as Payload).userId).toBe("u1");
   });
 
-  it("appends events", async () => {
-    const logger = await AgentRunLogger.start(mockDb, { agentType: "init" });
-    logger.appendEvent({ type: "log", message: "test" });
-    // No flush yet (< 20 events)
-  });
-
-  it("flushes on every 20 events", async () => {
-    const logger = await AgentRunLogger.start(mockDb, { agentType: "init" });
-    for (let i = 0; i < 20; i++) {
+  it("buffers events without flushing before the batch threshold", async () => {
+    const logger = await AgentRunLogger.start(storage, { agentType: "init" });
+    for (let i = 0; i < 9; i++) {
       logger.appendEvent({ type: "log", message: `event ${i}` });
     }
-    // Should have triggered a flush (update call)
-    expect(mockUpdate).toHaveBeenCalled();
+    // Below the every-10 threshold, nothing is flushed yet.
+    expect((await payloadOf(logger.runId)).eventCount).toBe(0);
+  });
+
+  it("flushes on every 10 events", async () => {
+    const logger = await AgentRunLogger.start(storage, { agentType: "init" });
+    for (let i = 0; i < 10; i++) {
+      logger.appendEvent({ type: "log", message: `event ${i}` });
+    }
+    // Allow the fire-and-forget flush() promise to settle.
+    await new Promise((r) => setTimeout(r, 0));
+    const payload = await payloadOf(logger.runId);
+    expect(payload.eventCount).toBe(10);
+    expect((payload.events as unknown[]).length).toBe(10);
   });
 
   it("completes a run", async () => {
-    const logger = await AgentRunLogger.start(mockDb, { agentType: "init" });
+    const logger = await AgentRunLogger.start(storage, { agentType: "init" });
     await logger.complete({ summary: "done" });
-    expect(mockSet).toHaveBeenCalledWith(expect.objectContaining({ status: "completed" }));
+    const rec = await storage.getRun(logger.runId);
+    expect(rec?.status).toBe("completed");
+    expect((rec?.payload as Payload).resultSummary).toEqual({ summary: "done" });
   });
 
   it("fails a run", async () => {
-    const logger = await AgentRunLogger.start(mockDb, { agentType: "init" });
+    const logger = await AgentRunLogger.start(storage, { agentType: "init" });
     await logger.fail("something broke");
-    expect(mockSet).toHaveBeenCalledWith(expect.objectContaining({ status: "error", errorMessage: "something broke" }));
+    const rec = await storage.getRun(logger.runId);
+    expect(rec?.status).toBe("failed");
+    expect((rec?.payload as Payload).errorMessage).toBe("something broke");
   });
 
   it("updates progress", async () => {
-    const logger = await AgentRunLogger.start(mockDb, { agentType: "init" });
+    const logger = await AgentRunLogger.start(storage, { agentType: "init" });
     await logger.updateProgress(50);
-    expect(mockSet).toHaveBeenCalledWith(expect.objectContaining({ progress: 50 }));
+    expect((await payloadOf(logger.runId)).progress).toBe(50);
   });
 
   it("clamps progress to 0-100", async () => {
-    const logger = await AgentRunLogger.start(mockDb, { agentType: "init" });
+    const logger = await AgentRunLogger.start(storage, { agentType: "init" });
     await logger.updateProgress(150);
-    expect(mockSet).toHaveBeenCalledWith(expect.objectContaining({ progress: 100 }));
+    expect((await payloadOf(logger.runId)).progress).toBe(100);
     await logger.updateProgress(-10);
-    expect(mockSet).toHaveBeenCalledWith(expect.objectContaining({ progress: 0 }));
+    expect((await payloadOf(logger.runId)).progress).toBe(0);
   });
 
   it("saves checkpoint", async () => {
-    const logger = await AgentRunLogger.start(mockDb, { agentType: "init" });
+    const logger = await AgentRunLogger.start(storage, { agentType: "init" });
     await logger.saveCheckpoint("deep_crawl", { round: 3 });
-    expect(mockSet).toHaveBeenCalledWith(expect.objectContaining({
-      checkpointPhase: "deep_crawl",
-      checkpointData: JSON.stringify({ round: 3 }),
-    }));
+    const payload = await payloadOf(logger.runId);
+    expect(payload.checkpointPhase).toBe("deep_crawl");
+    expect(payload.checkpointData).toEqual({ round: 3 });
   });
 
-  it("appendLog calls execute", async () => {
-    const logger = await AgentRunLogger.start(mockDb, { agentType: "init" });
+  it("appendLog persists a (truncated) log line", async () => {
+    const logger = await AgentRunLogger.start(storage, { agentType: "init" });
     await logger.appendLog("test message");
-    expect(mockExecute).toHaveBeenCalled();
+    expect((await payloadOf(logger.runId)).logs).toEqual(["test message"]);
+
+    await logger.appendLog("x".repeat(5000));
+    const logs = (await payloadOf(logger.runId)).logs as string[];
+    expect(logs.length).toBe(2);
+    expect(logs[1]!.length).toBe(4094);
+    expect(logs[1]!.endsWith("…")).toBe(true);
+  });
+
+  it("fromExistingAsync seeds the event buffer from storage", async () => {
+    const logger = await AgentRunLogger.start(storage, { agentType: "init" });
+    for (let i = 0; i < 10; i++) logger.appendEvent({ i });
+    await new Promise((r) => setTimeout(r, 0));
+
+    const resumed = await AgentRunLogger.fromExistingAsync(storage, logger.runId);
+    resumed.appendEvent({ i: 10 });
+    await resumed.complete();
+
+    const payload = await payloadOf(logger.runId);
+    expect(payload.eventCount).toBe(11);
+    expect((payload.events as unknown[]).length).toBe(11);
   });
 });

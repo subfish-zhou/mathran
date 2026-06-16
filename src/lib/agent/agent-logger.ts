@@ -1,12 +1,22 @@
-// TODO(mathran-v0.1): import { getDb } from '@/server/db';
 import { AgentRunLogger } from './run-logger';
+import type { Storage } from '../../core/providers/storage.js';
 
-/** No-op logger that silently ignores all calls when DB is unavailable */
+/** No-op logger that silently ignores all calls when no Storage is wired. */
 const noopLogger: AgentRunLogger = {
   runId: 'noop',
   complete: async () => {},
   fail: async () => {},
 } as unknown as AgentRunLogger;
+
+/** Process-wide Storage used for agent-run logging. Left unset in pure
+ *  one-shot / test contexts, in which case logging degrades to a no-op. */
+let runStorage: Storage | null = null;
+
+/** Inject the Storage backend used for agent-run logging (e.g. wire an
+ *  InMemoryStorage / FsStorage at process bootstrap). Pass `null` to disable. */
+export function setRunStorage(storage: Storage | null): void {
+  runStorage = storage;
+}
 
 export async function logAgentRun(params: {
   agentType: string;
@@ -15,16 +25,19 @@ export async function logAgentRun(params: {
   projectSlug?: string;
   metadata?: Record<string, unknown>;
 }): Promise<{ runId: string; logger: AgentRunLogger }> {
+  if (!runStorage) {
+    console.info(`[agent-run] ${params.agentType}: logAgentRun — no Storage wired, skipping log`);
+    return { runId: 'noop', logger: noopLogger };
+  }
   try {
-    const db = getDb();
-    const logger = await AgentRunLogger.start(db, {
+    const logger = await AgentRunLogger.start(runStorage, {
       agentType: params.agentType,
       projectSlug: params.projectSlug,
       input: { targetType: params.targetType, targetId: params.targetId, ...params.metadata },
     });
     return { runId: logger.runId, logger };
   } catch {
-    console.info(`[agent-run] ${params.agentType}: logAgentRun — DB unavailable, skipping log`);
+    console.info(`[agent-run] ${params.agentType}: logAgentRun — Storage error, skipping log`);
     return { runId: 'noop', logger: noopLogger };
   }
 }
