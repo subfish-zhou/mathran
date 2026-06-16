@@ -13,3 +13,4 @@ export type {
   ToolSpec,
 } from "./session.js";
 export { createLeanCheckTool, type LeanCheckToolOptions } from "./tools/lean-check.js";
+export { renderTranscriptMarkdown, type TranscriptMeta } from "./transcript.js";

@@ -30,6 +30,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { ChatSession } from "./session.js";
 import type { LLMMessage } from "../providers/llm.js";
+import { renderTranscriptMarkdown } from "./transcript.js";
 
 export type ChatScopeKind = "global" | "project" | "effort";
 
@@ -111,76 +112,11 @@ async function flushSession(dir: string, conversationId: string, history: LLMMes
 }
 
 /**
- * Render a chat history as a human-readable Markdown transcript and write it
- * next to the jsonl file under a `transcripts/` subdirectory (GAP #13).
- *
- * Why a separate file: jsonl is the source of truth for replay (lossless,
- * parseable), but users want a readable thread artifact too — to skim later,
- * paste into wiki by hand, or git-track. Each `flush()` rewrites the same
- * transcript file end-to-end so it always matches the underlying jsonl.
- *
- * The format is intentionally plain: `## role` headers, then content. Tool
- * calls and tool results are surfaced as fenced code blocks so the file is
- * still useful when you want to debug what a tool returned.
+ * Write a Markdown view of the same conversation under a `transcripts/`
+ * subdirectory. The Markdown is derived from the jsonl; it is overwritten
+ * end-to-end on every flush and never read back, so it can be edited or
+ * deleted without affecting replay.
  */
-function renderTranscriptMarkdown(
-  history: LLMMessage[],
-  meta: { scope: ChatScope; conversationId: string; title?: string },
-): string {
-  const out: string[] = [];
-  const scopeLabel =
-    meta.scope.kind === "global"
-      ? "global"
-      : meta.scope.kind === "project"
-      ? `project / ${meta.scope.projectSlug}`
-      : `effort / ${meta.scope.projectSlug} / ${meta.scope.effortSlug}`;
-  out.push(`# ${meta.title?.trim() || `Chat ${meta.conversationId}`}`);
-  out.push("");
-  out.push(`> **Scope:** ${scopeLabel}`);
-  out.push(`> **Conversation id:** \`${meta.conversationId}\``);
-  out.push(`> **Saved at:** ${new Date().toISOString()}`);
-  out.push("");
-  out.push("---");
-  out.push("");
-  for (const m of history) {
-    const role = m.role;
-    if (role === "system") {
-      out.push(`## system`);
-      out.push("");
-      out.push("<details><summary>system prompt</summary>");
-      out.push("");
-      out.push("```");
-      out.push(m.content ?? "");
-      out.push("```");
-      out.push("");
-      out.push("</details>");
-      out.push("");
-      continue;
-    }
-    out.push(`## ${role}`);
-    out.push("");
-    if (m.content && m.content.trim().length > 0) {
-      out.push(m.content);
-      out.push("");
-    }
-    if (Array.isArray(m.toolCalls) && m.toolCalls.length > 0) {
-      for (const call of m.toolCalls) {
-        out.push(`**tool call:** \`${call.name}\` (id \`${call.id}\`)`);
-        out.push("");
-        out.push("```json");
-        out.push(call.arguments);
-        out.push("```");
-        out.push("");
-      }
-    }
-    if (role === "tool" && m.toolCallId) {
-      out.push(`_tool result for \`${m.name ?? "?"}\` (id \`${m.toolCallId}\`)_`);
-      out.push("");
-    }
-  }
-  return out.join("\n");
-}
-
 async function flushTranscript(
   dir: string,
   conversationId: string,
@@ -189,8 +125,14 @@ async function flushTranscript(
 ): Promise<void> {
   const transcriptsDir = path.join(dir, "transcripts");
   await fs.mkdir(transcriptsDir, { recursive: true });
+  const scopeLabel =
+    meta.scope.kind === "global"
+      ? "global"
+      : meta.scope.kind === "project"
+      ? `project / ${meta.scope.projectSlug}`
+      : `effort / ${meta.scope.projectSlug} / ${meta.scope.effortSlug}`;
   const md = renderTranscriptMarkdown(history, {
-    scope: meta.scope,
+    scopeLabel,
     conversationId,
     title: meta.title,
   });
