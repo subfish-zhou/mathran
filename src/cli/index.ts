@@ -163,6 +163,61 @@ effortCmd
     process.exit(await runEffortList(project, { workspace: opts.workspace, json: opts.json }));
   });
 
+const configCmd = program
+  .command("config")
+  .description("Inspect or edit config.toml from the CLI (avoid hand-editing TOML)");
+
+configCmd
+  .command("path")
+  .description("Print the resolved config.toml path")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (opts: { workspace?: string }) => {
+    const { runConfigPath } = await import("./commands/config.js");
+    process.exit(await runConfigPath({ workspace: opts.workspace }));
+  });
+
+configCmd
+  .command("list")
+  .description("Print a redacted summary of providers and default model")
+  .option("--workspace <dir>", "Workspace root")
+  .option("--json", "Emit JSON", false)
+  .action(async (opts: { workspace?: string; json?: boolean }) => {
+    const { runConfigList } = await import("./commands/config.js");
+    process.exit(await runConfigList({ workspace: opts.workspace, json: opts.json }));
+  });
+
+configCmd
+  .command("get")
+  .description("Read one value. Key syntax: defaultModel or providers.<n>.<field>")
+  .argument("<key>", "Dotted key (e.g. defaultModel, providers.openai.defaultModel)")
+  .option("--workspace <dir>", "Workspace root")
+  .option("--json", "Emit the value as JSON", false)
+  .action(async (key: string, opts: { workspace?: string; json?: boolean }) => {
+    const { runConfigGet } = await import("./commands/config.js");
+    process.exit(await runConfigGet(key, { workspace: opts.workspace, json: opts.json }));
+  });
+
+configCmd
+  .command("set")
+  .description("Write one value. Key syntax: defaultModel or providers.<n>.<field>")
+  .argument("<key>", "Dotted key")
+  .argument("<value>", "New value")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (key: string, value: string, opts: { workspace?: string }) => {
+    const { runConfigSet } = await import("./commands/config.js");
+    process.exit(await runConfigSet(key, value, { workspace: opts.workspace }));
+  });
+
+configCmd
+  .command("unset")
+  .description("Remove one value (delete provider entry when last field goes)")
+  .argument("<key>", "Dotted key")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (key: string, opts: { workspace?: string }) => {
+    const { runConfigUnset } = await import("./commands/config.js");
+    process.exit(await runConfigUnset(key, { workspace: opts.workspace }));
+  });
+
 program
   .command("serve")
   .description("Start the local-only workstation server (Hono REST + SSE on 127.0.0.1)")
