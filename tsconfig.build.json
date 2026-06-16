@@ -12,7 +12,8 @@
     "src/cli/**/*.ts",
     "src/core/**/*.ts",
     "src/providers/**/*.ts",
-    "src/_stubs/**/*.d.ts"
+    "src/server/**/*.ts",
+    "src/lib/**/*.ts"
   ],
   "exclude": [
     "node_modules",
