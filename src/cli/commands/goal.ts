@@ -327,6 +327,44 @@ export async function runGoalPause(goalId: string, opts: GoalSimpleOptions): Pro
   return 0;
 }
 
+export async function runGoalReactivate(goalId: string, opts: GoalSimpleOptions): Promise<number> {
+  const workspace = resolveWorkspaceRoot(opts.workspace);
+  const resolved = await resolveGoalId(workspace, goalId);
+  if (!resolved) {
+    console.error(`mathran goal reactivate: not found or ambiguous: ${goalId}`);
+    return 1;
+  }
+  const g = await readGoal(workspace, resolved);
+  if (!g) {
+    console.error(`mathran goal reactivate: not found: ${resolved}`);
+    return 1;
+  }
+  if (g.status === "active") {
+    console.log(`mathran goal reactivate: ${resolved} already active; nothing to do`);
+    return 0;
+  }
+  if (g.status === "complete") {
+    console.error(`mathran goal reactivate: goal is complete; refusing to reopen (start a new goal instead)`);
+    return 1;
+  }
+  // failed | cancelled | exhausted | paused → all reactivatable.
+  // Note: exhausted goals will re-exhaust on the next round unless the
+  // budget is also widened; callers should adjust budget separately if needed.
+  const prevStatus = g.status;
+  const prevReason = g.endReason ?? "(no reason)";
+  g.status = "active";
+  delete g.endedAt;
+  delete g.endReason;
+  g.steps.push({
+    at: new Date().toISOString(),
+    kind: "status",
+    payload: { to: "active", reason: `reactivated from ${prevStatus} (was: ${prevReason})` },
+  });
+  await writeGoal(workspace, g);
+  console.log(`mathran: reactivated ${resolved} (was ${prevStatus}). Resume with 'mathran goal resume ${resolved}'.`);
+  return 0;
+}
+
 export async function runGoalCancel(goalId: string, opts: GoalSimpleOptions): Promise<number> {
   const workspace = resolveWorkspaceRoot(opts.workspace);
   const resolved = await resolveGoalId(workspace, goalId);

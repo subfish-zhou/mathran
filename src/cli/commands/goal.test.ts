@@ -18,6 +18,7 @@ import {
   runGoalStatus,
   runGoalPause,
   runGoalCancel,
+  runGoalReactivate,
   runGoalStop,
   goalStopMarkerPath,
 } from "./goal.js";
@@ -212,6 +213,69 @@ describe("runGoalPause + runGoalCancel", () => {
     stderr = "";
     expect(await runGoalPause(id, { workspace })).toBe(1);
     expect(stderr).toMatch(/can only pause active/);
+  });
+});
+
+describe("runGoalReactivate (v0.5 §8)", () => {
+  it("flips paused → active and clears endReason", async () => {
+    await runGoalStart("obj", { workspace, configPath: cfgPath, noRun: true });
+    const files = await fs.readdir(path.join(workspace, ".mathran", "goals"));
+    const id = files[0].replace(/\.json$/, "");
+    await runGoalPause(id, { workspace });
+    expect((await readGoal(workspace, id))?.status).toBe("paused");
+    stdout = "";
+    expect(await runGoalReactivate(id, { workspace })).toBe(0);
+    expect(stdout).toMatch(/reactivated/);
+    const g = await readGoal(workspace, id);
+    expect(g?.status).toBe("active");
+    expect(g?.endReason).toBeUndefined();
+    expect(g?.endedAt).toBeUndefined();
+    // audit step recorded the reactivation
+    expect(g?.steps[g.steps.length - 1]).toMatchObject({
+      kind: "status",
+      payload: { to: "active" },
+    });
+  });
+
+  it("flips cancelled → active (terminal state recoverable)", async () => {
+    await runGoalStart("obj", { workspace, configPath: cfgPath, noRun: true });
+    const files = await fs.readdir(path.join(workspace, ".mathran", "goals"));
+    const id = files[0].replace(/\.json$/, "");
+    await runGoalCancel(id, { workspace });
+    expect(await runGoalReactivate(id, { workspace })).toBe(0);
+    expect((await readGoal(workspace, id))?.status).toBe("active");
+  });
+
+  it("refuses to reopen a completed goal", async () => {
+    await runGoalStart("obj", { workspace, configPath: cfgPath, noRun: true });
+    const files = await fs.readdir(path.join(workspace, ".mathran", "goals"));
+    const id = files[0].replace(/\.json$/, "");
+    // Force the goal to 'complete' on disk (no public helper to do this).
+    const g = await readGoal(workspace, id);
+    g!.status = "complete";
+    g!.endedAt = new Date().toISOString();
+    g!.endReason = "test";
+    await fs.writeFile(
+      path.join(workspace, ".mathran", "goals", `${id}.json`),
+      JSON.stringify(g, null, 2),
+    );
+    stderr = "";
+    expect(await runGoalReactivate(id, { workspace })).toBe(1);
+    expect(stderr).toMatch(/complete/);
+  });
+
+  it("is a no-op on an already-active goal", async () => {
+    await runGoalStart("obj", { workspace, configPath: cfgPath, noRun: true });
+    const files = await fs.readdir(path.join(workspace, ".mathran", "goals"));
+    const id = files[0].replace(/\.json$/, "");
+    stdout = "";
+    expect(await runGoalReactivate(id, { workspace })).toBe(0);
+    expect(stdout).toMatch(/already active/);
+  });
+
+  it("rejects an unknown goal id", async () => {
+    expect(await runGoalReactivate("ffffffff", { workspace })).toBe(1);
+    expect(stderr).toMatch(/not found/);
   });
 });
 

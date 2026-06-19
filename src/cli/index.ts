@@ -316,6 +316,16 @@ goalCmd
   });
 
 goalCmd
+  .command("reactivate")
+  .description("Move a paused/failed/cancelled/exhausted goal back to active so it can be resumed")
+  .argument("<goalId>", "Goal id (or its 8-char prefix)")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (goalId: string, opts: any) => {
+    const { runGoalReactivate } = await import("./commands/goal.js");
+    process.exit(await runGoalReactivate(goalId, { workspace: opts.workspace }));
+  });
+
+goalCmd
   .command("stop")
   .description("Request abort of an in-flight round (writes a <id>.stop marker)")
   .argument("<goalId>", "Goal id")
