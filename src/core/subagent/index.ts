@@ -11,7 +11,29 @@ export type {
 } from "./types.js";
 export { SubagentRegistry, defaultSubagentRegistry } from "./registry.js";
 export { SubagentScheduler } from "./scheduler.js";
-export type { SchedulerOpts } from "./scheduler.js";
+export type {
+  SchedulerOpts,
+  SubagentTaskWithRuntime,
+  SubprocessRuntimeLike,
+} from "./scheduler.js";
+export {
+  SubprocessRuntime,
+} from "./runtime/subprocess.js";
+export type {
+  SubprocessRuntimeOpts,
+  SubprocessRunArgs,
+  SchedulerLike,
+} from "./runtime/subprocess.js";
+export {
+  encodeMessage,
+  decodeLine,
+  LineSplitter,
+} from "./runtime/protocol.js";
+export type {
+  Message as SubagentProtocolMessage,
+  ParentToChild,
+  ChildToParent,
+} from "./runtime/protocol.js";
 export {
   createArtifactDir,
   writeArtifact,
