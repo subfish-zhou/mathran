@@ -332,6 +332,97 @@ describe("runGoalRound", () => {
   });
 });
 
+describe("runGoalRound effort context (v0.2 §12)", () => {
+  it("goal with effort scope injects the document excerpt into the system prompt", async () => {
+    // Seed a project + effort with a document and one extra status transition
+    // so the loader has both branches to render.
+    await fs.mkdir(path.join(workspace, "projects", "alpha"), { recursive: true });
+    await initEffort(workspace, "alpha", { title: "Lemma One", type: "PROOF_ATTEMPT" });
+    const docBody = "## Notes\n\nThe candidate inequality is x^2 ≤ y.\n";
+    // writeEffortDocument lives on store.ts — reuse existing helper.
+    const { writeEffortDocument: writeDoc } = await import("../effort/store.js");
+    await writeDoc(workspace, "alpha", "lemma-one", docBody);
+
+    const g = await createGoal(workspace, {
+      objective: "prove the inequality",
+      scope: { kind: "effort", projectSlug: "alpha", effortSlug: "lemma-one" },
+      model: "fake",
+    });
+
+    // Capture the system prompt the runner builds for this round. The fake
+    // LLM records every request it receives.
+    const seenRequests: LLMRequest[] = [];
+    const recordingLlm: LLMProvider = {
+      async describe() {
+        return { name: "fake" };
+      },
+      async chat(req: LLMRequest) {
+        seenRequests.push(req);
+        return {
+          async *stream() {
+            yield { type: "text", delta: "ok" };
+            yield { type: "done", finishReason: "stop" };
+          },
+        };
+      },
+    };
+    await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "start",
+      llm: recordingLlm,
+      tools: [],
+    });
+
+    expect(seenRequests).toHaveLength(1);
+    const systemMsg = seenRequests[0].messages.find((m) => m.role === "system");
+    expect(systemMsg).toBeDefined();
+    const sys = String(systemMsg!.content);
+    expect(sys).toContain("## Working on effort: alpha / lemma-one");
+    expect(sys).toContain("### Effort notes (excerpt)");
+    expect(sys).toContain("The candidate inequality is x^2 ≤ y.");
+    // Seed status entry from defaultMetadata is DRAFT — it should appear.
+    expect(sys).toContain("DRAFT");
+    expect(sys).toContain(".mathran-efforts/alpha/lemma-one/document.md");
+  });
+
+  it("goal with global scope does NOT inject any effort fragment", async () => {
+    const g = await createGoal(workspace, {
+      objective: "anything",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+
+    const seenRequests: LLMRequest[] = [];
+    const recordingLlm: LLMProvider = {
+      async describe() {
+        return { name: "fake" };
+      },
+      async chat(req: LLMRequest) {
+        seenRequests.push(req);
+        return {
+          async *stream() {
+            yield { type: "text", delta: "ok" };
+            yield { type: "done", finishReason: "stop" };
+          },
+        };
+      },
+    };
+    await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "hi",
+      llm: recordingLlm,
+      tools: [],
+    });
+
+    const sys = String(seenRequests[0].messages.find((m) => m.role === "system")!.content);
+    expect(sys).not.toContain("Working on effort:");
+    expect(sys).not.toContain("### Effort notes");
+    expect(sys).not.toContain("### Recent status updates");
+  });
+});
+
 describe("runGoalRound persistence reuses ChatSessionStore (v0.2 §10)", () => {
   it("two goals in the same workspace persist independently (no cross-contamination)", async () => {
     const gA = await createGoal(workspace, { objective: "A", scope: { kind: "global" }, model: "fake" });

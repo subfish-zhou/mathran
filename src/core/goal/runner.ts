@@ -42,6 +42,7 @@ import {
 } from "../chat/store.js";
 import { atomicWriteFile } from "../chat/atomic-write.js";
 import { appendEffortDocument } from "../effort/store.js";
+import { loadEffortContext, formatEffortContext } from "../effort/context-builder.js";
 
 import {
   appendStep,
@@ -59,12 +60,20 @@ import { buildGoalTools, createGoalToolHandler } from "./tools.js";
  * Build the per-goal system prompt. Pinning objective + budget at the top
  * lets the assistant know when to wrap up. The `mark_done` / `give_up` tools
  * are how the runner detects completion.
+ *
+ * `effortFragment` (v0.2 §12): a pre-formatted block describing the current
+ * effort's document excerpt + recent status history. Loaded asynchronously
+ * by the caller (see `runGoalRound`) so this builder can stay synchronous.
+ * Appended after the budget/instructions but before any user objective
+ * restatement — placing it adjacent to the scope label gives the assistant
+ * grounded context without burying the completion-tool guidance.
  */
 export function buildGoalSystemPrompt(input: {
   goal: Goal;
   systemPromptBase: string;
+  effortFragment?: string;
 }): string {
-  const { goal, systemPromptBase } = input;
+  const { goal, systemPromptBase, effortFragment } = input;
   const scopeLabel =
     goal.scope.kind === "global"
       ? "global"
@@ -91,6 +100,10 @@ export function buildGoalSystemPrompt(input: {
       `\`give_up(reason)\`. Do not announce completion in plain text — only the ` +
       `tool call counts.`,
   );
+  if (effortFragment && effortFragment.trim().length > 0) {
+    lines.push("");
+    lines.push(effortFragment);
+  }
   return lines.join("\n");
 }
 
@@ -341,9 +354,35 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   // kept in sync across chat + goal.
   const history = await loadConversationHistory(workspace, goal.scope, conversationId);
 
+  // v0.2 §12: when the goal is scoped to an effort, eagerly pull a short
+  // context block (document head + last 3 status entries) and inject it into
+  // the system prompt so the assistant knows what page it's working on.
+  // Loading is done here (not inside the synchronous prompt builder) so the
+  // builder remains a pure function and is easy to unit-test.
+  let effortFragment = "";
+  if (goal.scope.kind === "effort" && goal.scope.projectSlug && goal.scope.effortSlug) {
+    try {
+      const ctx = await loadEffortContext({
+        workspace,
+        projectSlug: goal.scope.projectSlug,
+        effortSlug: goal.scope.effortSlug,
+      });
+      effortFragment = formatEffortContext(ctx);
+    } catch (err: any) {
+      // Don't fail the round just because context loading hit an unexpected
+      // error — record it and continue with an empty fragment. (Common
+      // benign cases like "effort missing" already return null, not throw.)
+      await appendStep(workspace, goalId, {
+        kind: "status",
+        payload: { effortContextError: String(err?.message ?? err) },
+      });
+    }
+  }
+
   const systemPrompt = buildGoalSystemPrompt({
     goal,
     systemPromptBase: systemPromptBase ?? "You are mathran, a local mathematician's workstation assistant.",
+    effortFragment,
   });
   const handler = createGoalToolHandler();
   const session = new ChatSession({
