@@ -29,7 +29,7 @@ import {
   type ExportTimelineItem,
 } from "../lib/chat-export.ts";
 import ContextMeter from "./ContextMeter.tsx";
-import { ToolCallDisplay } from "./ToolCallDisplay.tsx";
+import ToolCallGroup from "./ToolCallGroup.tsx";
 
 export default function ChatPanel({
   scope,
@@ -259,6 +259,34 @@ export default function ChatPanel({
     return conv?.title || scopeLabel || "Mathran chat";
   }, [conversations, conversationId, scopeLabel]);
 
+  // ─── Render rows: cluster adjacent tool bubbles into one ToolCallGroup
+  // (v0.14 §1). A row is either a single non-tool bubble or a run of one
+  // or more consecutive tool bubbles.
+  type NonToolBubble = Extract<Bubble, { kind: "user" } | { kind: "assistant" }>;
+  type Row =
+    | { kind: "single"; bubble: NonToolBubble }
+    | { kind: "tools"; tools: ToolBubble[] };
+  const rows = useMemo<Row[]>(() => {
+    const out: Row[] = [];
+    let buffer: ToolBubble[] = [];
+    const flushTools = () => {
+      if (buffer.length > 0) {
+        out.push({ kind: "tools", tools: buffer });
+        buffer = [];
+      }
+    };
+    for (const b of bubbles) {
+      if (b.kind === "tool") {
+        buffer.push(b);
+      } else {
+        flushTools();
+        out.push({ kind: "single", bubble: b });
+      }
+    }
+    flushTools();
+    return out;
+  }, [bubbles]);
+
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
   useEffect(() => {
     if (!copyFeedback) return;
@@ -286,6 +314,22 @@ export default function ChatPanel({
       "tex",
       "text/x-tex;charset=utf-8",
     );
+  }
+
+  // ─── Per-message actions (v0.14 §2) ─────────────────────────────────────────────────
+  // Copy = single message to clipboard.
+  // Re-run = restage the user's prompt as if they just typed it (useful when
+  // the assistant's previous reply was bad and you want a fresh sample).
+  async function copyOneMessage(text: string) {
+    const ok = await copyToClipboard(text);
+    setCopyFeedback(ok ? "Copied!" : "Copy failed");
+  }
+
+  function reRun(text: string) {
+    if (busy) return;
+    setInput(text);
+    // Defer one tick so the user can see what was loaded; they hit Send to commit.
+    // (Auto-submit would lose drafts in the input field.)
   }
 
   // ─── Render ────────────────────────────────────────────────────────────
@@ -376,8 +420,22 @@ export default function ChatPanel({
             value={model}
             onChange={(e) => setModel(e.target.value)}
             placeholder="model (e.g. copilot/gpt-5.5)"
+            list="mathran-model-suggestions"
             className="w-64 rounded-md border border-slate-300 px-2 py-1 text-xs font-mono outline-none focus:border-slate-500"
           />
+          <datalist id="mathran-model-suggestions">
+            {/* Common model strings the LLM router accepts. Free-form input
+                remains allowed — this is a datalist (suggestions), not a
+                <select> (exhaustive). v0.14 §3. */}
+            <option value="copilot/gpt-5.5" />
+            <option value="copilot/gpt-5.6" />
+            <option value="copilot/claude-opus-4.7" />
+            <option value="copilot/claude-opus-4.8" />
+            <option value="copilot/claude-sonnet-4.5" />
+            <option value="copilot/o1" />
+            <option value="copilot/o1-mini" />
+            <option value="copilot/o3-mini" />
+          </datalist>
         </div>
 
         {/* ─── Export toolbar ─── */}
@@ -442,29 +500,56 @@ export default function ChatPanel({
                 : "Ask a math or Lean question to start a new chat."}
             </p>
           )}
-          {bubbles.map((b, i) =>
-            b.kind === "tool" ? (
-              <ToolCallDisplay key={i} toolCall={b} />
+          {rows.map((row, i) =>
+            row.kind === "tools" ? (
+              <ToolCallGroup key={`g${i}`} tools={row.tools} />
             ) : (
               <div
                 key={i}
-                className={`flex ${b.kind === "user" ? "justify-end" : "justify-start"}`}
+                className={`group/msg flex ${row.bubble.kind === "user" ? "justify-end" : "justify-start"}`}
               >
-                <div
-                  className={`max-w-2xl rounded-lg px-4 py-2 text-sm ${
-                    b.kind === "user"
-                      ? "bg-slate-900 text-white"
-                      : "border border-slate-200 bg-white"
-                  }`}
-                >
-                  {b.kind === "assistant" ? (
-                    <div
-                      className="md"
-                      dangerouslySetInnerHTML={{ __html: marked.parse(b.text || "…") as string }}
-                    />
-                  ) : (
-                    <span className="whitespace-pre-wrap">{b.text}</span>
-                  )}
+                <div className="flex max-w-2xl flex-col">
+                  <div
+                    className={`rounded-lg px-4 py-2 text-sm ${
+                      row.bubble.kind === "user"
+                        ? "bg-slate-900 text-white"
+                        : "border border-slate-200 bg-white"
+                    }`}
+                  >
+                    {row.bubble.kind === "assistant" ? (
+                      <div
+                        className="md"
+                        dangerouslySetInnerHTML={{
+                          __html: marked.parse(row.bubble.text || "…") as string,
+                        }}
+                      />
+                    ) : (
+                      <span className="whitespace-pre-wrap">{row.bubble.text}</span>
+                    )}
+                  </div>
+                  {/* ─── v0.14 §2: per-message copy + re-run (assistant only).
+                      Re-run only makes sense from a user message — it resends
+                      the user's text into the LLM, so we expose it there too. */}
+                  <div className="mt-0.5 flex justify-end gap-1 text-[10px] text-slate-400 opacity-0 transition group-hover/msg:opacity-100">
+                    <button
+                      type="button"
+                      onClick={() => void copyOneMessage(row.bubble.text)}
+                      className="rounded px-1 py-0.5 hover:bg-slate-200"
+                      title="Copy this message to clipboard"
+                    >
+                      📋 Copy
+                    </button>
+                    {row.bubble.kind === "user" && (
+                      <button
+                        type="button"
+                        onClick={() => reRun(row.bubble.text)}
+                        className="rounded px-1 py-0.5 hover:bg-slate-200"
+                        title="Resend this prompt"
+                      >
+                        🔁 Re-run
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             ),
