@@ -32,6 +32,7 @@ import YAML from "yaml";
 import { createTwoFilesPatch } from "diff";
 
 import { resolveWorkspaceRoot, initProject } from "../cli/commands/project.js";
+import { resolveScopeRoot } from "../cli/commands/scope-paths.js";
 import { loadConfig } from "../core/config.js";
 import {
   BUILTIN_EFFORT_TYPES,
@@ -614,20 +615,47 @@ async function writeProviders(workspace: string, payload: any): Promise<Record<s
 
 // ─── Chat (SSE) ──────────────────────────────────────────────────────────────
 
-function defaultSessionFactory(workspace: string): ChatSessionFactory {
+export function defaultSessionFactory(workspace: string): ChatSessionFactory {
   return ({ model, scope }) => {
     const config = loadConfig(configPathFor(workspace));
     const resolvedModel = model ?? config.defaultModel ?? DEFAULT_MODEL;
     const router = new ModelRouter(config);
     const lean = new LocalLeanProvider();
+    // v0.5 §2 / Gap #6: scope-aware workspace + full builtin toolkit for web UI.
+    //
+    // Scope mapping (matches `mathran chat` / `mathran goal` via
+    // `resolveScopeRoot`):
+    //   - global               → workspace root
+    //   - project:<p>          → <workspace>/projects/<p>
+    //   - effort:<p>/<e>       → <workspace>/projects/<p>/efforts/<e>
+    //
+    // The web UI gets the SAME 6-builtin toolkit as CLI chat/goal
+    // (bash/read/write/edit + search/read_file_summary). The v0.11 audit
+    // explicitly answered "no, full set" to the "should we limit web tools?"
+    // question — `mathran serve` is local-only (127.0.0.1) and is meant to
+    // behave like a workspace-attached REPL with a browser UI. Anyone who
+    // can reach the loopback socket already has shell access on this
+    // machine; there is no auth boundary to add value to a tool-set cut.
+    const scopedWorkspace = scope ? resolveScopeRoot(workspace, scope) : workspace;
     return new ChatSession({
       llm: router,
       model: resolvedModel,
       // T1-D: thread workspace + scope into tools so lean_check (and future
       // wiki/effort tools) can resolve project-relative paths. BUG #7 fix.
-      toolContext: { workspace, scope },
+      // v0.5 §2: workspace is now scope-narrowed so fs tools land inside the
+      // project / effort dir, not at workspace root.
+      workspace: scopedWorkspace,
+      toolContext: { workspace: scopedWorkspace, scope },
       systemPrompt: buildScopedSystemPrompt(scope),
       tools: [createLeanCheckTool(lean)],
+      builtinTools: {
+        search: true,
+        read_file_summary: true,
+        bash: true,
+        read_file: true,
+        write_file: true,
+        edit_file: true,
+      },
     });
   };
 }
