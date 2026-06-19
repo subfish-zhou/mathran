@@ -285,6 +285,35 @@ export async function writeEffortDocument(
   }
 }
 
+/**
+ * Append `text` to the effort's `document.md`, creating the file if it does
+ * not yet exist. Auto-bumps the effort's `updatedAt`. Used by the goal runner
+ * to record post-completion summaries onto the effort's notebook so the human
+ * has a single place to read the trail of decisions.
+ *
+ * Throws if the effort directory is missing (caller mistake — efforts are
+ * created via `initEffort` first).
+ */
+export async function appendEffortDocument(
+  workspace: string,
+  project: string,
+  effort: string,
+  text: string,
+): Promise<void> {
+  if (!isSafeSlug(project) || !isSafeSlug(effort)) {
+    throw new Error("invalid project or effort slug");
+  }
+  const dir = effortDirFor(workspace, project, effort);
+  if (!(await pathExists(dir))) throw new Error(`effort not found: ${effort}`);
+  const file = path.join(dir, EFFORT_DOC);
+  await fs.appendFile(file, text, "utf-8");
+  const meta = await readEffortMetadata(workspace, project, effort);
+  if (meta) {
+    meta.updatedAt = new Date().toISOString();
+    await writeEffortMetadata(workspace, project, effort, meta);
+  }
+}
+
 /** Apply a partial metadata update; returns the new metadata. */
 export async function updateEffortMetadata(
   workspace: string,

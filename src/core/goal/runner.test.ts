@@ -11,8 +11,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import { runGoalRound, buildGoalSystemPrompt } from "./runner.js";
+import { runGoalRound, buildGoalSystemPrompt, GOAL_SUMMARY_PROMPT_DONE, GOAL_SUMMARY_PROMPT_GIVE_UP } from "./runner.js";
 import { createGoal, readGoal } from "./store.js";
+import { initEffort, readEffortDocument } from "../effort/store.js";
 import type { LLMProvider, LLMRequest, LLMStreamChunk } from "../providers/llm.js";
 
 let workspace: string;
@@ -354,3 +355,201 @@ describe("runGoalRound token counting", () => {
     expect(refreshed!.stats.tokensUsed).toBe(42);
   });
 });
+
+describe("runGoalRound summary on completion", () => {
+  /**
+   * Capturing LLM: records every chat() request and streams the queued turn.
+   * Lets us assert that the summary round was made *without* tools.
+   */
+  function capturingLLM(turns: LLMStreamChunk[][]): { llm: LLMProvider; calls: LLMRequest[] } {
+    const calls: LLMRequest[] = [];
+    let i = 0;
+    const llm: LLMProvider = {
+      async describe() {
+        return { name: "capturing" };
+      },
+      async chat(req: LLMRequest) {
+        calls.push(req);
+        const turn = turns[i++] ?? [{ type: "done", finishReason: "stop" }];
+        return {
+          async *stream() {
+            for (const c of turn) yield c;
+          },
+        };
+      },
+    };
+    return { llm, calls };
+  }
+
+  it("mark_done triggers a summary file under .mathran/goals/<id>.summary.md", async () => {
+    const g = await createGoal(workspace, { objective: "prove L", scope: { kind: "global" }, model: "fake" });
+    const { llm, calls } = capturingLLM([
+      // Turn 1: assistant calls mark_done.
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "lemma proved" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      // Turn 2: ChatSession's follow-up text after the tool result.
+      [
+        { type: "text", delta: "all set" },
+        { type: "done", finishReason: "stop" },
+      ],
+      // Turn 3: post-completion summary round (no tools).
+      [
+        { type: "text", delta: "We proved lemma L by reducing to a known fact." },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go prove it", llm, tools: [] });
+    expect(r.completed).toBe(true);
+
+    const summaryFile = path.join(workspace, ".mathran", "goals", `${g.id}.summary.md`);
+    const body = await fs.readFile(summaryFile, "utf-8");
+    expect(body).toContain("# Goal summary: prove L");
+    expect(body).toContain("**status**: complete");
+    expect(body).toContain("**endReason**: lemma proved");
+    expect(body).toContain("We proved lemma L by reducing to a known fact.");
+
+    // The summary round (calls[2]) MUST be a tools-free request to prevent
+    // the LLM from re-calling mark_done / give_up and re-entering this path.
+    expect(calls).toHaveLength(3);
+    expect(calls[2].tools).toBeUndefined();
+    // It also must include the closing user prompt for the summary.
+    const lastUserMsg = calls[2].messages[calls[2].messages.length - 1];
+    expect(lastUserMsg.role).toBe("user");
+    expect(lastUserMsg.content).toBe(GOAL_SUMMARY_PROMPT_DONE);
+  });
+
+  it("give_up triggers a summary file with abandoned framing in the header", async () => {
+    const g = await createGoal(workspace, { objective: "try X", scope: { kind: "global" }, model: "fake" });
+    const { llm, calls } = capturingLLM([
+      [
+        { type: "tool-call", id: "u1", name: "give_up", argsDelta: JSON.stringify({ reason: "scope too big" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "stopping" },
+        { type: "done", finishReason: "stop" },
+      ],
+      [
+        { type: "text", delta: "Tried approach A; ran out of time before B." },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    expect(r.failed).toBe(true);
+
+    const summaryFile = path.join(workspace, ".mathran", "goals", `${g.id}.summary.md`);
+    const body = await fs.readFile(summaryFile, "utf-8");
+    expect(body).toContain("**status**: failed");
+    expect(body).toContain("**endReason**: scope too big");
+    expect(body).toContain("Tried approach A");
+
+    // The summary prompt for give_up is the abandoned framing.
+    const lastUserMsg = calls[2].messages[calls[2].messages.length - 1];
+    expect(lastUserMsg.content).toBe(GOAL_SUMMARY_PROMPT_GIVE_UP);
+  });
+
+  it("sets goal.summaryPath after a successful completion", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    const { llm } = capturingLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "ok" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "all set" },
+        { type: "done", finishReason: "stop" },
+      ],
+      [
+        { type: "text", delta: "Summary text." },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    expect(r.completed).toBe(true);
+
+    const refreshed = await readGoal(workspace, g.id);
+    expect(refreshed?.summaryPath).toBe(path.join(".mathran", "goals", `${g.id}.summary.md`));
+    expect(r.goal.summaryPath).toBe(path.join(".mathran", "goals", `${g.id}.summary.md`));
+  });
+
+  it("appends the summary to the effort document.md when goal is effort-scoped", async () => {
+    // Scaffold a real effort so appendEffortDocument can find document.md.
+    await fs.mkdir(path.join(workspace, "projects", "alpha"), { recursive: true });
+    await initEffort(workspace, "alpha", { title: "Lemma A", type: "PROOF_ATTEMPT", slug: "lemma-a" });
+    const docBefore = (await readEffortDocument(workspace, "alpha", "lemma-a")) ?? "";
+
+    const g = await createGoal(workspace, {
+      objective: "finish lemma A",
+      scope: { kind: "effort", projectSlug: "alpha", effortSlug: "lemma-a" },
+      model: "fake",
+    });
+    const { llm } = capturingLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "qed" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "all set" },
+        { type: "done", finishReason: "stop" },
+      ],
+      [
+        { type: "text", delta: "We closed Lemma A via approach Y." },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    await runGoalRound({ workspace, goalId: g.id, userMessage: "finish it", llm, tools: [] });
+
+    const docAfter = (await readEffortDocument(workspace, "alpha", "lemma-a")) ?? "";
+    expect(docAfter.length).toBeGreaterThan(docBefore.length);
+    expect(docAfter).toContain("---");
+    expect(docAfter).toContain("## Goal: finish lemma A");
+    expect(docAfter).toContain("Completed");
+    expect(docAfter).toContain("We closed Lemma A via approach Y.");
+  });
+
+  it("a failing summary round does not break completion (summaryPath stays null)", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    let i = 0;
+    const llm: LLMProvider = {
+      async describe() {
+        return { name: "flaky" };
+      },
+      async chat() {
+        const turn = i++;
+        if (turn === 0) {
+          // Tool-call turn (mark_done).
+          return {
+            async *stream() {
+              yield { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "done" }) } as LLMStreamChunk;
+              yield { type: "done", finishReason: "tool_calls" } as LLMStreamChunk;
+            },
+          };
+        }
+        if (turn === 1) {
+          // ChatSession follow-up after tool result — must succeed so the
+          // completion path runs and we reach the summary stage.
+          return {
+            async *stream() {
+              yield { type: "text", delta: "all set" } as LLMStreamChunk;
+              yield { type: "done", finishReason: "stop" } as LLMStreamChunk;
+            },
+          };
+        }
+        // Summary round (turn === 2): explode — must be caught + ignored.
+        throw new Error("upstream LLM unavailable");
+      },
+    };
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    expect(r.completed).toBe(true);
+    const refreshed = await readGoal(workspace, g.id);
+    expect(refreshed?.status).toBe("complete");
+    // No summary file was written; summaryPath stays unset/null.
+    expect(refreshed?.summaryPath ?? null).toBeNull();
+    // The error was recorded as a status step.
+    const lastStep = refreshed!.steps.at(-1);
+    expect((lastStep?.payload as any)?.summaryError).toMatch(/upstream LLM/);
+  });
+});
+
