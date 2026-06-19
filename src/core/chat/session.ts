@@ -30,6 +30,7 @@ import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_KEEP_RECENT_ROUNDS,
 } from "../subagent/runners/compact.js";
+import { readSummarizeRunner } from "../subagent/runners/read-summarize.js";
 import { SubagentRegistry } from "../subagent/registry.js";
 import { SubagentScheduler } from "../subagent/scheduler.js";
 import { readArtifact } from "../subagent/artifact.js";
@@ -138,6 +139,19 @@ export interface ChatSessionOptions {
    * lazily on first compact.
    */
   subagentScheduler?: SubagentScheduler;
+  /**
+   * Built-in tools that ChatSession exposes to the LLM (v0.2 §9+). Each flag
+   * is opt-in; when enabled, the tool is mixed into `tools` ahead of any
+   * caller-supplied entries. Built-in tools require `subagentScheduler` to be
+   * wired (production code) or the lazy scheduler from `getOrBuildScheduler`
+   * (tests) — when the requirement is unmet, the tool is silently dropped to
+   * keep this purely additive.
+   *
+   * - `read_file_summary` — dispatches the `read_summarize` runner.
+   */
+  builtinTools?: {
+    read_file_summary?: boolean;
+  };
 }
 
 interface PendingToolCall {
@@ -245,6 +259,7 @@ export class ChatSession {
   private readonly autoCompactCfg?: ChatSessionOptions["autoCompact"];
   private readonly workspace?: string;
   private readonly subagentScheduler?: SubagentScheduler;
+  private readonly builtinToolsCfg?: ChatSessionOptions["builtinTools"];
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
   private messages: LLMMessage[] = [];
@@ -263,6 +278,15 @@ export class ChatSession {
     this.autoCompactCfg = opts.autoCompact;
     this.workspace = opts.workspace;
     this.subagentScheduler = opts.subagentScheduler;
+    this.builtinToolsCfg = opts.builtinTools;
+    // Mix in built-in tools (v0.2 §9+). Order: built-ins first, then caller's
+    // tools (so a caller-supplied tool with the same name wins via the
+    // `toolByName` map's last-write).
+    const builtins = this.buildBuiltinTools();
+    if (builtins.length > 0) {
+      this.tools = [...builtins, ...this.tools];
+      this.toolByName = new Map(this.tools.map((t) => [t.name, t]));
+    }
     if (opts.systemPrompt && opts.systemPrompt.trim().length > 0) {
       this.messages.push({ role: "system", content: opts.systemPrompt });
     }
@@ -302,11 +326,107 @@ export class ChatSession {
 
   // ─── Compact (v0.2 §5) ────────────────────────────────────────────────────
 
+  // ─── Built-in tools (v0.2 §9+) ──────────────────────────────────
+
+  /**
+   * Build the list of ChatSession-owned built-in tool specs based on
+   * `opts.builtinTools`. Currently produces:
+   *
+   *   - `read_file_summary` (Task 9) — dispatches `read_summarize` to a
+   *     subagent runner. Returns the runner's summary text + a link to the
+   *     cached source artifact. Silently a no-op if the caller didn't enable
+   *     it; never throws during construction.
+   *
+   * Tool `execute()` failures (path escape, file-not-found, LLM error) come
+   * back as `{ ok: false, content: <human msg> }` instead of throwing, so the
+   * model can see the error in a tool result and try a different path.
+   */
+  private buildBuiltinTools(): ToolSpec[] {
+    const cfg = this.builtinToolsCfg;
+    if (!cfg) return [];
+    const out: ToolSpec[] = [];
+    if (cfg.read_file_summary) {
+      out.push(this.makeReadFileSummaryTool());
+    }
+    return out;
+  }
+
+  /**
+   * Construct the `read_file_summary` ToolSpec. The closure captures `this`
+   * so the tool can lazily resolve `getOrBuildScheduler()` at call time —
+   * matches the compact lazy-init pattern.
+   */
+  private makeReadFileSummaryTool(): ToolSpec {
+    const self = this;
+    return {
+      name: "read_file_summary",
+      description:
+        "Read a file and get a focused summary answering your question. " +
+        "Use this for long files where you only need specific information. " +
+        "Returns summary text and a link to the cached source.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "File path relative to workspace",
+          },
+          question: {
+            type: "string",
+            description: "What you want to know from the file",
+          },
+        },
+        required: ["path", "question"],
+      },
+      async execute(args: Record<string, unknown>) {
+        const filePath = typeof args.path === "string" ? args.path : "";
+        const question = typeof args.question === "string" ? args.question : "";
+        if (!filePath) {
+          return { ok: false, content: "error: read_file_summary requires 'path'" };
+        }
+        if (!question) {
+          return {
+            ok: false,
+            content: "error: read_file_summary requires 'question'",
+          };
+        }
+        try {
+          const sched = self.getOrBuildScheduler();
+          const result = await sched.dispatch({
+            type: "read_summarize",
+            input: {
+              path: filePath,
+              question,
+              llm: self.llm,
+              modelHint: self.model,
+            } as unknown as Record<string, unknown>,
+            hardCapBytes: 2048,
+          });
+          if (result.status !== "ok") {
+            // Surface the error text directly to the model so it can recover
+            // (try a different path, ask for help, etc.). Don't throw.
+            const reason =
+              result.summary || result.errorMessage || `status=${result.status}`;
+            return { ok: false, content: `read_file_summary error: ${reason}` };
+          }
+          const link = result.artifactPath
+            ? `\n\nFull source cached at: ${result.artifactPath}`
+            : "";
+          return { ok: true, content: result.summary + link };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { ok: false, content: `read_file_summary error: ${msg}` };
+        }
+      },
+    };
+  }
+
   /** Resolve (or lazily build) the scheduler used for compact dispatch. */
   private getOrBuildScheduler(): SubagentScheduler {
     if (this.subagentScheduler) return this.subagentScheduler;
     const registry = new SubagentRegistry();
     registry.register(compactRunner);
+    registry.register(readSummarizeRunner);
     // Workspace: prefer user-provided; otherwise use process.cwd() as a sane
     // default (artifacts land under <cwd>/.mathran/subagents/<runId>/).
     const ws = this.workspace ?? process.cwd();

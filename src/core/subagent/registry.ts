@@ -6,6 +6,7 @@
 
 import type { SubagentRunner, SubagentTaskType } from "./types.js";
 import { compactRunner } from "./runners/compact.js";
+import { readSummarizeRunner } from "./runners/read-summarize.js";
 
 export class SubagentRegistry {
   private readonly runners = new Map<SubagentTaskType, SubagentRunner>();
@@ -28,11 +29,12 @@ export class SubagentRegistry {
 
 /**
  * Build a registry preloaded with the v0.2 default runners. Right now that's
- * just the `compact` runner; future runners (search, read_summarize,
- * research, lean_explore) plug in here.
+ * the `compact` runner (Task 5) and the `read_summarize` runner (Task 9);
+ * future runners (search, research, lean_explore) plug in here.
  */
 export function defaultSubagentRegistry(): SubagentRegistry {
   const r = new SubagentRegistry();
   r.register(compactRunner);
+  r.register(readSummarizeRunner);
   return r;
 }
