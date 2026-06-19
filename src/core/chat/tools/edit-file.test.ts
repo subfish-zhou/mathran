@@ -144,4 +144,61 @@ describe("createEditFileTool", () => {
     expect(res.ok).toBe(true);
     expect(await fs.readFile(p, "utf-8")).toBe("after");
   });
+
+  it("rejects edit of existing file without prior read", async () => {
+    const p = path.join(workspace, "f.txt");
+    await fs.writeFile(p, "hello world\n");
+    const read = new Set<string>();
+    const ctx = {
+      workspace,
+      recordRead: (x: string) => read.add(x),
+      hasRead: (x: string) => read.has(x),
+    };
+    const tool = createEditFileTool({ workspace });
+    const res = await tool.execute(
+      { path: "f.txt", old_string: "hello", new_string: "bye" },
+      ctx,
+    );
+    expect(res.ok).toBe(false);
+    expect(res.content).toContain("must read this file first");
+    expect(await fs.readFile(p, "utf-8")).toBe("hello world\n");
+  });
+
+  it("allows edit after recordRead was called", async () => {
+    const p = path.join(workspace, "g.txt");
+    await fs.writeFile(p, "hello world\n");
+    const read = new Set<string>();
+    const ctx = {
+      workspace,
+      recordRead: (x: string) => read.add(x),
+      hasRead: (x: string) => read.has(x),
+    };
+    ctx.recordRead(p);
+    const tool = createEditFileTool({ workspace });
+    const res = await tool.execute(
+      { path: "g.txt", old_string: "hello", new_string: "bye" },
+      ctx,
+    );
+    expect(res.ok).toBe(true);
+    expect(await fs.readFile(p, "utf-8")).toBe("bye world\n");
+  });
+
+  it("records the path as read after successful edit", async () => {
+    const p = path.join(workspace, "h.txt");
+    await fs.writeFile(p, "hello world\n");
+    const read = new Set<string>();
+    const ctx = {
+      workspace,
+      recordRead: (x: string) => read.add(x),
+      hasRead: (x: string) => read.has(x),
+    };
+    ctx.recordRead(p);
+    const tool = createEditFileTool({ workspace });
+    const res = await tool.execute(
+      { path: "h.txt", old_string: "hello", new_string: "bye" },
+      ctx,
+    );
+    expect(res.ok).toBe(true);
+    expect(read.has(p)).toBe(true);
+  });
 });
