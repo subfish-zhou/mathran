@@ -77,8 +77,12 @@ export function buildOpenAIParams(req: LLMRequest, model: string): any {
 export async function* streamOpenAI(
   client: OpenAI,
   params: any,
+  signal?: AbortSignal,
 ): AsyncIterable<LLMStreamChunk> {
-  const stream: any = await client.chat.completions.create(params);
+  const stream: any = await client.chat.completions.create(
+    params,
+    signal ? { signal } : undefined,
+  );
   let finishReason: FinishReason = "stop";
   let usage: { promptTokens: number; completionTokens: number } | undefined;
   const toolNames: Record<number, { id: string; name: string }> = {};

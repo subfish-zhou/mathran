@@ -1128,3 +1128,77 @@ describe("goal REST (GAP #11)", () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe("POST /api/goals/:id/interrupt (v0.2 §7)", () => {
+  it("aborts an in-flight round and returns 200, leaving the goal active", async () => {
+    // A provider that streams one chunk then blocks until the round is aborted.
+    const slowLlm: LLMProvider = {
+      async describe() {
+        return { name: "slow" };
+      },
+      async chat(): Promise<LLMResponse> {
+        return {
+          stream() {
+            return (async function* () {
+              yield { type: "text", delta: "thinking" } as LLMStreamChunk;
+              await new Promise<void>(() => {});
+              yield { type: "done", finishReason: "stop" } as LLMStreamChunk;
+            })();
+          },
+        };
+      },
+    };
+
+    const local = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      goalLlmFactory: () => slowLlm,
+    });
+    try {
+      const { goal } = await (await fetch(`${local.url}/api/goals`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ objective: "long running" }),
+      })).json();
+
+      // Kick off the round but don't await — it will block in the slow stream.
+      const runPromise = fetch(`${local.url}/api/goals/${goal.id}/run`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+
+      // Wait until the round has registered its AbortController, then interrupt.
+      let interrupt!: Response;
+      for (let i = 0; i < 50; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+        interrupt = await fetch(`${local.url}/api/goals/${goal.id}/interrupt`, { method: "POST" });
+        if (interrupt.status === 200) break;
+      }
+      expect(interrupt.status).toBe(200);
+      expect(await interrupt.json()).toMatchObject({ interrupted: true });
+
+      // The blocked round now unwinds and reports the abort.
+      const runRes = await runPromise;
+      expect(runRes.status).toBe(200);
+      expect(await runRes.json()).toMatchObject({ aborted: true });
+
+      // Goal status is left active (NOT failed) so it can be resumed.
+      const after = await (await fetch(`${local.url}/api/goals/${goal.id}`)).json();
+      expect(after.goal.status).toBe("active");
+    } finally {
+      await local.close();
+    }
+  });
+
+  it("returns 404 when there is no in-flight round", async () => {
+    const { goal } = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "idle" }),
+    })).json();
+    const res = await fetch(`${base}/api/goals/${goal.id}/interrupt`, { method: "POST" });
+    expect(res.status).toBe(404);
+  });
+});

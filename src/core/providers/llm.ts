@@ -41,6 +41,13 @@ export interface LLMRequest {
   }>;
   /** Provider-opaque options (e.g. seed, response_format). Pass-through. */
   extra?: Record<string, unknown>;
+  /**
+   * Optional cancellation signal. When provided, adapters thread it into the
+   * underlying transport (SDK request options / `fetch`) so an in-flight
+   * completion can be aborted mid-stream. Aborting rejects the stream with a
+   * `DOMException("Aborted", "AbortError")`.
+   */
+  signal?: AbortSignal;
 }
 
 export type LLMStreamChunk =

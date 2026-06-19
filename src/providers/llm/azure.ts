@@ -49,6 +49,6 @@ export class AzureOpenAIAdapter implements LLMProvider {
     // Azure ignores the model field in favour of the deployment, but the SDK
     // still requires one; use the requested model (or the deployment) as label.
     const params = buildOpenAIParams(req, req.model || this.deployment);
-    return { stream: () => streamOpenAI(client, params) };
+    return { stream: () => streamOpenAI(client, params, req.signal) };
   }
 }

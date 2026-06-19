@@ -191,6 +191,8 @@ export interface CopilotChatRequest {
   maxTokens?: number;
   /** JSON-schema tool definitions the model may call. */
   tools?: CopilotToolDef[];
+  /** Optional cancellation signal forwarded to the underlying `fetch`. */
+  signal?: AbortSignal;
 }
 
 /** A function/tool call parsed out of a model response. */
@@ -216,7 +218,12 @@ function isClaude(model: string): boolean {
   return /claude/i.test(model);
 }
 
-async function postJson(url: string, body: unknown, token: string): Promise<unknown> {
+async function postJson(
+  url: string,
+  body: unknown,
+  token: string,
+  signal?: AbortSignal,
+): Promise<unknown> {
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -225,6 +232,7 @@ async function postJson(url: string, body: unknown, token: string): Promise<unkn
       ...COPILOT_HEADERS,
     },
     body: JSON.stringify(body),
+    ...(signal ? { signal } : {}),
   });
   const text = await res.text();
   if (!res.ok) {
@@ -455,6 +463,7 @@ export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatR
         // GPT-5.5 rejects `temperature` so we deliberately omit it.
       },
       token,
+      req.signal,
     );
     const { text, input: inT, output: outT } = extractResponsesText(raw);
     const toolCalls = extractResponsesToolCalls(raw);
@@ -478,6 +487,7 @@ export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatR
         ...(hasTools ? { tools: buildMessagesTools(req.tools!) } : {}),
       },
       token,
+      req.signal,
     );
     const { text, input: inT, output: outT } = extractMessagesText(raw);
     const toolCalls = extractMessagesToolCalls(raw);
@@ -506,6 +516,7 @@ export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatR
       max_tokens: maxTokens,
     },
     token,
+    req.signal,
   ) as any;
   const text = raw?.choices?.[0]?.message?.content ?? "";
   const usage = raw?.usage ?? {};

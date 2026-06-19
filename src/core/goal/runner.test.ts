@@ -245,6 +245,88 @@ describe("runGoalRound", () => {
       runGoalRound({ workspace, goalId: "ghost", userMessage: "x", llm, tools: [] }),
     ).rejects.toThrow(/goal not found/);
   });
+
+  it("returns early on an already-aborted signal without changing goal status", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    const llm = fakeLLM([
+      [{ type: "text", delta: "should not run" }, { type: "done", finishReason: "stop" }],
+    ]);
+    const controller = new AbortController();
+    controller.abort();
+
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      signal: controller.signal,
+    });
+    expect(r.aborted).toBe(true);
+    expect(r.completed).toBe(false);
+    expect(r.failed).toBe(false);
+    expect(r.text).toBe("");
+
+    // Goal status + stats untouched; nothing was run.
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("active");
+    expect(round?.stats.roundsRun).toBe(0);
+  });
+
+  it("aborted mid-round leaves the goal resumable with no state corruption", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    // A provider that streams a partial chunk then blocks until aborted.
+    const slowLlm: LLMProvider = {
+      async describe() {
+        return { name: "slow" };
+      },
+      async chat() {
+        return {
+          stream() {
+            return (async function* () {
+              yield { type: "text", delta: "partial work" } as LLMStreamChunk;
+              await new Promise<void>(() => {});
+              yield { type: "done", finishReason: "stop" } as LLMStreamChunk;
+            })();
+          },
+        };
+      },
+    };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 50);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm: slowLlm,
+      tools: [],
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    expect(r.aborted).toBe(true);
+    expect(r.completed).toBe(false);
+    expect(r.failed).toBe(false);
+
+    // Goal stays active (NOT failed) and the partial conversation is persisted
+    // so a later resume continues cleanly.
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("active");
+    expect(round?.endedAt).toBeFalsy();
+    expect(round?.conversationIds).toHaveLength(1);
+    const convFile = path.join(workspace, ".mathran", "global-chat", `${round!.conversationIds[0]}.jsonl`);
+    const raw = await fs.readFile(convFile, "utf-8");
+    expect(raw).toContain("partial work");
+    expect(raw).toContain("[aborted]");
+
+    // Resuming with a normal provider works and finishes the round.
+    const finishLlm = fakeLLM([
+      [{ type: "text", delta: "resumed and done" }, { type: "done", finishReason: "stop" }],
+    ]);
+    const r2 = await runGoalRound({ workspace, goalId: g.id, userMessage: "continue", llm: finishLlm, tools: [] });
+    expect(r2.aborted).toBe(false);
+    expect(r2.text).toBe("resumed and done");
+  });
 });
 
 describe("runGoalRound token counting", () => {

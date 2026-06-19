@@ -315,6 +315,16 @@ goalCmd
     process.exit(await runGoalCancel(goalId, { workspace: opts.workspace }));
   });
 
+goalCmd
+  .command("stop")
+  .description("Request abort of an in-flight round (writes a <id>.stop marker)")
+  .argument("<goalId>", "Goal id")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (goalId: string, opts: any) => {
+    const { runGoalStop } = await import("./commands/goal.js");
+    process.exit(await runGoalStop(goalId, { workspace: opts.workspace }));
+  });
+
 const configCmd = program
   .command("config")
   .description("Inspect or edit config.toml from the CLI (avoid hand-editing TOML)");

@@ -109,6 +109,75 @@ interface PendingToolCall {
   args: string;
 }
 
+/** Per-`send()` options. */
+export interface SendOpts {
+  /**
+   * Cancellation signal. When it fires:
+   *   - before the turn starts, `send()` throws `AbortError` immediately and
+   *     the history is left untouched;
+   *   - mid-stream, the partial assistant text collected so far is committed to
+   *     history with an ` [aborted]` marker (so callers can see partial
+   *     progress) and `send()` throws `AbortError`;
+   *   - between tool calls, any not-yet-executed calls in the round get a
+   *     synthetic `[aborted]` tool result so history stays well-formed, then
+   *     `send()` throws `AbortError`.
+   * The signal is also threaded into the LLM request so providers abort the
+   * underlying transport.
+   */
+  signal?: AbortSignal;
+}
+
+/** Construct the canonical abort error (matches the Fetch/Streams convention). */
+function abortError(): DOMException {
+  return new DOMException("Aborted", "AbortError");
+}
+
+/** True when `err` is an AbortError (DOMException or a plain `.name` carrier). */
+function isAbortError(err: unknown): boolean {
+  return !!err && typeof err === "object" && (err as { name?: string }).name === "AbortError";
+}
+
+/**
+ * Iterate `iterable`, but reject with `AbortError` as soon as `signal` fires —
+ * even while we are parked awaiting the next chunk. The underlying iterator is
+ * best-effort cancelled (`return()`) on exit so providers can release sockets.
+ */
+async function* iterateWithAbort<T>(
+  iterable: AsyncIterable<T>,
+  signal?: AbortSignal,
+): AsyncIterable<T> {
+  if (!signal) {
+    yield* iterable;
+    return;
+  }
+  if (signal.aborted) throw abortError();
+  const iter = iterable[Symbol.asyncIterator]();
+  let onAbort!: () => void;
+  const abortPromise = new Promise<never>((_, reject) => {
+    onAbort = () => reject(abortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    for (;;) {
+      const res = await Promise.race([iter.next(), abortPromise]);
+      if (res.done) return;
+      yield res.value;
+    }
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    // Best-effort cancel of the underlying iterator. We must NOT await it: a
+    // provider parked on a never-settling promise would make `return()` hang
+    // too. Real fetch/SDK iterators settle once the transport is aborted.
+    const ret = iter.return?.();
+    if (ret && typeof (ret as Promise<unknown>).then === "function") {
+      (ret as Promise<unknown>).then(
+        () => {},
+        () => {},
+      );
+    }
+  }
+}
+
 export class ChatSession {
   private readonly llm: LLMProvider;
   private readonly tools: ToolSpec[];
@@ -174,15 +243,24 @@ export class ChatSession {
    * Run one user turn. Streams text/tool events; resolves the conversation by
    * looping through tool calls until the model stops requesting them.
    */
-  async *send(userText: string): AsyncIterable<ChatEvent> {
+  async *send(userText: string, opts: SendOpts = {}): AsyncIterable<ChatEvent> {
+    const signal = opts.signal;
+    // Abort before we touch history: leave `messages` untouched and bail.
+    if (signal?.aborted) throw abortError();
+
     this.messages.push({ role: "user", content: userText });
 
     for (let round = 0; round <= this.maxToolRounds; round++) {
+      // Abort between rounds (history is well-formed here: every prior
+      // assistant tool-call has a paired tool result).
+      if (signal?.aborted) throw abortError();
+
       const req: LLMRequest = {
         messages: this.messages.map((m) => ({ ...m })),
         model: this.model ?? "",
         ...(this.temperature !== undefined ? { temperature: this.temperature } : {}),
         ...(this.maxTokens !== undefined ? { maxTokens: this.maxTokens } : {}),
+        ...(signal ? { signal } : {}),
         ...(this.tools.length > 0
           ? {
               tools: this.tools.map((t) => ({
@@ -201,24 +279,38 @@ export class ChatSession {
       const callOrder: string[] = [];
       const calls = new Map<string, PendingToolCall>();
 
-      for await (const chunk of response.stream()) {
-        if (chunk.type === "text") {
-          text += chunk.delta;
-          yield { type: "text", delta: chunk.delta };
-        } else if (chunk.type === "tool-call") {
-          const key = chunk.id || chunk.name || `call_${callOrder.length}`;
-          let pending = calls.get(key);
-          if (!pending) {
-            pending = { id: chunk.id || key, name: chunk.name, args: "" };
-            calls.set(key, pending);
-            callOrder.push(key);
+      try {
+        for await (const chunk of iterateWithAbort(response.stream(), signal)) {
+          if (chunk.type === "text") {
+            text += chunk.delta;
+            yield { type: "text", delta: chunk.delta };
+          } else if (chunk.type === "tool-call") {
+            const key = chunk.id || chunk.name || `call_${callOrder.length}`;
+            let pending = calls.get(key);
+            if (!pending) {
+              pending = { id: chunk.id || key, name: chunk.name, args: "" };
+              calls.set(key, pending);
+              callOrder.push(key);
+            }
+            if (chunk.name) pending.name = chunk.name;
+            if (chunk.id) pending.id = chunk.id;
+            pending.args += chunk.argsDelta;
+          } else if (chunk.type === "done") {
+            finishReason = chunk.finishReason;
           }
-          if (chunk.name) pending.name = chunk.name;
-          if (chunk.id) pending.id = chunk.id;
-          pending.args += chunk.argsDelta;
-        } else if (chunk.type === "done") {
-          finishReason = chunk.finishReason;
         }
+      } catch (err) {
+        if (isAbortError(err)) {
+          // Commit the partial assistant text so the user/goal can see how far
+          // we got. We deliberately drop any half-streamed tool calls: the
+          // assistant message carries no `toolCalls`, so history stays
+          // well-formed (no dangling tool_call awaiting a tool result).
+          this.messages.push({
+            role: "assistant",
+            content: text.length > 0 ? `${text} [aborted]` : "[aborted]",
+          });
+        }
+        throw err;
       }
 
       const toolCalls = callOrder
@@ -272,7 +364,24 @@ export class ChatSession {
         return;
       }
 
-      for (const call of toolCalls) {
+      for (let ci = 0; ci < toolCalls.length; ci++) {
+        const call = toolCalls[ci];
+        // Abort between tool calls: keep history well-formed by closing every
+        // remaining (un-executed) call with a synthetic `[aborted]` tool
+        // result, then surface the AbortError to the caller.
+        if (signal?.aborted) {
+          for (let ri = ci; ri < toolCalls.length; ri++) {
+            const pending = toolCalls[ri];
+            this.messages.push({
+              role: "tool",
+              content: "[aborted]",
+              toolCallId: pending.id,
+              name: pending.name,
+            });
+          }
+          throw abortError();
+        }
+
         yield { type: "tool-call", id: call.id, name: call.name, args: call.args };
 
         const tool = this.toolByName.get(call.name);

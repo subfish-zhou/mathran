@@ -36,6 +36,6 @@ export class OpenAIAdapter implements LLMProvider {
   async chat(req: LLMRequest): Promise<LLMResponse> {
     const client = this.client;
     const params = buildOpenAIParams(req, req.model || this.defaultModel || "");
-    return { stream: () => streamOpenAI(client, params) };
+    return { stream: () => streamOpenAI(client, params, req.signal) };
   }
 }

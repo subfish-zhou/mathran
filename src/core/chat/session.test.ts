@@ -363,4 +363,89 @@ describe("ChatSession", () => {
     expect(toolMsg.content).toBe(big);
     expect(toolMsg.content).not.toContain("[output truncated");
   });
+
+  describe("AbortSignal (v0.2 §7)", () => {
+    it("throws AbortError immediately when the signal is already aborted", async () => {
+      const llm = new ScriptedLLM([
+        [{ type: "text", delta: "should not run" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({ llm, model: "m" });
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(collect(session.send("hi", { signal: controller.signal }))).rejects.toMatchObject({
+        name: "AbortError",
+      });
+      // History untouched — not even the user turn was committed, and the LLM
+      // was never contacted.
+      expect(session.history()).toEqual([]);
+      expect(llm.requests).toHaveLength(0);
+    });
+
+    it("saves a partial assistant turn with an [aborted] marker on mid-stream abort", async () => {
+      // A provider that yields one chunk then blocks forever on the next — the
+      // abort must unblock the consumer via the iterator race.
+      const slowLlm: LLMProvider = {
+        async describe() {
+          return { name: "slow" };
+        },
+        async chat(): Promise<LLMResponse> {
+          return {
+            stream() {
+              return (async function* () {
+                yield { type: "text", delta: "partial answer" } as LLMStreamChunk;
+                // Never resolves; only the abort race ends the wait.
+                await new Promise<void>(() => {});
+                yield { type: "done", finishReason: "stop" } as LLMStreamChunk;
+              })();
+            },
+          };
+        },
+      };
+      const session = new ChatSession({ llm: slowLlm, model: "m" });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 50);
+
+      const out: ChatEvent[] = [];
+      await expect(
+        (async () => {
+          for await (const ev of session.send("go", { signal: controller.signal })) out.push(ev);
+        })(),
+      ).rejects.toMatchObject({ name: "AbortError" });
+      clearTimeout(timer);
+
+      // We streamed the first delta before the abort landed.
+      expect(out).toContainEqual({ type: "text", delta: "partial answer" });
+
+      // History advanced by exactly 2 (user + partial assistant), and the
+      // assistant turn carries the [aborted] marker.
+      const history = session.history();
+      expect(history).toHaveLength(2);
+      expect(history[0]).toMatchObject({ role: "user", content: "go" });
+      expect(history[1].role).toBe("assistant");
+      expect(history[1].content).toContain("partial answer");
+      expect(history[1].content).toContain("[aborted]");
+    });
+
+    it("ignores a signal that aborts only after send() has completed", async () => {
+      const llm = new ScriptedLLM([
+        [
+          { type: "text", delta: "all" },
+          { type: "text", delta: " done" },
+          { type: "done", finishReason: "stop" },
+        ],
+      ]);
+      const session = new ChatSession({ llm, model: "m" });
+      const controller = new AbortController();
+
+      const events = await collect(session.send("hi", { signal: controller.signal }));
+      expect(events.at(-1)).toEqual({ type: "done", finishReason: "stop" });
+
+      // Aborting now is a no-op: the completed turn stays intact, no marker.
+      controller.abort();
+      const history = session.history();
+      expect(history.at(-1)).toMatchObject({ role: "assistant", content: "all done" });
+      expect(history.at(-1)!.content).not.toContain("[aborted]");
+    });
+  });
 });

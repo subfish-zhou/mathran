@@ -18,6 +18,8 @@ import {
   runGoalStatus,
   runGoalPause,
   runGoalCancel,
+  runGoalStop,
+  goalStopMarkerPath,
 } from "./goal.js";
 import { readGoal } from "../../core/goal/store.js";
 
@@ -210,5 +212,35 @@ describe("runGoalPause + runGoalCancel", () => {
     stderr = "";
     expect(await runGoalPause(id, { workspace })).toBe(1);
     expect(stderr).toMatch(/can only pause active/);
+  });
+});
+
+describe("runGoalStop (v0.2 §7)", () => {
+  it("writes a <id>.stop marker for an existing goal", async () => {
+    await runGoalStart("obj", { workspace, configPath: cfgPath, noRun: true });
+    const files = await fs.readdir(path.join(workspace, ".mathran", "goals"));
+    const id = files[0].replace(/\.json$/, "");
+
+    const code = await runGoalStop(id, { workspace });
+    expect(code).toBe(0);
+    expect(stdout).toContain("stop marker");
+
+    const marker = goalStopMarkerPath(workspace, id);
+    const exists = await fs
+      .stat(marker)
+      .then(() => true)
+      .catch(() => false);
+    expect(exists).toBe(true);
+
+    // The goal's status is NOT changed by a stop request.
+    const round = await readGoal(workspace, id);
+    expect(round?.status).toBe("active");
+  });
+
+  it("rejects an unknown goal id", async () => {
+    stderr = "";
+    const code = await runGoalStop("ghostghost", { workspace });
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/not found or ambiguous/);
   });
 });

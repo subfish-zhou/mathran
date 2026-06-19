@@ -70,6 +70,7 @@ export class CopilotAdapter implements LLMProvider {
       ...(systemParts.length ? { systemPrompt: systemParts.join("\n\n") } : {}),
       ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),
       ...(req.tools && req.tools.length > 0 ? { tools: req.tools } : {}),
+      ...(req.signal ? { signal: req.signal } : {}),
     };
 
     return {

@@ -132,13 +132,15 @@ export class AnthropicAdapter implements LLMProvider {
     }
     if (req.extra) Object.assign(params, req.extra);
 
-    return { stream: () => streamAnthropic(client, params) };
+    const signal = req.signal;
+    return { stream: () => streamAnthropic(client, params, signal) };
   }
 }
 
 async function* streamAnthropic(
   client: Anthropic,
   params: any,
+  signal?: AbortSignal,
 ): AsyncIterable<LLMStreamChunk> {
   let finishReason: FinishReason = "stop";
   let usage: { promptTokens: number; completionTokens: number } | undefined;
@@ -147,7 +149,7 @@ async function* streamAnthropic(
   const blocks: Record<number, { id: string; name: string }> = {};
 
   try {
-    const stream: any = await client.messages.create(params);
+    const stream: any = await client.messages.create(params, signal ? { signal } : undefined);
     for await (const event of stream) {
       switch (event?.type) {
         case "message_start": {
