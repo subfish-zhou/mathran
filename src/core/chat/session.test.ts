@@ -449,3 +449,204 @@ describe("ChatSession", () => {
     });
   });
 });
+
+// ─── v0.2 §5: /compact + auto-compact ──────────────────────────────────────────
+
+import type { LLMMessage as _LLMMessage } from "../providers/llm.js";
+
+/** Counting LLM — surfaces a configurable countTokens for autoCompact tests. */
+class CountingScriptedLLM implements LLMProvider {
+  readonly requests: LLMRequest[] = [];
+  private i = 0;
+  constructor(
+    private turns: LLMStreamChunk[][],
+    public tokenReturn: number,
+  ) {}
+  async describe() {
+    return { name: "counting-scripted" };
+  }
+  async chat(req: LLMRequest): Promise<LLMResponse> {
+    this.requests.push(req);
+    const turn = this.turns[this.i] ?? [{ type: "done", finishReason: "stop" }];
+    this.i += 1;
+    return responseOf(turn);
+  }
+  countTokens(_msgs: _LLMMessage[]): number {
+    return this.tokenReturn;
+  }
+}
+
+async function withWorkspace<T>(fn: (ws: string) => Promise<T>): Promise<T> {
+  const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-session-compact-"));
+  try {
+    return await fn(ws);
+  } finally {
+    await fs.rm(ws, { recursive: true, force: true });
+  }
+}
+
+describe("ChatSession.compact (v0.2 §5)", () => {
+  it("swaps the in-memory history when middle chunk is non-empty", async () => {
+    await withWorkspace(async (ws) => {
+      // Summarizer LLM (used by the runner) and the per-turn scripted LLM are
+      // the same object here — simplest possible setup.
+      const llm = new ScriptedLLM([
+        [{ type: "text", delta: "SUMMARY" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        systemPrompt: "SYS",
+        workspace: ws,
+      });
+      // Seed 20 rounds worth of history.
+      const seed: _LLMMessage[] = [];
+      for (let i = 1; i <= 20; i++) {
+        seed.push({ role: "user", content: `q${i}` });
+        seed.push({ role: "assistant", content: `a${i}` });
+      }
+      session.replaceHistory(seed);
+
+      const stats = await session.compact({ keepRecentRounds: 3 });
+      expect(stats.noop).toBe(false);
+      expect(stats.droppedRoundCount).toBe(17);
+      expect(stats.originalTokenCount).toBeGreaterThan(stats.newTokenCount);
+
+      const h = session.history();
+      // Expect: [system, summary-system, last 3 rounds = 6 msgs]
+      expect(h.length).toBe(2 + 6);
+      expect(h[0].role).toBe("system");
+      expect(h[0].content).toBe("SYS");
+      expect(h[1].role).toBe("system");
+      expect(h[1].content).toContain("SUMMARY");
+      expect(h[h.length - 2]).toMatchObject({ role: "user", content: "q20" });
+    });
+  });
+
+  it("is a no-op when history is short", async () => {
+    await withWorkspace(async (ws) => {
+      const llm = new ScriptedLLM([]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        systemPrompt: "SYS",
+        workspace: ws,
+      });
+      session.replaceHistory([
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "hello" },
+      ]);
+      const stats = await session.compact({ keepRecentRounds: 5 });
+      expect(stats.noop).toBe(true);
+      expect(stats.droppedRoundCount).toBe(0);
+      // History unchanged.
+      const h = session.history();
+      expect(h.length).toBe(3); // system + user + assistant
+    });
+  });
+
+  it("send() still works on the compacted history", async () => {
+    await withWorkspace(async (ws) => {
+      const llm = new ScriptedLLM([
+        // Compaction summarizer call.
+        [{ type: "text", delta: "OLD-SUMMARY" }, { type: "done", finishReason: "stop" }],
+        // The next send() turn.
+        [{ type: "text", delta: "post-compact reply" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        systemPrompt: "SYS",
+        workspace: ws,
+      });
+      const seed: _LLMMessage[] = [];
+      for (let i = 1; i <= 12; i++) {
+        seed.push({ role: "user", content: `q${i}` });
+        seed.push({ role: "assistant", content: `a${i}` });
+      }
+      session.replaceHistory(seed);
+      await session.compact({ keepRecentRounds: 2 });
+      const events = await collect(session.send("new question"));
+      const text = events
+        .filter((e) => e.type === "text")
+        .map((e) => (e as Extract<ChatEvent, { type: "text" }>).delta)
+        .join("");
+      expect(text).toBe("post-compact reply");
+      // Last message is the assistant reply, prior is the new user msg.
+      const h = session.history();
+      expect(h.at(-1)).toMatchObject({ role: "assistant", content: "post-compact reply" });
+      expect(h.at(-2)).toMatchObject({ role: "user", content: "new question" });
+    });
+  });
+
+  it("autoCompact disabled → never triggers compact even when over threshold", async () => {
+    await withWorkspace(async (ws) => {
+      const llm = new CountingScriptedLLM(
+        [[{ type: "text", delta: "reply" }, { type: "done", finishReason: "stop" }]],
+        999_999, // huge token count
+      );
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        systemPrompt: "SYS",
+        workspace: ws,
+        // autoCompact NOT set.
+      });
+      const seed: _LLMMessage[] = [];
+      for (let i = 1; i <= 20; i++) {
+        seed.push({ role: "user", content: `q${i}` });
+        seed.push({ role: "assistant", content: `a${i}` });
+      }
+      session.replaceHistory(seed);
+      const lenBefore = session.history().length;
+      await collect(session.send("new turn"));
+      const lenAfter = session.history().length;
+      // No compaction happened → history just grew by user + assistant (2).
+      expect(lenAfter).toBe(lenBefore + 2);
+    });
+  });
+
+  it("autoCompact enabled + high token count → compacts before the provider call", async () => {
+    await withWorkspace(async (ws) => {
+      const llm = new CountingScriptedLLM(
+        [
+          // Summarizer call.
+          [{ type: "text", delta: "AUTO-SUMMARY" }, { type: "done", finishReason: "stop" }],
+          // Real send() turn.
+          [{ type: "text", delta: "compacted reply" }, { type: "done", finishReason: "stop" }],
+        ],
+        999_999, // way over threshold
+      );
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        systemPrompt: "SYS",
+        workspace: ws,
+        autoCompact: {
+          enabled: true,
+          thresholdPct: 0.5,
+          keepRecentRounds: 2,
+          contextWindow: 1000,
+        },
+      });
+      const seed: _LLMMessage[] = [];
+      for (let i = 1; i <= 15; i++) {
+        seed.push({ role: "user", content: `q${i}` });
+        seed.push({ role: "assistant", content: `a${i}` });
+      }
+      session.replaceHistory(seed);
+
+      await collect(session.send("please continue"));
+
+      const h = session.history();
+      // After auto-compact: [system, summary-system, last 2 rounds = 4 msgs, new user, new assistant]
+      expect(h.length).toBe(2 + 4 + 2);
+      expect(h[1].role).toBe("system");
+      expect(h[1].content).toContain("AUTO-SUMMARY");
+      // The provider should have been called twice: once for the summarizer,
+      // once for the actual user turn.
+      expect(llm.requests.length).toBe(2);
+    });
+  });
+});
+

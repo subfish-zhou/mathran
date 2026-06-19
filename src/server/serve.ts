@@ -746,6 +746,49 @@ function registerChatScope(
     const ok = await store.drop(resolved.scope!, id);
     return c.json({ dropped: ok });
   });
+
+  // POST <base>/:conversationId/compact  — compact this conversation (v0.2 §5)
+  app.post(`${basePath}/:conversationId/compact`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+
+    // 404 unless the conversation is already on disk (we don't lazy-create here).
+    const history = await store.readHistory(scope, id);
+    if (history === null) return c.json({ error: "conversation not found" }, 404);
+
+    let body: any = {};
+    try {
+      const raw = await c.req.text();
+      if (raw && raw.trim().length > 0) body = JSON.parse(raw);
+    } catch {
+      // Ignore malformed body; treat as no opts.
+    }
+    const keep =
+      typeof body?.keepRecentRounds === "number" && body.keepRecentRounds > 0
+        ? body.keepRecentRounds
+        : undefined;
+
+    let session: ChatSession;
+    try {
+      session = await store.getOrCreate(scope, id, undefined);
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 500);
+    }
+
+    try {
+      const stats = await session.compact(keep ? { keepRecentRounds: keep } : undefined);
+      // Persist the freshly-shortened history.
+      await store.flush(scope, id);
+      return c.json({ ok: true, stats });
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 500);
+    }
+  });
 }
 
 /** Register all three chat scopes + the legacy `/api/chat` alias. */

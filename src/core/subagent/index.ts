@@ -9,7 +9,7 @@ export type {
   SubagentContext,
   SubagentRunner,
 } from "./types.js";
-export { SubagentRegistry } from "./registry.js";
+export { SubagentRegistry, defaultSubagentRegistry } from "./registry.js";
 export { SubagentScheduler } from "./scheduler.js";
 export type { SchedulerOpts } from "./scheduler.js";
 export {
@@ -18,3 +18,13 @@ export {
   readArtifact,
   listArtifactRuns,
 } from "./artifact.js";
+export {
+  compactRunner,
+  computeCompacted,
+  findKeepStartIndex,
+  DEFAULT_KEEP_RECENT_ROUNDS,
+  DEFAULT_CONTEXT_WINDOW,
+  COMPACT_SUMMARY_PREFIX,
+  type CompactRunnerInput,
+  type CompactedArtifact,
+} from "./runners/compact.js";
