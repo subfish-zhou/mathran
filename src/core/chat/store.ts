@@ -105,6 +105,20 @@ function conversationFile(dir: string, conversationId: string): string {
   return path.join(dir, `${conversationId}.jsonl`);
 }
 
+/**
+ * Public path resolver for a (scope, conversationId) jsonl. Exposed so the
+ * goal runner (and any future caller that needs the on-disk location for
+ * audit / migration / debugging) can compute the same path the store uses
+ * without recreating the layout rules.
+ */
+export function conversationFilePath(
+  workspace: string,
+  scope: ChatScope,
+  conversationId: string,
+): string {
+  return conversationFile(scopeDir(workspace, scope), conversationId);
+}
+
 /** Persist the full message history of a session as one `.jsonl` file. */
 async function flushSession(dir: string, conversationId: string, history: LLMMessage[]): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
@@ -141,6 +155,74 @@ async function flushTranscript(
     path.join(transcriptsDir, `${conversationId}.md`),
     md + (md.endsWith("\n") ? "" : "\n"),
   );
+}
+
+/**
+ * Reusable conversation persistence helpers (v0.2 §10).
+ *
+ * Both `ScopedChatSessionStore` (chat REPL / `serve`) and `GoalRunner`
+ * persist a stream of `LLMMessage`s scoped by (ChatScope, conversationId).
+ * Before §10 the goal runner duplicated the jsonl read/write inline, which
+ * meant it skipped atomic-write + the `.index.json` directory + the
+ * Markdown transcript that the chat store maintains. These two thin
+ * functions are the single source of truth — `ScopedChatSessionStore`
+ * delegates to them internally too (see below).
+ *
+ * Path layout is identical to the chat store, so existing
+ * `<workspace>/.mathran/global-chat/<id>.jsonl` (or project / effort dirs)
+ * files keep working unchanged — no migration required.
+ */
+
+/**
+ * Load a conversation's history from disk for the given scope. Returns an
+ * empty array if there is no file yet, matching the runner's previous
+ * "start a fresh conversation" semantics.
+ */
+export async function loadConversationHistory(
+  workspace: string,
+  scope: ChatScope,
+  conversationId: string,
+): Promise<LLMMessage[]> {
+  const out = await loadHistory(scopeDir(workspace, scope), conversationId);
+  return out ?? [];
+}
+
+/**
+ * Persist a conversation's full message history for the given scope. Performs
+ * the same three writes the chat store does after every `send()`:
+ *   - atomic write of the `.jsonl` (via `atomic-write.ts`),
+ *   - update of the per-scope `.index.json` (title / lastUsedAt / count),
+ *   - render of a Markdown transcript next to the jsonl.
+ * The transcript write is best-effort and never fails the call.
+ */
+export async function flushConversationHistory(
+  workspace: string,
+  scope: ChatScope,
+  conversationId: string,
+  history: LLMMessage[],
+  opts?: { title?: string },
+): Promise<void> {
+  const dir = scopeDir(workspace, scope);
+  await flushSession(dir, conversationId, history);
+
+  const idx = await readIndex(dir);
+  const now = new Date().toISOString();
+  const existing = idx.conversations[conversationId];
+  const resolvedTitle = existing?.title ?? opts?.title ?? deriveTitle(history);
+  idx.conversations[conversationId] = {
+    id: conversationId,
+    title: resolvedTitle,
+    createdAt: existing?.createdAt ?? now,
+    lastUsedAt: now,
+    messageCount: history.length,
+  };
+  await writeIndex(dir, idx);
+
+  try {
+    await flushTranscript(dir, conversationId, history, { scope, title: resolvedTitle });
+  } catch {
+    /* transcript is best-effort */
+  }
 }
 
 /** Lazy-load a conversation's history from disk. Returns null if no file. */
@@ -250,29 +332,15 @@ export class ScopedChatSessionStore {
     const key = this.cacheKey(scope, conversationId);
     const entry = this.entries.get(key);
     if (!entry) return;
-    const dir = scopeDir(this.workspace, scope);
-    const history = entry.session.history();
-    await flushSession(dir, conversationId, history);
-
-    const idx = await readIndex(dir);
-    const now = new Date().toISOString();
-    const existing = idx.conversations[conversationId];
-    const resolvedTitle = existing?.title ?? title ?? deriveTitle(history);
-    idx.conversations[conversationId] = {
-      id: conversationId,
-      title: resolvedTitle,
-      createdAt: existing?.createdAt ?? now,
-      lastUsedAt: now,
-      messageCount: history.length,
-    };
-    await writeIndex(dir, idx);
-
-    // GAP #13: keep a Markdown transcript view next to the jsonl.
-    try {
-      await flushTranscript(dir, conversationId, history, { scope, title: resolvedTitle });
-    } catch {
-      // Transcript is a convenience; never fail flush() on it.
-    }
+    // Delegate to the shared persistence helpers (v0.2 §10) so chat + goal
+    // can never drift on jsonl layout, index format, or transcript shape.
+    await flushConversationHistory(
+      this.workspace,
+      scope,
+      conversationId,
+      entry.session.history(),
+      title !== undefined ? { title } : undefined,
+    );
   }
 
   /** Drop a conversation: cache + disk file + index entry. */
