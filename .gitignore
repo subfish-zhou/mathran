@@ -69,3 +69,4 @@ logs/
 
 # v0.2 §1 subagent artifact scratch (per-runId compacted.json etc.)
 .mathran/
+src/server/static-assets.generated.ts

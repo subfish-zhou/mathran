@@ -27,6 +27,10 @@ import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
+import {
+  embeddedAssetCount,
+  makeEmbeddedAssetHandler,
+} from "./static-assets.js";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import YAML from "yaml";
 import { createTwoFilesPatch } from "diff";
@@ -1779,30 +1783,38 @@ function buildApp(
   registerChatRoutes(app, workspace, sessions);
 
   // ─── Static hosting / placeholder ──────────────────────────────────────────
-  const webDir = path.join(repoRoot(), "dist", "web");
-  if (fssync.existsSync(webDir)) {
-    const rel = path.relative(process.cwd(), webDir) || ".";
-    app.use("/*", serveStatic({ root: rel }));
-    app.get("/", serveStatic({ root: rel, path: "index.html" }));
-    // SPA fallback: any non-API GET that didn't match a static file should
-    // serve `index.html` so the React app's client-side routing survives a
-    // hard refresh on a deep URL (PRD §3a).
-    const indexPath = path.join(webDir, "index.html");
-    app.notFound(async (c) => {
-      if (c.req.method !== "GET") return c.json({ error: "not found" }, 404);
-      const url = new URL(c.req.url);
-      if (url.pathname.startsWith("/api/")) {
-        return c.json({ error: "not found" }, 404);
-      }
-      try {
-        const html = await fs.readFile(indexPath, "utf-8");
-        return c.html(html);
-      } catch {
-        return c.json({ error: "not found" }, 404);
-      }
-    });
+  // Three layers (v0.15 §3 single-binary support):
+  //   1. embedded asset map (populated when the generator has run; required
+  //      under `bun build --compile` because the binary has no surrounding
+  //      `dist/web/` dir)
+  //   2. on-disk `dist/web/` via @hono/node-server's serveStatic (dev /
+  //      `node dist/cli/index.js serve` path)
+  //   3. tiny placeholder page (neither is available)
+  if (embeddedAssetCount() > 0) {
+    app.use("/*", makeEmbeddedAssetHandler());
   } else {
-    app.get("/", (c) => c.html(PLACEHOLDER_HTML));
+    const webDir = path.join(repoRoot(), "dist", "web");
+    if (fssync.existsSync(webDir)) {
+      const rel = path.relative(process.cwd(), webDir) || ".";
+      app.use("/*", serveStatic({ root: rel }));
+      app.get("/", serveStatic({ root: rel, path: "index.html" }));
+      const indexPath = path.join(webDir, "index.html");
+      app.notFound(async (c) => {
+        if (c.req.method !== "GET") return c.json({ error: "not found" }, 404);
+        const url = new URL(c.req.url);
+        if (url.pathname.startsWith("/api/")) {
+          return c.json({ error: "not found" }, 404);
+        }
+        try {
+          const html = await fs.readFile(indexPath, "utf-8");
+          return c.html(html);
+        } catch {
+          return c.json({ error: "not found" }, 404);
+        }
+      });
+    } else {
+      app.get("/", (c) => c.html(PLACEHOLDER_HTML));
+    }
   }
 
   return app;

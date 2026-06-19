@@ -560,6 +560,10 @@ program
     process.exit(await runDoctor({ probe: opts.probe }));
   });
 
+// `bun build --compile` produces an argv that matches Node's convention:
+// argv[0] = bun runtime, argv[1] = embedded script path, argv[2+] = user args.
+// So commander's default "node" parsing works without further help (the
+// earlier v0.15 §3 wrap attempt was based on a wrong assumption).
 program.parseAsync(process.argv).catch((err) => {
   console.error(err);
   process.exit(1);

@@ -194,8 +194,22 @@ export class LocalLeanProvider implements LeanProvider {
 }
 
 // CLI smoke-test: `tsx src/providers/lean/local.ts <file>`
+// Note: in a `bun build --compile` bundle, *every* module's `import.meta.url`
+// resolves to the same single-file binary path (e.g. `/$bunfs/root/<name>`).
+// That makes `fileURLToPath(meta) === resolve(argv[1])` true even when the
+// real entry is the CLI — we'd then accidentally trigger this smoke-test
+// on every `mathran <anything>` invocation. Guard with `import.meta.main`,
+// which Bun (and Node ≥ 21) sets only on the *real* entry module.
 const moduleUrl = import.meta.url;
-const invokedAsScript = process.argv[1] && fileURLToPath(moduleUrl) === path.resolve(process.argv[1]);
+const metaMain = (import.meta as unknown as { main?: boolean }).main;
+const invokedAsScript =
+  metaMain === true ||
+  (metaMain === undefined &&
+    process.argv[1] &&
+    fileURLToPath(moduleUrl) === path.resolve(process.argv[1]) &&
+    // Belt-and-suspenders: refuse to self-run if we're clearly inside a bun
+    // single-file bundle (path starts with the virtual `$bunfs/` prefix).
+    !fileURLToPath(moduleUrl).startsWith("/$bunfs/"));
 if (invokedAsScript) {
   const file = process.argv[2];
   if (!file) {
