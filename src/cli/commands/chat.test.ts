@@ -214,3 +214,112 @@ describe("handleSlashCommand: /compact", () => {
   });
 });
 
+describe("handleSlashCommand: /memory (v0.3 §14)", () => {
+  it("prints both files with byte counts (or 'not present')", async () => {
+    // No files in tmpDir—both should report not present (project at least).
+    const res = await handleSlashCommand("/memory", {
+      ...ctx,
+      memoryWorkspace: tmpDir,
+      homeOverride: tmpDir,
+    });
+    expect(res.kind).toBe("continue");
+    expect(res.output).toMatch(/MATHRAN.md memory/);
+    expect(res.output).toContain("global:");
+    expect(res.output).toContain("project:");
+    expect(res.output).toContain("not present");
+  });
+
+  it("reports byte counts when files exist", async () => {
+    const proj = path.join(tmpDir, "MATHRAN.md");
+    await fs.writeFile(proj, "hello", "utf8");
+    const res = await handleSlashCommand("/memory", {
+      ...ctx,
+      memoryWorkspace: tmpDir,
+      homeOverride: tmpDir,
+    });
+    expect(res.output).toMatch(/project: .* \(5 bytes\)/);
+  });
+
+  it("/memory help prints sub-command list", async () => {
+    const res = await handleSlashCommand("/memory help", ctx);
+    expect(res.kind).toBe("continue");
+    expect(res.output).toContain("/memory edit project");
+    expect(res.output).toContain("/memory edit global");
+  });
+
+  it("rejects unknown sub-command", async () => {
+    const res = await handleSlashCommand("/memory dance", ctx);
+    expect(res.kind).toBe("continue");
+    expect(res.output).toMatch(/unknown \/memory sub-command "dance"/);
+  });
+
+  it("/memory edit without scope prints usage", async () => {
+    const res = await handleSlashCommand("/memory edit", ctx);
+    expect(res.kind).toBe("continue");
+    expect(res.output).toMatch(/usage: \/memory edit project\|global/);
+  });
+
+  it("/memory edit project seeds a default header when the file is missing", async () => {
+    const res = await handleSlashCommand("/memory edit project", {
+      ...ctx,
+      memoryWorkspace: tmpDir,
+      homeOverride: tmpDir,
+      editorOverride: "true", // /usr/bin/true — no-op editor, exits 0
+    });
+    expect(res.kind).toBe("continue");
+    const created = await fs.readFile(path.join(tmpDir, "MATHRAN.md"), "utf8");
+    expect(created).toContain("# MATHRAN project memory");
+  });
+
+  it("/memory edit global creates ~/.mathran/ dir if missing", async () => {
+    const fakeHome = path.join(tmpDir, "fake-home");
+    // intentionally don't pre-create the dir
+    const res = await handleSlashCommand("/memory edit global", {
+      ...ctx,
+      memoryWorkspace: tmpDir,
+      homeOverride: fakeHome,
+      editorOverride: "true",
+    });
+    expect(res.kind).toBe("continue");
+    const created = await fs.readFile(
+      path.join(fakeHome, ".mathran", "MATHRAN.md"),
+      "utf8",
+    );
+    expect(created).toContain("# MATHRAN global memory");
+  });
+
+  it("/memory edit + promptReload=true appends a fresh memory system message", async () => {
+    await fs.writeFile(path.join(tmpDir, "MATHRAN.md"), "NEW_BODY", "utf8");
+    const before = session.history().length;
+    const res = await handleSlashCommand("/memory edit project", {
+      ...ctx,
+      memoryWorkspace: tmpDir,
+      homeOverride: tmpDir,
+      editorOverride: "true",
+      promptReload: async () => true,
+    });
+    expect(res.kind).toBe("continue");
+    expect(res.output).toMatch(/memory reloaded/);
+    const after = session.history();
+    expect(after.length).toBe(before + 1);
+    const last = after[after.length - 1];
+    expect(last.role).toBe("system");
+    expect(last.content).toContain("Persistent memory updated");
+    expect(last.content).toContain("NEW_BODY");
+  });
+
+  it("/memory edit + promptReload=false does NOT mutate history", async () => {
+    await fs.writeFile(path.join(tmpDir, "MATHRAN.md"), "keep me", "utf8");
+    const before = session.history().length;
+    const res = await handleSlashCommand("/memory edit project", {
+      ...ctx,
+      memoryWorkspace: tmpDir,
+      homeOverride: tmpDir,
+      editorOverride: "true",
+      promptReload: async () => false,
+    });
+    expect(res.kind).toBe("continue");
+    expect(session.history().length).toBe(before);
+  });
+});
+
