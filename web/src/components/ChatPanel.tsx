@@ -21,6 +21,7 @@ import {
   type ToolBubble,
 } from "../lib/history-to-bubbles.ts";
 import ContextMeter from "./ContextMeter.tsx";
+import { ToolCallDisplay } from "./ToolCallDisplay.tsx";
 
 export default function ChatPanel({
   scope,
@@ -353,30 +354,7 @@ export default function ChatPanel({
           )}
           {bubbles.map((b, i) =>
             b.kind === "tool" ? (
-              <div
-                key={i}
-                className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs"
-              >
-                <div className="font-semibold text-amber-800">
-                  🛠 {b.name}
-                  {b.ok !== undefined && (
-                    <span className={b.ok ? "text-green-700" : "text-red-700"}>
-                      {" "}
-                      · {b.ok ? "ok" : "failed"}
-                    </span>
-                  )}
-                </div>
-                {b.args && (
-                  <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words text-amber-900">
-                    {b.args}
-                  </pre>
-                )}
-                {b.result && (
-                  <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words text-slate-700">
-                    {b.result}
-                  </pre>
-                )}
-              </div>
+              <ToolCallDisplay key={i} toolCall={b} />
             ) : (
               <div
                 key={i}
