@@ -336,7 +336,17 @@ export class ChatSession {
     this.model = opts.model;
     this.tools = opts.tools ?? [];
     this.toolByName = new Map(this.tools.map((t) => [t.name, t]));
-    this.maxToolRounds = opts.maxToolRounds ?? 8;
+    // Tool-call round cap. Default raised from 8 → 50 (v0.12.x).
+    //
+    // Background: at 8 rounds, LLM doing legitimate multi-step exploration
+    // (e.g. reading a multi-thousand-line file via `sed` slices because
+    // `read_file` is still un-paged) gets cut off mid-task with
+    // "tool-call budget exhausted". Claude Code has no equivalent hard cap;
+    // it bounds tool *output* (25K tokens per result, 100K total) and lets
+    // the LLM loop freely. v0.13 will follow that approach (paged read_file
+    // + per-result token cap) so this number becomes a runaway safety net,
+    // not a routine limit.
+    this.maxToolRounds = opts.maxToolRounds ?? 50;
     this.temperature = opts.temperature;
     this.maxTokens = opts.maxTokens;
     this.toolContext = opts.toolContext;

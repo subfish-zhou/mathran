@@ -409,3 +409,55 @@ describe("ScopedChatSessionStore eviction race (v0.3 §20)", () => {
     }
   });
 });
+
+describe("peekLiveHistory (v0.12.x — /usage live-stream meter)", () => {
+  it("returns the in-memory history of a cached session without touching disk", async () => {
+    const store = new ScopedChatSessionStore(workspace, makeFactory());
+    await send(store, { kind: "global" }, "cmeter", "hello");
+
+    const live = store.peekLiveHistory({ kind: "global" }, "cmeter");
+    expect(live).not.toBeNull();
+    expect(live!.length).toBeGreaterThanOrEqual(2); // user + assistant at minimum
+    const userMessages = live!.filter((m) => m.role === "user");
+    expect(userMessages.some((m) => m.content === "hello")).toBe(true);
+  });
+
+  it("returns null for an unknown (never-cached) session", () => {
+    const store = new ScopedChatSessionStore(workspace, makeFactory());
+    expect(store.peekLiveHistory({ kind: "global" }, "never-existed")).toBeNull();
+  });
+
+  it("returns null after the session is evicted (so /usage falls back to disk)", async () => {
+    // maxEntries=1 forces immediate eviction when a second conversation arrives.
+    const store = new ScopedChatSessionStore(workspace, makeFactory(), 1);
+    await send(store, { kind: "global" }, "first", "hi-1");
+    // Trigger LRU eviction of "first":
+    await send(store, { kind: "global" }, "second", "hi-2");
+
+    expect(store.peekLiveHistory({ kind: "global" }, "first")).toBeNull();
+    // But disk fallback still works:
+    const fromDisk = await store.readHistory({ kind: "global" }, "first");
+    expect(fromDisk).not.toBeNull();
+    expect(fromDisk!.some((m) => m.content === "hi-1")).toBe(true);
+  });
+
+  it("reflects live history BEFORE flush is called (the /usage during-SSE case)", async () => {
+    const store = new ScopedChatSessionStore(workspace, makeFactory());
+    const scope: ChatScope = { kind: "global" };
+    const cid = "unflushed";
+
+    // Drain the SSE stream but DO NOT call store.flush() — mimics the
+    // window where the browser polls /usage mid-stream.
+    const session = await store.getOrCreate(scope, cid, undefined);
+    for await (const _ of session.send("midstream-msg")) {
+      /* drain */
+    }
+    // Disk should still be empty (no flush yet):
+    const disk = await store.readHistory(scope, cid);
+    expect(disk).toBeNull();
+    // But peekLiveHistory sees it:
+    const live = store.peekLiveHistory(scope, cid);
+    expect(live).not.toBeNull();
+    expect(live!.some((m) => m.content === "midstream-msg")).toBe(true);
+  });
+});

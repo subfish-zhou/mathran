@@ -921,7 +921,11 @@ function registerChatScope(
     const id = c.req.param("conversationId");
     if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
 
-    const history = await store.readHistory(scope, id);
+    // Prefer the *live* in-memory history so the meter updates during SSE
+    // streams (disk flush only happens after the stream ends). Fall back to
+    // disk for sessions that have been evicted from the LRU cache.
+    const live = store.peekLiveHistory(scope, id);
+    const history = live ?? (await store.readHistory(scope, id));
     if (history === null) {
       // Fresh / unknown conversation — report a zeroed usage so the SPA can
       // render the meter even before the first turn lands on disk.

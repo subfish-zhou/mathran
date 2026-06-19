@@ -441,6 +441,18 @@ export class ScopedChatSessionStore {
     return loadHistory(scopeDir(this.workspace, scope), conversationId);
   }
 
+  /**
+   * Peek the live in-memory history for a cached session (does NOT touch
+   * lastUsedMs / LRU order). Returns null when no entry is cached.
+   *
+   * Used by `/usage` so the context-window meter reflects the *live* state
+   * during an SSE stream (history flush only happens after the stream ends).
+   */
+  peekLiveHistory(scope: ChatScope, conversationId: string): LLMMessage[] | null {
+    const entry = this.entries.get(this.cacheKey(scope, conversationId));
+    return entry ? entry.session.history() : null;
+  }
+
   /** Create a fresh conversation id. */
   static newConversationId(): string {
     return `c-${randomUUID().slice(0, 8)}-${Date.now().toString(36)}`;
