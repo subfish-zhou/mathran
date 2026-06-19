@@ -138,12 +138,87 @@ export interface ChatSessionOptions {
    * lazily on first compact.
    */
   subagentScheduler?: SubagentScheduler;
+  /**
+   * Opt-in built-in tools the LLM can call (v0.2 §8 onward). Each switch is
+   * default-off; enabling one injects a {@link ToolSpec} into the per-turn
+   * tool list. Currently:
+   *   - `search`: dispatches a workspace search via the `search` subagent
+   *     runner. Requires `subagentScheduler` to be wired; if it isn't, the
+   *     tool is silently NOT registered.
+   */
+  builtinTools?: {
+    search?: boolean;
+  };
 }
 
 interface PendingToolCall {
   id: string;
   name: string;
   args: string;
+}
+
+/**
+ * Build any built-in {@link ToolSpec}s the host opted into via
+ * {@link ChatSessionOptions.builtinTools}.
+ *
+ * - `search` requires a `subagentScheduler`; without one the tool is
+ *   silently NOT registered (caller can opt in but mis-wire — better to
+ *   degrade gracefully than to surface a broken tool).
+ */
+function buildBuiltinTools(opts: {
+  enable?: ChatSessionOptions["builtinTools"];
+  scheduler?: SubagentScheduler;
+}): ToolSpec[] {
+  const out: ToolSpec[] = [];
+  if (opts.enable?.search === true && opts.scheduler) {
+    const sched = opts.scheduler;
+    out.push({
+      name: "search",
+      description:
+        "Search the workspace for a pattern. Use this when looking for code, text, or files. Returns top files and counts; full results are stored in an artifact.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Pattern to search for (literal text).",
+          },
+          glob: {
+            type: "string",
+            description: "Optional file glob, e.g. **/*.ts",
+          },
+          caseInsensitive: {
+            type: "boolean",
+            description: "If true, the match is case-insensitive.",
+          },
+        },
+        required: ["query"],
+      },
+      async execute(args: Record<string, unknown>) {
+        const query = typeof args.query === "string" ? args.query : "";
+        const glob = typeof args.glob === "string" ? args.glob : undefined;
+        const caseInsensitive =
+          typeof args.caseInsensitive === "boolean" ? args.caseInsensitive : undefined;
+        const result = await sched.dispatch({
+          type: "search",
+          input: {
+            query,
+            ...(glob !== undefined ? { globPattern: glob } : {}),
+            ...(caseInsensitive !== undefined ? { caseInsensitive } : {}),
+          },
+          hardCapBytes: 2048,
+        });
+        if (result.status === "error" || result.status === "timeout") {
+          return {
+            ok: false,
+            content: `search failed (${result.status}): ${result.errorMessage ?? "unknown error"}`,
+          };
+        }
+        return { ok: true, content: result.summary };
+      },
+    });
+  }
+  return out;
 }
 
 /** Per-`send()` options. */
@@ -265,6 +340,25 @@ export class ChatSession {
     this.subagentScheduler = opts.subagentScheduler;
     if (opts.systemPrompt && opts.systemPrompt.trim().length > 0) {
       this.messages.push({ role: "system", content: opts.systemPrompt });
+    }
+
+    // ── Built-in tools (v0.2 §8) ────────────────────────────────────────────
+    // We append to `this.tools` after user-supplied tools so they show up at
+    // the end of the function-calling tool list. The `toolByName` map is
+    // rebuilt so dispatch resolves the built-ins too.
+    const builtins = buildBuiltinTools({
+      enable: opts.builtinTools,
+      scheduler: this.subagentScheduler,
+    });
+    if (builtins.length > 0) {
+      // Preserve user-supplied tools' priority for name collisions: only add
+      // a built-in if the user didn't already register a tool of that name.
+      for (const b of builtins) {
+        if (!this.toolByName.has(b.name)) {
+          this.tools.push(b);
+          this.toolByName.set(b.name, b);
+        }
+      }
     }
   }
 

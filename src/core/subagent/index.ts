@@ -28,3 +28,19 @@ export {
   type CompactRunnerInput,
   type CompactedArtifact,
 } from "./runners/compact.js";
+export {
+  searchRunner,
+  renderSearchSummary,
+  globToRegExp,
+  runNodeFallback,
+  _resetRgProbeForTests,
+  DEFAULT_GLOB,
+  DEFAULT_MAX_FILES,
+  DEFAULT_CONTEXT_LINES,
+  MAX_TOTAL_MATCHES,
+  MIN_QUERY_LENGTH,
+  DEFAULT_IGNORE_DIRS,
+  type SearchRunnerInput,
+  type SearchMatch,
+  type SearchSummary,
+} from "./runners/search.js";

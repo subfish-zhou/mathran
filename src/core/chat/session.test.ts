@@ -650,3 +650,123 @@ describe("ChatSession.compact (v0.2 §5)", () => {
   });
 });
 
+
+// ─── v0.2 §8: builtinTools.search ─────────────────────────────────────────────
+
+import { SubagentRegistry } from "../subagent/registry.js";
+import { SubagentScheduler } from "../subagent/scheduler.js";
+import { searchRunner } from "../subagent/runners/search.js";
+
+describe("ChatSession builtinTools.search (v0.2 §8)", () => {
+  it("does NOT register the search tool when subagentScheduler is missing", () => {
+    const llm = new ScriptedLLM([]);
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      builtinTools: { search: true },
+      // No subagentScheduler!
+    });
+    // Indirect check: send() with a model that wants to call "search" should
+    // get the "unknown tool" error path. But the simplest check is just that
+    // no provider request will list "search" as a tool. We can't introspect
+    // private fields cleanly; instead, kick a turn and inspect the LLMRequest
+    // the ScriptedLLM recorded.
+    return collect(session.send("hi")).then(() => {
+      const req = llm.requests[0];
+      const toolNames = (req.tools ?? []).map((t) => t.name);
+      expect(toolNames).not.toContain("search");
+    });
+  });
+
+  it("registers and exposes the search tool when scheduler is wired", async () => {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-session-search-"));
+    try {
+      const registry = new SubagentRegistry();
+      registry.register(searchRunner);
+      const scheduler = new SubagentScheduler({ workspace: ws, registry });
+      const llm = new ScriptedLLM([
+        [{ type: "text", delta: "no tool" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        builtinTools: { search: true },
+        subagentScheduler: scheduler,
+      });
+      await collect(session.send("hi"));
+      const req = llm.requests[0];
+      const toolNames = (req.tools ?? []).map((t) => t.name);
+      expect(toolNames).toContain("search");
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("executes the search tool and returns the summary text", async () => {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-session-search-"));
+    try {
+      // Seed one file with three matches.
+      await fs.writeFile(path.join(ws, "a.ts"), "needle\nother\nneedle\nneedle\n");
+
+      // Mock scheduler that returns a fixed summary regardless of input.
+      const stubScheduler = {
+        async dispatch(task: any) {
+          return {
+            runId: "sub-stub0001",
+            type: task.type,
+            status: "ok" as const,
+            summary: 'Found 3 matches in 1 file for "needle".',
+            artifactPath: ".mathran/subagents/sub-stub0001/matches.jsonl",
+            stats: {
+              startedAt: new Date().toISOString(),
+              endedAt: new Date().toISOString(),
+              durationMs: 0,
+            },
+          };
+        },
+        inFlightCount() {
+          return 0;
+        },
+      } as unknown as SubagentScheduler;
+
+      const llm = new ScriptedLLM([
+        // First turn: assistant calls the search tool.
+        [
+          {
+            type: "tool-call",
+            id: "call_1",
+            name: "search",
+            argsDelta: '{"query":"needle"}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        // Second turn: assistant produces final text.
+        [
+          { type: "text", delta: "done" },
+          { type: "done", finishReason: "stop" },
+        ],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        builtinTools: { search: true },
+        subagentScheduler: stubScheduler,
+      });
+
+      const events = await collect(session.send("look up needle"));
+      const toolResult = events.find((e) => e.type === "tool-result") as
+        | Extract<ChatEvent, { type: "tool-result" }>
+        | undefined;
+      expect(toolResult).toBeDefined();
+      expect(toolResult!.ok).toBe(true);
+      expect(toolResult!.content).toContain('Found 3 matches in 1 file for "needle".');
+
+      // The history should record the tool message with the summary.
+      const h = session.history();
+      const toolMsg = h.find((m) => m.role === "tool");
+      expect(toolMsg?.content).toContain("Found 3 matches");
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+});
