@@ -31,6 +31,7 @@ import { randomUUID } from "node:crypto";
 import { ChatSession } from "./session.js";
 import type { LLMMessage } from "../providers/llm.js";
 import { renderTranscriptMarkdown } from "./transcript.js";
+import { atomicWriteFile } from "./atomic-write.js";
 
 export type ChatScopeKind = "global" | "project" | "effort";
 
@@ -108,7 +109,7 @@ function conversationFile(dir: string, conversationId: string): string {
 async function flushSession(dir: string, conversationId: string, history: LLMMessage[]): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
   const lines = history.map((m) => JSON.stringify(m)).join("\n");
-  await fs.writeFile(conversationFile(dir, conversationId), lines + (lines.length > 0 ? "\n" : ""), "utf-8");
+  await atomicWriteFile(conversationFile(dir, conversationId), lines + (lines.length > 0 ? "\n" : ""));
 }
 
 /**
@@ -136,10 +137,9 @@ async function flushTranscript(
     conversationId,
     title: meta.title,
   });
-  await fs.writeFile(
+  await atomicWriteFile(
     path.join(transcriptsDir, `${conversationId}.md`),
     md + (md.endsWith("\n") ? "" : "\n"),
-    "utf-8",
   );
 }
 

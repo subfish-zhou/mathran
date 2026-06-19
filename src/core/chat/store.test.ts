@@ -209,3 +209,51 @@ describe("ScopedChatSessionStore", () => {
     expect(md).toContain("ack:second turn");
   });
 });
+
+describe("ScopedChatSessionStore atomic flush (T3)", () => {
+  it("flushSession writes the exact serialization atomically", async () => {
+    const store = new ScopedChatSessionStore(workspace, makeFactory());
+    await send(store, { kind: "global" }, "c1", "hello");
+
+    const file = path.join(workspace, ".mathran", "global-chat", "c1.jsonl");
+    const onDisk = await fs.readFile(file, "utf-8");
+
+    const history = await store.readHistory({ kind: "global" }, "c1");
+    const expected = history!.map((m) => JSON.stringify(m)).join("\n") + "\n";
+    expect(onDisk).toBe(expected);
+
+    // No stray temp files were left behind.
+    const dirEntries = await fs.readdir(path.join(workspace, ".mathran", "global-chat"));
+    expect(dirEntries.some((e) => e.includes(".tmp."))).toBe(false);
+  });
+
+  it("preserves previous file content when the write fails mid-flush", async () => {
+    const store = new ScopedChatSessionStore(workspace, makeFactory());
+    await send(store, { kind: "global" }, "c1", "first turn");
+
+    const gdir = path.join(workspace, ".mathran", "global-chat");
+    const file = path.join(gdir, "c1.jsonl");
+    const before = await fs.readFile(file, "utf-8");
+
+    // Queue a second turn, then make the chat dir read-only so the atomic
+    // temp-file write fails and the rename never happens.
+    const session = await store.getOrCreate({ kind: "global" }, "c1", undefined);
+    for await (const _ of session.send("second turn")) {
+      /* drain */
+    }
+
+    await fs.chmod(gdir, 0o555);
+    try {
+      await expect(store.flush({ kind: "global" }, "c1")).rejects.toThrow();
+    } finally {
+      await fs.chmod(gdir, 0o755);
+    }
+
+    // The original content survives — rename did not happen.
+    const after = await fs.readFile(file, "utf-8");
+    expect(after).toBe(before);
+
+    const dirEntries = await fs.readdir(gdir);
+    expect(dirEntries.some((e) => e.includes(".tmp."))).toBe(false);
+  });
+});
