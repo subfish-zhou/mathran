@@ -10,7 +10,7 @@
  *     via `api.getChatHistory()` and reconstructs `Bubble[]` from the
  *     persisted `LLMMessage[]`.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { marked } from "marked";
 import { streamChat, type ChatEvent } from "../lib/chat.ts";
@@ -20,6 +20,14 @@ import {
   type Bubble,
   type ToolBubble,
 } from "../lib/history-to-bubbles.ts";
+import {
+  buildConversationLatex,
+  buildConversationMarkdown,
+  copyToClipboard,
+  downloadMarkdown,
+  downloadText,
+  type ExportTimelineItem,
+} from "../lib/chat-export.ts";
 import ContextMeter from "./ContextMeter.tsx";
 import { ToolCallDisplay } from "./ToolCallDisplay.tsx";
 
@@ -232,6 +240,54 @@ export default function ChatPanel({
     }
   }
 
+  // ─── Export ───────────────────────────────────────────────────────────
+  //
+  // mathran chats are math-heavy and we (subfish, 2026-06-19) want both a quick
+  // copy-to-clipboard for re-posting and a clean LaTeX dump for archival. The
+  // helpers come from `lib/chat-export.ts` (adapted from mathub) which already
+  // handles math/CJK fidelity (see chat-export.test.ts).
+  const exportItems = useMemo<ExportTimelineItem[]>(() => {
+    const now = new Date();
+    // Tool bubbles are intentionally excluded — they're scaffolding, not chat.
+    return bubbles
+      .filter((b): b is Exclude<Bubble, ToolBubble> => b.kind !== "tool")
+      .map((b) => ({ role: b.kind, content: b.text, createdAt: now }));
+  }, [bubbles]);
+
+  const exportTitle = useMemo(() => {
+    const conv = conversations.find((c) => c.id === conversationId);
+    return conv?.title || scopeLabel || "Mathran chat";
+  }, [conversations, conversationId, scopeLabel]);
+
+  const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+  useEffect(() => {
+    if (!copyFeedback) return;
+    const t = window.setTimeout(() => setCopyFeedback(null), 1500);
+    return () => window.clearTimeout(t);
+  }, [copyFeedback]);
+
+  async function onCopyMarkdown() {
+    if (exportItems.length === 0) return;
+    const md = buildConversationMarkdown(exportTitle, exportItems);
+    const ok = await copyToClipboard(md);
+    setCopyFeedback(ok ? "Copied!" : "Copy failed");
+  }
+
+  function onDownloadMarkdown() {
+    if (exportItems.length === 0) return;
+    downloadMarkdown(exportTitle, buildConversationMarkdown(exportTitle, exportItems));
+  }
+
+  function onDownloadLatex() {
+    if (exportItems.length === 0) return;
+    downloadText(
+      exportTitle,
+      buildConversationLatex(exportTitle, exportItems),
+      "tex",
+      "text/x-tex;charset=utf-8",
+    );
+  }
+
   // ─── Render ────────────────────────────────────────────────────────────
   return (
     <div className="flex h-full">
@@ -323,6 +379,40 @@ export default function ChatPanel({
             className="w-64 rounded-md border border-slate-300 px-2 py-1 text-xs font-mono outline-none focus:border-slate-500"
           />
         </div>
+
+        {/* ─── Export toolbar ─── */}
+        {exportItems.length > 0 && (
+          <div className="flex items-center gap-1 border-b border-slate-200 bg-slate-50 px-6 py-1.5 text-xs">
+            <span className="mr-1 text-slate-500">Export:</span>
+            <button
+              type="button"
+              onClick={() => void onCopyMarkdown()}
+              className="rounded border border-slate-300 bg-white px-2 py-0.5 hover:bg-slate-100"
+              title="Copy the whole conversation to clipboard as Markdown"
+            >
+              📋 Copy MD
+            </button>
+            <button
+              type="button"
+              onClick={onDownloadMarkdown}
+              className="rounded border border-slate-300 bg-white px-2 py-0.5 hover:bg-slate-100"
+              title="Download as a .md file"
+            >
+              ⬇ .md
+            </button>
+            <button
+              type="button"
+              onClick={onDownloadLatex}
+              className="rounded border border-slate-300 bg-white px-2 py-0.5 hover:bg-slate-100"
+              title="Download as XeLaTeX (math + CJK safe)"
+            >
+              ⬇ .tex
+            </button>
+            {copyFeedback && (
+              <span className="ml-2 text-emerald-600">{copyFeedback}</span>
+            )}
+          </div>
+        )}
 
         {usage ? (
           <ContextMeter
