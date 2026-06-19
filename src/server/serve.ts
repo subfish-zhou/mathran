@@ -67,6 +67,13 @@ import {
   type ChatEvent,
 } from "../core/chat/index.js";
 import {
+  createOpenAITokenCounter,
+  createAnthropicTokenCounter,
+  createFallbackTokenCounter,
+  type TokenCounter,
+} from "../core/chat/token-counter.js";
+import type { LLMMessage } from "../core/providers/llm.js";
+import {
   ScopedChatSessionStore,
   type ChatScope,
   type ScopedChatSessionFactory,
@@ -659,6 +666,78 @@ const PLACEHOLDER_HTML = `<!doctype html>
  * `getScope` derives the `ChatScope` from the request context (and is the
  * place we run slug-safety / project-exists checks).
  */
+// Helper functions for the usage endpoint (Task 19).
+// We reuse the Task 4 token counters and the Task 5 default context window.
+// Per-model context-window table — keep in sync with provider docs.
+function resolveContextWindow(model: string | undefined): number {
+  if (!model) return 200_000;
+  const m = model.toLowerCase();
+  // Strip any "<provider>/" prefix (e.g. "copilot/gpt-5.5" → "gpt-5.5").
+  const bare = m.includes("/") ? m.split("/").pop() ?? m : m;
+  if (bare.startsWith("gpt-4o") || bare.includes("4o-")) return 128_000;
+  if (bare.startsWith("gpt-5")) return 128_000;
+  if (bare.startsWith("claude-3-5-sonnet")) return 200_000;
+  if (bare.startsWith("claude-opus-4") || bare.startsWith("claude-sonnet-4")) return 200_000;
+  if (bare.startsWith("o1") || bare.startsWith("o3") || bare.startsWith("o4")) return 200_000;
+  return 200_000;
+}
+
+/** Pick the right token counter for a model name (matches Task 4 conventions). */
+function pickCounter(model: string | undefined): TokenCounter {
+  if (!model) return createOpenAITokenCounter(undefined);
+  const m = model.toLowerCase();
+  const bare = m.includes("/") ? m.split("/").pop() ?? m : m;
+  if (bare.startsWith("claude") || bare.startsWith("anthropic")) {
+    return createAnthropicTokenCounter();
+  }
+  try {
+    return createOpenAITokenCounter(bare);
+  } catch {
+    return createFallbackTokenCounter();
+  }
+}
+
+/** Find the model hint to use for token counting / context-window resolution. */
+function modelHintFromHistory(history: LLMMessage[], fallback?: string): string | undefined {
+  // Walk backwards: prefer the most-recent assistant turn's `model` field.
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i] as LLMMessage & { model?: string };
+    if (m.role === "assistant" && typeof m.model === "string" && m.model.length > 0) {
+      return m.model;
+    }
+  }
+  return fallback;
+}
+
+export interface UsageStats {
+  tokens: number;
+  messages: number;
+  contextWindow: number;
+  percentage: number;
+  warning: string | null;
+}
+
+/** Build the `/usage` response payload from a conversation history. */
+export function computeUsageStats(
+  history: LLMMessage[],
+  fallbackModel?: string,
+): UsageStats {
+  const model = modelHintFromHistory(history, fallbackModel);
+  const counter = pickCounter(model);
+  const tokens = counter.countMessages(history);
+  const contextWindow = resolveContextWindow(model);
+  const percentage = contextWindow > 0
+    ? Math.round((tokens / contextWindow) * 10000) / 100
+    : 0;
+  let warning: string | null = null;
+  if (percentage >= 90) {
+    warning = "Context near limit. /compact strongly recommended.";
+  } else if (percentage >= 75) {
+    warning = "Context approaching limit. Consider /compact.";
+  }
+  return { tokens, messages: history.length, contextWindow, percentage, warning };
+}
+
 function registerChatScope(
   app: Hono,
   store: ScopedChatSessionStore,
@@ -788,6 +867,29 @@ function registerChatScope(
     } catch (err: any) {
       return c.json({ error: err?.message ?? String(err) }, 500);
     }
+  });
+
+  // GET <base>/:conversationId/usage  — token + context-window stats (v0.3 §19)
+  app.get(`${basePath}/:conversationId/usage`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+
+    const history = await store.readHistory(scope, id);
+    if (history === null) {
+      // Fresh / unknown conversation — report a zeroed usage so the SPA can
+      // render the meter even before the first turn lands on disk.
+      const fallbackModel = c.req.query("model") ?? undefined;
+      const stats = computeUsageStats([], fallbackModel);
+      return c.json(stats);
+    }
+    const fallbackModel = c.req.query("model") ?? undefined;
+    const stats = computeUsageStats(history, fallbackModel);
+    return c.json(stats);
   });
 }
 

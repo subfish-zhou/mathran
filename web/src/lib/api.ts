@@ -83,6 +83,15 @@ export interface ConversationSummary {
   messageCount: number;
 }
 
+/** Response shape of `GET <chat-base>/:id/usage` (v0.3 §19). */
+export interface UsageStats {
+  tokens: number;
+  messages: number;
+  contextWindow: number;
+  percentage: number;
+  warning: string | null;
+}
+
 async function jsonOrThrow<T>(res: Response): Promise<T> {
   const text = await res.text();
   let data: unknown;
@@ -288,6 +297,22 @@ export const api = {
   async dropChat(scope: ChatScopeSpec, conversationId: string): Promise<void> {
     await jsonOrThrow(
       await fetch(`${chatScopeBase(scope)}/${enc(conversationId)}`, { method: "DELETE" }),
+    );
+  },
+
+  // ─── Context-window usage meter (v0.3 §19) ─────────────────────────────
+  async getChatUsage(
+    scope: ChatScopeSpec,
+    conversationId: string,
+    modelHint?: string,
+  ): Promise<UsageStats> {
+    const url = new URL(
+      `${chatScopeBase(scope)}/${enc(conversationId)}/usage`,
+      window.location.origin,
+    );
+    if (modelHint) url.searchParams.set("model", modelHint);
+    return jsonOrThrow<UsageStats>(
+      await fetch(url.pathname + url.search),
     );
   },
 
