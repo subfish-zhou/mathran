@@ -257,3 +257,155 @@ describe("ScopedChatSessionStore atomic flush (T3)", () => {
     expect(dirEntries.some((e) => e.includes(".tmp."))).toBe(false);
   });
 });
+
+/**
+ * Eviction race tests (v0.3 §20).
+ *
+ * The bug fixed by Task 20 is that `evictLRU` / `evictExpired` used to delete
+ * cache entries synchronously, dropping the most recent turn before its
+ * pending flush hit disk. Tests here drive the race deterministically by:
+ *   - using a tiny `maxEntries` to force LRU on every insert,
+ *   - using a tiny `ttlMs` to force bulk TTL eviction,
+ *   - reaching into the eviction path via the `_forceEvictForTesting` helper
+ *     for parallel-key cases.
+ *
+ * The store delegates flushing to the module-level `flushConversationHistory`
+ * helper, so we verify ordering by reading the .jsonl back: if eviction
+ * raced ahead of the flush, the most recent in-memory turn would be missing
+ * from disk after the eviction returns.
+ */
+describe("ScopedChatSessionStore eviction race (v0.3 §20)", () => {
+  it("awaits pending flush before deleting the cache entry (LRU)", async () => {
+    // maxEntries=1 → every fresh insert evicts the previous one.
+    const store = new ScopedChatSessionStore(workspace, makeFactory(), 1);
+    await send(store, { kind: "global" }, "a", "a-msg");
+
+    const file = path.join(workspace, ".mathran", "global-chat", "a.jsonl");
+    expect(await fs.readFile(file, "utf-8")).toContain("a-msg");
+
+    // Append a turn directly to the in-memory session WITHOUT flushing, so
+    // there's a real "pending writes" delta the eviction must persist.
+    const sessA = await store.getOrCreate({ kind: "global" }, "a", undefined);
+    for await (const _ of sessA.send("a-msg-2")) {
+      /* drain */
+    }
+    // In-memory has 'a-msg-2' but disk does not yet — confirm the gap.
+    const beforeEvict = await fs.readFile(file, "utf-8");
+    expect(beforeEvict).not.toContain("a-msg-2");
+
+    // Force LRU eviction by inserting a second session.
+    await send(store, { kind: "global" }, "b", "b-msg");
+
+    // After eviction returns, 'a' must already be on disk in full. If the
+    // old buggy path ran (delete first, never flush), 'a-msg-2' would be
+    // permanently lost.
+    const afterEvict = await fs.readFile(file, "utf-8");
+    expect(afterEvict).toContain("a-msg");
+    expect(afterEvict).toContain("a-msg-2");
+  });
+
+  it("de-dupes concurrent evictions of the same key", async () => {
+    const store = new ScopedChatSessionStore(workspace, makeFactory(), 8);
+    await send(store, { kind: "global" }, "k1", "hello");
+
+    // Append an unflushed turn so eviction has work to do.
+    const sess = await store.getOrCreate({ kind: "global" }, "k1", undefined);
+    for await (const _ of sess.send("second")) {
+      /* drain */
+    }
+
+    // Two concurrent evictors of the same key. The lock should serialize
+    // them; the second observes the entry already gone and returns cleanly
+    // without throwing or double-flushing.
+    await Promise.all([
+      store._forceEvictForTesting({ kind: "global" }, "k1"),
+      store._forceEvictForTesting({ kind: "global" }, "k1"),
+    ]);
+
+    // Disk has both turns intact.
+    const onDisk = await fs.readFile(
+      path.join(workspace, ".mathran", "global-chat", "k1.jsonl"),
+      "utf-8",
+    );
+    expect(onDisk).toContain("hello");
+    expect(onDisk).toContain("second");
+
+    // Cache entry is gone — a re-read must rehydrate from disk.
+    const re = await store.readHistory({ kind: "global" }, "k1");
+    expect(re!.some((m) => m.content === "second")).toBe(true);
+  });
+
+  it("different keys evict in parallel — the per-session lock is not global", async () => {
+    const store = new ScopedChatSessionStore(workspace, makeFactory(), 8);
+    const scopeA: ChatScope = { kind: "global" };
+    const scopeB: ChatScope = { kind: "project", projectSlug: "p" };
+
+    await send(store, scopeA, "a", "a-1");
+    await send(store, scopeB, "b", "b-1");
+
+    // Stage unflushed turns on both.
+    const sa = await store.getOrCreate(scopeA, "a", undefined);
+    for await (const _ of sa.send("a-2")) {
+      /* drain */
+    }
+    const sb = await store.getOrCreate(scopeB, "b", undefined);
+    for await (const _ of sb.send("b-2")) {
+      /* drain */
+    }
+
+    // Run two evictions in parallel. The per-key lock means they don't
+    // serialize; both must succeed and both files must contain their final
+    // turns.
+    const t0 = Date.now();
+    await Promise.all([
+      store._forceEvictForTesting(scopeA, "a"),
+      store._forceEvictForTesting(scopeB, "b"),
+    ]);
+    const elapsed = Date.now() - t0;
+
+    const aOnDisk = await fs.readFile(
+      path.join(workspace, ".mathran", "global-chat", "a.jsonl"),
+      "utf-8",
+    );
+    const bOnDisk = await fs.readFile(
+      path.join(workspace, "projects", "p", "chat", "b.jsonl"),
+      "utf-8",
+    );
+    expect(aOnDisk).toContain("a-2");
+    expect(bOnDisk).toContain("b-2");
+
+    // Sanity bound: two small flushes shouldn't take seconds wall-clock.
+    expect(elapsed).toBeLessThan(2000);
+  });
+
+  it("bulk TTL eviction flushes every expired session before deleting", async () => {
+    // ttlMs=1 → every entry is stale on the next eviction pass.
+    const store = new ScopedChatSessionStore(workspace, makeFactory(), 64, 1);
+    const scope: ChatScope = { kind: "global" };
+
+    for (const cid of ["x1", "x2", "x3"]) {
+      await send(store, scope, cid, `${cid}-first`);
+      const s = await store.getOrCreate(scope, cid, undefined);
+      for await (const _ of s.send(`${cid}-second`)) {
+        /* drain */
+      }
+    }
+
+    // Wait past the TTL window so the next getOrCreate triggers bulk evict.
+    await new Promise((res) => setTimeout(res, 5));
+
+    // Inserting a fresh key drives `evictExpired` over all three stale ones.
+    await send(store, scope, "trigger", "go");
+
+    // Every previously-staged session must be on disk in full — no key was
+    // dropped before its pending flush.
+    for (const cid of ["x1", "x2", "x3"]) {
+      const onDisk = await fs.readFile(
+        path.join(workspace, ".mathran", "global-chat", `${cid}.jsonl`),
+        "utf-8",
+      );
+      expect(onDisk).toContain(`${cid}-first`);
+      expect(onDisk).toContain(`${cid}-second`);
+    }
+  });
+});

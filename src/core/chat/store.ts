@@ -273,6 +273,19 @@ const DEFAULT_MAX_ENTRIES = 256;
  */
 export class ScopedChatSessionStore {
   private readonly entries = new Map<string, SessionEntry>();
+  /**
+   * Per-session eviction lock (v0.3 §20). Keyed by `cacheKey(scope, cid)`.
+   *
+   * Without this, concurrent evictions of the *same* session can race:
+   *   - evictor A awaits `flushSession(K)`,
+   *   - evictor B sees the entry still present, also calls `flushSession(K)`,
+   *   - one of them deletes the entry mid-flush of the other.
+   *
+   * The lock is per-key so two *different* sessions still evict in parallel.
+   * It does NOT block reads (`getOrCreate` for a hot, non-evicting key) — only
+   * other evictions of the same key.
+   */
+  private readonly evictionLocks = new Map<string, Promise<void>>();
   constructor(
     private readonly workspace: string,
     private readonly factory: ScopedChatSessionFactory,
@@ -285,6 +298,56 @@ export class ScopedChatSessionStore {
   }
 
   /**
+   * Acquire the eviction lock for `key`. Returns a release fn the caller MUST
+   * invoke in a `finally` block.
+   *
+   * Multiple awaiters on the same key are serialized (each waits for the
+   * previous holder's promise to resolve before installing its own).
+   */
+  private async acquireEvictionLock(key: string): Promise<() => void> {
+    while (this.evictionLocks.has(key)) {
+      await this.evictionLocks.get(key);
+    }
+    let release!: () => void;
+    const p = new Promise<void>((res) => {
+      release = res;
+    });
+    this.evictionLocks.set(key, p);
+    return () => {
+      this.evictionLocks.delete(key);
+      release();
+    };
+  }
+
+  /**
+   * Evict a single cached session by `key`, awaiting any pending flush first
+   * so the latest in-memory history is durably on disk before the cache entry
+   * disappears (v0.3 §20).
+   *
+   * Concurrent calls for the same key de-dupe via the per-session lock: the
+   * second caller observes the entry already gone and returns without re-
+   * flushing.
+   */
+  private async evictOne(key: string): Promise<void> {
+    const release = await this.acquireEvictionLock(key);
+    try {
+      const entry = this.entries.get(key);
+      if (!entry) return; // already evicted by a concurrent caller
+      // Persist the latest history before dropping the cache entry. We use the
+      // shared persistence helper so chat + goal stay on identical layout.
+      await flushConversationHistory(
+        this.workspace,
+        entry.scope,
+        entry.conversationId,
+        entry.session.history(),
+      );
+      this.entries.delete(key);
+    } finally {
+      release();
+    }
+  }
+
+  /**
    * Get a session for (scope, conversationId), hydrating from disk if needed.
    * Brand new conversations (no jsonl, no index entry) are created on first call.
    */
@@ -293,14 +356,14 @@ export class ScopedChatSessionStore {
     conversationId: string,
     model: string | undefined,
   ): Promise<ChatSession> {
-    this.evictExpired();
+    await this.evictExpired();
     const key = this.cacheKey(scope, conversationId);
     const cached = this.entries.get(key);
     if (cached) {
       cached.lastUsedMs = Date.now();
       return cached.session;
     }
-    if (this.entries.size >= this.maxEntries) this.evictLRU();
+    if (this.entries.size >= this.maxEntries) await this.evictLRU();
 
     const dir = scopeDir(this.workspace, scope);
     const session = this.factory({ scope, model });
@@ -383,14 +446,32 @@ export class ScopedChatSessionStore {
     return `c-${randomUUID().slice(0, 8)}-${Date.now().toString(36)}`;
   }
 
-  private evictExpired(): void {
+  /**
+   * Drop all entries whose `lastUsedMs` is older than the TTL window.
+   *
+   * Each candidate is evicted via `evictOne`, which awaits its pending flush
+   * before removing the cache entry. Different keys evict in parallel; the
+   * per-session lock only serializes concurrent evictions of the *same* key.
+   * (v0.3 §20)
+   */
+  private async evictExpired(): Promise<void> {
     const cutoff = Date.now() - this.ttlMs;
+    const stale: string[] = [];
     for (const [k, v] of this.entries) {
-      if (v.lastUsedMs < cutoff) this.entries.delete(k);
+      if (v.lastUsedMs < cutoff) stale.push(k);
     }
+    if (stale.length === 0) return;
+    await Promise.all(stale.map((k) => this.evictOne(k)));
   }
 
-  private evictLRU(): void {
+  /**
+   * Drop the single least-recently-used entry to make room for a new one.
+   *
+   * The drop awaits the entry's pending flush before deleting it from the
+   * cache, so the most recent in-memory turn is durably on disk before the
+   * `ChatSession` becomes unreferenced. (v0.3 §20)
+   */
+  private async evictLRU(): Promise<void> {
     let oldestKey: string | undefined;
     let oldestMs = Infinity;
     for (const [k, v] of this.entries) {
@@ -399,7 +480,18 @@ export class ScopedChatSessionStore {
         oldestKey = k;
       }
     }
-    if (oldestKey) this.entries.delete(oldestKey);
+    if (oldestKey) await this.evictOne(oldestKey);
+  }
+
+  /**
+   * Test-only helper (v0.3 §20): force-evict a single key, awaiting flush.
+   * Production callers should rely on `getOrCreate` to trigger eviction
+   * automatically; tests use this to drive the race scenarios deterministically.
+   *
+   * @internal
+   */
+  async _forceEvictForTesting(scope: ChatScope, conversationId: string): Promise<void> {
+    await this.evictOne(this.cacheKey(scope, conversationId));
   }
 }
 
