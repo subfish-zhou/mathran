@@ -30,6 +30,8 @@ import {
 } from "../../core/goal/store.js";
 import { runGoalRound } from "../../core/goal/runner.js";
 import type { ChatScope } from "../../core/chat/store.js";
+import type { ToolExecuteContext } from "../../core/chat/session.js";
+import { resolveScopeRoot } from "./scope-paths.js";
 import { loadConfig } from "../../core/config.js";
 import { ModelRouter, LocalLeanProvider } from "../../providers/index.js";
 
@@ -177,6 +179,25 @@ async function driveOneRound(
   const lean = new LocalLeanProvider();
   const tools = [createLeanCheckTool(lean)];
 
+  // v0.4 §1.1 (post-smoke fix): narrow ctx.workspace to the goal's scope so
+  // bash/read_file/write_file/edit_file resolve paths relative to the project
+  // or effort dir — not the mathran workspace root. Without this, an agent
+  // working on `project:smoke` writes `hello.txt` into the workspace root,
+  // not `projects/smoke/hello.txt`. See goal scope-tool wire-up note in
+  // results/01-fs-tools.md (slot reserved).
+  const goalForScope = await readGoal(workspace, goalId);
+  const scopeRoot = goalForScope ? resolveScopeRoot(workspace, goalForScope.scope) : workspace;
+  const toolContext: ToolExecuteContext = goalForScope
+    ? {
+        workspace: scopeRoot,
+        scope: {
+          kind: goalForScope.scope.kind,
+          ...(goalForScope.scope.kind !== "global" ? { projectSlug: goalForScope.scope.projectSlug } : {}),
+          ...(goalForScope.scope.kind === "effort" ? { effortSlug: goalForScope.scope.effortSlug } : {}),
+        },
+      }
+    : { workspace };
+
   try {
     const r = await runGoalRound({
       workspace,
@@ -184,6 +205,8 @@ async function driveOneRound(
       userMessage,
       llm: router,
       tools,
+      toolContext,
+      chatWorkspace: scopeRoot,
       // v0.4 §1: goal runners get the full builtin toolkit so the agent
       // can read, write, edit, search, and shell out without us having to
       // pre-register every helper as a goal tool.
