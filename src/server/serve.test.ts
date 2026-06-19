@@ -11,7 +11,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import { startServer, type RunningServer } from "./serve.js";
+import { startServer, defaultSessionFactory, type RunningServer } from "./serve.js";
 import { ChatSession } from "../core/chat/index.js";
 import type {
   LLMProvider,
@@ -995,6 +995,86 @@ describe("scoped chat (T1-C)", () => {
       sessionId: "legacy-1",
     });
     expect(events.find((e) => e.type === "done")).toBeTruthy();
+  });
+
+  it("v0.5 §2 Gap #6: project-scoped POST resolves workspace to <ws>/projects/<slug>", async () => {
+    // Spin up an isolated server whose chatSessionFactory captures the
+    // options it was called with. This is the simplest way to assert that
+    // serve.ts threads a scope-narrowed workspace through to ChatSession
+    // (without exercising real fs tools or a real LLM).
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-serve-scope-"));
+    // Seed config + project dir so the project-chat scope check passes.
+    await fs.writeFile(path.join(ws, "config.toml"), 'defaultModel = "openai/gpt-4o"\n', "utf-8");
+    await fs.mkdir(path.join(ws, "projects", "scoped-proj"), { recursive: true });
+
+    const captured: Array<{ scope?: any; model?: string }> = [];
+    const localServer = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace: ws,
+      chatSessionFactory: (opts) => {
+        captured.push({ scope: opts.scope, model: opts.model });
+        return new ChatSession({
+          llm: fakeLlm("scoped"),
+          model: opts.model,
+        });
+      },
+    });
+    try {
+      const res = await fetch(`${localServer.url}/api/projects/scoped-proj/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "hi", conversationId: "scope-c1" }),
+      });
+      expect(res.status).toBe(200);
+      await res.text(); // drain SSE stream
+
+      // Factory must have been invoked with the project scope.
+      expect(captured.length).toBeGreaterThan(0);
+      const call = captured[0];
+      expect(call.scope).toEqual({ kind: "project", projectSlug: "scoped-proj" });
+    } finally {
+      await localServer.close();
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("v0.5 §2 Gap #6: default factory wires full 6-builtin toolkit + scope-narrowed workspace", async () => {
+    // White-box check: the default factory must produce a ChatSession whose
+    // workspace is the scope-narrowed dir (so fs builtins land inside
+    // <ws>/projects/<slug>/, not at <ws>/), AND whose builtin toolkit
+    // matches the CLI chat/goal surface (6 tools).
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-serve-scope-"));
+    await fs.writeFile(path.join(ws, "config.toml"), 'defaultModel = "openai/gpt-4o"\n', "utf-8");
+    await fs.mkdir(path.join(ws, "projects", "toolsproj"), { recursive: true });
+    try {
+      const factory = defaultSessionFactory(ws);
+      const session = factory({
+        scope: { kind: "project", projectSlug: "toolsproj" },
+      });
+      // The session must own write_file/read_file/bash/edit_file/search/read_file_summary.
+      const tools = (session as any).tools as Array<{ name: string }>;
+      const names = new Set(tools.map((t) => t.name));
+      for (const expected of ["lean_check", "bash", "read_file", "write_file", "edit_file", "search", "read_file_summary"]) {
+        expect(names.has(expected), `expected tool ${expected} in default factory output (got: ${[...names].join(",")})`).toBe(true);
+      }
+      // The session's workspace must be the project dir.
+      expect((session as any).workspace).toBe(path.join(ws, "projects", "toolsproj"));
+
+      // Effort scope narrows further.
+      const effSession = factory({
+        scope: { kind: "effort", projectSlug: "toolsproj", effortSlug: "effort-x" },
+      });
+      expect((effSession as any).workspace).toBe(
+        path.join(ws, "projects", "toolsproj", "efforts", "effort-x"),
+      );
+
+      // Global scope falls back to workspace root.
+      const globSession = factory({ scope: { kind: "global" } });
+      expect((globSession as any).workspace).toBe(ws);
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
   });
 });
 
