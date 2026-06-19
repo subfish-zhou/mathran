@@ -6,12 +6,12 @@
  * `chatSessionFactory` seam) so no real provider is ever contacted.
  */
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import { startServer, defaultSessionFactory, type RunningServer } from "./serve.js";
+import { startServer, defaultSessionFactory, buildScopedSystemPrompt, appendPersistentContext, type RunningServer } from "./serve.js";
 import { ChatSession } from "../core/chat/index.js";
 import type {
   LLMProvider,
@@ -1384,5 +1384,74 @@ describe("GET /api/global-chat/:id/usage (v0.3 §19)", () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toMatch(/invalid conversation id/i);
+  });
+});
+
+describe("persistent context injection (v0.15 §1)", () => {
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-persist-"));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
+  it("returns base prompt unchanged when MEMORY.md/AGENTS.md are absent", () => {
+    const out = buildScopedSystemPrompt(undefined, tmp);
+    expect(out).toContain("You are mathran");
+    expect(out).not.toContain("# Persistent context");
+  });
+
+  it("appends MEMORY.md content under a labeled section", async () => {
+    await fs.writeFile(path.join(tmp, "MEMORY.md"), "# my long-term memory\n\n- prefer concise answers\n");
+    const out = buildScopedSystemPrompt(undefined, tmp);
+    expect(out).toContain("# Persistent context");
+    expect(out).toContain("## MEMORY.md (workspace root)");
+    expect(out).toContain("prefer concise answers");
+  });
+
+  it("appends both MEMORY.md and AGENTS.md when both exist", async () => {
+    await fs.writeFile(path.join(tmp, "MEMORY.md"), "mem alpha");
+    await fs.writeFile(path.join(tmp, "AGENTS.md"), "agents beta");
+    const out = buildScopedSystemPrompt(undefined, tmp);
+    expect(out).toContain("mem alpha");
+    expect(out).toContain("agents beta");
+    expect(out.indexOf("MEMORY.md")).toBeLessThan(out.indexOf("AGENTS.md"));
+  });
+
+  it("truncates files larger than 64 KiB with a marker", async () => {
+    const big = "x".repeat(64 * 1024 + 5000);
+    await fs.writeFile(path.join(tmp, "MEMORY.md"), big);
+    const out = buildScopedSystemPrompt(undefined, tmp);
+    expect(out).toContain("... [truncated at");
+    // The marker count: prompt size must be << len(big) + prompt overhead
+    expect(out.length).toBeLessThan(big.length);
+  });
+
+  it("ignores zero-byte files", async () => {
+    await fs.writeFile(path.join(tmp, "MEMORY.md"), "");
+    const out = buildScopedSystemPrompt(undefined, tmp);
+    expect(out).not.toContain("# Persistent context");
+  });
+
+  it("silently survives a workspace dir that doesn't exist", () => {
+    const out = buildScopedSystemPrompt(undefined, path.join(tmp, "nope"));
+    expect(out).toContain("You are mathran");
+    expect(out).not.toContain("# Persistent context");
+  });
+
+  it("preserves the scope hint (project) even when context is appended", async () => {
+    await fs.writeFile(path.join(tmp, "MEMORY.md"), "recall me");
+    const out = buildScopedSystemPrompt({ kind: "project", projectSlug: "my-proj" }, tmp);
+    expect(out).toContain('chatting inside project "my-proj"');
+    expect(out).toContain("recall me");
+  });
+
+  it("appendPersistentContext is idempotent on missing files", () => {
+    const base = "You are X.";
+    const out = appendPersistentContext(base, path.join(tmp, "absent"), undefined);
+    expect(out).toBe(base);
   });
 });

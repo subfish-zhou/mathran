@@ -20,6 +20,7 @@ const TOOL_ICONS: Record<string, string> = {
   lean_check: "🧮",
   search: "🔍",
   read_file_summary: "📋",
+  dispatch_subagent: "🤖",
 };
 
 const TOOL_LABELS: Record<string, string> = {
@@ -30,6 +31,16 @@ const TOOL_LABELS: Record<string, string> = {
   lean_check: "Lean check",
   search: "Search",
   read_file_summary: "Read summary",
+  dispatch_subagent: "Subagent",
+};
+
+// Per-subagent-type icon shown to the right of the parent label.
+const SUBAGENT_TYPE_GLYPHS: Record<string, string> = {
+  compact: "🗜",
+  search: "🔍",
+  read_summarize: "📋",
+  research: "🔬",
+  lean_explore: "🧮",
 };
 
 function summarize(name: string, args?: string): string {
@@ -60,6 +71,26 @@ function summarize(name: string, args?: string): string {
     case "lean_check":
       raw = pick("path") ?? pick("code");
       break;
+    case "dispatch_subagent": {
+      const t = pick("type");
+      const glyph = t && SUBAGENT_TYPE_GLYPHS[t] ? `${SUBAGENT_TYPE_GLYPHS[t]} ` : "";
+      // Pick the most informative inner input field as the summary tail.
+      let inner = "";
+      const input = (parsed as Record<string, unknown>).input as Record<string, unknown> | undefined;
+      if (input && typeof input === "object") {
+        const query =
+          typeof input.query === "string"
+            ? input.query
+            : typeof input.path === "string"
+              ? input.path
+              : typeof input.prompt === "string"
+                ? input.prompt
+                : null;
+        if (query) inner = `: ${query}`;
+      }
+      raw = t ? `${glyph}${t}${inner}` : null;
+      break;
+    }
   }
   if (raw === null) {
     for (const v of Object.values(parsed)) {

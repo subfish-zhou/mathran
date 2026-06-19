@@ -673,7 +673,7 @@ export function defaultSessionFactory(workspace: string): ChatSessionFactory {
       // project / effort dir, not at workspace root.
       workspace: scopedWorkspace,
       toolContext: { workspace: scopedWorkspace, scope },
-      systemPrompt: buildScopedSystemPrompt(scope),
+      systemPrompt: buildScopedSystemPrompt(scope, scopedWorkspace),
       tools: [createLeanCheckTool(lean)],
       subagentScheduler: scheduler,
       scheduler,
@@ -691,12 +691,71 @@ export function defaultSessionFactory(workspace: string): ChatSessionFactory {
 }
 
 /** Append a short scope hint to the system prompt so the model knows where it is. */
-function buildScopedSystemPrompt(scope: ChatScope | undefined): string {
-  if (!scope || scope.kind === "global") return SYSTEM_PROMPT;
-  if (scope.kind === "project") {
-    return `${SYSTEM_PROMPT}\n\nYou are chatting inside project "${scope.projectSlug}".`;
+export function buildScopedSystemPrompt(
+  scope: ChatScope | undefined,
+  workspace: string,
+): string {
+  const base =
+    !scope || scope.kind === "global"
+      ? SYSTEM_PROMPT
+      : scope.kind === "project"
+        ? `${SYSTEM_PROMPT}\n\nYou are chatting inside project "${scope.projectSlug}".`
+        : `${SYSTEM_PROMPT}\n\nYou are chatting inside effort "${scope.effortSlug}" of project "${scope.projectSlug}".`;
+  return appendPersistentContext(base, workspace, scope);
+}
+
+/**
+ * Read MEMORY.md / AGENTS.md style files from the workspace and append them
+ * to the system prompt. v0.15 §1.
+ *
+ * Why both a global and a scoped layer: a user typically wants the same
+ * "who I am, what conventions matter" preamble on every chat (MEMORY.md
+ * at workspace root), plus an optional project-/effort-specific note that
+ * only applies inside that scope (`<scope>/MEMORY.md`).
+ *
+ * Failure modes (file missing, unreadable, too large) are silent — the
+ * chat must keep working even with no persistent context. We cap each
+ * file at ~64 KiB so a runaway MEMORY.md can't blow up every prompt.
+ */
+const PERSISTENT_CONTEXT_MAX_BYTES = 64 * 1024;
+const PERSISTENT_CONTEXT_FILES = ["MEMORY.md", "AGENTS.md"] as const;
+
+function readPersistentFile(dir: string, name: string): string | null {
+  try {
+    const full = path.join(dir, name);
+    const stat = fssync.statSync(full);
+    if (!stat.isFile()) return null;
+    const buf = fssync.readFileSync(full);
+    if (buf.byteLength === 0) return null;
+    if (buf.byteLength <= PERSISTENT_CONTEXT_MAX_BYTES) return buf.toString("utf8");
+    // Soft cap — keep the head, append a marker so the model knows it's truncated.
+    return (
+      buf.subarray(0, PERSISTENT_CONTEXT_MAX_BYTES).toString("utf8") +
+      `\n\n... [truncated at ${PERSISTENT_CONTEXT_MAX_BYTES} bytes] ...`
+    );
+  } catch {
+    return null;
   }
-  return `${SYSTEM_PROMPT}\n\nYou are chatting inside effort "${scope.effortSlug}" of project "${scope.projectSlug}".`;
+}
+
+export function appendPersistentContext(
+  base: string,
+  workspace: string,
+  scope: ChatScope | undefined,
+): string {
+  const sections: string[] = [];
+  // Global layer: <workspace root>/MEMORY.md and AGENTS.md
+  for (const name of PERSISTENT_CONTEXT_FILES) {
+    const content = readPersistentFile(workspace, name);
+    if (content) {
+      sections.push(`## ${name} (workspace root)\n\n${content.trim()}`);
+    }
+  }
+  // Scoped layer: project- or effort-specific notes (mathran already scopes
+  // `workspace` per chat, so for scoped chats the loop above already covers
+  // the scoped dir; nothing extra needed here).
+  if (sections.length === 0) return base;
+  return `${base}\n\n# Persistent context\n\nThe following files were loaded from your workspace and represent\nlong-lived preferences, conventions, and notes. Treat them as authoritative\nunless a more specific instruction overrides them.\n\n${sections.join("\n\n")}`;
 }
 
 // ─── Chat session store (disk-backed; see src/core/chat/store.ts) ────────────
