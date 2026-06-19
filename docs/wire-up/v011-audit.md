@@ -50,6 +50,22 @@ end-user workflows.
 - **Affected**: goals that hit Gap #1 failure are marked `failed` and can't be resumed even after the fix. Workaround: `goal start` a new goal.
 - **Optional fix**: `mathran goal reactivate <id>` admin command. Low priority.
 
+## v0.5 wire-up completion (commits 30aa65b / d5f623f / ddb39ab / 7460082 / e2048af, tag v0.5-pending)
+
+- **Gap #4 fixed** (commit bde5a13 → e2048af merge): added `dispatch_subagent` ChatSession builtin tool + `mathran subagent <type> <input-json>` CLI command. Both routes go through `SubagentScheduler.dispatch()`, so all 5 runners (compact/search/read_summarize/research/lean_explore) are now LLM- and human-callable.
+- **Gap #5 fixed** (same commits): the new tool/CLI both accept `--runtime subprocess` (CLI) / `runtime: "subprocess"` (tool args), routing through the existing `SubagentTaskWithRuntime` cast. Inline path verified end-to-end; subprocess from `dist/` still hits the pre-existing v0.3 §16 ESM resolve quirk (`defaultHostPath()` returns `.ts` extension), tracked separately — not in v0.5 scope.
+- **Gap #6 fixed** (commit c5fdd30 → 30aa65b merge): `serve.ts` `defaultSessionFactory` now wires the full 6-builtin toolkit AND scope-narrowed workspace via `resolveScopeRoot`. Per-scope POST `/api/projects/<slug>/chat` and `/api/projects/<slug>/efforts/<slug>/chat` resolve correctly. Decision documented inline: web UI gets full toolkit because the server is loopback-only; cutting tools doesn't add a security boundary.
+- **Gap #7 fixed** (commit 21b2868 → d5f623f merge): ChatSession now tracks `readPaths: Set<string>` and gates `write_file`/`edit_file` on prior `read_file`. New files (ENOENT) are auto-allowed; `replaceHistory()` clears the set; successful write counts as read (so write→edit doesn't trip the gate). Matches Claude Code behavior.
+- **Gap #8 fixed** (commit 7460082): added `mathran goal reactivate <goalId>` to move failed/cancelled/exhausted/paused goals back to active. Refuses `complete` (start a new goal instead). Verified end-to-end against the stuck v0.11.0 smoke goal `47910cec`: reactivated successfully.
+- **TypeScript lib bump** (commit ddb39ab): tsconfig lib bumped from ES2022 → ES2023 to admit `Array.prototype.findLast` (used by Gap #7 test). Target stays ES2022; only the lib type defs move up.
+
+Resulting test count: 673 (v0.11.1 baseline) → 705 (+32). `npx tsc --noEmit` clean, `npm run build` clean.
+
+## Still open after v0.5
+
+- **Subprocess + `dist/` runtime resolve** (pre-existing v0.3 §16 quirk): `defaultHostPath()` returns `subagent-host.ts`; the compiled JS is at `subagent-host.js`. From `dist/` builds, `node --import tsx` can't resolve the `.ts` path. Workaround: run `npx tsx src/cli/index.ts subagent ...` directly. Real fix is a one-line conditional in `defaultHostPath()` — defer to v0.5.1 or v0.6.
+
+
 ## Untested in v0.11.0 smoke (blocked by Gap #4)
 
 - `research` runner end-to-end
