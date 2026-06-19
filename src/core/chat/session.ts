@@ -15,12 +15,14 @@
  * called again — until it produces a turn with no tool calls.
  */
 
+import { randomUUID } from "node:crypto";
 import type {
   LLMProvider,
   LLMMessage,
   LLMRequest,
   LLMStreamChunk,
 } from "../providers/llm.js";
+import { capToolOutput } from "./tool-output-cap.js";
 
 /**
  * Per-invocation context the kernel threads into a tool's `execute()`.
@@ -85,6 +87,20 @@ export interface ChatSessionOptions {
    * inside the right project/effort directory (T1-D / BUG #7 fix).
    */
   toolContext?: ToolExecuteContext;
+  /**
+   * Stable identifier for this session, used to namespace spilled tool-output
+   * dumps under `<workspace>/.mathran/tool-output/<sessionId>/`. Defaults to a
+   * generated UUID when omitted.
+   */
+  sessionId?: string;
+  /**
+   * Tool-result hard cap (v0.2 §2). When set, every tool result is passed
+   * through `capToolOutput()` before being pushed into history: the inline
+   * portion is truncated to `maxInlineBytes` (default 4096) and, when a
+   * `workspace` is given, the full output is spilled to disk. When this option
+   * is *undefined*, tool results are stored verbatim (backward-compatible).
+   */
+  toolOutputCap?: { maxInlineBytes?: number; workspace?: string | null };
 }
 
 interface PendingToolCall {
@@ -102,6 +118,8 @@ export class ChatSession {
   private temperature?: number;
   private maxTokens?: number;
   private readonly toolContext?: ToolExecuteContext;
+  readonly sessionId: string;
+  private readonly toolOutputCap?: { maxInlineBytes?: number; workspace?: string | null };
   private messages: LLMMessage[] = [];
 
   constructor(opts: ChatSessionOptions) {
@@ -113,6 +131,8 @@ export class ChatSession {
     this.temperature = opts.temperature;
     this.maxTokens = opts.maxTokens;
     this.toolContext = opts.toolContext;
+    this.sessionId = opts.sessionId ?? randomUUID();
+    this.toolOutputCap = opts.toolOutputCap;
     if (opts.systemPrompt && opts.systemPrompt.trim().length > 0) {
       this.messages.push({ role: "system", content: opts.systemPrompt });
     }
@@ -282,9 +302,19 @@ export class ChatSession {
           }
         }
 
+        let inlineContent = result.content;
+        if (this.toolOutputCap) {
+          const capped = await capToolOutput(call.id, result.content, {
+            maxInlineBytes: this.toolOutputCap.maxInlineBytes ?? 4096,
+            workspace: this.toolOutputCap.workspace ?? null,
+            sessionId: this.sessionId,
+          });
+          inlineContent = capped.inlineContent;
+        }
+
         this.messages.push({
           role: "tool",
-          content: result.content,
+          content: inlineContent,
           toolCallId: call.id,
           name: call.name,
         });

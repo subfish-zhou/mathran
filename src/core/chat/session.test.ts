@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { ChatSession, type ChatEvent } from "./session.js";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { ChatSession, type ChatEvent, type ToolSpec } from "./session.js";
 import { createLeanCheckTool } from "./tools/lean-check.js";
 import type {
   LLMProvider,
@@ -287,5 +290,77 @@ describe("ChatSession", () => {
     const toolMsg = history.find((m) => m.role === "tool" && m.toolCallId === "call_x");
     expect(toolMsg, "a synthetic tool message must close the call").toBeDefined();
     expect(toolMsg!.content).toMatch(/budget/);
+  });
+
+  it("caps a large tool result in history and spills to disk when configured", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-sess-cap-"));
+    try {
+      const big = "Z".repeat(10_000);
+      const bigTool: ToolSpec = {
+        name: "big",
+        parameters: {},
+        async execute() {
+          return { ok: false, content: big };
+        },
+      };
+      const llm = new ScriptedLLM([
+        [
+          { type: "tool-call", id: "call_big", name: "big", argsDelta: "{}" },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [{ type: "text", delta: "done" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        tools: [bigTool],
+        sessionId: "sess-cap",
+        toolOutputCap: { workspace: tmp },
+      });
+
+      // The streamed event still carries the full content.
+      const events = await collect(session.send("go"));
+      const toolResult = events.find((e) => e.type === "tool-result") as Extract<
+        ChatEvent,
+        { type: "tool-result" }
+      >;
+      expect(toolResult.content).toBe(big);
+
+      // History message is capped well under 4.5KB and carries the breadcrumb.
+      const toolMsg = session.history().find((m) => m.role === "tool")!;
+      expect(toolMsg.content).toContain("[output truncated");
+      expect(Buffer.byteLength(toolMsg.content, "utf-8")).toBeLessThan(4500);
+
+      // Full output dumped to disk.
+      const dump = path.join(tmp, ".mathran", "tool-output", "sess-cap", "call_big.txt");
+      const saved = await fs.readFile(dump, "utf-8");
+      expect(saved).toBe(big);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("does not cap tool results when toolOutputCap is unset (backward compat)", async () => {
+    const big = "Q".repeat(10_000);
+    const bigTool: ToolSpec = {
+      name: "big",
+      parameters: {},
+      async execute() {
+        return { ok: true, content: big };
+      },
+    };
+    const llm = new ScriptedLLM([
+      [
+        { type: "tool-call", id: "call_big", name: "big", argsDelta: "{}" },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [{ type: "text", delta: "done" }, { type: "done", finishReason: "stop" }],
+    ]);
+    const session = new ChatSession({ llm, model: "m", tools: [bigTool] });
+    await collect(session.send("go"));
+
+    const toolMsg = session.history().find((m) => m.role === "tool")!;
+    expect(toolMsg.content).toBe(big);
+    expect(toolMsg.content).not.toContain("[output truncated");
   });
 });
