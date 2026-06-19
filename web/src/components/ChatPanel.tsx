@@ -1,63 +1,121 @@
 /**
  * Scoped chat panel: drives one conversation inside a given `ChatScopeSpec`
- * (global / project / effort). The parent route component picks the scope and
- * passes it in.
+ * (global / project / effort).
  *
- * Multi-turn support: we read the `session` event from the first SSE response
- * and remember the `conversationId`, so subsequent messages in this UI session
- * append to the same on-disk conversation (BUG #6).
- *
- * A `scopeKey` prop is used to force a state reset when the route switches
- * between scopes (otherwise React reuses our state across routes).
+ * v0.12.x changes:
+ *   - Adds a per-scope conversation sidebar (list / new / select / delete).
+ *   - URL `?c=<id>` persists the active conversation so a hard refresh
+ *     re-hydrates the same chat (previously refresh = blank new chat).
+ *   - Selecting / refreshing an existing conversation fetches its history
+ *     via `api.getChatHistory()` and reconstructs `Bubble[]` from the
+ *     persisted `LLMMessage[]`.
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { marked } from "marked";
 import { streamChat, type ChatEvent } from "../lib/chat.ts";
-import { api, type ChatScopeSpec, type UsageStats } from "../lib/api.ts";
+import { api, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
+import {
+  historyToBubbles,
+  type Bubble,
+  type ToolBubble,
+} from "../lib/history-to-bubbles.ts";
 import ContextMeter from "./ContextMeter.tsx";
-
-interface ToolBubble {
-  kind: "tool";
-  id: string;
-  name: string;
-  args?: string;
-  result?: string;
-  ok?: boolean;
-}
-
-interface TextBubble {
-  kind: "user" | "assistant";
-  text: string;
-}
-
-type Bubble = ToolBubble | TextBubble;
 
 export default function ChatPanel({
   scope,
   scopeLabel,
 }: {
   scope: ChatScopeSpec;
-  /** Short label for the header (e.g. "global", "project: foo", "effort: bar"). */
   scopeLabel: string;
 }) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const urlConvId = searchParams.get("c");
+
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
-  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(urlConvId);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [usage, setUsage] = useState<UsageStats | null>(null);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Reset everything when the active scope changes.
+  // ─── Conversation list ─────────────────────────────────────────────────
+  const refreshList = useCallback(async () => {
+    try {
+      const list = await api.listChats(scope);
+      setConversations(list);
+    } catch {
+      // Silent — the list is best-effort.
+    }
+  }, [scope.kind, (scope as any).projectSlug, (scope as any).effortSlug]);
+
+  // ─── Scope change: reset everything, then reload list + selected conv ──
   useEffect(() => {
     setBubbles([]);
-    setConversationId(null);
     setError(null);
     setInput("");
     setUsage(null);
+    setConversationId(urlConvId);
+    void refreshList();
+    // We intentionally re-run when scope changes; urlConvId is read once per
+    // scope switch (URL state is per-scope independent anyway).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope.kind, (scope as any).projectSlug, (scope as any).effortSlug]);
 
+  // ─── Selection change (URL?c=…): hydrate history if not blank ──────────
+  useEffect(() => {
+    if (!conversationId) {
+      setBubbles([]);
+      setUsage(null);
+      return;
+    }
+    let cancelled = false;
+    setLoadingHistory(true);
+    api
+      .getChatHistory(scope, conversationId)
+      .then((data) => {
+        if (cancelled) return;
+        setBubbles(historyToBubbles(data.history));
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        // 404 = brand-new id not yet on disk; fine, leave empty.
+        if (!/404|not found/i.test((err as Error).message)) {
+          setError((err as Error).message);
+        }
+        setBubbles([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingHistory(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId, scope.kind, (scope as any).projectSlug, (scope as any).effortSlug]);
+
+  // ─── Selection change: keep URL in sync ────────────────────────────────
+  useEffect(() => {
+    const next = new URLSearchParams(searchParams);
+    if (conversationId) {
+      if (next.get("c") !== conversationId) {
+        next.set("c", conversationId);
+        setSearchParams(next, { replace: true });
+      }
+    } else {
+      if (next.has("c")) {
+        next.delete("c");
+        setSearchParams(next, { replace: true });
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId]);
+
+  // ─── Default model from /api/providers ─────────────────────────────────
   useEffect(() => {
     api
       .getProviders()
@@ -67,10 +125,29 @@ export default function ChatPanel({
       .catch(() => {});
   }, []);
 
+  // ─── Auto-scroll on new bubbles ────────────────────────────────────────
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [bubbles]);
 
+  // ─── Usage meter: refetch whenever conversationId changes ──────────────
+  const refreshUsage = useCallback(async () => {
+    if (!conversationId) return;
+    try {
+      const u = await api.getChatUsage(scope, conversationId, model || undefined);
+      setUsage(u);
+    } catch {
+      // Meter is decorative; never break the chat surface.
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId, scope.kind, model]);
+
+  useEffect(() => {
+    if (!conversationId) return;
+    void refreshUsage();
+  }, [conversationId, refreshUsage]);
+
+  // ─── Send a message ────────────────────────────────────────────────────
   async function send(e: React.FormEvent) {
     e.preventDefault();
     const text = input.trim();
@@ -124,150 +201,231 @@ export default function ChatPanel({
         if (last && last.kind === "assistant" && last.text === "") return prev.slice(0, -1);
         return prev;
       });
-      // Turn complete — refresh the context meter. We read `conversationId` from
-      // a ref-like fallback because the just-completed POST may have minted it.
-      // The closure captures the pre-POST value; that's fine for second-and-on
-      // turns. For the first turn the SSE `session` event already updated state
-      // and React will re-render before we get here, but to be safe we also
-      // refetch once any time `conversationId` changes (see effect below).
       void refreshUsage();
+      void refreshList(); // pick up the brand-new conv in the sidebar
     }
   }
 
-  // Fetch usage stats whenever the conversation id changes (covers first-turn
-  // case where the id is minted server-side and arrives via SSE) or after a
-  // turn completes (see the `refreshUsage()` call in `send`'s finally block).
-  async function refreshUsage() {
-    if (!conversationId) return;
+  // ─── New / Select / Delete ─────────────────────────────────────────────
+  function newChat() {
+    setConversationId(null);
+    setBubbles([]);
+    setError(null);
+    setUsage(null);
+  }
+
+  function selectConv(id: string) {
+    if (id === conversationId) return;
+    setConversationId(id);
+    setError(null);
+  }
+
+  async function deleteConv(id: string) {
+    if (!confirm(`Delete conversation "${id}"? This cannot be undone.`)) return;
     try {
-      const u = await api.getChatUsage(scope, conversationId, model || undefined);
-      setUsage(u);
-    } catch {
-      // Hide silently — the meter is decorative; never break the chat surface.
+      await api.dropChat(scope, id);
+      await refreshList();
+      if (id === conversationId) newChat();
+    } catch (err) {
+      setError((err as Error).message);
     }
   }
 
-  useEffect(() => {
-    if (!conversationId) return;
-    void refreshUsage();
-    // refreshUsage is a stable closure over scope+model; we intentionally do
-    // not include it in deps to avoid loops.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conversationId]);
-
+  // ─── Render ────────────────────────────────────────────────────────────
   return (
-    <div className="flex h-full flex-col">
-      <div className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
-        <div>
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Chat</h2>
-          <p className="text-xs text-slate-400">
+    <div className="flex h-full">
+      {/* ─── Conversation sidebar ─────────────────────────────────────── */}
+      <aside className="flex w-60 shrink-0 flex-col border-r border-slate-200 bg-white">
+        <div className="border-b border-slate-200 p-3">
+          <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
             {scopeLabel}
-            {conversationId && <> · <span className="font-mono">{conversationId}</span></>}
-          </p>
+          </div>
+          <button
+            type="button"
+            onClick={newChat}
+            className="w-full rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800"
+          >
+            + New chat
+          </button>
         </div>
-        <input
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          placeholder="model (e.g. copilot/gpt-5.5)"
-          className="w-64 rounded-md border border-slate-300 px-2 py-1 text-xs font-mono outline-none focus:border-slate-500"
-        />
-      </div>
-
-      {/* v0.3 §19: context-window meter. Hidden gracefully when no usage data
-          has landed yet (initial / pre-first-turn state). */}
-      {usage ? (
-        <ContextMeter
-          tokens={usage.tokens}
-          contextWindow={usage.contextWindow}
-          warning={usage.warning}
-          percentage={usage.percentage}
-        />
-      ) : conversationId ? (
-        <ContextMeter
-          tokens={0}
-          contextWindow={200_000}
-          warning={null}
-          percentage={0}
-          loading
-        />
-      ) : null}
-
-      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-6">
-        {bubbles.length === 0 && (
-          <p className="text-sm text-slate-400">Ask a math or Lean question to start.</p>
-        )}
-        {bubbles.map((b, i) =>
-          b.kind === "tool" ? (
-            <div
-              key={i}
-              className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs"
-            >
-              <div className="font-semibold text-amber-800">
-                🛠 {b.name}
-                {b.ok !== undefined && (
-                  <span className={b.ok ? "text-green-700" : "text-red-700"}>
-                    {" "}
-                    · {b.ok ? "ok" : "failed"}
-                  </span>
-                )}
-              </div>
-              {b.args && (
-                <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words text-amber-900">
-                  {b.args}
-                </pre>
-              )}
-              {b.result && (
-                <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words text-slate-700">
-                  {b.result}
-                </pre>
-              )}
-            </div>
-          ) : (
-            <div
-              key={i}
-              className={`flex ${b.kind === "user" ? "justify-end" : "justify-start"}`}
-            >
-              <div
-                className={`max-w-2xl rounded-lg px-4 py-2 text-sm ${
-                  b.kind === "user"
-                    ? "bg-slate-900 text-white"
-                    : "border border-slate-200 bg-white"
-                }`}
-              >
-                {b.kind === "assistant" ? (
+        <div className="flex-1 overflow-y-auto p-2">
+          {conversations.length === 0 && (
+            <p className="px-2 py-3 text-xs text-slate-400">No chats yet.</p>
+          )}
+          <ul className="space-y-1">
+            {conversations.map((c) => {
+              const active = c.id === conversationId;
+              return (
+                <li key={c.id}>
                   <div
-                    className="md"
-                    dangerouslySetInnerHTML={{ __html: marked.parse(b.text || "…") as string }}
-                  />
-                ) : (
-                  <span className="whitespace-pre-wrap">{b.text}</span>
+                    className={`group flex items-center gap-1 rounded-md px-2 py-1.5 text-xs transition ${
+                      active
+                        ? "bg-slate-900 text-white"
+                        : "text-slate-700 hover:bg-slate-100"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => selectConv(c.id)}
+                      className="min-w-0 flex-1 truncate text-left"
+                      title={`${c.title}\n${c.messageCount} message${c.messageCount === 1 ? "" : "s"} · ${new Date(c.lastUsedAt).toLocaleString()}`}
+                    >
+                      <div className="truncate font-medium">{c.title || c.id}</div>
+                      <div
+                        className={`truncate text-[10px] ${
+                          active ? "text-slate-300" : "text-slate-400"
+                        }`}
+                      >
+                        {c.messageCount} msg · {new Date(c.lastUsedAt).toLocaleDateString()}
+                      </div>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void deleteConv(c.id)}
+                      className={`shrink-0 rounded px-1 py-0.5 text-[10px] opacity-0 transition group-hover:opacity-100 ${
+                        active
+                          ? "text-slate-300 hover:bg-slate-700"
+                          : "text-slate-400 hover:bg-red-100 hover:text-red-700"
+                      }`}
+                      title="Delete this conversation"
+                      aria-label={`Delete ${c.id}`}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      </aside>
+
+      {/* ─── Chat surface ─────────────────────────────────────────────── */}
+      <div className="flex h-full min-w-0 flex-1 flex-col">
+        <div className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
+          <div className="min-w-0">
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Chat</h2>
+            <p className="truncate text-xs text-slate-400">
+              {scopeLabel}
+              {conversationId && (
+                <>
+                  {" "}
+                  · <span className="font-mono">{conversationId}</span>
+                </>
+              )}
+            </p>
+          </div>
+          <input
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder="model (e.g. copilot/gpt-5.5)"
+            className="w-64 rounded-md border border-slate-300 px-2 py-1 text-xs font-mono outline-none focus:border-slate-500"
+          />
+        </div>
+
+        {usage ? (
+          <ContextMeter
+            tokens={usage.tokens}
+            contextWindow={usage.contextWindow}
+            warning={usage.warning}
+            percentage={usage.percentage}
+          />
+        ) : conversationId ? (
+          <ContextMeter
+            tokens={0}
+            contextWindow={200_000}
+            warning={null}
+            percentage={0}
+            loading
+          />
+        ) : null}
+
+        <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-6">
+          {loadingHistory && (
+            <p className="text-sm text-slate-400">Loading history…</p>
+          )}
+          {!loadingHistory && bubbles.length === 0 && (
+            <p className="text-sm text-slate-400">
+              {conversationId
+                ? "Empty conversation. Send a message to start."
+                : "Ask a math or Lean question to start a new chat."}
+            </p>
+          )}
+          {bubbles.map((b, i) =>
+            b.kind === "tool" ? (
+              <div
+                key={i}
+                className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs"
+              >
+                <div className="font-semibold text-amber-800">
+                  🛠 {b.name}
+                  {b.ok !== undefined && (
+                    <span className={b.ok ? "text-green-700" : "text-red-700"}>
+                      {" "}
+                      · {b.ok ? "ok" : "failed"}
+                    </span>
+                  )}
+                </div>
+                {b.args && (
+                  <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words text-amber-900">
+                    {b.args}
+                  </pre>
+                )}
+                {b.result && (
+                  <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words text-slate-700">
+                    {b.result}
+                  </pre>
                 )}
               </div>
-            </div>
-          ),
+            ) : (
+              <div
+                key={i}
+                className={`flex ${b.kind === "user" ? "justify-end" : "justify-start"}`}
+              >
+                <div
+                  className={`max-w-2xl rounded-lg px-4 py-2 text-sm ${
+                    b.kind === "user"
+                      ? "bg-slate-900 text-white"
+                      : "border border-slate-200 bg-white"
+                  }`}
+                >
+                  {b.kind === "assistant" ? (
+                    <div
+                      className="md"
+                      dangerouslySetInnerHTML={{ __html: marked.parse(b.text || "…") as string }}
+                    />
+                  ) : (
+                    <span className="whitespace-pre-wrap">{b.text}</span>
+                  )}
+                </div>
+              </div>
+            ),
+          )}
+        </div>
+
+        {error && (
+          <div className="mx-6 mb-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">
+            {error}
+          </div>
         )}
+
+        <form onSubmit={send} className="flex gap-2 border-t border-slate-200 bg-white p-4">
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Message…"
+            disabled={busy}
+            className="flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
+          />
+          <button
+            type="submit"
+            disabled={busy || !input.trim()}
+            className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+          >
+            {busy ? "…" : "Send"}
+          </button>
+        </form>
       </div>
-
-      {error && (
-        <div className="mx-6 mb-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
-      )}
-
-      <form onSubmit={send} className="flex gap-2 border-t border-slate-200 bg-white p-4">
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="Message…"
-          disabled={busy}
-          className="flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
-        />
-        <button
-          type="submit"
-          disabled={busy || !input.trim()}
-          className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-        >
-          {busy ? "…" : "Send"}
-        </button>
-      </form>
     </div>
   );
 }

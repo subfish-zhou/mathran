@@ -300,7 +300,31 @@ export const api = {
     );
   },
 
-  // ─── Context-window usage meter (v0.3 §19) ─────────────────────────────
+  /** List conversations for any scope (dispatch by kind). */
+  async listChats(scope: ChatScopeSpec): Promise<ConversationSummary[]> {
+    switch (scope.kind) {
+      case "global":
+        return this.listGlobalChats();
+      case "project":
+        return this.listProjectChats(scope.projectSlug);
+      case "effort":
+        return this.listEffortChats(scope.projectSlug, scope.effortSlug);
+    }
+  },
+
+  /**
+   * Read the on-disk history of one conversation (any scope). Returns the
+   * full LLMMessage[] sequence so a refresh / sidebar click can re-hydrate
+   * the chat panel.
+   */
+  async getChatHistory(
+    scope: ChatScopeSpec,
+    conversationId: string,
+  ): Promise<{ conversationId: string; history: any[] }> {
+    return jsonOrThrow<{ conversationId: string; history: any[] }>(
+      await fetch(`${chatScopeBase(scope)}/${enc(conversationId)}`),
+    );
+  },
   async getChatUsage(
     scope: ChatScopeSpec,
     conversationId: string,
