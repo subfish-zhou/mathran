@@ -204,4 +204,26 @@ describe("writeGoal round-trip", () => {
     expect(round?.steps).toHaveLength(3);
     expect(round?.steps.at(-1)?.kind).toBe("tool-result");
   });
+
+  it("preserves summaryPath across write+read", async () => {
+    const g = await createGoal(workspace, {
+      objective: "with summary",
+      scope: { kind: "global" },
+      model: "m",
+    });
+    g.summaryPath = `.mathran/goals/${g.id}.summary.md`;
+    await writeGoal(workspace, g);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.summaryPath).toBe(`.mathran/goals/${g.id}.summary.md`);
+  });
+
+  it("a goal written without summaryPath loads with summaryPath === undefined (backward compat)", async () => {
+    const g = await createGoal(workspace, {
+      objective: "no summary yet",
+      scope: { kind: "global" },
+      model: "m",
+    });
+    const round = await readGoal(workspace, g.id);
+    expect(round?.summaryPath).toBeUndefined();
+  });
 });

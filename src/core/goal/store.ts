@@ -69,6 +69,13 @@ export interface Goal {
   conversationIds: string[];
   /** Append-only step audit log. */
   steps: GoalStep[];
+  /**
+   * Path (relative to workspace) to the post-completion summary markdown
+   * file at `.mathran/goals/<id>.summary.md`. Written by the runner after
+   * `mark_done` / `give_up`. `null` (or missing) when not yet generated
+   * or when the summary round failed (see endReason for details).
+   */
+  summaryPath?: string | null;
 }
 
 /** One row in the goal's audit log. */

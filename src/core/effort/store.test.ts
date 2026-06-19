@@ -18,6 +18,7 @@ import {
   updateEffortMetadata,
   readEffortDocument,
   writeEffortDocument,
+  appendEffortDocument,
   listEffortFiles,
   readEffortFile,
   writeEffortFile,
@@ -148,6 +149,34 @@ describe("metadata + document round-trip", () => {
     await writeEffortDocument(workspace, PROJECT, "lemma-a", "body");
     const after = await readEffortMetadata(workspace, PROJECT, "lemma-a");
     expect(after?.updatedAt).not.toBe(before?.updatedAt);
+  });
+
+  it("appendEffortDocument appends to the existing document.md (twice)", async () => {
+    await writeEffortDocument(workspace, PROJECT, "lemma-a", "# Lemma A\n");
+    await appendEffortDocument(workspace, PROJECT, "lemma-a", "\n---\n## First\n\nfirst chunk\n");
+    await appendEffortDocument(workspace, PROJECT, "lemma-a", "\n---\n## Second\n\nsecond chunk\n");
+    const body = await readEffortDocument(workspace, PROJECT, "lemma-a");
+    expect(body).toContain("# Lemma A");
+    expect(body).toContain("## First");
+    expect(body).toContain("first chunk");
+    expect(body).toContain("## Second");
+    expect(body).toContain("second chunk");
+    // First chunk comes before second chunk.
+    expect((body ?? "").indexOf("## First")).toBeLessThan((body ?? "").indexOf("## Second"));
+  });
+
+  it("appendEffortDocument bumps metadata.updatedAt", async () => {
+    const before = await readEffortMetadata(workspace, PROJECT, "lemma-a");
+    await new Promise((r) => setTimeout(r, 5));
+    await appendEffortDocument(workspace, PROJECT, "lemma-a", "appended");
+    const after = await readEffortMetadata(workspace, PROJECT, "lemma-a");
+    expect(after?.updatedAt).not.toBe(before?.updatedAt);
+  });
+
+  it("appendEffortDocument throws when the effort directory does not exist", async () => {
+    await expect(
+      appendEffortDocument(workspace, PROJECT, "ghost-effort", "x"),
+    ).rejects.toThrow(/effort not found/);
   });
 });
 

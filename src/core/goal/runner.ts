@@ -28,16 +28,20 @@
  *   - chat + goal can never drift on path layout.
  */
 
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { ChatSession, type ToolExecuteContext, type ToolSpec } from "../chat/session.js";
-import type { LLMProvider } from "../providers/llm.js";
+import type { LLMMessage, LLMProvider } from "../providers/llm.js";
 import type { ChatEvent } from "../chat/index.js";
 import {
   conversationFilePath,
   flushConversationHistory,
   loadConversationHistory,
 } from "../chat/store.js";
+import { atomicWriteFile } from "../chat/atomic-write.js";
+import { appendEffortDocument } from "../effort/store.js";
 
 import {
   appendStep,
@@ -46,6 +50,7 @@ import {
   readGoal,
   updateGoalStats,
   withinBudget,
+  writeGoal,
   type Goal,
 } from "./store.js";
 import { buildGoalTools, createGoalToolHandler } from "./tools.js";
@@ -128,6 +133,169 @@ export interface RunRoundResult {
   aborted: boolean;
   /** End reason, only set when status changed. */
   endReason?: string;
+}
+
+/**
+ * Summary prompts the runner sends after `mark_done` / `give_up`. Kept here
+ * so tests can assert on the exact wording.
+ */
+export const GOAL_SUMMARY_PROMPT_DONE =
+  "The goal is complete. Write a concise paragraph (≤300 words) summarizing what was accomplished, key decisions made, and any important artifacts produced. Use past tense. Do not call any tools — reply with plain prose only.";
+
+export const GOAL_SUMMARY_PROMPT_GIVE_UP =
+  "The goal was abandoned. Write a concise paragraph (≤300 words) summarizing what was attempted, what blocked progress, and what would need to change to retry. Use past tense. Do not call any tools — reply with plain prose only.";
+
+/**
+ * Header prepended to the saved summary file. Captures objective + outcome
+ * so the file is self-describing even when read in isolation.
+ */
+function formatSummaryHeader(goal: Goal, outcome: "done" | "give_up", reason: string): string {
+  const lines: string[] = [
+    `# Goal summary: ${goal.objective}`,
+    "",
+    `- **id**: ${goal.id}`,
+    `- **status**: ${outcome === "done" ? "complete" : "failed"}`,
+    `- **endReason**: ${reason}`,
+    `- **started**: ${goal.createdAt}`,
+    `- **completed**: ${new Date().toISOString()}`,
+    `- **rounds**: ${goal.stats.roundsRun}`,
+    `- **tokens**: ${goal.stats.tokensUsed}`,
+  ];
+  if (goal.scope.kind === "effort") {
+    lines.push(`- **scope**: effort ${goal.scope.projectSlug} / ${goal.scope.effortSlug}`);
+  } else if (goal.scope.kind === "project") {
+    lines.push(`- **scope**: project ${goal.scope.projectSlug}`);
+  } else {
+    lines.push(`- **scope**: global`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Drive one no-tools LLM round to write a post-completion summary. Returns
+ * the assistant's text (may be empty on transport errors). Caller is
+ * responsible for persisting the result and updating the goal record.
+ *
+ * Critical: we pass `tools: []` so the assistant cannot re-call
+ * `mark_done`/`give_up` and re-enter the completion path (infinite loop).
+ */
+async function runSummaryRound(opts: {
+  llm: LLMProvider;
+  model: string;
+  systemPrompt: string;
+  history: LLMMessage[];
+  prompt: string;
+}): Promise<string> {
+  const messages: LLMMessage[] = [
+    { role: "system", content: opts.systemPrompt },
+    ...opts.history,
+    { role: "user", content: opts.prompt },
+  ];
+  const response = await opts.llm.chat({
+    messages,
+    model: opts.model,
+    // No tools — the summary round must not be able to call mark_done /
+    // give_up again, otherwise the runner would re-enter the completion path.
+  });
+  let buf = "";
+  for await (const chunk of response.stream()) {
+    if (chunk.type === "text") buf += chunk.delta;
+    // Ignore any spurious tool-call chunks: with tools=[] adapters should not
+    // emit them, but if one slips through we deliberately drop it.
+  }
+  return buf;
+}
+
+/**
+ * Handle the post-completion summary: run an extra LLM round, atomically
+ * write the summary file, update `goal.summaryPath`, and append to the
+ * effort document when scoped. All failures are logged + swallowed — a
+ * broken summary round must not block completion (the goal is already
+ * marked complete/failed by the caller).
+ */
+async function finalizeWithSummary(opts: {
+  workspace: string;
+  goal: Goal;
+  outcome: "done" | "give_up";
+  reason: string;
+  llm: LLMProvider;
+  systemPrompt: string;
+  history: LLMMessage[];
+}): Promise<Goal> {
+  const { workspace, goal, outcome, reason, llm, systemPrompt, history } = opts;
+
+  // Skip empty conversations (e.g. mark_done called with zero real work) —
+  // there's nothing to summarize and we'd just burn a round on "the user
+  // didn't say anything".
+  if (history.length === 0) {
+    return goal;
+  }
+
+  let summaryText = "";
+  try {
+    summaryText = await runSummaryRound({
+      llm,
+      model: goal.model,
+      systemPrompt,
+      history,
+      prompt: outcome === "done" ? GOAL_SUMMARY_PROMPT_DONE : GOAL_SUMMARY_PROMPT_GIVE_UP,
+    });
+  } catch (err: any) {
+    // Log + bail: completion stands, summary just stays null.
+    await appendStep(workspace, goal.id, {
+      kind: "status",
+      payload: { summaryError: String(err?.message ?? err) },
+    });
+    return goal;
+  }
+
+  // Always write the header even if the model returned an empty body — the
+  // file is still useful as a record of "this goal ended at <time>".
+  const body = formatSummaryHeader(goal, outcome, reason) + "\n\n" + summaryText.trim() + "\n";
+  const relPath = path.join(".mathran", "goals", `${goal.id}.summary.md`);
+  const absPath = path.join(workspace, relPath);
+  try {
+    await fs.mkdir(path.dirname(absPath), { recursive: true });
+    await atomicWriteFile(absPath, body);
+  } catch (err: any) {
+    await appendStep(workspace, goal.id, {
+      kind: "status",
+      payload: { summaryWriteError: String(err?.message ?? err) },
+    });
+    return goal;
+  }
+
+  // Persist the relative summary path on the goal record so callers (CLI /
+  // REST) can surface it without re-deriving the filename.
+  const refreshed = (await readGoal(workspace, goal.id)) ?? goal;
+  refreshed.summaryPath = relPath;
+  await writeGoal(workspace, refreshed);
+
+  // If the goal is scoped to an effort, also append the summary to the
+  // effort's notebook so the human sees "what happened" inline with the
+  // rest of the effort's writeup.
+  if (refreshed.scope.kind === "effort" && refreshed.scope.projectSlug && refreshed.scope.effortSlug) {
+    try {
+      const block =
+        `\n\n---\n\n## Goal: ${refreshed.objective}\n` +
+        `*${outcome === "done" ? "Completed" : "Abandoned"} ${new Date().toISOString()}*\n\n` +
+        `${summaryText.trim()}\n`;
+      await appendEffortDocument(
+        workspace,
+        refreshed.scope.projectSlug,
+        refreshed.scope.effortSlug,
+        block,
+      );
+    } catch (err: any) {
+      // Don't roll back the summary file — just record the partial failure.
+      await appendStep(workspace, refreshed.id, {
+        kind: "status",
+        payload: { effortAppendError: String(err?.message ?? err) },
+      });
+    }
+  }
+
+  return refreshed;
 }
 
 /**
@@ -256,12 +424,30 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   if (handler.completion?.outcome === "done") {
     const reason = handler.completion.reason;
     const ended = await endGoal(workspace, goalId, "complete", reason);
-    return { goal: ended ?? goal, text: textBuf, completed: true, exhausted: false, failed: false, aborted: false, endReason: reason };
+    const finalGoal = await finalizeWithSummary({
+      workspace,
+      goal: ended ?? goal,
+      outcome: "done",
+      reason,
+      llm,
+      systemPrompt,
+      history: session.history(),
+    });
+    return { goal: finalGoal, text: textBuf, completed: true, exhausted: false, failed: false, aborted: false, endReason: reason };
   }
   if (handler.completion?.outcome === "give_up") {
     const reason = handler.completion.reason;
     const ended = await endGoal(workspace, goalId, "failed", reason);
-    return { goal: ended ?? goal, text: textBuf, completed: false, exhausted: false, failed: true, aborted: false, endReason: reason };
+    const finalGoal = await finalizeWithSummary({
+      workspace,
+      goal: ended ?? goal,
+      outcome: "give_up",
+      reason,
+      llm,
+      systemPrompt,
+      history: session.history(),
+    });
+    return { goal: finalGoal, text: textBuf, completed: false, exhausted: false, failed: true, aborted: false, endReason: reason };
   }
 
   // Re-check budget for the next round.
