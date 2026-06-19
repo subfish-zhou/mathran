@@ -5,8 +5,8 @@
  *
  * A "round" here is one `ChatSession.send()` call (which itself may run
  * multiple tool-call iterations inside `maxToolRounds`). After every round
- * we re-check the goal's status + budget; an explicit `DONE:<reason>` line
- * in the assistant's reply completes the goal.
+ * we re-check the goal's status + budget; calling the `mark_done` tool
+ * completes the goal.
  *
  * This is a synchronous driver — the caller (CLI / REST) waits for each
  * round to finish. A daemon variant is left for a later commit; for now
@@ -38,11 +38,12 @@ import {
   withinBudget,
   type Goal,
 } from "./store.js";
+import { buildGoalTools, createGoalToolHandler } from "./tools.js";
 
 /**
  * Build the per-goal system prompt. Pinning objective + budget at the top
- * lets the assistant know when to wrap up. The `DONE:` / `GIVE_UP:` line
- * is how the runner detects completion without a separate tool.
+ * lets the assistant know when to wrap up. The `mark_done` / `give_up` tools
+ * are how the runner detects completion.
  */
 export function buildGoalSystemPrompt(input: {
   goal: Goal;
@@ -70,9 +71,10 @@ export function buildGoalSystemPrompt(input: {
   lines.push(`Already spent: ${goal.stats.tokensUsed} tokens / ${goal.stats.roundsRun} rounds.`);
   lines.push("");
   lines.push(
-    `When the goal is achieved, write a single line starting with "DONE:" followed ` +
-      `by a one-line summary. If you decide the goal is impossible or out of scope, ` +
-      `write "GIVE_UP:" followed by why.`,
+    `When the objective is complete, call the \`mark_done(reason)\` tool with a ` +
+      `one-line summary. If you decide the goal cannot be completed, call ` +
+      `\`give_up(reason)\`. Do not announce completion in plain text — only the ` +
+      `tool call counts.`,
   );
   return lines.join("\n");
 }
@@ -130,11 +132,11 @@ export interface RunRoundResult {
   goal: Goal;
   /** Concatenated assistant text from this round. */
   text: string;
-  /** True if the assistant emitted "DONE:" — the runner flipped status. */
+  /** True if the assistant called `mark_done` — the runner flipped status. */
   completed: boolean;
   /** True if budget was exhausted during this round. */
   exhausted: boolean;
-  /** True if the assistant emitted "GIVE_UP:" — runner flipped to failed. */
+  /** True if the assistant called `give_up` — runner flipped to failed. */
   failed: boolean;
   /** End reason, only set when status changed. */
   endReason?: string;
@@ -178,10 +180,11 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     goal,
     systemPromptBase: systemPromptBase ?? "You are mathran, a local mathematician's workstation assistant.",
   });
+  const handler = createGoalToolHandler();
   const session = new ChatSession({
     llm,
     model: goal.model,
-    tools,
+    tools: [...tools, ...buildGoalTools(handler)],
     systemPrompt,
     toolContext,
   });
@@ -226,16 +229,15 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     tokensUsed: Math.ceil((userMessage.length + textBuf.length) / 4),
   });
 
-  // DONE: / GIVE_UP: markers wrap the goal.
-  const doneMatch = /(?:^|\n)\s*DONE:\s*(.+?)$/m.exec(textBuf);
-  const giveUpMatch = /(?:^|\n)\s*GIVE_UP:\s*(.+?)$/m.exec(textBuf);
-  if (doneMatch) {
-    const reason = doneMatch[1].trim();
+  // mark_done / give_up tool calls wrap the goal (recorded on the handler
+  // during session.send above — see ./tools.ts for why we can't throw).
+  if (handler.completion?.outcome === "done") {
+    const reason = handler.completion.reason;
     const ended = await endGoal(workspace, goalId, "complete", reason);
     return { goal: ended ?? goal, text: textBuf, completed: true, exhausted: false, failed: false, endReason: reason };
   }
-  if (giveUpMatch) {
-    const reason = giveUpMatch[1].trim();
+  if (handler.completion?.outcome === "give_up") {
+    const reason = handler.completion.reason;
     const ended = await endGoal(workspace, goalId, "failed", reason);
     return { goal: ended ?? goal, text: textBuf, completed: false, exhausted: false, failed: true, endReason: reason };
   }
