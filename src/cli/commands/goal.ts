@@ -16,11 +16,13 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
+import * as fs from "node:fs/promises";
 
 import { ChatSession, createLeanCheckTool } from "../../core/chat/index.js";
 import {
   createGoal,
   endGoal,
+  goalsDirFor,
   listGoals,
   readGoal,
   writeGoal,
@@ -309,6 +311,48 @@ export async function runGoalCancel(goalId: string, opts: GoalSimpleOptions): Pr
   }
   const ended = await endGoal(workspace, resolved, "cancelled", "user cancelled");
   console.log(`mathran: cancelled ${ended?.id}`);
+  return 0;
+}
+
+/**
+ * Path of the per-goal "stop" marker. A running round (started in-process by
+ * `serve`) registers an AbortController and interrupts directly; this marker is
+ * the out-of-process fallback so a separate `mathran` invocation can request an
+ * abort. The marker is advisory: a round only observes it if the same process
+ * (or a future file-poll hook) checks for it. Multi-process abort therefore
+ * needs the round to have been started by a process that watches this file.
+ */
+export function goalStopMarkerPath(workspace: string, goalId: string): string {
+  return path.join(goalsDirFor(workspace), `${goalId}.stop`);
+}
+
+/**
+ * `mathran goal stop <goalId>` — request that an in-flight round be aborted by
+ * writing a `<id>.stop` marker file next to the goal record. This does NOT
+ * change the goal's persisted status (use `pause`/`cancel` for that); it only
+ * signals a running round to wind down.
+ */
+export async function runGoalStop(goalId: string, opts: GoalSimpleOptions): Promise<number> {
+  const workspace = resolveWorkspaceRoot(opts.workspace);
+  const resolved = await resolveGoalId(workspace, goalId);
+  if (!resolved) {
+    console.error(`mathran goal stop: not found or ambiguous: ${goalId}`);
+    return 1;
+  }
+  const g = await readGoal(workspace, resolved);
+  if (!g) {
+    console.error(`mathran goal stop: not found: ${resolved}`);
+    return 1;
+  }
+  const marker = goalStopMarkerPath(workspace, resolved);
+  await fs.mkdir(path.dirname(marker), { recursive: true });
+  await fs.writeFile(marker, new Date().toISOString() + "\n", "utf-8");
+  console.log(`mathran: wrote stop marker for ${resolved}.`);
+  console.log(
+    `  note: this only aborts a round started in the same process (or one ` +
+      `polling for the marker). A round driven by 'mathran serve' is best ` +
+      `stopped via POST /api/goals/${resolved}/interrupt.`,
+  );
   return 0;
 }
 

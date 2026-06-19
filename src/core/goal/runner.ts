@@ -124,6 +124,13 @@ export interface RunRoundOptions {
   toolContext?: ToolExecuteContext;
   /** Optional override for the base system prompt the goal wraps. */
   systemPromptBase?: string;
+  /**
+   * Cancellation signal threaded into `ChatSession.send`. When it fires the
+   * round stops, any partial assistant text is persisted to the conversation
+   * jsonl (so a later `resume` sees the progress), and the goal's status is
+   * left untouched (NOT marked failed) — the runner returns `aborted: true`.
+   */
+  signal?: AbortSignal;
 }
 
 export interface RunRoundResult {
@@ -136,6 +143,11 @@ export interface RunRoundResult {
   exhausted: boolean;
   /** True if the assistant emitted "GIVE_UP:" — runner flipped to failed. */
   failed: boolean;
+  /**
+   * True if the round was aborted via `opts.signal`. The goal's persisted
+   * status is left unchanged (active/paused) so it can be resumed.
+   */
+  aborted: boolean;
   /** End reason, only set when status changed. */
   endReason?: string;
 }
@@ -145,7 +157,7 @@ export interface RunRoundResult {
  * events to the goal's audit log and re-evaluates status + budget on exit.
  */
 export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResult> {
-  const { workspace, goalId, userMessage, llm, tools, toolContext, systemPromptBase } = opts;
+  const { workspace, goalId, userMessage, llm, tools, toolContext, systemPromptBase, signal } = opts;
   let goal = await readGoal(workspace, goalId);
   if (!goal) throw new Error(`goal not found: ${goalId}`);
 
@@ -156,14 +168,21 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
       completed: goal.status === "complete",
       exhausted: goal.status === "exhausted",
       failed: goal.status === "failed",
+      aborted: false,
       endReason: goal.endReason ?? `goal is ${goal.status}, refuse to run`,
     };
+  }
+
+  // Already-aborted before any work: return early without side effects so the
+  // goal's status (and stats) stay untouched.
+  if (signal?.aborted) {
+    return { goal, text: "", completed: false, exhausted: false, failed: false, aborted: true };
   }
 
   const before = withinBudget(goal);
   if (!before.ok) {
     const ended = await endGoal(workspace, goalId, "exhausted", before.reason);
-    return { goal: ended ?? goal, text: "", completed: false, exhausted: true, failed: false, endReason: before.reason };
+    return { goal: ended ?? goal, text: "", completed: false, exhausted: true, failed: false, aborted: false, endReason: before.reason };
   }
 
   // Reuse the goal's primary conversation if attached; otherwise mint one.
@@ -192,24 +211,39 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
 
   let textBuf = "";
   let toolCallCount = 0;
-  for await (const ev of session.send(userMessage) as AsyncIterable<ChatEvent>) {
-    if (ev.type === "text") {
-      textBuf += ev.delta;
-    } else if (ev.type === "tool-call") {
-      toolCallCount++;
-      await appendStep(workspace, goalId, {
-        kind: "tool-call",
-        payload: { id: ev.id, name: ev.name, args: ev.args },
-      });
-    } else if (ev.type === "tool-result") {
-      const trimmed = ev.content.length > 4000 ? ev.content.slice(0, 4000) + " …[truncated]" : ev.content;
-      await appendStep(workspace, goalId, {
-        kind: "tool-result",
-        payload: { id: ev.id, name: ev.name, ok: ev.ok, content: trimmed },
-      });
-    } else if (ev.type === "done") {
-      /* recorded below via stats */
+  try {
+    for await (const ev of session.send(userMessage, { signal }) as AsyncIterable<ChatEvent>) {
+      if (ev.type === "text") {
+        textBuf += ev.delta;
+      } else if (ev.type === "tool-call") {
+        toolCallCount++;
+        await appendStep(workspace, goalId, {
+          kind: "tool-call",
+          payload: { id: ev.id, name: ev.name, args: ev.args },
+        });
+      } else if (ev.type === "tool-result") {
+        const trimmed = ev.content.length > 4000 ? ev.content.slice(0, 4000) + " …[truncated]" : ev.content;
+        await appendStep(workspace, goalId, {
+          kind: "tool-result",
+          payload: { id: ev.id, name: ev.name, ok: ev.ok, content: trimmed },
+        });
+      } else if (ev.type === "done") {
+        /* recorded below via stats */
+      }
     }
+  } catch (err: any) {
+    if (err?.name === "AbortError") {
+      // Persist whatever partial progress made it into history so a later
+      // `resume` continues from here. Crucially we do NOT mark the goal failed
+      // — its status is left as-is (active/paused) for the caller to decide.
+      await saveConversation(convFile, session.history());
+      await appendStep(workspace, goalId, {
+        kind: "status",
+        payload: { aborted: true, reason: "round aborted via signal" },
+      });
+      return { goal, text: textBuf, completed: false, exhausted: false, failed: false, aborted: true };
+    }
+    throw err;
   }
 
   // Persist the conversation jsonl so resumes pick up the latest turn.
@@ -232,12 +266,12 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   if (doneMatch) {
     const reason = doneMatch[1].trim();
     const ended = await endGoal(workspace, goalId, "complete", reason);
-    return { goal: ended ?? goal, text: textBuf, completed: true, exhausted: false, failed: false, endReason: reason };
+    return { goal: ended ?? goal, text: textBuf, completed: true, exhausted: false, failed: false, aborted: false, endReason: reason };
   }
   if (giveUpMatch) {
     const reason = giveUpMatch[1].trim();
     const ended = await endGoal(workspace, goalId, "failed", reason);
-    return { goal: ended ?? goal, text: textBuf, completed: false, exhausted: false, failed: true, endReason: reason };
+    return { goal: ended ?? goal, text: textBuf, completed: false, exhausted: false, failed: true, aborted: false, endReason: reason };
   }
 
   // Re-check budget for the next round.
@@ -245,8 +279,8 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   const after = withinBudget(goal);
   if (!after.ok) {
     const ended = await endGoal(workspace, goalId, "exhausted", after.reason);
-    return { goal: ended ?? goal, text: textBuf, completed: false, exhausted: true, failed: false, endReason: after.reason };
+    return { goal: ended ?? goal, text: textBuf, completed: false, exhausted: true, failed: false, aborted: false, endReason: after.reason };
   }
 
-  return { goal, text: textBuf, completed: false, exhausted: false, failed: false };
+  return { goal, text: textBuf, completed: false, exhausted: false, failed: false, aborted: false };
 }

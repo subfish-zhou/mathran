@@ -80,6 +80,7 @@ import {
   type Goal,
 } from "../core/goal/store.js";
 import { runGoalRound } from "../core/goal/runner.js";
+import type { LLMProvider } from "../core/providers/llm.js";
 import { randomUUID } from "node:crypto";
 import {
   ModelRouter,
@@ -109,6 +110,13 @@ export type ChatSessionFactory = (opts: {
   scope?: ChatScope;
 }) => ChatSession;
 
+/**
+ * Factory the goal-run endpoint uses to build the LLM provider for a round.
+ * Injectable for tests so an in-flight round can be driven by a controllable
+ * (e.g. slow) provider; the default wires a `ModelRouter` from config.
+ */
+export type GoalLLMFactory = (opts: { model?: string }) => LLMProvider;
+
 export interface StartServerOptions {
   host?: string;
   port?: number;
@@ -118,6 +126,11 @@ export interface StartServerOptions {
    * omitted the server wires a `ModelRouter` from `<workspace>/config.toml`.
    */
   chatSessionFactory?: ChatSessionFactory;
+  /**
+   * Test seam: override the LLM provider used to drive goal rounds. When
+   * omitted the server wires a `ModelRouter` from `<workspace>/config.toml`.
+   */
+  goalLlmFactory?: GoalLLMFactory;
 }
 
 export interface RunningServer {
@@ -793,12 +806,21 @@ function registerChatRoutes(
   });
 }
 
-function buildApp(workspace: string, factory: ChatSessionFactory): Hono {
+function buildApp(
+  workspace: string,
+  factory: ChatSessionFactory,
+  goalLlmFactory?: GoalLLMFactory,
+): Hono {
   const app = new Hono();
   // Adapt the test-friendly `ChatSessionFactory(opts)` to the store's
   // `ScopedChatSessionFactory({ scope, model })` signature.
   const scopedFactory: ScopedChatSessionFactory = ({ scope, model }) => factory({ scope, model });
   const sessions = new ScopedChatSessionStore(workspace, scopedFactory);
+
+  // Per-goal AbortControllers for in-flight rounds. POST /interrupt aborts the
+  // matching controller. Single-process only — a multi-process deployment would
+  // need IPC (or the `<id>.stop` file-marker poll) to reach the right worker.
+  const inflightGoals = new Map<string, AbortController>();
 
   app.get("/api/health", async (c) => {
     return c.json({ ok: true, version: await readPackageVersion(), workspace });
@@ -1386,17 +1408,24 @@ function buildApp(workspace: string, factory: ChatSessionFactory): Hono {
         : "Continue with the current objective.";
 
     const cfg = loadConfig(configPathFor(workspace));
-    const router = new ModelRouter(cfg);
+    const llm: LLMProvider = goalLlmFactory
+      ? goalLlmFactory({ model: g.model })
+      : new ModelRouter(cfg);
     const lean = new LocalLeanProvider();
     const tools = [createLeanCheckTool(lean)];
+
+    // Register an AbortController so POST /interrupt can stop this round.
+    const controller = new AbortController();
+    inflightGoals.set(goalId, controller);
     try {
       const r = await runGoalRound({
         workspace,
         goalId,
         userMessage,
-        llm: router,
+        llm,
         tools,
         toolContext: { workspace, scope: g.scope },
+        signal: controller.signal,
       });
       return c.json({
         goal: r.goal,
@@ -1404,12 +1433,32 @@ function buildApp(workspace: string, factory: ChatSessionFactory): Hono {
         completed: r.completed,
         failed: r.failed,
         exhausted: r.exhausted,
+        aborted: r.aborted,
         endReason: r.endReason,
       });
     } catch (err: any) {
       await endGoal(workspace, goalId, "failed", String(err?.message ?? err));
       return c.json({ error: String(err?.message ?? err) }, 500);
+    } finally {
+      inflightGoals.delete(goalId);
     }
+  });
+
+  /**
+   * POST /api/goals/:id/interrupt — abort the in-flight round for this goal.
+   *
+   * Returns 200 (with `{ interrupted: true }`) when a controller was found and
+   * aborted, 404 when no round is currently running for the goal. The goal's
+   * persisted status is NOT changed here — the round winds down and the runner
+   * leaves it active/paused for the caller to decide next.
+   */
+  app.post("/api/goals/:goalId/interrupt", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const controller = inflightGoals.get(goalId);
+    if (!controller) return c.json({ error: "no in-flight round" }, 404);
+    controller.abort();
+    return c.json({ interrupted: true });
   });
 
   app.post("/api/goals/:goalId/pause", async (c) => {
@@ -1503,7 +1552,7 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
   const workspace = resolveWorkspaceRoot(opts.workspace);
   const factory = opts.chatSessionFactory ?? defaultSessionFactory(workspace);
 
-  const app = buildApp(workspace, factory);
+  const app = buildApp(workspace, factory, opts.goalLlmFactory);
 
   const server = await new Promise<ReturnType<typeof serve>>((resolve) => {
     const s = serve({ fetch: app.fetch, hostname: host, port }, () => resolve(s));
