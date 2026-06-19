@@ -54,8 +54,8 @@ describe("buildGoalSystemPrompt", () => {
     expect(prompt).toContain("effort p / e");
     expect(prompt).toContain("Token budget: 1000");
     expect(prompt).toContain("Round budget: 5");
-    expect(prompt).toMatch(/DONE:/);
-    expect(prompt).toMatch(/GIVE_UP:/);
+    expect(prompt).toMatch(/mark_done/);
+    expect(prompt).toMatch(/give_up/);
   });
 });
 
@@ -99,11 +99,15 @@ describe("runGoalRound", () => {
     expect(raw).toContain("hello world");
   });
 
-  it("DONE: marker flips status to complete", async () => {
+  it("mark_done tool flips status to complete", async () => {
     const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
     const llm = fakeLLM([
       [
-        { type: "text", delta: "verified the lemma.\nDONE: lemma proved" },
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "lemma proved" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "all set" },
         { type: "done", finishReason: "stop" },
       ],
     ]);
@@ -115,11 +119,15 @@ describe("runGoalRound", () => {
     expect(round?.endedAt).toBeTruthy();
   });
 
-  it("GIVE_UP: marker flips status to failed", async () => {
+  it("give_up tool flips status to failed", async () => {
     const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
     const llm = fakeLLM([
       [
-        { type: "text", delta: "GIVE_UP: scope too big" },
+        { type: "tool-call", id: "u1", name: "give_up", argsDelta: JSON.stringify({ reason: "scope too big" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "stopping" },
         { type: "done", finishReason: "stop" },
       ],
     ]);
@@ -128,6 +136,21 @@ describe("runGoalRound", () => {
     expect(r.endReason).toBe("scope too big");
     const round = await readGoal(workspace, g.id);
     expect(round?.status).toBe("failed");
+  });
+
+  it("plain-text DONE: in output does NOT complete the goal (regex must not trigger)", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    const llm = fakeLLM([
+      [
+        { type: "text", delta: "I'll mark DONE: when ready" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    expect(r.completed).toBe(false);
+    expect(r.failed).toBe(false);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("active");
   });
 
   it("round budget exhaustion trips between rounds", async () => {
