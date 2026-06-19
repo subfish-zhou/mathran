@@ -754,3 +754,430 @@ describe("runGoalRound summary on completion", () => {
   });
 });
 
+/**
+ * Tests for v0.3 §15 — nested sub-goals via `spawn_sub_goal`. Each test
+ * scripts the fake LLM with a sequence of turns covering both the parent
+ * goal and any sub-goal it spawns. Order of `chat()` calls inside one test:
+ *
+ *   parent.send #1     (parent emits spawn_sub_goal tool-call)
+ *     → sub-goal.send #1   (sub-goal turn 1)
+ *     → sub-goal.send #2+  (sub-goal turn 2 — follow-up after tool-result)
+ *     → sub-goal.send +    (sub-goal post-completion summary, no tools)
+ *   parent.send #2     (parent follow-up text after sub-goal tool-result)
+ *
+ * Tests assert on the recorded request stream so we can pin the exact
+ * tool-result string the parent receives back from the sub-goal.
+ */
+describe("runGoalRound nested sub-goals (v0.3 §15)", () => {
+  /** Tracking LLM that records every chat() request for later assertion. */
+  function recordingLLM(turns: LLMStreamChunk[][]): {
+    llm: LLMProvider;
+    calls: LLMRequest[];
+  } {
+    const calls: LLMRequest[] = [];
+    let i = 0;
+    const llm: LLMProvider = {
+      async describe() {
+        return { name: "fake-nested" };
+      },
+      async chat(req: LLMRequest) {
+        calls.push(req);
+        const turn = turns[i++] ?? [{ type: "done", finishReason: "stop" }];
+        return {
+          async *stream() {
+            for (const c of turn) yield c;
+          },
+        };
+      },
+    };
+    return { llm, calls };
+  }
+
+  it("happy path: parent spawn_sub_goal → sub-goal mark_done → parent sees summary", async () => {
+    const g = await createGoal(workspace, {
+      objective: "top-level",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const { llm, calls } = recordingLLM([
+      // parent.send #1: assistant decides to decompose.
+      [
+        {
+          type: "tool-call",
+          id: "s1",
+          name: "spawn_sub_goal",
+          argsDelta: JSON.stringify({ objective: "prove subclaim X" }),
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      // sub-goal.send #1: sub-goal calls mark_done immediately.
+      [
+        {
+          type: "tool-call",
+          id: "d1",
+          name: "mark_done",
+          argsDelta: JSON.stringify({ reason: "X done" }),
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      // sub-goal.send #2: ChatSession follow-up text after tool-result.
+      [
+        { type: "text", delta: "sub-goal wrap" },
+        { type: "done", finishReason: "stop" },
+      ],
+      // sub-goal post-completion summary round (tools=[]).
+      [
+        { type: "text", delta: "Subclaim X was proved by Lemma 1." },
+        { type: "done", finishReason: "stop" },
+      ],
+      // parent.send round-2 follow-up after sub-goal tool result is fed back.
+      [
+        { type: "text", delta: "parent acknowledges sub-goal" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "do the work",
+      llm,
+      tools: [],
+    });
+
+    // The parent's text contains its post-tool follow-up.
+    expect(r.text).toContain("parent acknowledges");
+    expect(r.completed).toBe(false);
+    expect(r.failed).toBe(false);
+
+    // Two goal records exist now: parent + sub-goal.
+    const goalsDir = path.join(workspace, ".mathran", "goals");
+    const entries = (await fs.readdir(goalsDir)).filter((n) => n.endsWith(".json"));
+    expect(entries.length).toBe(2);
+
+    // Find the sub-goal: it's NOT the parent id.
+    const allGoals = await Promise.all(
+      entries.map((n) => fs.readFile(path.join(goalsDir, n), "utf-8").then((raw) => JSON.parse(raw))),
+    );
+    const subGoal = allGoals.find((x: any) => x.id !== g.id) as any;
+    expect(subGoal).toBeDefined();
+    expect(subGoal.objective).toBe("prove subclaim X");
+    expect(subGoal.status).toBe("complete");
+    expect(subGoal.endReason).toBe("X done");
+
+    // Parent.send #2 (the follow-up call) must include the sub-goal's summary
+    // string as a tool-result message in its conversation history.
+    const parentFollowUp = calls.at(-1)!;
+    const toolResult = parentFollowUp.messages.find(
+      (m) => (m as any).role === "tool" && (m as any).toolCallId === "s1",
+    );
+    expect(toolResult).toBeDefined();
+    const trContent = String((toolResult as any).content);
+    expect(trContent).toContain(`Sub-goal ${subGoal.id} completed`);
+    expect(trContent).toContain("status=complete");
+    expect(trContent).toContain("X done");
+  });
+
+  it("depth limit: a sub-goal at depth 1 has NO spawn_sub_goal in its tool list", async () => {
+    const g = await createGoal(workspace, {
+      objective: "top",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const { llm, calls } = recordingLLM([
+      // parent.send #1: spawn sub-goal.
+      [
+        {
+          type: "tool-call",
+          id: "s1",
+          name: "spawn_sub_goal",
+          argsDelta: JSON.stringify({ objective: "inner" }),
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      // sub-goal.send #1: try to spawn ANOTHER sub-goal. ChatSession's
+      // "unknown tool" branch returns an error tool-result string
+      // because the runner did NOT register spawn_sub_goal at depth 1.
+      [
+        {
+          type: "tool-call",
+          id: "s2",
+          name: "spawn_sub_goal",
+          argsDelta: JSON.stringify({ objective: "inner-inner" }),
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      // sub-goal.send #2: after seeing the unknown-tool error, the
+      // sub-goal gives up.
+      [
+        {
+          type: "tool-call",
+          id: "u1",
+          name: "give_up",
+          argsDelta: JSON.stringify({ reason: "cannot recurse further" }),
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      // sub-goal.send #3: ChatSession follow-up after give_up tool-result.
+      [
+        { type: "text", delta: "giving up" },
+        { type: "done", finishReason: "stop" },
+      ],
+      // sub-goal post-give_up summary round.
+      [
+        { type: "text", delta: "Could not recurse; gave up." },
+        { type: "done", finishReason: "stop" },
+      ],
+      // parent.send #2: follow-up after sub-goal tool-result.
+      [
+        { type: "text", delta: "parent ack" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "try recursion",
+      llm,
+      tools: [],
+    });
+
+    // Sub-goal.send #1 was the FIRST call where the sub-goal acted.
+    // Inspect its `tools` array: the parent's first round (calls[0]) DOES
+    // include spawn_sub_goal; the sub-goal's first round (calls[1]) does NOT.
+    const parentFirst = calls[0];
+    const subFirst = calls[1];
+    const parentToolNames = (parentFirst.tools ?? []).map((t: any) => t.name);
+    const subToolNames = (subFirst.tools ?? []).map((t: any) => t.name);
+    expect(parentToolNames).toContain("spawn_sub_goal");
+    expect(subToolNames).not.toContain("spawn_sub_goal");
+    // mark_done / give_up still present at depth 1.
+    expect(subToolNames).toContain("mark_done");
+    expect(subToolNames).toContain("give_up");
+
+    // Sub-goal eventually gave up (the runaway recursion attempt was
+    // benignly rejected as unknown tool, then the model gave up).
+    const goalsDir = path.join(workspace, ".mathran", "goals");
+    const entries = (await fs.readdir(goalsDir)).filter((n) => n.endsWith(".json"));
+    const allGoals = await Promise.all(
+      entries.map((n) => fs.readFile(path.join(goalsDir, n), "utf-8").then((raw) => JSON.parse(raw))),
+    );
+    const subGoal = allGoals.find((x: any) => x.id !== g.id) as any;
+    expect(subGoal.status).toBe("failed");
+    expect(subGoal.endReason).toBe("cannot recurse further");
+  });
+
+  it("sub-goal abort (give_up) reports failed status to the parent", async () => {
+    const g = await createGoal(workspace, {
+      objective: "top",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const { llm, calls } = recordingLLM([
+      [
+        {
+          type: "tool-call",
+          id: "s1",
+          name: "spawn_sub_goal",
+          argsDelta: JSON.stringify({ objective: "impossible task" }),
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      // sub-goal.send #1: gives up immediately.
+      [
+        {
+          type: "tool-call",
+          id: "u1",
+          name: "give_up",
+          argsDelta: JSON.stringify({ reason: "too vague" }),
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      // sub-goal.send #2: follow-up text after tool-result.
+      [
+        { type: "text", delta: "halting" },
+        { type: "done", finishReason: "stop" },
+      ],
+      // sub-goal summary round.
+      [
+        { type: "text", delta: "Tried nothing; gave up." },
+        { type: "done", finishReason: "stop" },
+      ],
+      // parent.send #2: follow-up.
+      [
+        { type: "text", delta: "noted" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "try it",
+      llm,
+      tools: [],
+    });
+
+    // Tool-result fed back to the parent should label status=failed.
+    const parentFollowUp = calls.at(-1)!;
+    const toolResult = parentFollowUp.messages.find(
+      (m) => (m as any).role === "tool" && (m as any).toolCallId === "s1",
+    );
+    const trContent = String((toolResult as any)?.content ?? "");
+    expect(trContent).toContain("status=failed");
+    expect(trContent).toContain("too vague");
+  });
+
+  it("sub-goal turn cap: sub-goal that never mark_dones returns incomplete", async () => {
+    const g = await createGoal(workspace, {
+      objective: "top",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    // We want the sub-goal to spin forever. With maxSubGoalRounds=2, the
+    // tool will call runGoalRound at most twice. Each round costs ONE
+    // chat() call (the sub-goal's session.send returns after the model
+    // emits final text without tool calls).
+    const { llm, calls } = recordingLLM([
+      // parent.send #1: spawn sub-goal.
+      [
+        {
+          type: "tool-call",
+          id: "s1",
+          name: "spawn_sub_goal",
+          argsDelta: JSON.stringify({ objective: "never finish" }),
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      // sub-goal.send (round 1): no tool call, just text. Returns active.
+      [
+        { type: "text", delta: "working..." },
+        { type: "done", finishReason: "stop" },
+      ],
+      // sub-goal.send (round 2): same. After this, exhaustion trips because
+      // budgetRoundsMax === 2 was passed via maxSubGoalRounds.
+      [
+        { type: "text", delta: "still working..." },
+        { type: "done", finishReason: "stop" },
+      ],
+      // parent.send #2: follow-up text.
+      [
+        { type: "text", delta: "hmm" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      maxSubGoalRounds: 2,
+    });
+
+    // Sub-goal status should be "exhausted" (round budget hit).
+    const goalsDir = path.join(workspace, ".mathran", "goals");
+    const entries = (await fs.readdir(goalsDir)).filter((n) => n.endsWith(".json"));
+    const allGoals = await Promise.all(
+      entries.map((n) => fs.readFile(path.join(goalsDir, n), "utf-8").then((raw) => JSON.parse(raw))),
+    );
+    const subGoal = allGoals.find((x: any) => x.id !== g.id) as any;
+    expect(subGoal.status).toBe("exhausted");
+
+    // Tool-result label maps exhausted → incomplete.
+    const parentFollowUp = calls.at(-1)!;
+    const toolResult = parentFollowUp.messages.find(
+      (m) => (m as any).role === "tool" && (m as any).toolCallId === "s1",
+    );
+    const trContent = String((toolResult as any)?.content ?? "");
+    expect(trContent).toContain("status=incomplete");
+    expect(trContent).toContain(`Sub-goal ${subGoal.id}`);
+  });
+
+  it("parent abort signal propagates: in-flight sub-goal observes the abort", async () => {
+    const g = await createGoal(workspace, {
+      objective: "top",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+
+    const controller = new AbortController();
+    let chatCallCount = 0;
+    const llm: LLMProvider = {
+      async describe() {
+        return { name: "abort-test" };
+      },
+      async chat() {
+        chatCallCount++;
+        if (chatCallCount === 1) {
+          // parent.send #1: spawn sub-goal.
+          return {
+            async *stream() {
+              yield {
+                type: "tool-call",
+                id: "s1",
+                name: "spawn_sub_goal",
+                argsDelta: JSON.stringify({ objective: "slow work" }),
+              } as LLMStreamChunk;
+              yield { type: "done", finishReason: "tool_calls" } as LLMStreamChunk;
+            },
+          };
+        }
+        if (chatCallCount === 2) {
+          // sub-goal.send #1: streams a chunk, then BLOCKS forever —
+          // mimics a slow upstream LLM. Aborting the parent must
+          // interrupt this hang.
+          return {
+            stream() {
+              return (async function* () {
+                yield { type: "text", delta: "slow" } as LLMStreamChunk;
+                // Trigger the parent abort right here so it fires while
+                // the sub-goal's iterator is parked.
+                setTimeout(() => controller.abort(), 10);
+                await new Promise<void>(() => {}); // never resolves
+                yield { type: "done", finishReason: "stop" } as LLMStreamChunk;
+              })();
+            },
+          };
+        }
+        // Any further calls (shouldn't happen): empty stream.
+        return {
+          async *stream() {
+            yield { type: "done", finishReason: "stop" } as LLMStreamChunk;
+          },
+        };
+      },
+    };
+
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go slow",
+      llm,
+      tools: [],
+      signal: controller.signal,
+    });
+
+    // The PARENT round was aborted (the abort is observed inside the
+    // sub-goal's session.send, which throws AbortError; that bubbles
+    // up into the parent's session.send too because the same signal
+    // is wired to both).
+    expect(r.aborted).toBe(true);
+
+    // The sub-goal record exists and is still active (NOT failed): its
+    // status is left untouched per the abort contract, so a later
+    // resume could continue it.
+    const goalsDir = path.join(workspace, ".mathran", "goals");
+    const entries = (await fs.readdir(goalsDir)).filter((n) => n.endsWith(".json"));
+    expect(entries.length).toBe(2);
+    const allGoals = await Promise.all(
+      entries.map((n) => fs.readFile(path.join(goalsDir, n), "utf-8").then((raw) => JSON.parse(raw))),
+    );
+    const subGoal = allGoals.find((x: any) => x.id !== g.id) as any;
+    expect(subGoal.status).toBe("active");
+    expect(subGoal.endedAt).toBeFalsy();
+
+    // Parent stays active too — abort is non-destructive.
+    const parent = await readGoal(workspace, g.id);
+    expect(parent?.status).toBe("active");
+  });
+});
+
