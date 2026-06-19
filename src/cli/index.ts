@@ -325,6 +325,91 @@ goalCmd
     process.exit(await runGoalStop(goalId, { workspace: opts.workspace }));
   });
 
+const planCmd = program
+  .command("plan")
+  .description("Read-only planning ChatSession (v0.3 §13). Drafts an effort outline before any write happens.");
+
+planCmd
+  .command("run", { isDefault: true })
+  .description("Run the planning runner against an objective and save a draft plan")
+  .argument("<objective>", "What you want to plan (quoted)")
+  .option("--model <m>", "Model id, e.g. copilot/gpt-5.5")
+  .option("--max-turns <n>", "Max LLM rounds before forcibly stopping", (v) => parseInt(v, 10))
+  .option("--config <path>", "Path to mathran config.toml")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (objective: string, opts: any) => {
+    const { runPlanRun } = await import("./commands/plan.js");
+    process.exit(
+      await runPlanRun(objective, {
+        workspace: opts.workspace,
+        configPath: opts.config,
+        model: opts.model,
+        maxTurns: opts.maxTurns,
+      }),
+    );
+  });
+
+planCmd
+  .command("list")
+  .description("List plans on disk (drafts + accepted/rejected)")
+  .option("--json", "Emit JSON", false)
+  .option("--no-all", "Show only drafts")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (opts: any) => {
+    const { runPlanList } = await import("./commands/plan.js");
+    process.exit(
+      await runPlanList({
+        workspace: opts.workspace,
+        json: opts.json,
+        all: opts.all, // commander negates --no-all → opts.all === false
+      }),
+    );
+  });
+
+planCmd
+  .command("show")
+  .description("Print a plan's metadata + body")
+  .argument("<planId>", "Plan id (or unique prefix)")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (planId: string, opts: any) => {
+    const { runPlanShow } = await import("./commands/plan.js");
+    process.exit(await runPlanShow(planId, { workspace: opts.workspace }));
+  });
+
+planCmd
+  .command("accept")
+  .description("Promote a draft plan to a real effort + seed goal")
+  .argument("<planId>", "Plan id (or unique prefix)")
+  .requiredOption("--project <slug>", "Project to attach the new effort to")
+  .option("--effort-slug <slug>", "Override the auto-generated effort slug")
+  .option("--effort-type <type>", "Effort type (default AUXILIARY)")
+  .option("--model <m>", "Model id for the seed goal")
+  .option("--config <path>", "Path to mathran config.toml")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (planId: string, opts: any) => {
+    const { runPlanAccept } = await import("./commands/plan.js");
+    process.exit(
+      await runPlanAccept(planId, {
+        workspace: opts.workspace,
+        configPath: opts.config,
+        project: opts.project,
+        effortSlug: opts.effortSlug,
+        effortType: opts.effortType,
+        model: opts.model,
+      }),
+    );
+  });
+
+planCmd
+  .command("reject")
+  .description("Shelve a draft plan")
+  .argument("<planId>", "Plan id (or unique prefix)")
+  .option("--workspace <dir>", "Workspace root")
+  .action(async (planId: string, opts: any) => {
+    const { runPlanReject } = await import("./commands/plan.js");
+    process.exit(await runPlanReject(planId, { workspace: opts.workspace }));
+  });
+
 const configCmd = program
   .command("config")
   .description("Inspect or edit config.toml from the CLI (avoid hand-editing TOML)");
