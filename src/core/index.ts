@@ -15,4 +15,6 @@ export type { Storage } from "./providers/storage";
 export type { ArtifactSink, PageInput, CommitInput, NotificationPayload, ActivityEntry } from "./providers/artifact-sink";
 export type { IPrincipal, PrincipalKind } from "./principal";
 
+export * from "./subagent/index.js";
+
 export const MATHRAN_VERSION = "0.0.0-pre";
