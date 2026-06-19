@@ -9,6 +9,7 @@ import { compactRunner } from "./runners/compact.js";
 import { searchRunner } from "./runners/search.js";
 import { readSummarizeRunner } from "./runners/read-summarize.js";
 import { researchRunner } from "./runners/research.js";
+import { leanExploreRunner } from "./runners/lean-explore.js";
 
 export class SubagentRegistry {
   private readonly runners = new Map<SubagentTaskType, SubagentRunner>();
@@ -35,7 +36,7 @@ export class SubagentRegistry {
  *   - `search` (v0.2 Task 8)
  *   - `read_summarize` (v0.2 Task 9)
  *   - `research` (v0.3 Task 17)
- * Future runners (lean_explore) plug in here.
+ *   - `lean_explore` (v0.3 Task 18)
  */
 export function defaultSubagentRegistry(): SubagentRegistry {
   const r = new SubagentRegistry();
@@ -43,5 +44,6 @@ export function defaultSubagentRegistry(): SubagentRegistry {
   r.register(searchRunner);
   r.register(readSummarizeRunner);
   r.register(researchRunner);
+  r.register(leanExploreRunner);
   return r;
 }
