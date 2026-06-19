@@ -35,6 +35,10 @@ import { searchRunner } from "../subagent/runners/search.js";
 import { SubagentRegistry } from "../subagent/registry.js";
 import { SubagentScheduler } from "../subagent/scheduler.js";
 import { readArtifact } from "../subagent/artifact.js";
+import {
+  loadMathranMemorySync,
+  formatMathranMemory,
+} from "../memory/index.js";
 import * as path from "node:path";
 
 /**
@@ -155,6 +159,21 @@ export interface ChatSessionOptions {
   builtinTools?: {
     search?: boolean;
     read_file_summary?: boolean;
+  };
+  /**
+   * MATHRAN.md memory injection (v0.3 §14). When `enabled: true`, the
+   * constructor synchronously reads `~/.mathran/MATHRAN.md` (global) and
+   * `<workspace>/MATHRAN.md` (project) and prepends a single system message
+   * with their concatenated contents BEFORE `opts.systemPrompt`. Order:
+   * global → project → systemPrompt (the persona may reference memory).
+   *
+   * Reads are best-effort: missing or unreadable files are silently skipped.
+   * If both files are missing, no memory message is injected.
+   */
+  memoryFiles?: {
+    enabled: boolean;
+    /** Defaults to `process.cwd()`. */
+    workspace?: string;
   };
 }
 
@@ -292,6 +311,23 @@ export class ChatSession {
       this.tools = [...builtins, ...this.tools];
       this.toolByName = new Map(this.tools.map((t) => [t.name, t]));
     }
+    // v0.3 §14: prepend MATHRAN.md memory (global → project) BEFORE the
+    // persona system prompt. Reads are sync (tiny files) and never throw —
+    // any error makes the section disappear silently.
+    if (opts.memoryFiles?.enabled) {
+      try {
+        const memWorkspace = opts.memoryFiles.workspace ?? process.cwd();
+        const mem = loadMathranMemorySync({ workspace: memWorkspace });
+        const fragment = formatMathranMemory(mem);
+        if (fragment.length > 0) {
+          this.messages.push({ role: "system", content: fragment });
+        }
+      } catch {
+        // Defense-in-depth: loadMathranMemorySync swallows IO errors itself
+        // but constructors must NEVER throw. Belt-and-suspenders.
+      }
+    }
+
     if (opts.systemPrompt && opts.systemPrompt.trim().length > 0) {
       this.messages.push({ role: "system", content: opts.systemPrompt });
     }
@@ -303,10 +339,10 @@ export class ChatSession {
     return this.messages.map((m) => ({ ...m }));
   }
 
-  /** Clear history, keeping any leading system prompt. */
+  /** Clear history, keeping any leading system prompt(s). */
   reset(): void {
-    const system = this.messages.find((m) => m.role === "system");
-    this.messages = system ? [{ ...system }] : [];
+    const leading = this.collectLeadingSystemMessages();
+    this.messages = leading.map((m) => ({ ...m }));
   }
 
   /**
@@ -316,18 +352,30 @@ export class ChatSession {
    *
    * Behavior:
    *   - If `next` contains a leading `system` message, it is used verbatim.
-   *   - Otherwise the session's existing system prompt (if any) is preserved
-   *     and `next` is appended after it.
+   *   - Otherwise the session's existing leading system prompt(s) are
+   *     preserved and `next` is appended after them. v0.3 §14 may inject
+   *     multiple leading system messages (memory + persona); all are kept.
    */
   replaceHistory(next: LLMMessage[]): void {
     if (next.length > 0 && next[0].role === "system") {
       this.messages = next.map((m) => ({ ...m }));
       return;
     }
-    const system = this.messages.find((m) => m.role === "system");
-    this.messages = system
-      ? [{ ...system }, ...next.map((m) => ({ ...m }))]
-      : next.map((m) => ({ ...m }));
+    const leading = this.collectLeadingSystemMessages();
+    this.messages = [
+      ...leading.map((m) => ({ ...m })),
+      ...next.map((m) => ({ ...m })),
+    ];
+  }
+
+  /** All consecutive system messages at the start of {@link messages}. */
+  private collectLeadingSystemMessages(): LLMMessage[] {
+    const out: LLMMessage[] = [];
+    for (const m of this.messages) {
+      if (m.role !== "system") break;
+      out.push(m);
+    }
+    return out;
   }
 
   // ─── Compact (v0.2 §5) ────────────────────────────────────────────────────

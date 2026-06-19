@@ -21,7 +21,10 @@
 
 import * as readline from "node:readline";
 import * as fs from "node:fs/promises";
+import * as fsSync from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
+import { spawn } from "node:child_process";
 import { loadConfig } from "../../core/config.js";
 import {
   ChatSession,
@@ -31,6 +34,12 @@ import {
 import type { ChatEvent } from "../../core/chat/index.js";
 import type { LLMMessage } from "../../core/providers/llm.js";
 import { ModelRouter, LocalLeanProvider } from "../../providers/index.js";
+import {
+  loadMathranMemory,
+  resolveGlobalMemoryPath,
+  resolveProjectMemoryPath,
+  formatMathranMemory,
+} from "../../core/memory/index.js";
 
 const DEFAULT_MODEL = "copilot/gpt-5.5";
 
@@ -44,6 +53,13 @@ export interface BuildSessionOptions {
   model?: string;
   configPath?: string;
   systemPrompt?: string;
+  /**
+   * v0.3 §14: project workspace root for MATHRAN.md auto-load. When set, the
+   * built ChatSession is constructed with `memoryFiles: { enabled, workspace }`
+   * — i.e. the persistent memory files at `<workspace>/MATHRAN.md` and
+   * `~/.mathran/MATHRAN.md` are read & prepended to the system prompt.
+   */
+  memoryWorkspace?: string;
 }
 
 /** Build a ChatSession wired to the configured ModelRouter + lean_check tool. */
@@ -68,6 +84,9 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     model,
     systemPrompt: opts.systemPrompt ?? SYSTEM_PROMPT,
     tools: [createLeanCheckTool(lean)],
+    ...(opts.memoryWorkspace
+      ? { memoryFiles: { enabled: true, workspace: opts.memoryWorkspace } }
+      : {}),
   });
 
   return { session, model, providerKey };
@@ -120,7 +139,20 @@ export interface OneShotOptions {
 
 /** Run a single prompt and exit. Returns a process exit code. */
 export async function runOneShot(opts: OneShotOptions): Promise<number> {
-  const { session } = buildChatSession({ model: opts.model, configPath: opts.configPath });
+  const workspace = process.cwd();
+  const memInfo = detectMemoryFiles(workspace);
+  const { session } = buildChatSession({
+    model: opts.model,
+    configPath: opts.configPath,
+    ...(memInfo.anyPresent ? { memoryWorkspace: workspace } : {}),
+  });
+  if (memInfo.anyPresent) {
+    // Match REPL behaviour: a one-line stderr breadcrumb so users know
+    // memory was injected. Stdout stays clean for piped consumers.
+    process.stderr.write(
+      `Loaded memory: global=${memInfo.globalSize}B project=${memInfo.projectSize}B\n`,
+    );
+  }
   try {
     await renderTurn(session.send(opts.prompt));
     return 0;
@@ -150,6 +182,28 @@ export interface SlashContext {
   model: string;
   providerKey: string;
   configPath?: string;
+  /**
+   * Workspace root used by the `/memory` slash command to resolve project
+   * MATHRAN.md. Defaults to {@link process.cwd} when unset. The CLI auto-fills
+   * this from `runRepl`/`runOneShot`.
+   */
+  memoryWorkspace?: string;
+  /**
+   * Editor binary for `/memory edit`. Defaults to `$EDITOR` then `nano`. Tests
+   * override it (e.g. `"true"`) to make the spawn a no-op.
+   */
+  editorOverride?: string;
+  /**
+   * Override `os.homedir()` for `/memory` global path resolution. Tests use
+   * this to keep operations sandboxed.
+   */
+  homeOverride?: string;
+  /**
+   * Hook the REPL uses to surface a "reload memory?" prompt after
+   * `/memory edit`. Returns `true` to reload, `false` to skip. When unset,
+   * `/memory edit` skips the reload prompt (used by tests).
+   */
+  promptReload?: () => Promise<boolean>;
 }
 
 const HELP_TEXT = `commands:
@@ -158,11 +212,21 @@ const HELP_TEXT = `commands:
   /reset                   clear conversation history (keep system prompt)
   /history                 print a summary of the current history
   /compact [k]             compact history via subagent (keep last k user rounds, default 5)
+  /memory                  show MATHRAN.md memory (use /memory help for sub-commands)
   /system [text]           show or replace the system prompt (resets history)
   /model [model]           show or switch the active model (resets history)
   /save [path]             save history to a Markdown transcript (default ./mathran-chat-<ts>.md)
   /load <path>             load history from a .jsonl file (the disk format used by serve)
 type anything else to chat; Ctrl-C / Ctrl-D also quit.`;
+
+const MEMORY_HELP_TEXT = `/memory commands:
+  /memory                  print both memory files (with paths and byte counts)
+  /memory edit project     open $EDITOR on <workspace>/MATHRAN.md
+  /memory edit global      open $EDITOR on ~/.mathran/MATHRAN.md
+  /memory help             show this help`;
+
+const DEFAULT_MEMORY_HEADER = (scope: "project" | "global") =>
+  `# MATHRAN ${scope} memory\n\n(Notes here are auto-injected into mathran chat sessions. Keep concise \u2014 limit ~16 KB.)\n`;
 
 /**
  * Parse + execute one slash command. Returns a `SlashResult` rather than
@@ -222,6 +286,9 @@ export async function handleSlashCommand(
       });
       return { kind: "continue", output: `history (${h.length}):\n${lines.join("\n")}` };
     }
+
+    case "/memory":
+      return await handleMemoryCommand(rest, ctx);
 
     case "/system": {
       if (!arg) {
@@ -308,6 +375,142 @@ function defaultSavePath(): string {
   return `./mathran-chat-${ts}.md`;
 }
 
+// ─── /memory command (v0.3 §14) ─────────────────────────────────────
+
+/**
+ * Dispatch `/memory` and its sub-commands.
+ *
+ * Sub-commands:
+ *   /memory                 — print both files with byte counts (or `not present`)
+ *   /memory help            — show sub-command list
+ *   /memory edit project    — open $EDITOR on <workspace>/MATHRAN.md
+ *   /memory edit global     — open $EDITOR on ~/.mathran/MATHRAN.md
+ *
+ * After an edit, the REPL is asked (via `ctx.promptReload`) whether to reload
+ * memory into the current session. On confirmation, a system message is
+ * prepended noting the reload — we cannot mutate the original constructor-
+ * captured snapshot, so the reload writes a fresh `system` message that the
+ * model will see on its next turn.
+ */
+async function handleMemoryCommand(
+  rest: string[],
+  ctx: SlashContext,
+): Promise<SlashResult> {
+  const sub = (rest[0] ?? "").toLowerCase();
+  const home = ctx.homeOverride ?? os.homedir();
+  const workspace = ctx.memoryWorkspace ?? process.cwd();
+  const globalPath = resolveGlobalMemoryPath(home);
+  const projectPath = resolveProjectMemoryPath(workspace);
+
+  if (sub === "" ) {
+    // Print both files (with sizes / "not present").
+    const lines: string[] = ["MATHRAN.md memory:"];
+    lines.push(...(await formatMemoryEntry("global", globalPath)));
+    lines.push(...(await formatMemoryEntry("project", projectPath)));
+    return { kind: "continue", output: lines.join("\n") };
+  }
+
+  if (sub === "help" || sub === "-h" || sub === "--help") {
+    return { kind: "continue", output: MEMORY_HELP_TEXT };
+  }
+
+  if (sub === "edit") {
+    const scope = (rest[1] ?? "").toLowerCase();
+    if (scope !== "project" && scope !== "global") {
+      return {
+        kind: "continue",
+        output: "usage: /memory edit project|global",
+      };
+    }
+    try {
+      const target = scope === "global" ? globalPath : projectPath;
+      // Ensure parent dir exists for global; for project, the workspace dir
+      // should already exist (we never auto-create user dirs).
+      if (scope === "global") {
+        fsSync.mkdirSync(path.dirname(target), { recursive: true });
+      }
+      // Seed default header if file is missing.
+      try {
+        await fs.access(target);
+      } catch {
+        await fs.writeFile(target, DEFAULT_MEMORY_HEADER(scope), "utf8");
+      }
+
+      const editor = ctx.editorOverride ?? process.env.EDITOR ?? "nano";
+      await runEditor(editor, target);
+
+      const reload = ctx.promptReload ? await ctx.promptReload() : false;
+      const reloadMsg = reload
+        ? await reloadMemoryIntoSession(ctx, workspace, home)
+        : "";
+      const head = `edited ${target}`;
+      return {
+        kind: "continue",
+        output: reloadMsg ? `${head}\n${reloadMsg}` : head,
+      };
+    } catch (err: any) {
+      return {
+        kind: "continue",
+        output: `mathran: /memory edit failed: ${err?.message ?? err}`,
+      };
+    }
+  }
+
+  return {
+    kind: "continue",
+    output: `mathran: unknown /memory sub-command "${sub}". Try /memory help.`,
+  };
+}
+
+async function formatMemoryEntry(
+  label: "global" | "project",
+  absPath: string,
+): Promise<string[]> {
+  try {
+    const stat = await fs.stat(absPath);
+    return [`  ${label}: ${absPath}  (${stat.size} bytes)`];
+  } catch {
+    return [`  ${label}: ${absPath}  (not present)`];
+  }
+}
+
+function runEditor(editor: string, target: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(editor, [target], { stdio: "inherit" });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0 || code === null) resolve();
+      else reject(new Error(`editor "${editor}" exited with code ${code}`));
+    });
+  });
+}
+
+async function reloadMemoryIntoSession(
+  ctx: SlashContext,
+  workspace: string,
+  home: string,
+): Promise<string> {
+  const mem = await loadMathranMemory({ workspace, home });
+  const fragment = formatMathranMemory(mem);
+  if (fragment.length === 0) {
+    // Nothing to inject — both files are missing/empty after the edit.
+    return "(reload: no memory content)";
+  }
+  // We can't mutate the constructor-captured snapshot in-place, but we CAN
+  // append a fresh system message describing the reload. The model will see
+  // it on its next turn. This is intentionally additive.
+  const note =
+    "# Persistent memory updated\n\n" +
+    "The user just edited a MATHRAN.md memory file. Use the latest version below " +
+    "in preference to any earlier persistent-memory block in this conversation.\n\n" +
+    fragment;
+  ctx.session.replaceHistory([
+    ...ctx.session.history(),
+    { role: "system", content: note },
+  ]);
+  return "(memory reloaded into current session)";
+}
+
 export interface ReplOptions {
   model?: string;
   configPath?: string;
@@ -315,12 +518,20 @@ export interface ReplOptions {
 
 /** Run the interactive REPL. Returns a process exit code. */
 export async function runRepl(opts: ReplOptions = {}): Promise<number> {
+  const workspace = process.cwd();
+  const memInfo = detectMemoryFiles(workspace);
   let { session, model, providerKey } = buildChatSession({
     model: opts.model,
     configPath: opts.configPath,
+    ...(memInfo.anyPresent ? { memoryWorkspace: workspace } : {}),
   });
 
   console.log(`mathran chat — model: ${model}  (provider: ${providerKey})`);
+  if (memInfo.anyPresent) {
+    console.log(
+      `Loaded memory: global=${memInfo.globalSize}B project=${memInfo.projectSize}B`,
+    );
+  }
   console.log(`Type your message. /help for commands, /exit to quit.\n`);
 
   const rl = readline.createInterface({
@@ -328,6 +539,15 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
     output: process.stdout,
     prompt: "› ",
   });
+
+  // Reload-prompt helper: pauses the readline, asks the user, resumes.
+  const promptReload = async (): Promise<boolean> => {
+    return await new Promise<boolean>((resolve) => {
+      rl.question("Reload memory into current session? [y/N] ", (answer) => {
+        resolve(/^y(es)?$/i.test(answer.trim()));
+      });
+    });
+  };
 
   rl.prompt();
 
@@ -345,11 +565,16 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           model,
           providerKey,
           configPath: opts.configPath,
+          memoryWorkspace: workspace,
+          promptReload,
         });
         if (result.output) console.log(result.output);
         if (result.kind === "exit") break;
         if (result.kind === "rebuild") {
-          const built = buildChatSession(result.nextBuild);
+          const built = buildChatSession({
+            ...result.nextBuild,
+            ...(memInfo.anyPresent ? { memoryWorkspace: workspace } : {}),
+          });
           session = built.session;
           model = built.model;
           providerKey = built.providerKey;
@@ -375,4 +600,26 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
   rl.close();
   console.log("bye.");
   return 0;
+}
+
+/**
+ * Best-effort sync probe for MATHRAN.md presence at REPL/one-shot start.
+ * Returns the byte sizes of the two files (0 if absent) and whether either
+ * is present. Never throws.
+ */
+function detectMemoryFiles(workspace: string): {
+  globalSize: number;
+  projectSize: number;
+  anyPresent: boolean;
+} {
+  const sizeOf = (p: string): number => {
+    try {
+      return fsSync.statSync(p).size;
+    } catch {
+      return 0;
+    }
+  };
+  const g = sizeOf(resolveGlobalMemoryPath());
+  const p = sizeOf(resolveProjectMemoryPath(workspace));
+  return { globalSize: g, projectSize: p, anyPresent: g > 0 || p > 0 };
 }

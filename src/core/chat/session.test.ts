@@ -967,3 +967,111 @@ describe("ChatSession.builtinTools.read_file_summary (v0.2 §9)", () => {
   });
 });
 
+describe("ChatSession memoryFiles (v0.3 §14)", () => {
+  it("injects memory block before systemPrompt when MATHRAN.md exists", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-session-mem-"));
+    try {
+      await fs.writeFile(path.join(tmp, "MATHRAN.md"), "PROJECT_NOTES_XYZ", "utf8");
+
+      const llm = new ScriptedLLM([]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        systemPrompt: "persona-prompt",
+        memoryFiles: { enabled: true, workspace: tmp },
+      });
+
+      const history = session.history();
+      // Two system messages: memory first, persona second.
+      expect(history[0].role).toBe("system");
+      expect(history[0].content).toContain("PROJECT_NOTES_XYZ");
+      expect(history[0].content).toContain("# Persistent memory");
+      expect(history[1]?.role).toBe("system");
+      expect(history[1]?.content).toBe("persona-prompt");
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("injects only persona when memoryFiles is omitted (default off)", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-session-mem-"));
+    try {
+      await fs.writeFile(path.join(tmp, "MATHRAN.md"), "NEVER_INJECTED", "utf8");
+      const llm = new ScriptedLLM([]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        systemPrompt: "persona-prompt",
+        // memoryFiles intentionally unset — default behavior must NOT touch
+        // disk for MATHRAN.md.
+      });
+      const history = session.history();
+      expect(history.length).toBe(1);
+      expect(history[0].role).toBe("system");
+      expect(history[0].content).toBe("persona-prompt");
+      expect(history[0].content).not.toContain("NEVER_INJECTED");
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("injects nothing when memoryFiles.enabled=true but no files exist", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-session-mem-"));
+    try {
+      const llm = new ScriptedLLM([]);
+      // Use a non-existent workspace dir so neither global (likely absent) nor
+      // project file is found. We can't easily mock $HOME here so the global
+      // file is probably absent in CI; if it exists, the persona is still
+      // present after it.
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        systemPrompt: "persona-only",
+        memoryFiles: { enabled: true, workspace: tmp },
+      });
+      const history = session.history();
+      // Last leading system message must be the persona.
+      const personaIdx = history.findIndex((m) => m.content === "persona-only");
+      expect(personaIdx).toBeGreaterThanOrEqual(0);
+      // No system message should contain a project body header pointing into
+      // our (empty) tmp dir.
+      const projHeader = `## Project (${path.join(tmp, "MATHRAN.md")})`;
+      const sawProj = history.some(
+        (m) => m.role === "system" && (m.content ?? "").includes(projHeader),
+      );
+      expect(sawProj).toBe(false);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("reset() preserves both leading system messages (memory + persona)", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-session-mem-"));
+    try {
+      await fs.writeFile(path.join(tmp, "MATHRAN.md"), "MEM_BODY", "utf8");
+      const llm = new ScriptedLLM([
+        [
+          { type: "text", delta: "hi" },
+          { type: "done", finishReason: "stop" },
+        ],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        systemPrompt: "persona",
+        memoryFiles: { enabled: true, workspace: tmp },
+      });
+      // Add a user/assistant round, then reset.
+      await collect(session.send("yo"));
+      session.reset();
+      const remaining = session.history();
+      expect(remaining.every((m) => m.role === "system")).toBe(true);
+      // Memory should still be there.
+      expect(remaining.some((m) => (m.content ?? "").includes("MEM_BODY"))).toBe(true);
+      expect(remaining.some((m) => m.content === "persona")).toBe(true);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
