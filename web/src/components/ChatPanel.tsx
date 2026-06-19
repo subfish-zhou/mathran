@@ -13,7 +13,8 @@
 import { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
 import { streamChat, type ChatEvent } from "../lib/chat.ts";
-import { api, type ChatScopeSpec } from "../lib/api.ts";
+import { api, type ChatScopeSpec, type UsageStats } from "../lib/api.ts";
+import ContextMeter from "./ContextMeter.tsx";
 
 interface ToolBubble {
   kind: "tool";
@@ -45,6 +46,7 @@ export default function ChatPanel({
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [usage, setUsage] = useState<UsageStats | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Reset everything when the active scope changes.
@@ -53,6 +55,7 @@ export default function ChatPanel({
     setConversationId(null);
     setError(null);
     setInput("");
+    setUsage(null);
   }, [scope.kind, (scope as any).projectSlug, (scope as any).effortSlug]);
 
   useEffect(() => {
@@ -121,8 +124,36 @@ export default function ChatPanel({
         if (last && last.kind === "assistant" && last.text === "") return prev.slice(0, -1);
         return prev;
       });
+      // Turn complete — refresh the context meter. We read `conversationId` from
+      // a ref-like fallback because the just-completed POST may have minted it.
+      // The closure captures the pre-POST value; that's fine for second-and-on
+      // turns. For the first turn the SSE `session` event already updated state
+      // and React will re-render before we get here, but to be safe we also
+      // refetch once any time `conversationId` changes (see effect below).
+      void refreshUsage();
     }
   }
+
+  // Fetch usage stats whenever the conversation id changes (covers first-turn
+  // case where the id is minted server-side and arrives via SSE) or after a
+  // turn completes (see the `refreshUsage()` call in `send`'s finally block).
+  async function refreshUsage() {
+    if (!conversationId) return;
+    try {
+      const u = await api.getChatUsage(scope, conversationId, model || undefined);
+      setUsage(u);
+    } catch {
+      // Hide silently — the meter is decorative; never break the chat surface.
+    }
+  }
+
+  useEffect(() => {
+    if (!conversationId) return;
+    void refreshUsage();
+    // refreshUsage is a stable closure over scope+model; we intentionally do
+    // not include it in deps to avoid loops.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId]);
 
   return (
     <div className="flex h-full flex-col">
@@ -141,6 +172,25 @@ export default function ChatPanel({
           className="w-64 rounded-md border border-slate-300 px-2 py-1 text-xs font-mono outline-none focus:border-slate-500"
         />
       </div>
+
+      {/* v0.3 §19: context-window meter. Hidden gracefully when no usage data
+          has landed yet (initial / pre-first-turn state). */}
+      {usage ? (
+        <ContextMeter
+          tokens={usage.tokens}
+          contextWindow={usage.contextWindow}
+          warning={usage.warning}
+          percentage={usage.percentage}
+        />
+      ) : conversationId ? (
+        <ContextMeter
+          tokens={0}
+          contextWindow={200_000}
+          warning={null}
+          percentage={0}
+          loading
+        />
+      ) : null}
 
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-6">
         {bubbles.length === 0 && (

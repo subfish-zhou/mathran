@@ -1242,3 +1242,67 @@ describe("POST /api/global-chat/:id/compact (v0.2 §5)", () => {
     expect(body.stats.droppedRoundCount).toBeGreaterThanOrEqual(3);
   });
 });
+
+describe("GET /api/global-chat/:id/usage (v0.3 §19)", () => {
+  it("returns zeroed stats for an empty / unknown conversation", async () => {
+    const res = await fetch(`${base}/api/global-chat/no-such-usage-conv/usage`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.tokens).toBe(0);
+    expect(body.messages).toBe(0);
+    expect(typeof body.contextWindow).toBe("number");
+    expect(body.contextWindow).toBeGreaterThan(0);
+    expect(body.percentage).toBe(0);
+    expect(body.warning).toBeNull();
+  });
+
+  it("returns reasonable numbers for a conversation with content", async () => {
+    // Seed a conversation through global-chat (fake LLM streams "hi there").
+    const cid = "usage-rest-1";
+    for (let i = 0; i < 3; i++) {
+      const res = await fetch(`${base}/api/global-chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: `hello world ${i}`, conversationId: cid }),
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+    }
+    const res = await fetch(`${base}/api/global-chat/${cid}/usage`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.tokens).toBeGreaterThan(0);
+    expect(body.messages).toBeGreaterThanOrEqual(6); // 3 user + 3 assistant at least
+    expect(typeof body.contextWindow).toBe("number");
+    // percentage matches tokens / contextWindow (within rounding tolerance).
+    expect(body.percentage).toBeCloseTo((body.tokens / body.contextWindow) * 100, 1);
+    // Tiny conversation → no warning.
+    expect(body.warning).toBeNull();
+  });
+
+  it("honors the model query hint when picking contextWindow", async () => {
+    // Empty conv with model=gpt-4o → contextWindow=128_000.
+    const a = await fetch(
+      `${base}/api/global-chat/no-such-usage-conv/usage?model=gpt-4o`,
+    );
+    expect(a.status).toBe(200);
+    const aBody = await a.json();
+    expect(aBody.contextWindow).toBe(128_000);
+
+    // model=claude-3-5-sonnet → 200_000.
+    const b = await fetch(
+      `${base}/api/global-chat/no-such-usage-conv/usage?model=claude-3-5-sonnet-20240620`,
+    );
+    expect(b.status).toBe(200);
+    const bBody = await b.json();
+    expect(bBody.contextWindow).toBe(200_000);
+  });
+
+  it("rejects an invalid conversation id", async () => {
+    // Slug containing path-separator-ish chars must fail isSafeSlug.
+    const res = await fetch(`${base}/api/global-chat/_leading-underscore/usage`);
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/invalid conversation id/i);
+  });
+});
