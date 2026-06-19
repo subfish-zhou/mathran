@@ -13,6 +13,8 @@ import * as os from "node:os";
 
 import { runGoalRound, buildGoalSystemPrompt } from "./runner.js";
 import { createGoal, readGoal } from "./store.js";
+import { ScopedChatSessionStore, conversationFilePath } from "../chat/store.js";
+import { ChatSession } from "../chat/session.js";
 import type { LLMProvider, LLMRequest, LLMStreamChunk } from "../providers/llm.js";
 
 let workspace: string;
@@ -326,6 +328,114 @@ describe("runGoalRound", () => {
     const r2 = await runGoalRound({ workspace, goalId: g.id, userMessage: "continue", llm: finishLlm, tools: [] });
     expect(r2.aborted).toBe(false);
     expect(r2.text).toBe("resumed and done");
+  });
+});
+
+describe("runGoalRound persistence reuses ChatSessionStore (v0.2 §10)", () => {
+  it("two goals in the same workspace persist independently (no cross-contamination)", async () => {
+    const gA = await createGoal(workspace, { objective: "A", scope: { kind: "global" }, model: "fake" });
+    const gB = await createGoal(workspace, { objective: "B", scope: { kind: "global" }, model: "fake" });
+
+    const llmA = fakeLLM([[{ type: "text", delta: "alpha" }, { type: "done", finishReason: "stop" }]]);
+    const llmB = fakeLLM([[{ type: "text", delta: "bravo" }, { type: "done", finishReason: "stop" }]]);
+
+    await Promise.all([
+      runGoalRound({ workspace, goalId: gA.id, userMessage: "hello A", llm: llmA, tools: [] }),
+      runGoalRound({ workspace, goalId: gB.id, userMessage: "hello B", llm: llmB, tools: [] }),
+    ]);
+
+    const refreshedA = await readGoal(workspace, gA.id);
+    const refreshedB = await readGoal(workspace, gB.id);
+    expect(refreshedA?.conversationIds[0]).toBeTruthy();
+    expect(refreshedB?.conversationIds[0]).toBeTruthy();
+    expect(refreshedA?.conversationIds[0]).not.toBe(refreshedB?.conversationIds[0]);
+
+    const fileA = conversationFilePath(workspace, { kind: "global" }, refreshedA!.conversationIds[0]);
+    const fileB = conversationFilePath(workspace, { kind: "global" }, refreshedB!.conversationIds[0]);
+    const rawA = await fs.readFile(fileA, "utf-8");
+    const rawB = await fs.readFile(fileB, "utf-8");
+
+    expect(rawA).toContain("hello A");
+    expect(rawA).toContain("alpha");
+    expect(rawA).not.toContain("hello B");
+    expect(rawA).not.toContain("bravo");
+
+    expect(rawB).toContain("hello B");
+    expect(rawB).toContain("bravo");
+    expect(rawB).not.toContain("hello A");
+    expect(rawB).not.toContain("alpha");
+  });
+
+  it("goal persistence integrates with ScopedChatSessionStore (index + transcript exist)", async () => {
+    // Run one goal round, then enumerate conversations via the chat store: the
+    // goal's conversationId should appear in the scope's .index.json (because
+    // the runner now goes through the shared flushConversationHistory helper).
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    const llm = fakeLLM([
+      [{ type: "text", delta: "persisted via store" }, { type: "done", finishReason: "stop" }],
+    ]);
+    await runGoalRound({ workspace, goalId: g.id, userMessage: "check store", llm, tools: [] });
+
+    const refreshed = await readGoal(workspace, g.id);
+    const conversationId = refreshed!.conversationIds[0];
+
+    // A bare ScopedChatSessionStore (no factory needs since we only read) sees
+    // the goal's conversation listed in the scope index.
+    const store = new ScopedChatSessionStore(workspace, () => new ChatSession({ llm }));
+    const convs = await store.listConversations({ kind: "global" });
+    expect(convs.map((c) => c.id)).toContain(conversationId);
+    const meta = convs.find((c) => c.id === conversationId)!;
+    expect(meta.messageCount).toBeGreaterThan(0);
+    expect(meta.title.length).toBeGreaterThan(0);
+
+    // Reading the same conversation back via the store yields the goal's
+    // history (proving they share the on-disk layout, not just the path).
+    const history = await store.readHistory({ kind: "global" }, conversationId);
+    expect(history).not.toBeNull();
+    expect(history!.some((m) => m.role === "user" && m.content === "check store")).toBe(true);
+    expect(history!.some((m) => m.role === "assistant" && m.content.includes("persisted via store"))).toBe(true);
+
+    // Transcript Markdown was written next to the jsonl (best-effort by spec
+    // but it is the chat store's normal flush path).
+    const transcriptFile = path.join(workspace, ".mathran", "global-chat", "transcripts", `${conversationId}.md`);
+    const md = await fs.readFile(transcriptFile, "utf-8");
+    expect(md).toContain("check store");
+    expect(md).toContain("persisted via store");
+  });
+
+  it("a pre-existing legacy goal jsonl at the same path is read on resume (backward compat)", async () => {
+    // The new persistence layer uses the exact same path layout the old
+    // runner did (and the chat store always did). This test seeds a legacy
+    // jsonl from a hypothetical pre-§10 install and verifies the runner
+    // picks it up unchanged — no migration code, no data loss.
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    const conversationId = "legacy-conv-id";
+    const dir = path.join(workspace, ".mathran", "global-chat");
+    await fs.mkdir(dir, { recursive: true });
+    const legacy = [
+      { role: "system", content: "legacy system" },
+      { role: "user", content: "older question" },
+      { role: "assistant", content: "older answer" },
+    ];
+    await fs.writeFile(
+      path.join(dir, `${conversationId}.jsonl`),
+      legacy.map((m) => JSON.stringify(m)).join("\n") + "\n",
+      "utf-8",
+    );
+    // Attach the legacy id to the goal so the runner picks it up.
+    const { attachConversation } = await import("./store.js");
+    await attachConversation(workspace, g.id, conversationId);
+
+    const llm = fakeLLM([
+      [{ type: "text", delta: "new turn" }, { type: "done", finishReason: "stop" }],
+    ]);
+    await runGoalRound({ workspace, goalId: g.id, userMessage: "follow up", llm, tools: [] });
+
+    const raw = await fs.readFile(path.join(dir, `${conversationId}.jsonl`), "utf-8");
+    expect(raw).toContain("older question");
+    expect(raw).toContain("older answer");
+    expect(raw).toContain("follow up");
+    expect(raw).toContain("new turn");
   });
 });
 

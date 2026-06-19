@@ -16,18 +16,28 @@
  * `ScopedChatSessionStore` so that:
  *
  *   - the per-round system prompt can be rebuilt to reflect updated stats,
- *   - the conversation file can still live in the scoped chat directory
- *     (we read/write it directly via the same jsonl format).
+ *   - the per-round tool set can include the goal-specific
+ *     `mark_done` / `give_up` tools.
+ *
+ * Persistence, however, is delegated to the same conversation-history
+ * helpers the chat store uses (`loadConversationHistory` /
+ * `flushConversationHistory` in `../chat/store.ts`, v0.2 §10). That means:
+ *   - jsonl writes go through `atomic-write.ts`,
+ *   - the per-scope `.index.json` and Markdown transcript are kept in sync
+ *     with what `serve` and the CLI REPL see,
+ *   - chat + goal can never drift on path layout.
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { ChatSession, type ToolExecuteContext, type ToolSpec } from "../chat/session.js";
-import type { LLMMessage, LLMProvider } from "../providers/llm.js";
+import type { LLMProvider } from "../providers/llm.js";
 import type { ChatEvent } from "../chat/index.js";
-import { scopeDir, type ChatScope } from "../chat/store.js";
+import {
+  conversationFilePath,
+  flushConversationHistory,
+  loadConversationHistory,
+} from "../chat/store.js";
 
 import {
   appendStep,
@@ -77,40 +87,6 @@ export function buildGoalSystemPrompt(input: {
       `tool call counts.`,
   );
   return lines.join("\n");
-}
-
-/**
- * Where the goal's chat jsonl lives on disk — delegated to the scoped chat
- * store's `scopeDir` so we share the exact layout it expects.
- */
-function goalConversationFile(workspace: string, scope: ChatScope, conversationId: string): string {
-  return path.join(scopeDir(workspace, scope), `${conversationId}.jsonl`);
-}
-
-async function loadConversation(file: string): Promise<LLMMessage[]> {
-  try {
-    const raw = await fs.readFile(file, "utf-8");
-    const out: LLMMessage[] = [];
-    for (const line of raw.split("\n")) {
-      const s = line.trim();
-      if (!s) continue;
-      try {
-        out.push(JSON.parse(s) as LLMMessage);
-      } catch {
-        /* skip malformed */
-      }
-    }
-    return out;
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return [];
-    throw err;
-  }
-}
-
-async function saveConversation(file: string, history: LLMMessage[]): Promise<void> {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const lines = history.map((m) => JSON.stringify(m)).join("\n");
-  await fs.writeFile(file, lines + (lines.length > 0 ? "\n" : ""), "utf-8");
 }
 
 export interface RunRoundOptions {
@@ -192,8 +168,10 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   await attachConversation(workspace, goalId, conversationId);
   goal = (await readGoal(workspace, goalId)) ?? goal;
 
-  const convFile = goalConversationFile(workspace, goal.scope, conversationId);
-  const history = await loadConversation(convFile);
+  // Persistence delegated to the same helpers `ScopedChatSessionStore` uses
+  // (v0.2 §10): atomic writes, scope index, and Markdown transcript are all
+  // kept in sync across chat + goal.
+  const history = await loadConversationHistory(workspace, goal.scope, conversationId);
 
   const systemPrompt = buildGoalSystemPrompt({
     goal,
@@ -239,7 +217,9 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
       // Persist whatever partial progress made it into history so a later
       // `resume` continues from here. Crucially we do NOT mark the goal failed
       // — its status is left as-is (active/paused) for the caller to decide.
-      await saveConversation(convFile, session.history());
+      await flushConversationHistory(workspace, goal.scope, conversationId, session.history(), {
+        title: `goal ${goal.id}`,
+      });
       await appendStep(workspace, goalId, {
         kind: "status",
         payload: { aborted: true, reason: "round aborted via signal" },
@@ -250,7 +230,9 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   }
 
   // Persist the conversation jsonl so resumes pick up the latest turn.
-  await saveConversation(convFile, session.history());
+  await flushConversationHistory(workspace, goal.scope, conversationId, session.history(), {
+    title: `goal ${goal.id}`,
+  });
 
   if (textBuf.trim().length > 0) {
     await appendStep(workspace, goalId, { kind: "text", payload: textBuf });
