@@ -34,6 +34,10 @@ import type { ToolExecuteContext } from "../../core/chat/session.js";
 import { resolveScopeRoot } from "./scope-paths.js";
 import { loadConfig } from "../../core/config.js";
 import { ModelRouter, LocalLeanProvider } from "../../providers/index.js";
+import {
+  SubagentScheduler,
+  defaultSubagentRegistry,
+} from "../../core/subagent/index.js";
 
 const DEFAULT_MODEL = "copilot/gpt-5.5";
 
@@ -207,9 +211,16 @@ async function driveOneRound(
       tools,
       toolContext,
       chatWorkspace: scopeRoot,
+      // v0.5 wire-up Gap #4 + #5: pass scheduler so `dispatch_subagent`
+      // builtin tool can dispatch into the registered runners.
+      scheduler: new SubagentScheduler({
+        workspace: scopeRoot,
+        registry: defaultSubagentRegistry(),
+      }),
       // v0.4 §1: goal runners get the full builtin toolkit so the agent
       // can read, write, edit, search, and shell out without us having to
       // pre-register every helper as a goal tool.
+      // v0.5 wire-up: + dispatch_subagent for research/lean_explore access.
       builtinTools: {
         search: true,
         read_file_summary: true,
@@ -217,6 +228,7 @@ async function driveOneRound(
         read_file: true,
         write_file: true,
         edit_file: true,
+        dispatch_subagent: true,
       },
     });
     if (r.text.trim().length > 0) {

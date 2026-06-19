@@ -43,6 +43,7 @@ import { createBashTool } from "./tools/bash.js";
 import { createReadFileTool } from "./tools/read-file.js";
 import { createWriteFileTool } from "./tools/write-file.js";
 import { createEditFileTool } from "./tools/edit-file.js";
+import { createDispatchSubagentTool } from "./tools/dispatch-subagent.js";
 import * as path from "node:path";
 
 /**
@@ -167,6 +168,11 @@ export interface ChatSessionOptions {
    *   - `read_file` (v0.4 §1) — raw bytes with `cat -n` line numbers.
    *   - `write_file` (v0.4 §1) — create / overwrite UTF-8 file.
    *   - `edit_file` (v0.4 §1) — unique-string replace (or `replace_all`).
+   *   - `dispatch_subagent` (v0.5 wire-up Gap #4 + #5) — generic dispatch
+   *     into the subagent scheduler (compact/search/read_summarize/research/
+   *     lean_explore), optional subprocess runtime. Requires
+   *     `opts.scheduler` to be wired; otherwise the tool is silently skipped
+   *     with a console warning (purely additive — no crash).
    */
   builtinTools?: {
     search?: boolean;
@@ -175,7 +181,18 @@ export interface ChatSessionOptions {
     read_file?: boolean;
     write_file?: boolean;
     edit_file?: boolean;
+    dispatch_subagent?: boolean;
   };
+  /**
+   * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
+   * (v0.5 wire-up Gap #4 + #5). When unset, enabling the tool flag is a
+   * silent no-op (with a console warning so the wiring mistake is visible
+   * during local dev). This is intentionally separate from
+   * `subagentScheduler` (which is the legacy compact-only scheduler injection
+   * — kept for backward compatibility); production callers should pass the
+   * SAME scheduler to both fields when both compact and dispatch are wanted.
+   */
+  scheduler?: SubagentScheduler;
   /**
    * MATHRAN.md memory injection (v0.3 §14). When `enabled: true`, the
    * constructor synchronously reads `~/.mathran/MATHRAN.md` (global) and
@@ -299,6 +316,14 @@ export class ChatSession {
   private readonly autoCompactCfg?: ChatSessionOptions["autoCompact"];
   private readonly workspace?: string;
   private readonly subagentScheduler?: SubagentScheduler;
+  /**
+   * v0.5 wire-up: separate scheduler reference used by the
+   * `dispatch_subagent` builtin tool. Holds the SAME instance as
+   * `subagentScheduler` for production callers (which pass one scheduler in
+   * both fields), but kept distinct so test harnesses can wire only the
+   * dispatch surface without picking up compact's lazy-init defaults.
+   */
+  private readonly dispatchScheduler?: SubagentScheduler;
   /** v0.5 §7 — absolute paths read this session (read-before-write gate). */
   private readonly readPaths = new Set<string>();
   private readonly builtinToolsCfg?: ChatSessionOptions["builtinTools"];
@@ -320,6 +345,10 @@ export class ChatSession {
     this.autoCompactCfg = opts.autoCompact;
     this.workspace = opts.workspace;
     this.subagentScheduler = opts.subagentScheduler;
+    // v0.5 wire-up: prefer `opts.scheduler` for the dispatch tool, but fall
+    // back to `opts.subagentScheduler` so production callers that already
+    // pass the latter (for compact) automatically get dispatch too.
+    this.dispatchScheduler = opts.scheduler ?? opts.subagentScheduler;
     this.builtinToolsCfg = opts.builtinTools;
     // Mix in built-in tools (v0.2 §9+). Order: built-ins first, then caller's
     // tools (so a caller-supplied tool with the same name wins via the
@@ -448,6 +477,21 @@ export class ChatSession {
       out.push(
         createEditFileTool(this.workspace ? { workspace: this.workspace } : {}),
       );
+    }
+    // v0.5 wire-up Gap #4 + #5: generic dispatch tool. Requires a scheduler
+    // to be wired (callers that opt in but forget to pass one get a console
+    // warning + silent skip, never a crash).
+    if (cfg.dispatch_subagent) {
+      if (this.dispatchScheduler) {
+        out.push(
+          createDispatchSubagentTool({ scheduler: this.dispatchScheduler }),
+        );
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[mathran] ChatSession builtinTools.dispatch_subagent enabled but no `scheduler` provided; skipping.",
+        );
+      }
     }
     return out;
   }
