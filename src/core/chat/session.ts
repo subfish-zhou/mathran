@@ -30,6 +30,8 @@ import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_KEEP_RECENT_ROUNDS,
 } from "../subagent/runners/compact.js";
+import { readSummarizeRunner } from "../subagent/runners/read-summarize.js";
+import { searchRunner } from "../subagent/runners/search.js";
 import { SubagentRegistry } from "../subagent/registry.js";
 import { SubagentScheduler } from "../subagent/scheduler.js";
 import { readArtifact } from "../subagent/artifact.js";
@@ -139,15 +141,20 @@ export interface ChatSessionOptions {
    */
   subagentScheduler?: SubagentScheduler;
   /**
+  /**
    * Opt-in built-in tools the LLM can call (v0.2 §8 onward). Each switch is
    * default-off; enabling one injects a {@link ToolSpec} into the per-turn
-   * tool list. Currently:
-   *   - `search`: dispatches a workspace search via the `search` subagent
-   *     runner. Requires `subagentScheduler` to be wired; if it isn't, the
-   *     tool is silently NOT registered.
+   * tool list. Built-in tools require `subagentScheduler` to be wired
+   * (production code) or the lazy scheduler from `getOrBuildScheduler`
+   * (tests) — when the requirement is unmet, the tool is silently dropped to
+   * keep this purely additive.
+   *
+   *   - `search` — dispatches the `search` subagent runner (Task 8).
+   *   - `read_file_summary` — dispatches the `read_summarize` runner (Task 9).
    */
   builtinTools?: {
     search?: boolean;
+    read_file_summary?: boolean;
   };
 }
 
@@ -157,69 +164,6 @@ interface PendingToolCall {
   args: string;
 }
 
-/**
- * Build any built-in {@link ToolSpec}s the host opted into via
- * {@link ChatSessionOptions.builtinTools}.
- *
- * - `search` requires a `subagentScheduler`; without one the tool is
- *   silently NOT registered (caller can opt in but mis-wire — better to
- *   degrade gracefully than to surface a broken tool).
- */
-function buildBuiltinTools(opts: {
-  enable?: ChatSessionOptions["builtinTools"];
-  scheduler?: SubagentScheduler;
-}): ToolSpec[] {
-  const out: ToolSpec[] = [];
-  if (opts.enable?.search === true && opts.scheduler) {
-    const sched = opts.scheduler;
-    out.push({
-      name: "search",
-      description:
-        "Search the workspace for a pattern. Use this when looking for code, text, or files. Returns top files and counts; full results are stored in an artifact.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "Pattern to search for (literal text).",
-          },
-          glob: {
-            type: "string",
-            description: "Optional file glob, e.g. **/*.ts",
-          },
-          caseInsensitive: {
-            type: "boolean",
-            description: "If true, the match is case-insensitive.",
-          },
-        },
-        required: ["query"],
-      },
-      async execute(args: Record<string, unknown>) {
-        const query = typeof args.query === "string" ? args.query : "";
-        const glob = typeof args.glob === "string" ? args.glob : undefined;
-        const caseInsensitive =
-          typeof args.caseInsensitive === "boolean" ? args.caseInsensitive : undefined;
-        const result = await sched.dispatch({
-          type: "search",
-          input: {
-            query,
-            ...(glob !== undefined ? { globPattern: glob } : {}),
-            ...(caseInsensitive !== undefined ? { caseInsensitive } : {}),
-          },
-          hardCapBytes: 2048,
-        });
-        if (result.status === "error" || result.status === "timeout") {
-          return {
-            ok: false,
-            content: `search failed (${result.status}): ${result.errorMessage ?? "unknown error"}`,
-          };
-        }
-        return { ok: true, content: result.summary };
-      },
-    });
-  }
-  return out;
-}
 
 /** Per-`send()` options. */
 export interface SendOpts {
@@ -320,6 +264,7 @@ export class ChatSession {
   private readonly autoCompactCfg?: ChatSessionOptions["autoCompact"];
   private readonly workspace?: string;
   private readonly subagentScheduler?: SubagentScheduler;
+  private readonly builtinToolsCfg?: ChatSessionOptions["builtinTools"];
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
   private messages: LLMMessage[] = [];
@@ -338,28 +283,19 @@ export class ChatSession {
     this.autoCompactCfg = opts.autoCompact;
     this.workspace = opts.workspace;
     this.subagentScheduler = opts.subagentScheduler;
+    this.builtinToolsCfg = opts.builtinTools;
+    // Mix in built-in tools (v0.2 §9+). Order: built-ins first, then caller's
+    // tools (so a caller-supplied tool with the same name wins via the
+    // `toolByName` map's last-write).
+    const builtins = this.buildBuiltinTools();
+    if (builtins.length > 0) {
+      this.tools = [...builtins, ...this.tools];
+      this.toolByName = new Map(this.tools.map((t) => [t.name, t]));
+    }
     if (opts.systemPrompt && opts.systemPrompt.trim().length > 0) {
       this.messages.push({ role: "system", content: opts.systemPrompt });
     }
 
-    // ── Built-in tools (v0.2 §8) ────────────────────────────────────────────
-    // We append to `this.tools` after user-supplied tools so they show up at
-    // the end of the function-calling tool list. The `toolByName` map is
-    // rebuilt so dispatch resolves the built-ins too.
-    const builtins = buildBuiltinTools({
-      enable: opts.builtinTools,
-      scheduler: this.subagentScheduler,
-    });
-    if (builtins.length > 0) {
-      // Preserve user-supplied tools' priority for name collisions: only add
-      // a built-in if the user didn't already register a tool of that name.
-      for (const b of builtins) {
-        if (!this.toolByName.has(b.name)) {
-          this.tools.push(b);
-          this.toolByName.set(b.name, b);
-        }
-      }
-    }
   }
 
   /** Current conversation history (read-only copy). */
@@ -396,11 +332,171 @@ export class ChatSession {
 
   // ─── Compact (v0.2 §5) ────────────────────────────────────────────────────
 
+  // ─── Built-in tools (v0.2 §9+) ──────────────────────────────────
+
+  /**
+   * Build the list of ChatSession-owned built-in tool specs based on
+   * `opts.builtinTools`. Currently produces:
+   *
+   *   - `read_file_summary` (Task 9) — dispatches `read_summarize` to a
+   *     subagent runner. Returns the runner's summary text + a link to the
+   *     cached source artifact. Silently a no-op if the caller didn't enable
+   *     it; never throws during construction.
+   *
+   * Tool `execute()` failures (path escape, file-not-found, LLM error) come
+   * back as `{ ok: false, content: <human msg> }` instead of throwing, so the
+   * model can see the error in a tool result and try a different path.
+   */
+  private buildBuiltinTools(): ToolSpec[] {
+    const cfg = this.builtinToolsCfg;
+    if (!cfg) return [];
+    const out: ToolSpec[] = [];
+    if (cfg.search) {
+      out.push(this.makeSearchTool());
+    }
+    if (cfg.read_file_summary) {
+      out.push(this.makeReadFileSummaryTool());
+    }
+    return out;
+  }
+
+  /**
+   * Construct the `search` ToolSpec (v0.2 §8). Closure captures `this` so
+   * the tool lazily resolves `getOrBuildScheduler()` at call time — matches
+   * the compact / read_file_summary lazy-init pattern.
+   */
+  private makeSearchTool(): ToolSpec {
+    const self = this;
+    return {
+      name: "search",
+      description:
+        "Search the workspace for a pattern. Use this when looking for code, text, or files. Returns top files and counts; full results are stored in an artifact.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Pattern to search for (literal text).",
+          },
+          glob: {
+            type: "string",
+            description: "Optional file glob, e.g. **/*.ts",
+          },
+          caseInsensitive: {
+            type: "boolean",
+            description: "If true, the match is case-insensitive.",
+          },
+        },
+        required: ["query"],
+      },
+      async execute(args: Record<string, unknown>) {
+        const query = typeof args.query === "string" ? args.query : "";
+        const glob = typeof args.glob === "string" ? args.glob : undefined;
+        const caseInsensitive =
+          typeof args.caseInsensitive === "boolean" ? args.caseInsensitive : undefined;
+        try {
+          const sched = self.getOrBuildScheduler();
+          const result = await sched.dispatch({
+            type: "search",
+            input: {
+              query,
+              ...(glob !== undefined ? { globPattern: glob } : {}),
+              ...(caseInsensitive !== undefined ? { caseInsensitive } : {}),
+            },
+            hardCapBytes: 2048,
+          });
+          if (result.status === "error" || result.status === "timeout") {
+            return {
+              ok: false,
+              content: `search failed (${result.status}): ${result.errorMessage ?? "unknown error"}`,
+            };
+          }
+          return { ok: true, content: result.summary };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { ok: false, content: `search error: ${msg}` };
+        }
+      },
+    };
+  }
+
+  /**
+   * Construct the `read_file_summary` ToolSpec. The closure captures `this`
+   * so the tool can lazily resolve `getOrBuildScheduler()` at call time —
+   * matches the compact lazy-init pattern.
+   */
+  private makeReadFileSummaryTool(): ToolSpec {
+    const self = this;
+    return {
+      name: "read_file_summary",
+      description:
+        "Read a file and get a focused summary answering your question. " +
+        "Use this for long files where you only need specific information. " +
+        "Returns summary text and a link to the cached source.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "File path relative to workspace",
+          },
+          question: {
+            type: "string",
+            description: "What you want to know from the file",
+          },
+        },
+        required: ["path", "question"],
+      },
+      async execute(args: Record<string, unknown>) {
+        const filePath = typeof args.path === "string" ? args.path : "";
+        const question = typeof args.question === "string" ? args.question : "";
+        if (!filePath) {
+          return { ok: false, content: "error: read_file_summary requires 'path'" };
+        }
+        if (!question) {
+          return {
+            ok: false,
+            content: "error: read_file_summary requires 'question'",
+          };
+        }
+        try {
+          const sched = self.getOrBuildScheduler();
+          const result = await sched.dispatch({
+            type: "read_summarize",
+            input: {
+              path: filePath,
+              question,
+              llm: self.llm,
+              modelHint: self.model,
+            } as unknown as Record<string, unknown>,
+            hardCapBytes: 2048,
+          });
+          if (result.status !== "ok") {
+            // Surface the error text directly to the model so it can recover
+            // (try a different path, ask for help, etc.). Don't throw.
+            const reason =
+              result.summary || result.errorMessage || `status=${result.status}`;
+            return { ok: false, content: `read_file_summary error: ${reason}` };
+          }
+          const link = result.artifactPath
+            ? `\n\nFull source cached at: ${result.artifactPath}`
+            : "";
+          return { ok: true, content: result.summary + link };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { ok: false, content: `read_file_summary error: ${msg}` };
+        }
+      },
+    };
+  }
+
   /** Resolve (or lazily build) the scheduler used for compact dispatch. */
   private getOrBuildScheduler(): SubagentScheduler {
     if (this.subagentScheduler) return this.subagentScheduler;
     const registry = new SubagentRegistry();
     registry.register(compactRunner);
+    registry.register(searchRunner);
+    registry.register(readSummarizeRunner);
     // Workspace: prefer user-provided; otherwise use process.cwd() as a sane
     // default (artifacts land under <cwd>/.mathran/subagents/<runId>/).
     const ws = this.workspace ?? process.cwd();

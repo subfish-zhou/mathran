@@ -658,24 +658,38 @@ import { SubagentScheduler } from "../subagent/scheduler.js";
 import { searchRunner } from "../subagent/runners/search.js";
 
 describe("ChatSession builtinTools.search (v0.2 §8)", () => {
-  it("does NOT register the search tool when subagentScheduler is missing", () => {
-    const llm = new ScriptedLLM([]);
+  it("does NOT register the search tool when builtinTools.search is unset", () => {
+    const llm = new ScriptedLLM([
+      [{ type: "text", delta: "plain" }, { type: "done", finishReason: "stop" }],
+    ]);
     const session = new ChatSession({
       llm,
       model: "m",
-      builtinTools: { search: true },
-      // No subagentScheduler!
+      // builtinTools omitted entirely.
     });
-    // Indirect check: send() with a model that wants to call "search" should
-    // get the "unknown tool" error path. But the simplest check is just that
-    // no provider request will list "search" as a tool. We can't introspect
-    // private fields cleanly; instead, kick a turn and inspect the LLMRequest
-    // the ScriptedLLM recorded.
     return collect(session.send("hi")).then(() => {
       const req = llm.requests[0];
       const toolNames = (req.tools ?? []).map((t) => t.name);
       expect(toolNames).not.toContain("search");
     });
+  });
+
+  it("registers the search tool via lazy scheduler when builtinTools.search is true (no explicit scheduler)", async () => {
+    // v0.2 §9+ unified semantics: built-in tools use the lazy
+    // `getOrBuildScheduler()` pattern (same as compact / read_file_summary),
+    // so the tool registers even without an injected scheduler.
+    const llm = new ScriptedLLM([
+      [{ type: "text", delta: "no tool" }, { type: "done", finishReason: "stop" }],
+    ]);
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      builtinTools: { search: true },
+    });
+    await collect(session.send("hi"));
+    const req = llm.requests[0];
+    const toolNames = (req.tools ?? []).map((t) => t.name);
+    expect(toolNames).toContain("search");
   });
 
   it("registers and exposes the search tool when scheduler is wired", async () => {
@@ -770,3 +784,186 @@ describe("ChatSession builtinTools.search (v0.2 §8)", () => {
     }
   });
 });
+// ─── v0.2 §9: read_file_summary built-in tool ─────────────────────────
+
+import type { SubagentResult } from "../subagent/types.js";
+
+/**
+ * Mock SubagentScheduler that records every dispatch and returns canned
+ * results. The constructor accepts a callback so tests can decide the
+ * response on a per-dispatch basis (so we can vary status: ok / error).
+ */
+class RecordingScheduler {
+  readonly seen: Array<{
+    type: string;
+    input: Record<string, unknown>;
+    hardCapBytes?: number;
+  }> = [];
+  constructor(
+    private respond: (
+      task: { type: string; input: Record<string, unknown> },
+    ) => Partial<SubagentResult>,
+  ) {}
+  async dispatch(task: {
+    type: string;
+    input: Record<string, unknown>;
+    hardCapBytes?: number;
+  }): Promise<SubagentResult> {
+    this.seen.push({
+      type: task.type,
+      input: task.input,
+      hardCapBytes: task.hardCapBytes,
+    });
+    const base = this.respond(task);
+    const now = new Date().toISOString();
+    return {
+      runId: "sub-mock0000",
+      type: "read_summarize",
+      status: base.status ?? "ok",
+      summary: base.summary ?? "",
+      artifactPath: base.artifactPath ?? null,
+      stats: {
+        startedAt: now,
+        endedAt: now,
+        durationMs: 0,
+      },
+      ...(base.errorMessage ? { errorMessage: base.errorMessage } : {}),
+    };
+  }
+}
+
+describe("ChatSession.builtinTools.read_file_summary (v0.2 §9)", () => {
+  it("registers the tool, dispatches to the scheduler, feeds the summary back to the LLM", async () => {
+    // Two turns: assistant calls read_file_summary; then assistant replies
+    // with plain text after seeing the tool result.
+    const llm = new ScriptedLLM([
+      [
+        {
+          type: "tool-call",
+          id: "call_1",
+          name: "read_file_summary",
+          argsDelta: JSON.stringify({
+            path: "notes.md",
+            question: "What's the v0.2 plan?",
+          }),
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "The summary says X." },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const scheduler = new RecordingScheduler(() => ({
+      status: "ok",
+      summary: "v0.2 ships subagents, compact, memory.",
+      artifactPath: ".mathran/subagents/sub-abc/source.txt",
+    }));
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      // Cast: we duck-type the scheduler in tests.
+      subagentScheduler: scheduler as unknown as SubagentScheduler,
+      builtinTools: { read_file_summary: true },
+    });
+
+    const events = await collect(session.send("summarize notes.md please"));
+
+    // The tool was advertised in the first request.
+    expect(llm.requests.length).toBe(2);
+    const toolsInReq = llm.requests[0].tools ?? [];
+    const names = toolsInReq.map((t) => t.name);
+    expect(names).toContain("read_file_summary");
+
+    // The scheduler saw exactly one dispatch with the correct shape.
+    expect(scheduler.seen.length).toBe(1);
+    expect(scheduler.seen[0].type).toBe("read_summarize");
+    expect(scheduler.seen[0].input.path).toBe("notes.md");
+    expect(scheduler.seen[0].input.question).toBe("What's the v0.2 plan?");
+    // llm injected into the runner input (mirrors compact pattern).
+    expect(scheduler.seen[0].input.llm).toBeDefined();
+    expect(scheduler.seen[0].hardCapBytes).toBe(2048);
+
+    // The second request to the LLM carries the tool result.
+    const followupMessages = llm.requests[1].messages;
+    const toolMsg = followupMessages.find((m) => m.role === "tool");
+    expect(toolMsg?.content).toContain("v0.2 ships subagents, compact, memory.");
+    expect(toolMsg?.content).toContain(".mathran/subagents/sub-abc/source.txt");
+
+    // And the final assistant text streamed out.
+    const finalText = events
+      .filter((e) => e.type === "text")
+      .map((e) => (e as Extract<ChatEvent, { type: "text" }>).delta)
+      .join("");
+    expect(finalText).toBe("The summary says X.");
+  });
+
+  it("surfaces a runner error (path escape) as a non-OK tool result, not a thrown exception", async () => {
+    const llm = new ScriptedLLM([
+      [
+        {
+          type: "tool-call",
+          id: "call_x",
+          name: "read_file_summary",
+          argsDelta: JSON.stringify({
+            path: "../../etc/passwd",
+            question: "creds?",
+          }),
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "Sorry, can't." },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const scheduler = new RecordingScheduler(() => ({
+      status: "error",
+      summary: "Refused: path \"../../etc/passwd\" escapes the workspace",
+      artifactPath: null,
+      errorMessage: "read_summarize: path escapes workspace",
+    }));
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      subagentScheduler: scheduler as unknown as SubagentScheduler,
+      builtinTools: { read_file_summary: true },
+    });
+
+    const events = await collect(session.send("read /etc/passwd"));
+
+    // No throw, and the tool result carries the refusal text.
+    const toolResult = events.find((e) => e.type === "tool-result") as Extract<
+      ChatEvent,
+      { type: "tool-result" }
+    >;
+    expect(toolResult).toBeDefined();
+    expect(toolResult.ok).toBe(false);
+    expect(toolResult.content).toMatch(/escape|workspace/i);
+  });
+
+  it("does NOT register read_file_summary when builtinTools is unset", async () => {
+    const llm = new ScriptedLLM([
+      [
+        { type: "text", delta: "plain reply" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      // builtinTools omitted entirely.
+    });
+    await collect(session.send("hi"));
+    const toolsInReq = llm.requests[0].tools;
+    // Either undefined (no tools advertised) or an array that doesn't contain
+    // our built-in.
+    if (toolsInReq) {
+      const names = toolsInReq.map((t) => t.name);
+      expect(names).not.toContain("read_file_summary");
+    } else {
+      expect(toolsInReq).toBeUndefined();
+    }
+  });
+});
+
