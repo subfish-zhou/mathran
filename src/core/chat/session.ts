@@ -23,6 +23,17 @@ import type {
   LLMStreamChunk,
 } from "../providers/llm.js";
 import { capToolOutput } from "./tool-output-cap.js";
+import {
+  compactRunner,
+  type CompactRunnerInput,
+  type CompactedArtifact,
+  DEFAULT_CONTEXT_WINDOW,
+  DEFAULT_KEEP_RECENT_ROUNDS,
+} from "../subagent/runners/compact.js";
+import { SubagentRegistry } from "../subagent/registry.js";
+import { SubagentScheduler } from "../subagent/scheduler.js";
+import { readArtifact } from "../subagent/artifact.js";
+import * as path from "node:path";
 
 /**
  * Per-invocation context the kernel threads into a tool's `execute()`.
@@ -101,6 +112,32 @@ export interface ChatSessionOptions {
    * is *undefined*, tool results are stored verbatim (backward-compatible).
    */
   toolOutputCap?: { maxInlineBytes?: number; workspace?: string | null };
+  /**
+   * Auto-compact (v0.2 §5). When `enabled: true`, every `send()` call checks
+   * the token count of `this.messages` against `contextWindow * thresholdPct`
+   * and runs `compact()` first if we'd overflow. Requires the wrapped
+   * LLMProvider to implement `countTokens`; falls back to a silent no-op
+   * when the provider can't count tokens. Defaults: thresholdPct=0.75,
+   * keepRecentRounds=5, contextWindow=200000.
+   */
+  autoCompact?: {
+    enabled?: boolean;
+    thresholdPct?: number;
+    keepRecentRounds?: number;
+    contextWindow?: number;
+  };
+  /**
+   * Workspace root for subagent artifacts (v0.2 §5). Required for `compact()`
+   * to write the compacted-history artifact. When omitted, `compact()` falls
+   * back to a per-session temp dir.
+   */
+  workspace?: string;
+  /**
+   * Optional injected subagent scheduler. Tests pass a custom one; production
+   * code lets ChatSession build its own (with the compact runner registered)
+   * lazily on first compact.
+   */
+  subagentScheduler?: SubagentScheduler;
 }
 
 interface PendingToolCall {
@@ -130,6 +167,22 @@ export interface SendOpts {
 /** Construct the canonical abort error (matches the Fetch/Streams convention). */
 function abortError(): DOMException {
   return new DOMException("Aborted", "AbortError");
+}
+
+/** Stats returned by {@link ChatSession.compact} — the caller (CLI / REST)
+ *  surfaces these to the user. */
+export interface CompactStats {
+  /** Token count of history before compaction. */
+  originalTokenCount: number;
+  /** Token count of history after compaction. */
+  newTokenCount: number;
+  /** Number of complete user-rooted rounds dropped from the middle. */
+  droppedRoundCount: number;
+  /** True when the call was a no-op (nothing to compact). */
+  noop: boolean;
+  /** Truthy warning string when compaction failed to drop the token count
+   *  below the threshold (relevant for auto-compact loops). Absent on success. */
+  warning?: string;
 }
 
 /** True when `err` is an AbortError (DOMException or a plain `.name` carrier). */
@@ -189,6 +242,11 @@ export class ChatSession {
   private readonly toolContext?: ToolExecuteContext;
   readonly sessionId: string;
   private readonly toolOutputCap?: { maxInlineBytes?: number; workspace?: string | null };
+  private readonly autoCompactCfg?: ChatSessionOptions["autoCompact"];
+  private readonly workspace?: string;
+  private readonly subagentScheduler?: SubagentScheduler;
+  /** Promise of an in-flight compact() — second concurrent caller awaits it. */
+  private compactInFlight: Promise<CompactStats> | null = null;
   private messages: LLMMessage[] = [];
 
   constructor(opts: ChatSessionOptions) {
@@ -202,6 +260,9 @@ export class ChatSession {
     this.toolContext = opts.toolContext;
     this.sessionId = opts.sessionId ?? randomUUID();
     this.toolOutputCap = opts.toolOutputCap;
+    this.autoCompactCfg = opts.autoCompact;
+    this.workspace = opts.workspace;
+    this.subagentScheduler = opts.subagentScheduler;
     if (opts.systemPrompt && opts.systemPrompt.trim().length > 0) {
       this.messages.push({ role: "system", content: opts.systemPrompt });
     }
@@ -239,6 +300,137 @@ export class ChatSession {
       : next.map((m) => ({ ...m }));
   }
 
+  // ─── Compact (v0.2 §5) ────────────────────────────────────────────────────
+
+  /** Resolve (or lazily build) the scheduler used for compact dispatch. */
+  private getOrBuildScheduler(): SubagentScheduler {
+    if (this.subagentScheduler) return this.subagentScheduler;
+    const registry = new SubagentRegistry();
+    registry.register(compactRunner);
+    // Workspace: prefer user-provided; otherwise use process.cwd() as a sane
+    // default (artifacts land under <cwd>/.mathran/subagents/<runId>/).
+    const ws = this.workspace ?? process.cwd();
+    return new SubagentScheduler({ workspace: ws, registry });
+  }
+
+  /**
+   * Compact the current history via the `compact` subagent runner. Always
+   * preserves the leading system message; drops the middle chunk in favor of
+   * a single summary `role:"system"` message; keeps the last
+   * `keepRecentRounds` user-rooted rounds verbatim.
+   *
+   * Concurrent calls await the first in-flight compaction.
+   */
+  async compact(opts?: { keepRecentRounds?: number }): Promise<CompactStats> {
+    if (this.compactInFlight) return this.compactInFlight;
+    this.compactInFlight = this.compactImpl(opts).finally(() => {
+      this.compactInFlight = null;
+    });
+    return this.compactInFlight;
+  }
+
+  private async compactImpl(opts?: { keepRecentRounds?: number }): Promise<CompactStats> {
+    const sched = this.getOrBuildScheduler();
+    const cfg = this.autoCompactCfg;
+    const keepRecentRounds =
+      opts?.keepRecentRounds ??
+      cfg?.keepRecentRounds ??
+      DEFAULT_KEEP_RECENT_ROUNDS;
+    const contextWindow = cfg?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+
+    const input: CompactRunnerInput = {
+      messages: this.messages.map((m) => ({ ...m })),
+      contextWindow,
+      keepRecentRounds,
+      modelHint: this.model,
+      llm: this.llm,
+    };
+
+    const result = await sched.dispatch({
+      type: "compact",
+      input: input as unknown as Record<string, unknown>,
+    });
+
+    if (result.status !== "ok" || !result.artifactPath) {
+      throw new Error(
+        `compact failed: ${result.status}${
+          result.errorMessage ? ": " + result.errorMessage : ""
+        }`,
+      );
+    }
+
+    // Read the artifact and swap messages.
+    const ws = this.workspace ?? process.cwd();
+    const relative = result.artifactPath;
+    // artifactPath is POSIX-style relative to workspace, of the form
+    // `.mathran/subagents/<runId>/compacted.json`. Recover runId + filename to
+    // call readArtifact (which already knows the layout).
+    const segs = relative.split("/");
+    const filename = segs[segs.length - 1];
+    const runId = segs[segs.length - 2];
+    let raw: string;
+    try {
+      raw = await readArtifact(ws, runId, filename);
+    } catch {
+      // Fallback: read directly via path.join.
+      raw = await (await import("node:fs/promises")).readFile(
+        path.join(ws, relative),
+        "utf8",
+      );
+    }
+    const artifact = JSON.parse(raw) as CompactedArtifact;
+
+    if (!artifact.noop) {
+      this.messages = artifact.newMessages.map((m) => ({ ...m }));
+    }
+
+    const stats: CompactStats = {
+      originalTokenCount: artifact.originalTokenCount,
+      newTokenCount: artifact.newTokenCount,
+      droppedRoundCount: artifact.droppedRoundCount,
+      noop: artifact.noop,
+    };
+    // Surface a warning if we still exceed the threshold after compaction,
+    // so the caller / auto-compact loop doesn't infinitely re-trigger.
+    if (cfg && !artifact.noop) {
+      const thresholdPct = cfg.thresholdPct ?? 0.75;
+      const limit = contextWindow * thresholdPct;
+      if (artifact.newTokenCount > limit) {
+        stats.warning = `compacted history (${artifact.newTokenCount} tok) still exceeds threshold (${Math.round(
+          limit,
+        )} tok); will not re-compact this turn`;
+      }
+    }
+    return stats;
+  }
+
+  /**
+   * Auto-compact pre-check (v0.2 §5). Called once at the start of {@link send}
+   * when `autoCompact.enabled` is true. Silent no-op when the provider can't
+   * count tokens, or when the count is under the configured threshold.
+   */
+  private async maybeAutoCompact(): Promise<void> {
+    const cfg = this.autoCompactCfg;
+    if (!cfg?.enabled) return;
+    const llm = this.llm as LLMProvider & { countTokens?: (m: LLMMessage[]) => number };
+    if (typeof llm.countTokens !== "function") return;
+    let count: number;
+    try {
+      count = llm.countTokens(this.messages);
+    } catch {
+      return; // never crash the send path due to counting errors
+    }
+    if (typeof count !== "number" || !Number.isFinite(count)) return;
+    const window = cfg.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+    const threshold = window * (cfg.thresholdPct ?? 0.75);
+    if (count <= threshold) return;
+    try {
+      await this.compact();
+    } catch {
+      // Swallow: auto-compact must never block the user's send.
+    }
+  }
+
   /**
    * Run one user turn. Streams text/tool events; resolves the conversation by
    * looping through tool calls until the model stops requesting them.
@@ -247,6 +439,10 @@ export class ChatSession {
     const signal = opts.signal;
     // Abort before we touch history: leave `messages` untouched and bail.
     if (signal?.aborted) throw abortError();
+
+    // Auto-compact pre-check (v0.2 §5): compact BEFORE we push the new user
+    // message, so we don't immediately discard it. Silent on failure.
+    await this.maybeAutoCompact();
 
     this.messages.push({ role: "user", content: userText });
 

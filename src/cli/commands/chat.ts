@@ -157,6 +157,7 @@ const HELP_TEXT = `commands:
   /exit | /quit            quit the REPL
   /reset                   clear conversation history (keep system prompt)
   /history                 print a summary of the current history
+  /compact [k]             compact history via subagent (keep last k user rounds, default 5)
   /system [text]           show or replace the system prompt (resets history)
   /model [model]           show or switch the active model (resets history)
   /save [path]             save history to a Markdown transcript (default ./mathran-chat-<ts>.md)
@@ -187,6 +188,27 @@ export async function handleSlashCommand(
     case "/reset":
       ctx.session.reset();
       return { kind: "continue", output: "(history cleared)" };
+
+    case "/compact": {
+      const k = arg ? Number.parseInt(arg, 10) : NaN;
+      try {
+        const stats = await ctx.session.compact(
+          Number.isFinite(k) && k > 0 ? { keepRecentRounds: k } : undefined,
+        );
+        if (stats.noop) {
+          return { kind: "continue", output: "(history short enough; nothing to compact)" };
+        }
+        const warn = stats.warning ? `\n(warning: ${stats.warning})` : "";
+        return {
+          kind: "continue",
+          output:
+            `Compacted. Tokens: ${stats.originalTokenCount} → ${stats.newTokenCount}. ` +
+            `Dropped ${stats.droppedRoundCount} round(s).${warn}`,
+        };
+      } catch (err: any) {
+        return { kind: "continue", output: `mathran: compact failed: ${err?.message ?? err}` };
+      }
+    }
 
     case "/history": {
       const h = ctx.session.history();

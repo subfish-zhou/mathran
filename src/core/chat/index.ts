@@ -11,6 +11,7 @@ export type {
   ChatEvent,
   ChatSessionOptions,
   ToolSpec,
+  CompactStats,
 } from "./session.js";
 export { createLeanCheckTool, type LeanCheckToolOptions } from "./tools/lean-check.js";
 export { renderTranscriptMarkdown, type TranscriptMeta } from "./transcript.js";

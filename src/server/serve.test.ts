@@ -1202,3 +1202,43 @@ describe("POST /api/goals/:id/interrupt (v0.2 §7)", () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe("POST /api/global-chat/:id/compact (v0.2 §5)", () => {
+  it("returns 404 for an unknown conversation", async () => {
+    const res = await fetch(`${base}/api/global-chat/no-such-conv/compact`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 200 + stats for a real conversation", async () => {
+    // Seed a conversation with enough turns to compact.
+    const cid = "compact-rest-1";
+    // Use the global-chat POST to create one turn. The fake LLM streams "hi there".
+    for (let i = 0; i < 4; i++) {
+      const res = await fetch(`${base}/api/global-chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: `q${i}`, conversationId: cid }),
+      });
+      expect(res.status).toBe(200);
+      // Drain the SSE stream so the server-side flush completes before next POST.
+      await res.text();
+    }
+    const res = await fetch(`${base}/api/global-chat/${cid}/compact`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ keepRecentRounds: 1 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.stats).toBeTruthy();
+    expect(typeof body.stats.originalTokenCount).toBe("number");
+    expect(typeof body.stats.newTokenCount).toBe("number");
+    // We had 4 user rounds; keep 1 → drop at least the remaining 3.
+    expect(body.stats.droppedRoundCount).toBeGreaterThanOrEqual(3);
+  });
+});

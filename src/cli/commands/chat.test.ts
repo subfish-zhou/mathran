@@ -188,3 +188,29 @@ describe("handleSlashCommand: /save + /load round-trip", () => {
     expect(res.output).toMatch(/usage/);
   });
 });
+
+describe("handleSlashCommand: /compact", () => {
+  it("reports no-op when history is short", async () => {
+    // Default session has only the system prompt.
+    const res = await handleSlashCommand("/compact", { ...ctx, session });
+    expect(res.kind).toBe("continue");
+    expect(res.output).toMatch(/nothing to compact|Compacted/);
+  });
+
+  it("compacts and reports stats when history is long", async () => {
+    // Seed a long history; ChatSession.compact uses the wrapped llm to
+    // summarize — the scripted LLM just acks the last user turn, which is fine.
+    const messages: { role: "user" | "assistant"; content: string }[] = [];
+    for (let i = 1; i <= 12; i++) {
+      messages.push({ role: "user", content: `Q ${i}` });
+      messages.push({ role: "assistant", content: `A ${i}` });
+    }
+    session.replaceHistory(messages);
+    const res = await handleSlashCommand("/compact 2", { ...ctx, session });
+    expect(res.kind).toBe("continue");
+    expect(res.output).toMatch(/Compacted\. Tokens: \d+ → \d+\. Dropped \d+ round/);
+    // After compact: system + summary system + 2 rounds (4 msgs) = 6
+    expect(session.history().length).toBe(6);
+  });
+});
+
