@@ -68,6 +68,10 @@ import {
   type ChatEvent,
 } from "../core/chat/index.js";
 import {
+  SubagentScheduler,
+  defaultSubagentRegistry,
+} from "../core/subagent/index.js";
+import {
   createOpenAITokenCounter,
   createAnthropicTokenCounter,
   createFallbackTokenCounter,
@@ -637,6 +641,13 @@ export function defaultSessionFactory(workspace: string): ChatSessionFactory {
     // can reach the loopback socket already has shell access on this
     // machine; there is no auth boundary to add value to a tool-set cut.
     const scopedWorkspace = scope ? resolveScopeRoot(workspace, scope) : workspace;
+    // v0.5 wire-up Gap #4 + #5: scoped scheduler with all 5 runners so the
+    // web UI's `dispatch_subagent` builtin tool can fan out to research /
+    // lean_explore / etc. Mirrors the CLI chat scheduler wiring.
+    const scheduler = new SubagentScheduler({
+      workspace: scopedWorkspace,
+      registry: defaultSubagentRegistry(),
+    });
     return new ChatSession({
       llm: router,
       model: resolvedModel,
@@ -648,6 +659,8 @@ export function defaultSessionFactory(workspace: string): ChatSessionFactory {
       toolContext: { workspace: scopedWorkspace, scope },
       systemPrompt: buildScopedSystemPrompt(scope),
       tools: [createLeanCheckTool(lean)],
+      subagentScheduler: scheduler,
+      scheduler,
       builtinTools: {
         search: true,
         read_file_summary: true,
@@ -655,6 +668,7 @@ export function defaultSessionFactory(workspace: string): ChatSessionFactory {
         read_file: true,
         write_file: true,
         edit_file: true,
+        dispatch_subagent: true,
       },
     });
   };

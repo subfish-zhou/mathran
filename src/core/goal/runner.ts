@@ -154,6 +154,13 @@ export interface RunRoundOptions {
    * to `opts.workspace` when unset.
    */
   chatWorkspace?: string;
+  /**
+   * v0.5 wire-up Gap #4 + #5: subagent scheduler forwarded into the inner
+   * `ChatSession` so the `dispatch_subagent` builtin tool can dispatch into
+   * search/research/lean_explore runners. Optional — when unset, enabling
+   * `builtinTools.dispatch_subagent` is a silent no-op.
+   */
+  scheduler?: import("../subagent/scheduler.js").SubagentScheduler;
 }
 
 export interface RunRoundResult {
@@ -450,6 +457,7 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     toolContext,
     workspace: opts.chatWorkspace ?? opts.workspace,
     ...(opts.builtinTools ? { builtinTools: opts.builtinTools } : {}),
+    ...(opts.scheduler ? { subagentScheduler: opts.scheduler, scheduler: opts.scheduler } : {}),
   });
   if (history.length > 0) session.replaceHistory(history);
 

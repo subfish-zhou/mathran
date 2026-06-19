@@ -18,4 +18,8 @@ export { createBashTool, type BashToolOptions } from "./tools/bash.js";
 export { createReadFileTool, type ReadFileToolOptions } from "./tools/read-file.js";
 export { createWriteFileTool, type WriteFileToolOptions } from "./tools/write-file.js";
 export { createEditFileTool, type EditFileToolOptions } from "./tools/edit-file.js";
+export {
+  createDispatchSubagentTool,
+  type DispatchSubagentToolOptions,
+} from "./tools/dispatch-subagent.js";
 export { renderTranscriptMarkdown, type TranscriptMeta } from "./transcript.js";

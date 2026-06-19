@@ -35,6 +35,10 @@ import type { ChatEvent } from "../../core/chat/index.js";
 import type { LLMMessage } from "../../core/providers/llm.js";
 import { ModelRouter, LocalLeanProvider } from "../../providers/index.js";
 import {
+  SubagentScheduler,
+  defaultSubagentRegistry,
+} from "../../core/subagent/index.js";
+import {
   loadMathranMemory,
   resolveGlobalMemoryPath,
   resolveProjectMemoryPath,
@@ -80,15 +84,27 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
 
   const lean = new LocalLeanProvider();
   const workspace = opts.memoryWorkspace ?? process.cwd();
+  // v0.5 wire-up: build a scheduler with all 5 runners pre-registered so the
+  // `dispatch_subagent` builtin tool has a place to dispatch into. Same
+  // scheduler is also forwarded as `subagentScheduler` so compact uses it
+  // instead of lazily building a smaller one.
+  const scheduler = new SubagentScheduler({
+    workspace,
+    registry: defaultSubagentRegistry(),
+  });
   const session = new ChatSession({
     llm: router,
     model,
     systemPrompt: opts.systemPrompt ?? SYSTEM_PROMPT,
     tools: [createLeanCheckTool(lean)],
     workspace,
+    subagentScheduler: scheduler,
+    scheduler,
     // v0.4 §1: enable the full builtin toolkit for `mathran chat`. Users
     // run chat at a workspace root with full access; treat it like a local
     // shell session.
+    // v0.5 wire-up Gap #4 + #5: dispatch_subagent gives the agent direct
+    // access to search/read_summarize/research/lean_explore runners.
     builtinTools: {
       search: true,
       read_file_summary: true,
@@ -96,6 +112,7 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
       read_file: true,
       write_file: true,
       edit_file: true,
+      dispatch_subagent: true,
     },
     ...(opts.memoryWorkspace
       ? { memoryFiles: { enabled: true, workspace: opts.memoryWorkspace } }

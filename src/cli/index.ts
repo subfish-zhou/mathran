@@ -476,6 +476,71 @@ configCmd
   });
 
 program
+  .command("subagent")
+  .description(
+    "Dispatch a single subagent runner directly (compact | search | read_summarize | research | lean_explore). v0.5 wire-up Gap #4 + #5.",
+  )
+  .argument("<type>", "Runner type")
+  .argument("<inputJson>", "JSON-encoded runner input (object)")
+  .option("--runtime <runtime>", "inline (default) or subprocess")
+  .option("--timeout-ms <ms>", "Override runner timeout (default 60000)")
+  .option("--hard-cap-bytes <bytes>", "Override summary byte cap (default 2048)")
+  .option("--workspace <dir>", "Workspace root (overrides MATHRAN_WORKSPACE and the default)")
+  .option("--config <path>", "Path to config file")
+  .option("--json", "Emit the SubagentResult as JSON", false)
+  .option("--no-summary", "Suppress the inline summary block in human output")
+  .option("--artifact", "After the run, cat the artifact file (if any)", false)
+  .option("--no-inject-llm", "Skip auto-wiring an LLM provider into input.llm")
+  .option("-m, --model <model>", "Model id for the auto-wired LLM")
+  .action(
+    async (
+      type: string,
+      inputJson: string,
+      opts: {
+        runtime?: string;
+        timeoutMs?: string;
+        hardCapBytes?: string;
+        workspace?: string;
+        config?: string;
+        json?: boolean;
+        summary?: boolean; // commander negates --no-summary → opts.summary === false
+        artifact?: boolean;
+        injectLlm?: boolean; // commander negates --no-inject-llm → opts.injectLlm === false
+        model?: string;
+      },
+    ) => {
+      const { runSubagentCommand } = await import("./commands/subagent.js");
+      const timeoutMs = opts.timeoutMs !== undefined ? Number(opts.timeoutMs) : undefined;
+      const hardCapBytes =
+        opts.hardCapBytes !== undefined ? Number(opts.hardCapBytes) : undefined;
+      if (timeoutMs !== undefined && !Number.isFinite(timeoutMs)) {
+        console.error("--timeout-ms must be a number");
+        process.exit(2);
+      }
+      if (hardCapBytes !== undefined && !Number.isFinite(hardCapBytes)) {
+        console.error("--hard-cap-bytes must be a number");
+        process.exit(2);
+      }
+      process.exit(
+        await runSubagentCommand({
+          type,
+          inputJson,
+          ...(opts.runtime !== undefined ? { runtime: opts.runtime } : {}),
+          ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+          ...(hardCapBytes !== undefined ? { hardCapBytes } : {}),
+          ...(opts.workspace !== undefined ? { workspace: opts.workspace } : {}),
+          ...(opts.config !== undefined ? { configPath: opts.config } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+          ...(opts.summary === false ? { noSummary: true } : {}),
+          ...(opts.artifact !== undefined ? { artifact: opts.artifact } : {}),
+          ...(opts.injectLlm === false ? { injectLlm: false } : {}),
+          ...(opts.model !== undefined ? { model: opts.model } : {}),
+        }),
+      );
+    },
+  );
+
+program
   .command("serve")
   .description("Start the local-only workstation server (Hono REST + SSE on 127.0.0.1)")
   .option("--port <port>", "Port to listen on (default 7878)")
