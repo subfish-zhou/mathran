@@ -170,4 +170,226 @@ describe("SubagentScheduler", () => {
     );
     expect(onDisk).toBe("full output");
   });
+
+  // ─── Subprocess runtime routing (v0.3 §16) ─────────────────────────────
+
+  it("task with no `runtime` field defaults to inline (no subprocess spawn)", async () => {
+    let inlineRan = false;
+    registry.register({
+      type: "search",
+      async run() {
+        inlineRan = true;
+        return { status: "ok" as const, summary: "x", artifactPath: null };
+      },
+    });
+    let subprocessRan = false;
+    const fakeRuntime = {
+      async run() {
+        subprocessRan = true;
+        return {
+          runId: "sub-fake0001",
+          type: "search" as const,
+          status: "ok" as const,
+          summary: "sub",
+          artifactPath: null,
+          stats: {
+            startedAt: new Date().toISOString(),
+            endedAt: new Date().toISOString(),
+            durationMs: 0,
+          },
+        };
+      },
+    };
+    const sched = new SubagentScheduler({
+      workspace,
+      registry,
+      subprocessRuntime: fakeRuntime,
+    });
+    const res = await sched.dispatch({ type: "search", input: {} });
+    expect(res.status).toBe("ok");
+    expect(inlineRan).toBe(true);
+    expect(subprocessRan).toBe(false);
+  });
+
+  it("task with `runtime: \"subprocess\"` routes through the subprocess runtime", async () => {
+    let inlineRan = false;
+    registry.register({
+      type: "search",
+      async run() {
+        inlineRan = true;
+        return { status: "ok" as const, summary: "in", artifactPath: null };
+      },
+    });
+    let observed: { type?: string; input?: unknown; workspace?: string } = {};
+    const fakeRuntime = {
+      async run(args: { type: string; input: unknown; workspace?: string }) {
+        observed = { type: args.type, input: args.input, workspace: args.workspace };
+        return {
+          runId: "sub-fake0002",
+          type: args.type as "search",
+          status: "ok" as const,
+          summary: "hello from subprocess",
+          artifactPath: null,
+          stats: {
+            startedAt: new Date().toISOString(),
+            endedAt: new Date().toISOString(),
+            durationMs: 7,
+          },
+        };
+      },
+    };
+    const sched = new SubagentScheduler({
+      workspace,
+      registry,
+      subprocessRuntime: fakeRuntime,
+    });
+    const res = await sched.dispatch({
+      type: "search",
+      input: { query: "q" },
+      runtime: "subprocess",
+    } as never);
+    expect(inlineRan).toBe(false);
+    expect(res.status).toBe("ok");
+    expect(res.summary).toBe("hello from subprocess");
+    expect(observed.type).toBe("search");
+    expect((observed.input as { query: string }).query).toBe("q");
+    expect(observed.workspace).toBe(workspace);
+  });
+
+  it("subprocess routing strips `llm`/`scheduler` from input before forwarding", async () => {
+    registry.register({
+      type: "search",
+      async run() {
+        return { status: "ok" as const, summary: "x", artifactPath: null };
+      },
+    });
+    let observed: Record<string, unknown> | null = null;
+    let llmReceived: unknown = null;
+    let schedulerReceived: unknown = null;
+    const fakeRuntime = {
+      async run(args: {
+        type: string;
+        input: unknown;
+        llm?: unknown;
+        scheduler?: unknown;
+      }) {
+        observed = args.input as Record<string, unknown>;
+        llmReceived = args.llm;
+        schedulerReceived = args.scheduler;
+        return {
+          runId: "sub-fake0003",
+          type: args.type as "search",
+          status: "ok" as const,
+          summary: "",
+          artifactPath: null,
+          stats: {
+            startedAt: new Date().toISOString(),
+            endedAt: new Date().toISOString(),
+            durationMs: 0,
+          },
+        };
+      },
+    };
+    const sched = new SubagentScheduler({
+      workspace,
+      registry,
+      subprocessRuntime: fakeRuntime,
+    });
+    const fakeLlm = { describe: async () => ({ name: "x" }), chat: async () => ({} as never) };
+    const fakeChildScheduler = { dispatch: async () => ({} as never) };
+    await sched.dispatch({
+      type: "search",
+      input: {
+        query: "q",
+        llm: fakeLlm,
+        scheduler: fakeChildScheduler,
+      },
+      runtime: "subprocess",
+    } as never);
+    expect(observed).not.toBeNull();
+    const obs = observed as unknown as Record<string, unknown>;
+    expect(obs.llm).toBeUndefined();
+    expect(obs.scheduler).toBeUndefined();
+    expect(obs.query).toBe("q");
+    expect(llmReceived).toBe(fakeLlm);
+    expect(schedulerReceived).toBe(fakeChildScheduler);
+  });
+
+  it("subprocess runtime falls back to the scheduler itself when input lacks `scheduler`", async () => {
+    registry.register({
+      type: "search",
+      async run() {
+        return { status: "ok" as const, summary: "x", artifactPath: null };
+      },
+    });
+    let schedulerForwarded: unknown = null;
+    const fakeRuntime = {
+      async run(args: { type: string; input: unknown; scheduler?: unknown }) {
+        schedulerForwarded = args.scheduler;
+        return {
+          runId: "sub-fake0004",
+          type: args.type as "search",
+          status: "ok" as const,
+          summary: "",
+          artifactPath: null,
+          stats: {
+            startedAt: new Date().toISOString(),
+            endedAt: new Date().toISOString(),
+            durationMs: 0,
+          },
+        };
+      },
+    };
+    const sched = new SubagentScheduler({
+      workspace,
+      registry,
+      subprocessRuntime: fakeRuntime,
+    });
+    await sched.dispatch({
+      type: "search",
+      input: { query: "q" },
+      runtime: "subprocess",
+    } as never);
+    expect(schedulerForwarded).toBe(sched);
+  });
+
+  it("subprocess runtime preserves runId/stats and applies hard cap on summary", async () => {
+    registry.register({
+      type: "search",
+      async run() {
+        return { status: "ok" as const, summary: "x", artifactPath: null };
+      },
+    });
+    const longSummary = "a".repeat(5_000);
+    const fakeRuntime = {
+      async run(args: { type: string; runId: string }) {
+        return {
+          runId: args.runId,
+          type: args.type as "search",
+          status: "ok" as const,
+          summary: longSummary,
+          artifactPath: null,
+          stats: {
+            startedAt: "2025-01-01T00:00:00.000Z",
+            endedAt: "2025-01-01T00:00:00.123Z",
+            durationMs: 123,
+          },
+        };
+      },
+    };
+    const sched = new SubagentScheduler({
+      workspace,
+      registry,
+      subprocessRuntime: fakeRuntime,
+    });
+    const res = await sched.dispatch({
+      type: "search",
+      input: {},
+      runtime: "subprocess",
+      hardCapBytes: 100,
+    } as never);
+    expect(res.status).toBe("cap_exceeded");
+    expect(Buffer.byteLength(res.summary, "utf8")).toBeLessThanOrEqual(100);
+    expect(res.stats.durationMs).toBe(123);
+  });
 });
