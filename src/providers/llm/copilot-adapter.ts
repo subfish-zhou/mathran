@@ -5,8 +5,9 @@
  * chunk (per the LLMProvider streaming contract).
  */
 
-import type { LLMProvider, LLMRequest, LLMResponse, LLMStreamChunk } from "../../core/providers/llm.js";
+import type { LLMProvider, LLMRequest, LLMResponse, LLMStreamChunk, LLMMessage } from "../../core/providers/llm.js";
 import { copilotChat, type CopilotChatRequest } from "./copilot.js";
+import { createOpenAITokenCounter, type TokenCounter } from "../../core/chat/token-counter.js";
 
 export interface CopilotAdapterOptions {
   defaultModel?: string;
@@ -17,14 +18,20 @@ export interface CopilotAdapterOptions {
 export class CopilotAdapter implements LLMProvider {
   protected defaultModel?: string;
   protected chatFn: typeof copilotChat;
+  protected tokenCounter: TokenCounter;
 
   constructor(opts: CopilotAdapterOptions = {}) {
     this.defaultModel = opts.defaultModel;
     this.chatFn = opts.chatFn ?? copilotChat;
+    this.tokenCounter = createOpenAITokenCounter(this.defaultModel);
   }
 
   async describe(): Promise<{ name: string; defaultModel?: string }> {
     return { name: "copilot", defaultModel: this.defaultModel };
+  }
+
+  countTokens(messages: LLMMessage[]): number {
+    return this.tokenCounter.countMessages(messages);
   }
 
   async chat(req: LLMRequest): Promise<LLMResponse> {

@@ -5,8 +5,9 @@
  */
 
 import OpenAI from "openai";
-import type { LLMProvider, LLMRequest, LLMResponse } from "../../core/providers/llm.js";
+import type { LLMProvider, LLMRequest, LLMResponse, LLMMessage } from "../../core/providers/llm.js";
 import { buildOpenAIParams, streamOpenAI } from "./openai-common.js";
+import { createOpenAITokenCounter, type TokenCounter } from "../../core/chat/token-counter.js";
 
 const DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434/v1";
 
@@ -19,6 +20,7 @@ export interface OllamaAdapterOptions {
 export class OllamaAdapter implements LLMProvider {
   protected client: OpenAI;
   protected defaultModel?: string;
+  protected tokenCounter: TokenCounter;
 
   constructor(opts: OllamaAdapterOptions = {}) {
     this.client = new OpenAI({
@@ -26,10 +28,15 @@ export class OllamaAdapter implements LLMProvider {
       baseURL: opts.baseUrl ?? DEFAULT_OLLAMA_BASE_URL,
     });
     this.defaultModel = opts.defaultModel;
+    this.tokenCounter = createOpenAITokenCounter(this.defaultModel);
   }
 
   async describe(): Promise<{ name: string; defaultModel?: string }> {
     return { name: "ollama", defaultModel: this.defaultModel };
+  }
+
+  countTokens(messages: LLMMessage[]): number {
+    return this.tokenCounter.countMessages(messages);
   }
 
   async chat(req: LLMRequest): Promise<LLMResponse> {

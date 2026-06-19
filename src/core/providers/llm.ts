@@ -59,4 +59,11 @@ export interface LLMProvider {
 
   /** Send a chat completion request and get a streaming response. */
   chat(req: LLMRequest): Promise<LLMResponse>;
+
+  /**
+   * Best-effort token count for a request. Used by the goal runner to track
+   * `stats.tokensUsed` accurately. Implementations should be SYNC and CHEAP;
+   * gpt-tokenizer's `encode()` is sync.
+   */
+  countTokens?(messages: LLMMessage[]): number;
 }
