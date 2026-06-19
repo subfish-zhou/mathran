@@ -14,12 +14,13 @@
  * unused provider never crashes the router.
  */
 
-import type { LLMProvider, LLMRequest, LLMResponse } from "../../core/providers/llm.js";
+import type { LLMProvider, LLMRequest, LLMResponse, LLMMessage } from "../../core/providers/llm.js";
 import { OpenAIAdapter } from "./openai.js";
 import { AnthropicAdapter } from "./anthropic.js";
 import { AzureOpenAIAdapter } from "./azure.js";
 import { OllamaAdapter } from "./ollama.js";
 import { CopilotAdapter } from "./copilot-adapter.js";
+import { createFallbackTokenCounter } from "../../core/chat/token-counter.js";
 
 export type ProviderKind = "openai" | "anthropic" | "azure" | "copilot" | "ollama";
 
@@ -89,6 +90,23 @@ export class ModelRouter implements LLMProvider {
     const { providerKey, model } = this.resolve(req.model);
     const adapter = this.getAdapter(providerKey);
     return adapter.chat({ ...req, model });
+  }
+
+  /**
+   * Delegate token counting to the provider the router would route to for the
+   * default model. Falls back to the legacy char/4 counter when no provider
+   * resolves or the inner provider lacks `countTokens`.
+   */
+  countTokens(messages: LLMMessage[]): number {
+    let adapter: LLMProvider | undefined;
+    try {
+      const { providerKey } = this.resolve(this.cfg.defaultModel ?? "");
+      adapter = this.getAdapter(providerKey);
+    } catch {
+      adapter = undefined;
+    }
+    if (adapter?.countTokens) return adapter.countTokens(messages);
+    return createFallbackTokenCounter().countMessages(messages);
   }
 
   /** Parse a routing string into a provider key + real model name. */

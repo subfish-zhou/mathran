@@ -6,8 +6,9 @@
  */
 
 import { AzureOpenAI } from "openai";
-import type { LLMProvider, LLMRequest, LLMResponse } from "../../core/providers/llm.js";
+import type { LLMProvider, LLMRequest, LLMResponse, LLMMessage } from "../../core/providers/llm.js";
 import { buildOpenAIParams, streamOpenAI } from "./openai-common.js";
+import { createOpenAITokenCounter, type TokenCounter } from "../../core/chat/token-counter.js";
 
 export interface AzureOpenAIAdapterOptions {
   apiKey: string;
@@ -21,6 +22,7 @@ export class AzureOpenAIAdapter implements LLMProvider {
   protected client: AzureOpenAI;
   protected deployment: string;
   protected defaultModel?: string;
+  protected tokenCounter: TokenCounter;
 
   constructor(opts: AzureOpenAIAdapterOptions) {
     this.client = new AzureOpenAI({
@@ -31,10 +33,15 @@ export class AzureOpenAIAdapter implements LLMProvider {
     });
     this.deployment = opts.deployment;
     this.defaultModel = opts.defaultModel ?? opts.deployment;
+    this.tokenCounter = createOpenAITokenCounter(this.defaultModel);
   }
 
   async describe(): Promise<{ name: string; defaultModel?: string }> {
     return { name: "azure", defaultModel: this.defaultModel };
+  }
+
+  countTokens(messages: LLMMessage[]): number {
+    return this.tokenCounter.countMessages(messages);
   }
 
   async chat(req: LLMRequest): Promise<LLMResponse> {

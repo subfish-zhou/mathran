@@ -13,6 +13,7 @@ import type {
   LLMStreamChunk,
   LLMMessage,
 } from "../../core/providers/llm.js";
+import { createAnthropicTokenCounter, type TokenCounter } from "../../core/chat/token-counter.js";
 
 type FinishReason = Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
 
@@ -94,14 +95,20 @@ export function toAnthropicMessages(messages: LLMMessage[]): {
 export class AnthropicAdapter implements LLMProvider {
   protected client: Anthropic;
   protected defaultModel?: string;
+  protected tokenCounter: TokenCounter;
 
   constructor(opts: AnthropicAdapterOptions) {
     this.client = new Anthropic({ apiKey: opts.apiKey, baseURL: opts.baseUrl });
     this.defaultModel = opts.defaultModel;
+    this.tokenCounter = createAnthropicTokenCounter();
   }
 
   async describe(): Promise<{ name: string; defaultModel?: string }> {
     return { name: "anthropic", defaultModel: this.defaultModel };
+  }
+
+  countTokens(messages: LLMMessage[]): number {
+    return this.tokenCounter.countMessages(messages);
   }
 
   async chat(req: LLMRequest): Promise<LLMResponse> {

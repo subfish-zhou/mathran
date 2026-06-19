@@ -219,11 +219,17 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     await appendStep(workspace, goalId, { kind: "text", payload: textBuf });
   }
 
-  // Cheap token estimate — 4 chars/token, good enough for budget gating.
+  // Per-round token count via llm.countTokens when available; cumulative goal
+  // stats sum across rounds (store.updateGoalStats).
   await updateGoalStats(workspace, goalId, {
     roundsRun: 1,
     toolCallCount,
-    tokensUsed: Math.ceil((userMessage.length + textBuf.length) / 4),
+    tokensUsed: llm.countTokens
+      ? llm.countTokens([
+          { role: "user", content: userMessage },
+          { role: "assistant", content: textBuf },
+        ])
+      : Math.ceil((userMessage.length + textBuf.length) / 4),
   });
 
   // DONE: / GIVE_UP: markers wrap the goal.

@@ -3,8 +3,9 @@
  */
 
 import OpenAI from "openai";
-import type { LLMProvider, LLMRequest, LLMResponse } from "../../core/providers/llm.js";
+import type { LLMProvider, LLMRequest, LLMResponse, LLMMessage } from "../../core/providers/llm.js";
 import { buildOpenAIParams, streamOpenAI } from "./openai-common.js";
+import { createOpenAITokenCounter, type TokenCounter } from "../../core/chat/token-counter.js";
 
 export interface OpenAIAdapterOptions {
   apiKey: string;
@@ -16,14 +17,20 @@ export class OpenAIAdapter implements LLMProvider {
   protected client: OpenAI;
   protected readonly providerName: string = "openai";
   protected defaultModel?: string;
+  protected tokenCounter: TokenCounter;
 
   constructor(opts: OpenAIAdapterOptions) {
     this.client = new OpenAI({ apiKey: opts.apiKey, baseURL: opts.baseUrl });
     this.defaultModel = opts.defaultModel;
+    this.tokenCounter = createOpenAITokenCounter(this.defaultModel);
   }
 
   async describe(): Promise<{ name: string; defaultModel?: string }> {
     return { name: this.providerName, defaultModel: this.defaultModel };
+  }
+
+  countTokens(messages: LLMMessage[]): number {
+    return this.tokenCounter.countMessages(messages);
   }
 
   async chat(req: LLMRequest): Promise<LLMResponse> {

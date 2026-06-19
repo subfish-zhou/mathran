@@ -223,3 +223,29 @@ describe("runGoalRound", () => {
     ).rejects.toThrow(/goal not found/);
   });
 });
+
+describe("runGoalRound token counting", () => {
+  it("uses provider.countTokens when available", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "effort", projectSlug: "p", effortSlug: "e" },
+      model: "fake",
+      budgetTokensMax: 10000,
+      budgetRoundsMax: 5,
+    });
+    const llm: LLMProvider = {
+      ...fakeLLM([
+        [
+          { type: "text", delta: "hello world" },
+          { type: "done", finishReason: "stop" },
+        ],
+      ]),
+      countTokens(_messages) {
+        return 42;
+      },
+    };
+    await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    const refreshed = await readGoal(workspace, g.id);
+    expect(refreshed!.stats.tokensUsed).toBe(42);
+  });
+});
