@@ -79,11 +79,24 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
   }
 
   const lean = new LocalLeanProvider();
+  const workspace = opts.memoryWorkspace ?? process.cwd();
   const session = new ChatSession({
     llm: router,
     model,
     systemPrompt: opts.systemPrompt ?? SYSTEM_PROMPT,
     tools: [createLeanCheckTool(lean)],
+    workspace,
+    // v0.4 §1: enable the full builtin toolkit for `mathran chat`. Users
+    // run chat at a workspace root with full access; treat it like a local
+    // shell session.
+    builtinTools: {
+      search: true,
+      read_file_summary: true,
+      bash: true,
+      read_file: true,
+      write_file: true,
+      edit_file: true,
+    },
     ...(opts.memoryWorkspace
       ? { memoryFiles: { enabled: true, workspace: opts.memoryWorkspace } }
       : {}),
