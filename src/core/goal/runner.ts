@@ -55,6 +55,7 @@ import {
   type Goal,
 } from "./store.js";
 import { buildGoalTools, createGoalToolHandler } from "./tools.js";
+import { buildSpawnSubGoalTool, DEFAULT_SUB_GOAL_MAX_ROUNDS } from "./sub-goal-tool.js";
 
 /**
  * Build the per-goal system prompt. Pinning objective + budget at the top
@@ -127,6 +128,19 @@ export interface RunRoundOptions {
    * left untouched (NOT marked failed) — the runner returns `aborted: true`.
    */
   signal?: AbortSignal;
+  /**
+   * Recursion depth (v0.3 §15). 0 = top-level goal, 1 = sub-goal spawned
+   * via `spawn_sub_goal`. The runner ONLY registers the `spawn_sub_goal`
+   * tool when `depth === 0`; at depth ≥ 1 the tool is omitted entirely so
+   * sub-goals cannot recurse further. Defaults to 0.
+   */
+  depth?: number;
+  /**
+   * Per-sub-goal turn cap (v0.3 §15). Forwarded to the `spawn_sub_goal`
+   * tool so a misbehaving sub-goal can't burn the whole budget. Default 12
+   * rounds. Has no effect at depth ≥ 1 (no tool to forward into).
+   */
+  maxSubGoalRounds?: number;
 }
 
 export interface RunRoundResult {
@@ -317,6 +331,10 @@ async function finalizeWithSummary(opts: {
  */
 export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResult> {
   const { workspace, goalId, userMessage, llm, tools, toolContext, systemPromptBase, signal } = opts;
+  // Recursion depth (v0.3 §15). Default 0 = top-level. Only depth 0 gets
+  // `spawn_sub_goal`; depth >= 1 omits it so sub-goals cannot recurse.
+  const depth = opts.depth ?? 0;
+  const maxSubGoalRounds = opts.maxSubGoalRounds ?? DEFAULT_SUB_GOAL_MAX_ROUNDS;
   let goal = await readGoal(workspace, goalId);
   if (!goal) throw new Error(`goal not found: ${goalId}`);
 
@@ -385,10 +403,36 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     effortFragment,
   });
   const handler = createGoalToolHandler();
+  // Compose the per-round tool list:
+  //   - user-supplied tools (search, read, etc.)
+  //   - mark_done / give_up (always present)
+  //   - spawn_sub_goal (ONLY when depth === 0). At depth >= 1 the sub-goal
+  //     tool is silently omitted, so the inner ChatSession never sees it
+  //     in its tool list — the model literally cannot call it. If a model
+  //     somehow names the tool anyway (memorised name), ChatSession's
+  //     own "unknown tool" branch returns a benign error tool-result
+  //     (test (b) exercises this path).
+  const subGoalTools: ToolSpec[] =
+    depth === 0
+      ? [
+          buildSpawnSubGoalTool({
+            workspace,
+            parent: goal,
+            llm,
+            tools,
+            toolContext,
+            systemPromptBase,
+            signal,
+            maxSubGoalRounds,
+            // Inject `runGoalRound` to break the runner ↔ sub-goal-tool cycle.
+            runRound: (input) => runGoalRound(input),
+          }),
+        ]
+      : [];
   const session = new ChatSession({
     llm,
     model: goal.model,
-    tools: [...tools, ...buildGoalTools(handler)],
+    tools: [...tools, ...buildGoalTools(handler), ...subGoalTools],
     systemPrompt,
     toolContext,
   });
