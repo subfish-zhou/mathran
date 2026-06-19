@@ -103,9 +103,12 @@ export function createBashTool(opts: BashToolOptions = {}): ToolSpec {
     name: "bash",
     description:
       "Run a shell command via `bash -lc`. Each call is a fresh shell (no persistent state). " +
-      "Use it for git, build, test, file inspection — but prefer the dedicated `read_file`, " +
-      "`write_file`, and `edit_file` tools when you only need filesystem work; they're cheaper " +
-      "and easier for the user to audit. " +
+      "Use it for git, build, test runs, package management, and anything that genuinely needs a shell. " +
+      "For plain filesystem work, ALWAYS prefer the dedicated tools — they are cheaper, auditable, " +
+      "and (for `read_file`) support `offset`/`limit` so you do not need to slice large files yourself:\n" +
+      "  • Read files: use `read_file` (NOT cat / head / tail / sed for slicing)\n" +
+      "  • Write files: use `write_file` (NOT echo > / cat <<EOF)\n" +
+      "  • Edit files: use `edit_file` (NOT sed / awk in-place)\n" +
       "Captures stdout + stderr (each capped at ~32 KiB). Default timeout 30 s.",
     parameters: {
       type: "object",

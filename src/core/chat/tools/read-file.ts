@@ -63,9 +63,13 @@ export function createReadFileTool(opts: ReadFileToolOptions = {}): ToolSpec {
   return {
     name: "read_file",
     description:
-      "Read a text file from the workspace and return its contents with 1-indexed line numbers. " +
-      "Use `offset` (0-indexed line) and `limit` (max lines) for large files. " +
-      `Default limit is ${defaultLimit} lines; files larger than ${Math.round(maxBytes / 1024)} KiB and binary files are refused.`,
+      "Read a text file from the workspace and return its contents with 1-indexed line numbers (cat -n format). " +
+      `Default returns the first ${defaultLimit} lines starting at line 1. ` +
+      "For large files, supply `offset` (0-indexed first line) and `limit` (max lines). " +
+      "You can re-call with successive offsets to walk through the file — " +
+      "do NOT shell out to `cat`/`sed`/`head`/`tail` for slicing; this tool already handles it. " +
+      `Files larger than ${Math.round(maxBytes / 1024)} KiB and binary files (NUL byte in first 4 KiB) are refused; ` +
+      "in that case use `grep` (via bash) to locate the region first, then re-read with offset/limit.",
     parameters: {
       type: "object",
       properties: {

@@ -119,4 +119,15 @@ describe("createBashTool", () => {
     expect(res.content).toMatch(/stdout:\nout/);
     expect(res.content).toMatch(/stderr:\nerr/);
   });
+
+  it("description nudges away from cat/sed/echo etc. for plain filesystem work (v0.13 §1)", () => {
+    const tool = createBashTool({ workspace: "/tmp" });
+    const desc = (tool.description ?? "").toLowerCase();
+    expect(desc).toContain("read_file");
+    expect(desc).toContain("write_file");
+    expect(desc).toContain("edit_file");
+    // Explicit anti-patterns — the wedge against "reflexive bash for everything".
+    expect(desc).toMatch(/not cat/);
+    expect(desc).toMatch(/not (echo|sed|awk)/);
+  });
 });

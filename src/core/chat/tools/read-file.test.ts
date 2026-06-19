@@ -135,4 +135,13 @@ describe("createReadFileTool", () => {
     expect(res.ok).toBe(false);
     expect(read.size).toBe(0);
   });
+
+  it("description steers the LLM toward offset/limit and away from shell slicing (v0.13 §1)", () => {
+    const tool = createReadFileTool({ workspace: "/tmp" });
+    const desc = (tool.description ?? "").toLowerCase();
+    expect(desc).toContain("offset");
+    expect(desc).toContain("limit");
+    expect(desc).toMatch(/not.*cat|not.*sed/);
+    expect(desc).toMatch(/grep/);
+  });
 });
