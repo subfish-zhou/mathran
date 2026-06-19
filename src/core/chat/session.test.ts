@@ -1075,3 +1075,183 @@ describe("ChatSession memoryFiles (v0.3 §14)", () => {
   });
 });
 
+
+// ─── v0.4 §1: filesystem & shell builtin tools ──────────────────────────
+describe("ChatSession builtinTools.{bash,read_file,write_file,edit_file} (v0.4 §1)", () => {
+  it("registers none of the v0.4 tools when their flags are unset", async () => {
+    const llm = new ScriptedLLM([
+      [{ type: "text", delta: "ok" }, { type: "done", finishReason: "stop" }],
+    ]);
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      builtinTools: {},
+    });
+    await collect(session.send("hi"));
+    const names = (llm.requests[0].tools ?? []).map((t) => t.name);
+    expect(names).not.toContain("bash");
+    expect(names).not.toContain("read_file");
+    expect(names).not.toContain("write_file");
+    expect(names).not.toContain("edit_file");
+  });
+
+  it("registers each tool exactly when its flag is true", async () => {
+    const llm = new ScriptedLLM([
+      [{ type: "text", delta: "ok" }, { type: "done", finishReason: "stop" }],
+    ]);
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      builtinTools: {
+        bash: true,
+        read_file: true,
+        write_file: true,
+        edit_file: true,
+      },
+    });
+    await collect(session.send("hi"));
+    const names = (llm.requests[0].tools ?? []).map((t) => t.name);
+    expect(names).toContain("bash");
+    expect(names).toContain("read_file");
+    expect(names).toContain("write_file");
+    expect(names).toContain("edit_file");
+  });
+
+  it("read_file resolves paths against ChatSession.workspace", async () => {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-session-rf-"));
+    try {
+      await fs.writeFile(path.join(ws, "hi.txt"), "hello v0.4");
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "call_1",
+            name: "read_file",
+            argsDelta: '{"path":"hi.txt"}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [{ type: "text", delta: "done" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        workspace: ws,
+        builtinTools: { read_file: true },
+      });
+      const events = await collect(session.send("hi"));
+      const result = events.find((e) => e.type === "tool-result") as
+        | Extract<ChatEvent, { type: "tool-result" }>
+        | undefined;
+      expect(result).toBeDefined();
+      expect(result!.ok).toBe(true);
+      expect(result!.content).toContain("hello v0.4");
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("write_file persists to disk inside ChatSession.workspace", async () => {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-session-wf-"));
+    try {
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "call_1",
+            name: "write_file",
+            argsDelta: '{"path":"out.txt","content":"round trip"}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [{ type: "text", delta: "done" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        workspace: ws,
+        builtinTools: { write_file: true },
+      });
+      const events = await collect(session.send("hi"));
+      const result = events.find((e) => e.type === "tool-result") as
+        | Extract<ChatEvent, { type: "tool-result" }>
+        | undefined;
+      expect(result).toBeDefined();
+      expect(result!.ok).toBe(true);
+      const onDisk = await fs.readFile(path.join(ws, "out.txt"), "utf-8");
+      expect(onDisk).toBe("round trip");
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("edit_file replaces a unique occurrence inside ChatSession.workspace", async () => {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-session-ef-"));
+    try {
+      await fs.writeFile(path.join(ws, "doc.md"), "alpha\nbeta\n");
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "call_1",
+            name: "edit_file",
+            argsDelta:
+              '{"path":"doc.md","old_string":"beta","new_string":"delta"}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [{ type: "text", delta: "done" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        workspace: ws,
+        builtinTools: { edit_file: true },
+      });
+      const events = await collect(session.send("hi"));
+      const result = events.find((e) => e.type === "tool-result") as
+        | Extract<ChatEvent, { type: "tool-result" }>
+        | undefined;
+      expect(result).toBeDefined();
+      expect(result!.ok).toBe(true);
+      const onDisk = await fs.readFile(path.join(ws, "doc.md"), "utf-8");
+      expect(onDisk).toBe("alpha\ndelta\n");
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("bash runs a quick command inside ChatSession.workspace", async () => {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-session-bash-"));
+    try {
+      await fs.writeFile(path.join(ws, "marker"), "yes");
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "call_1",
+            name: "bash",
+            argsDelta: '{"command":"cat marker"}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [{ type: "text", delta: "done" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        workspace: ws,
+        builtinTools: { bash: true },
+      });
+      const events = await collect(session.send("hi"));
+      const result = events.find((e) => e.type === "tool-result") as
+        | Extract<ChatEvent, { type: "tool-result" }>
+        | undefined;
+      expect(result).toBeDefined();
+      expect(result!.ok).toBe(true);
+      expect(result!.content).toContain("yes");
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+});

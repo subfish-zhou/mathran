@@ -39,6 +39,10 @@ import {
   loadMathranMemorySync,
   formatMathranMemory,
 } from "../memory/index.js";
+import { createBashTool } from "./tools/bash.js";
+import { createReadFileTool } from "./tools/read-file.js";
+import { createWriteFileTool } from "./tools/write-file.js";
+import { createEditFileTool } from "./tools/edit-file.js";
 import * as path from "node:path";
 
 /**
@@ -155,10 +159,18 @@ export interface ChatSessionOptions {
    *
    *   - `search` — dispatches the `search` subagent runner (Task 8).
    *   - `read_file_summary` — dispatches the `read_summarize` runner (Task 9).
+   *   - `bash` (v0.4 §1) — `bash -lc` shell, workspace-scoped, capped output.
+   *   - `read_file` (v0.4 §1) — raw bytes with `cat -n` line numbers.
+   *   - `write_file` (v0.4 §1) — create / overwrite UTF-8 file.
+   *   - `edit_file` (v0.4 §1) — unique-string replace (or `replace_all`).
    */
   builtinTools?: {
     search?: boolean;
     read_file_summary?: boolean;
+    bash?: boolean;
+    read_file?: boolean;
+    write_file?: boolean;
+    edit_file?: boolean;
   };
   /**
    * MATHRAN.md memory injection (v0.3 §14). When `enabled: true`, the
@@ -404,6 +416,30 @@ export class ChatSession {
     }
     if (cfg.read_file_summary) {
       out.push(this.makeReadFileSummaryTool());
+    }
+    // v0.4 §1 filesystem & shell tools. These are workspace-scoped: each
+    // tool gets `this.workspace` baked in at construction time so escape
+    // checks can be done with `path.relative`. When `workspace` is unset the
+    // tool falls back to `ctx.workspace` and finally `process.cwd()`.
+    if (cfg.bash) {
+      out.push(
+        createBashTool(this.workspace ? { workspace: this.workspace } : {}),
+      );
+    }
+    if (cfg.read_file) {
+      out.push(
+        createReadFileTool(this.workspace ? { workspace: this.workspace } : {}),
+      );
+    }
+    if (cfg.write_file) {
+      out.push(
+        createWriteFileTool(this.workspace ? { workspace: this.workspace } : {}),
+      );
+    }
+    if (cfg.edit_file) {
+      out.push(
+        createEditFileTool(this.workspace ? { workspace: this.workspace } : {}),
+      );
     }
     return out;
   }

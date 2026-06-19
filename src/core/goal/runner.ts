@@ -141,6 +141,19 @@ export interface RunRoundOptions {
    * rounds. Has no effect at depth ≥ 1 (no tool to forward into).
    */
   maxSubGoalRounds?: number;
+  /**
+   * Opt-in built-in tools forwarded straight into the inner `ChatSession`
+   * (v0.4 §1). Default unset = the runner only sees the caller-supplied
+   * `tools` array. CLI callers turn `bash` / `read_file` / `write_file` /
+   * `edit_file` on so the agent has full filesystem reach.
+   */
+  builtinTools?: import("../chat/session.js").ChatSessionOptions["builtinTools"];
+  /**
+   * Workspace root forwarded into the inner `ChatSession`. Required for the
+   * v0.4 §1 filesystem tools so they can resolve & sandbox paths. Defaults
+   * to `opts.workspace` when unset.
+   */
+  chatWorkspace?: string;
 }
 
 export interface RunRoundResult {
@@ -435,6 +448,8 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     tools: [...tools, ...buildGoalTools(handler), ...subGoalTools],
     systemPrompt,
     toolContext,
+    workspace: opts.chatWorkspace ?? opts.workspace,
+    ...(opts.builtinTools ? { builtinTools: opts.builtinTools } : {}),
   });
   if (history.length > 0) session.replaceHistory(history);
 

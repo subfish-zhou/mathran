@@ -184,6 +184,17 @@ async function driveOneRound(
       userMessage,
       llm: router,
       tools,
+      // v0.4 §1: goal runners get the full builtin toolkit so the agent
+      // can read, write, edit, search, and shell out without us having to
+      // pre-register every helper as a goal tool.
+      builtinTools: {
+        search: true,
+        read_file_summary: true,
+        bash: true,
+        read_file: true,
+        write_file: true,
+        edit_file: true,
+      },
     });
     if (r.text.trim().length > 0) {
       console.log("");

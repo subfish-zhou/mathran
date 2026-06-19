@@ -175,14 +175,25 @@ export interface InitEffortResult {
   metadata: EffortMetadata;
 }
 
-/** Build a url-safe slug from a free-form title. */
+/**
+ * Build a url-safe slug from a free-form title.
+ *
+ * v0.4 §1 cap: long titles are clipped to 60 chars. We prefer to break at
+ * the last hyphen boundary within the first 60 chars to avoid mid-word cuts;
+ * if there is no hyphen in the first 60 chars, hard-cut at 60.
+ */
 export function slugifyTitle(s: string): string {
-  return s
+  const base = s
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 200);
+    .replace(/^-+|-+$/g, "");
+  if (base.length <= 60) return base;
+  const head = base.slice(0, 60);
+  const lastHyphen = head.lastIndexOf("-");
+  const cut = lastHyphen > 0 ? head.slice(0, lastHyphen) : head;
+  // Trim trailing hyphens that may sneak in after the cut (defensive).
+  return cut.replace(/-+$/g, "");
 }
 
 /** Scaffold a new effort directory and write `effort.toml` + empty `document.md`. */

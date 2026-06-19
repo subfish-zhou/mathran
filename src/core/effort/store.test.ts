@@ -32,6 +32,7 @@ import {
   listEffortRelations,
   listEffortDependents,
   removeRelation,
+  slugifyTitle,
 } from "./store.js";
 import { BUILTIN_EFFORT_TYPES, EFFORT_STATUSES, isValidTransition, VALID_TRANSITIONS } from "./types.js";
 
@@ -520,5 +521,50 @@ describe("effort relations (GAP #9)", () => {
     await fs.appendFile(file, "not-json\n{broken:1}\n", "utf-8");
     const all = await listAllRelations(workspace, PROJECT);
     expect(all).toHaveLength(1); // malformed lines silently skipped
+  });
+});
+
+// ─── v0.4 §1: slugifyTitle 60-char cap ──────────────────────────
+describe("slugifyTitle (v0.4 §1 cap at 60)", () => {
+  it("leaves short titles unchanged", () => {
+    expect(slugifyTitle("hello world")).toBe("hello-world");
+  });
+
+  it("normalises non-slug chars to single hyphens", () => {
+    expect(slugifyTitle("  Hello,  World!! ")).toBe("hello-world");
+  });
+
+  it("preserves a 60-char slug unchanged", () => {
+    const s60 = "a".repeat(60);
+    const out = slugifyTitle(s60);
+    expect(out).toBe(s60);
+    expect(out.length).toBe(60);
+  });
+
+  it("clips a long hyphen-separated title at the last hyphen <= 60", () => {
+    // Many words → many hyphens; ensure result <= 60 and ends at a hyphen boundary.
+    const title = Array.from({ length: 40 }, (_, i) => `word${i + 1}`).join(" ");
+    const out = slugifyTitle(title);
+    expect(out.length).toBeLessThanOrEqual(60);
+    // Should NOT end with a hyphen — trim defense ran.
+    expect(out.endsWith("-")).toBe(false);
+    // Should end at a hyphen boundary inside the original head (i.e. a
+    // complete "wordN"), so the last char is a digit, not a fragment.
+    expect(/word\d+$/.test(out)).toBe(true);
+  });
+
+  it("hard-cuts a hyphen-less 100-char input to 60", () => {
+    const s = "a".repeat(100);
+    const out = slugifyTitle(s);
+    expect(out.length).toBe(60);
+    expect(out).toBe("a".repeat(60));
+  });
+
+  it("never returns a slug with a leading or trailing hyphen even for huge inputs", () => {
+    const title = "the-quick-brown-fox-".repeat(20); // way past 60
+    const out = slugifyTitle(title);
+    expect(out.length).toBeLessThanOrEqual(60);
+    expect(out.startsWith("-")).toBe(false);
+    expect(out.endsWith("-")).toBe(false);
   });
 });
