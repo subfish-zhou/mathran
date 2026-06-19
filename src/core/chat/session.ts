@@ -63,6 +63,10 @@ export interface ToolExecuteContext {
     projectSlug?: string;
     effortSlug?: string;
   };
+  /** v0.5 §7 — record that a path has been read this session. */
+  recordRead?: (path: string) => void;
+  /** v0.5 §7 — query whether a path has been read this session. */
+  hasRead?: (path: string) => boolean;
 }
 
 /** A tool the model can invoke. Parameters are a JSON-schema object. */
@@ -295,6 +299,8 @@ export class ChatSession {
   private readonly autoCompactCfg?: ChatSessionOptions["autoCompact"];
   private readonly workspace?: string;
   private readonly subagentScheduler?: SubagentScheduler;
+  /** v0.5 §7 — absolute paths read this session (read-before-write gate). */
+  private readonly readPaths = new Set<string>();
   private readonly builtinToolsCfg?: ChatSessionOptions["builtinTools"];
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
@@ -369,6 +375,8 @@ export class ChatSession {
    *     multiple leading system messages (memory + persona); all are kept.
    */
   replaceHistory(next: LLMMessage[]): void {
+    // Conversation context changed — invalidate read-before-write tracking.
+    this.readPaths.clear();
     if (next.length > 0 && next[0].role === "system") {
       this.messages = next.map((m) => ({ ...m }));
       return;
@@ -872,7 +880,22 @@ export class ChatSession {
           }
           if (!parseFailed) {
             try {
-              result = await tool.execute(parsed, this.toolContext);
+              const callCtx: ToolExecuteContext = {
+                ...this.toolContext,
+                recordRead: (p: string) =>
+                  this.readPaths.add(
+                    path.isAbsolute(p)
+                      ? p
+                      : path.resolve(this.workspace ?? "", p),
+                  ),
+                hasRead: (p: string) =>
+                  this.readPaths.has(
+                    path.isAbsolute(p)
+                      ? p
+                      : path.resolve(this.workspace ?? "", p),
+                  ),
+              };
+              result = await tool.execute(parsed, callCtx);
             } catch (err: any) {
               result = { ok: false, content: `error: ${err?.message ?? String(err)}` };
             }

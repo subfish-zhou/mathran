@@ -107,4 +107,32 @@ describe("createReadFileTool", () => {
     expect(res.ok).toBe(true);
     expect(res.content).toContain("empty");
   });
+
+  it("calls ctx.recordRead on successful read", async () => {
+    const p = path.join(workspace, "tracked.txt");
+    await fs.writeFile(p, "alpha\nbeta\n");
+    const read = new Set<string>();
+    const ctx = {
+      workspace,
+      recordRead: (x: string) => read.add(x),
+      hasRead: (x: string) => read.has(x),
+    };
+    const tool = createReadFileTool({ workspace });
+    const res = await tool.execute({ path: "tracked.txt" }, ctx);
+    expect(res.ok).toBe(true);
+    expect(read.has(p)).toBe(true);
+  });
+
+  it("does NOT call ctx.recordRead on failed read (ENOENT)", async () => {
+    const read = new Set<string>();
+    const ctx = {
+      workspace,
+      recordRead: (x: string) => read.add(x),
+      hasRead: (x: string) => read.has(x),
+    };
+    const tool = createReadFileTool({ workspace });
+    const res = await tool.execute({ path: "missing.txt" }, ctx);
+    expect(res.ok).toBe(false);
+    expect(read.size).toBe(0);
+  });
 });

@@ -8,8 +8,9 @@
  * Intentional deltas vs Claude Code's FileReadTool prompt:
  *   - No image / PDF / Jupyter handling (mathran's LLM bridge doesn't render
  *     multimodal tool results yet).
- *   - No "must have read before write" tracking (mathran's session carries no
- *     per-tool bookkeeping; documented in the task spec).
+ *   - No "must have read before write" tracking here directly; instead the
+ *     session records reads via `ctx.recordRead` so write_file/edit_file can
+ *     enforce read-before-write (v0.5 §7).
  *   - Hard cap at 1 MiB, default 2000 lines from `offset`.
  *   - Binary refusal heuristic: first 4 KiB contains a NUL byte → reject.
  */
@@ -146,6 +147,7 @@ export function createReadFileTool(opts: ReadFileToolOptions = {}): ToolSpec {
       }
 
       const text = buf.toString("utf-8");
+      ctx?.recordRead?.(resolved);
       const lines = text.split("\n");
       // A trailing newline produces an extra empty element; drop it for the
       // line count so we don't pad with a spurious blank line.

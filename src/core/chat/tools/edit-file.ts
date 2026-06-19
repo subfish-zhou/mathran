@@ -5,7 +5,8 @@
  * `replace_all: true` to swap every occurrence at once.
  *
  * Intentional deltas vs Claude Code's FileEditTool prompt:
- *   - No "read before edit" enforcement (no per-session tracking in mathran).
+ *   - Read-before-edit enforced via per-session tracking (v0.5 §7): the target
+ *     must have been read this session (`ctx.hasRead`) before it can be edited.
  *   - No multi-edit batching (one tool call = one replacement set).
  *   - Same uniqueness rule as Claude Code — if `replace_all` is false and the
  *     match count isn't exactly 1, we fail loudly so the model can add more
@@ -162,6 +163,13 @@ export function createEditFileTool(opts: EditFileToolOptions = {}): ToolSpec {
         };
       }
 
+      if (ctx?.hasRead?.(resolved) === false) {
+        return {
+          ok: false,
+          content: `must read this file first (use read_file) before editing; or the file may not exist yet — checked path: ${rawPath}`,
+        };
+      }
+
       let buf: Buffer;
       try {
         buf = await fs.readFile(resolved);
@@ -202,6 +210,7 @@ export function createEditFileTool(opts: EditFileToolOptions = {}): ToolSpec {
       }
 
       const n = replaceAllFlag ? matches : 1;
+      ctx?.recordRead?.(resolved);
       return {
         ok: true,
         content: `edited ${rawPath}: ${n} replacement${n === 1 ? "" : "s"}`,

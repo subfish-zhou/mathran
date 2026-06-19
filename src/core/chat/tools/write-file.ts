@@ -2,12 +2,13 @@
  * Built-in `write_file` tool (v0.4 §1).
  *
  * Write a file to disk inside the workspace, creating parent directories as
- * needed. Existing files are overwritten — there's no `read-before-write`
- * gate because mathran's session has no per-tool bookkeeping; the spec
- * explicitly accepts this UX difference for v1.
+ * needed. Existing files are overwritten — but v0.5 §7 adds a read-before-write
+ * gate: overwriting an *existing* file requires it to have been read this
+ * session (via `ctx.hasRead`). New files are exempt. After a successful write
+ * the path is recorded as read so subsequent edits don't need a re-read.
  *
  * Intentional deltas vs Claude Code's FileWriteTool prompt:
- *   - No "read before write" enforcement (see above).
+ *   - Read-before-write only enforced for existing files (new files allowed).
  *   - No notebook / multipart payload handling.
  *   - Strict workspace escape check via `path.relative`.
  */
@@ -84,6 +85,19 @@ export function createWriteFileTool(
       }
 
       try {
+        let exists = false;
+        try {
+          await fs.access(resolved);
+          exists = true;
+        } catch {
+          exists = false;
+        }
+        if (exists && ctx?.hasRead?.(resolved) === false) {
+          return {
+            ok: false,
+            content: `must read this file first (use read_file) before overwriting; or the file may not exist yet — checked path: ${rawPath}`,
+          };
+        }
         await fs.mkdir(path.dirname(resolved), { recursive: true });
         await fs.writeFile(resolved, content, "utf-8");
       } catch (err: any) {
@@ -92,6 +106,8 @@ export function createWriteFileTool(
           content: `write_file error: ${err?.message ?? String(err)}`,
         };
       }
+
+      ctx?.recordRead?.(resolved);
 
       const bytes = Buffer.byteLength(content, "utf-8");
       return {

@@ -1193,6 +1193,15 @@ describe("ChatSession builtinTools.{bash,read_file,write_file,edit_file} (v0.4 �
         [
           {
             type: "tool-call",
+            id: "call_0",
+            name: "read_file",
+            argsDelta: '{"path":"doc.md"}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [
+          {
+            type: "tool-call",
             id: "call_1",
             name: "edit_file",
             argsDelta:
@@ -1206,10 +1215,10 @@ describe("ChatSession builtinTools.{bash,read_file,write_file,edit_file} (v0.4 �
         llm,
         model: "m",
         workspace: ws,
-        builtinTools: { edit_file: true },
+        builtinTools: { read_file: true, edit_file: true },
       });
       const events = await collect(session.send("hi"));
-      const result = events.find((e) => e.type === "tool-result") as
+      const result = events.findLast((e) => e.type === "tool-result") as
         | Extract<ChatEvent, { type: "tool-result" }>
         | undefined;
       expect(result).toBeDefined();
@@ -1250,6 +1259,156 @@ describe("ChatSession builtinTools.{bash,read_file,write_file,edit_file} (v0.4 �
       expect(result).toBeDefined();
       expect(result!.ok).toBe(true);
       expect(result!.content).toContain("yes");
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── v0.5 §7: read-before-write tracking (Gap #7) ────────────────────────────
+describe("ChatSession read-before-write tracking (v0.5 §7)", () => {
+  it("read_file then write_file on existing file succeeds end-to-end", async () => {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-readtrack-"));
+    try {
+      await fs.writeFile(path.join(ws, "doc.txt"), "original\n", "utf8");
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "c1",
+            name: "read_file",
+            argsDelta: JSON.stringify({ path: "doc.txt" }),
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [
+          {
+            type: "tool-call",
+            id: "c2",
+            name: "write_file",
+            argsDelta: JSON.stringify({ path: "doc.txt", content: "updated\n" }),
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [
+          { type: "text", delta: "done" },
+          { type: "done", finishReason: "stop" },
+        ],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        workspace: ws,
+        builtinTools: { read_file: true, write_file: true },
+      });
+
+      const events = await collect(session.send("update doc.txt"));
+      const results = events.filter((e) => e.type === "tool-result") as Extract<
+        ChatEvent,
+        { type: "tool-result" }
+      >[];
+      expect(results).toHaveLength(2);
+      expect(results[0].ok).toBe(true);
+      expect(results[1].ok).toBe(true);
+      expect(await fs.readFile(path.join(ws, "doc.txt"), "utf8")).toBe("updated\n");
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("write_file on existing file without prior read_file returns helpful error", async () => {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-readtrack-"));
+    try {
+      await fs.writeFile(path.join(ws, "doc.txt"), "original\n", "utf8");
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "c1",
+            name: "write_file",
+            argsDelta: JSON.stringify({ path: "doc.txt", content: "nope\n" }),
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [
+          { type: "text", delta: "ok" },
+          { type: "done", finishReason: "stop" },
+        ],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        workspace: ws,
+        builtinTools: { read_file: true, write_file: true },
+      });
+
+      const events = await collect(session.send("overwrite doc.txt"));
+      const result = events.find((e) => e.type === "tool-result") as Extract<
+        ChatEvent,
+        { type: "tool-result" }
+      >;
+      expect(result.ok).toBe(false);
+      expect(result.content).toContain("must read this file first");
+      // File left untouched.
+      expect(await fs.readFile(path.join(ws, "doc.txt"), "utf8")).toBe("original\n");
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("replaceHistory clears readPaths so next write needs re-read", async () => {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-readtrack-"));
+    try {
+      await fs.writeFile(path.join(ws, "doc.txt"), "original\n", "utf8");
+      const llm = new ScriptedLLM([
+        // Send 1: read_file registers the path.
+        [
+          {
+            type: "tool-call",
+            id: "c1",
+            name: "read_file",
+            argsDelta: JSON.stringify({ path: "doc.txt" }),
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [
+          { type: "text", delta: "read" },
+          { type: "done", finishReason: "stop" },
+        ],
+        // Send 2 (after replaceHistory): write_file must be rejected.
+        [
+          {
+            type: "tool-call",
+            id: "c2",
+            name: "write_file",
+            argsDelta: JSON.stringify({ path: "doc.txt", content: "x\n" }),
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [
+          { type: "text", delta: "ok" },
+          { type: "done", finishReason: "stop" },
+        ],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        workspace: ws,
+        builtinTools: { read_file: true, write_file: true },
+      });
+
+      await collect(session.send("read doc.txt"));
+      // Wipe conversation context — read tracking must reset too.
+      session.replaceHistory([]);
+
+      const events = await collect(session.send("overwrite doc.txt"));
+      const result = events.find((e) => e.type === "tool-result") as Extract<
+        ChatEvent,
+        { type: "tool-result" }
+      >;
+      expect(result.ok).toBe(false);
+      expect(result.content).toContain("must read this file first");
+      expect(await fs.readFile(path.join(ws, "doc.txt"), "utf8")).toBe("original\n");
     } finally {
       await fs.rm(ws, { recursive: true, force: true });
     }

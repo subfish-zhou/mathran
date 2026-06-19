@@ -81,4 +81,70 @@ describe("createWriteFileTool", () => {
       await fs.readFile(path.join(workspace, "ctx.txt"), "utf-8"),
     ).toBe("via ctx");
   });
+
+  it("rejects overwrite of existing file without prior read", async () => {
+    const p = path.join(workspace, "ex.txt");
+    await fs.writeFile(p, "old");
+    const read = new Set<string>();
+    const ctx = {
+      workspace,
+      recordRead: (x: string) => read.add(x),
+      hasRead: (x: string) => read.has(x),
+    };
+    const tool = createWriteFileTool({ workspace });
+    const res = await tool.execute({ path: "ex.txt", content: "new" }, ctx);
+    expect(res.ok).toBe(false);
+    expect(res.content).toContain("must read this file first");
+    expect(await fs.readFile(p, "utf-8")).toBe("old");
+  });
+
+  it("allows write to a new (non-existent) file without prior read", async () => {
+    const read = new Set<string>();
+    const ctx = {
+      workspace,
+      recordRead: (x: string) => read.add(x),
+      hasRead: (x: string) => read.has(x),
+    };
+    const tool = createWriteFileTool({ workspace });
+    const res = await tool.execute(
+      { path: "fresh.txt", content: "brand new" },
+      ctx,
+    );
+    expect(res.ok).toBe(true);
+    expect(
+      await fs.readFile(path.join(workspace, "fresh.txt"), "utf-8"),
+    ).toBe("brand new");
+  });
+
+  it("allows overwrite after recordRead was called", async () => {
+    const p = path.join(workspace, "ex.txt");
+    await fs.writeFile(p, "old");
+    const read = new Set<string>();
+    const ctx = {
+      workspace,
+      recordRead: (x: string) => read.add(x),
+      hasRead: (x: string) => read.has(x),
+    };
+    ctx.recordRead(p);
+    const tool = createWriteFileTool({ workspace });
+    const res = await tool.execute({ path: "ex.txt", content: "new" }, ctx);
+    expect(res.ok).toBe(true);
+    expect(await fs.readFile(p, "utf-8")).toBe("new");
+  });
+
+  it("records the path as read after successful write", async () => {
+    const read = new Set<string>();
+    const ctx = {
+      workspace,
+      recordRead: (x: string) => read.add(x),
+      hasRead: (x: string) => read.has(x),
+    };
+    const tool = createWriteFileTool({ workspace });
+    const res = await tool.execute(
+      { path: "tracked.txt", content: "hi" },
+      ctx,
+    );
+    expect(res.ok).toBe(true);
+    expect(read.has(path.join(workspace, "tracked.txt"))).toBe(true);
+  });
 });
