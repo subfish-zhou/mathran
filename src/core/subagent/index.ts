@@ -54,3 +54,16 @@ export {
   TRUNCATION_MARKER,
   type ReadSummarizeRunnerInput,
 } from "./runners/read-summarize.js";
+export {
+  researchRunner,
+  parsePlannerAction,
+  formatFindings,
+  PLANNER_SYSTEM,
+  SYNTHESIS_SYSTEM,
+  DEFAULT_MAX_ROUNDS,
+  SUBDISPATCH_HARD_CAP_BYTES,
+  type ResearchInput,
+  type ResearchScheduler,
+  type ResearchFinding,
+  type PlannerAction,
+} from "./runners/research.js";
