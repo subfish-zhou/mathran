@@ -167,6 +167,32 @@ export class PlanStore {
   }
 
   /**
+   * SPA-flavoured accept: flip a draft plan to `accepted` without binding
+   * it to an effort. The CLI/full accept flow keeps using {@link accept}
+   * with an effort id; the web overlay (v0.16 §9 audit #2) only needs to
+   * mark the plan saved-and-reviewed so it stops showing up as a pending
+   * draft. Idempotent on already-accepted draft-acceptances (i.e. when
+   * `acceptedEffortId === null`).
+   */
+  async acceptDraft(id: string): Promise<Plan> {
+    const cur = await this.requireExisting(id);
+    if (cur.status === "accepted" && cur.acceptedEffortId === null) {
+      return cur;
+    }
+    if (cur.status !== "draft") {
+      throw new Error(`plan ${id} is ${cur.status}; cannot accept`);
+    }
+    const next: Plan = {
+      ...cur,
+      status: "accepted",
+      acceptedEffortId: null,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.writeRecord(next);
+    return next;
+  }
+
+  /**
    * Mark the plan rejected. Refuses unless the current status is `draft` —
    * `accepted` plans are immutable so the audit trail back to the effort
    * stays intact. (Reject-of-rejected is a no-op.)

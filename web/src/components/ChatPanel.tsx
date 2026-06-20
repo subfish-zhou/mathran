@@ -29,6 +29,7 @@ import {
   type GoalRow,
 } from "../lib/chat.ts";
 import GoalControls from "./GoalControls.tsx";
+import PlanRunOverlay from "./PlanRunOverlay.tsx";
 import { api, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
 import {
   historyToBubbles,
@@ -128,6 +129,11 @@ export default function ChatPanel({
   // currently shown.
   const [owningGoal, setOwningGoal] = useState<GoalRow | null>(null);
   const [threadStack, setThreadStack] = useState<string[]>([]);
+  // v0.16 §9 audit #2: plan-mode overlay state. Lives outside the chat
+  // bubble stream so a plan run never pollutes conversation history; only
+  // a transient "Plan saved to <path>" toast surfaces back here.
+  const [planOverlayOpen, setPlanOverlayOpen] = useState(false);
+  const [planSavedToast, setPlanSavedToast] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // ─── Conversation list ─────────────────────────────────────────────────
@@ -1242,6 +1248,18 @@ export default function ChatPanel({
               — useful entry point when you want to see goal status / end
               reason / round count without scrolling. Hidden when not a
               goal-mode chat. */}
+          {/* v0.16 §9 audit #2: 📋 Plan button. Spawns a plan-mode run in a
+              modal overlay; the user can Accept (writes the plan to
+              .mathran/plans/) or Reject without touching this chat. */}
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => setPlanOverlayOpen(true)}
+            className="ml-2 shrink-0 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+            title="Draft a read-only plan (Approach / Steps / Key files / Risks / Acceptance) before doing the work"
+          >
+            📋 Plan
+          </button>
           {/* v0.16 §4: GoalControls handles BOTH non-goal (Start) and goal
               (Run / Interrupt / Cancel / budget meter) states. The thread
               shortcut is kept as a separate button so users can pop the
@@ -1772,6 +1790,28 @@ export default function ChatPanel({
         canGoBack={threadStack.length > 1}
         onBack={handleBackThread}
       />
+      {planOverlayOpen && (
+        <PlanRunOverlay
+          initialObjective={input}
+          defaultModel={model || null}
+          onAccepted={({ location }) => {
+            // Surface the save location as a transient toast; "plan
+            // mode lives outside chat history" per v0.16 §9, so we don't
+            // inject a bubble. Auto-clears after 6s.
+            setPlanSavedToast(`📋 Plan saved to ${location}`);
+            window.setTimeout(() => setPlanSavedToast(null), 6000);
+          }}
+          onClose={() => setPlanOverlayOpen(false)}
+        />
+      )}
+      {planSavedToast && (
+        <div
+          className="fixed bottom-4 right-4 z-50 max-w-sm rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs text-emerald-900 shadow"
+          role="status"
+        >
+          {planSavedToast}
+        </div>
+      )}
     </div>
   );
 }

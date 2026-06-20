@@ -1944,3 +1944,190 @@ describe("persistent context injection (v0.15 §1)", () => {
     expect(out).toBe(base);
   });
 });
+
+describe("plan REST (v0.16 §9 audit #2)", () => {
+  /**
+   * Fake LLM that streams a realistic plan-mode markdown reply (one plan
+   * with every required section) and then finishes. Used to exercise the
+   * POST → SSE → accept happy path end-to-end without touching a real
+   * provider.
+   */
+  function planLlm(reply: string): LLMProvider {
+    return {
+      async describe() { return { name: "fake-plan" }; },
+      async chat(_req: LLMRequest): Promise<LLMResponse> {
+        return {
+          async *stream(): AsyncIterable<LLMStreamChunk> {
+            // Chunk every 16 chars so we can observe multiple `token` frames.
+            const step = 16;
+            for (let i = 0; i < reply.length; i += step) {
+              yield { type: "text", delta: reply.slice(i, i + step) };
+            }
+            yield { type: "done", finishReason: "stop" };
+          },
+        };
+      },
+    };
+  }
+
+  /** Read an SSE response body into a `{event, data}[]` list. */
+  async function drainSSE(res: Response): Promise<Array<{ event: string; data: any }>> {
+    expect(res.body).toBeTruthy();
+    const reader = res.body!.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    const out: Array<{ event: string; data: any }> = [];
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        let event = "message";
+        const dataLines: string[] = [];
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+        }
+        if (dataLines.length === 0) continue;
+        try {
+          out.push({ event, data: JSON.parse(dataLines.join("\n")) });
+        } catch {
+          // ignore unparseable trailing frame
+        }
+      }
+    }
+    return out;
+  }
+
+  const PLAN_MD = [
+    "# Plan",
+    "",
+    "## Approach",
+    "Stub out the parser, then wire it up.",
+    "",
+    "## Steps",
+    "- [ ] Sketch the API",
+    "- [ ] Implement",
+    "- [ ] Add tests",
+    "",
+    "## Key files",
+    "- src/foo.ts",
+    "- src/bar.ts",
+    "",
+    "## Risks",
+    "- Might break BUG #42.",
+    "",
+    "## Acceptance",
+    "- [ ] `npm test` is green.",
+    "",
+  ].join("\n");
+
+  it("POST → SSE → done → accept saves the plan", async () => {
+    const local = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      goalLlmFactory: () => planLlm(PLAN_MD),
+    });
+    try {
+      const created = await fetch(`${local.url}/api/plans`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ objective: "Plan the world." }),
+      });
+      expect(created.status).toBe(202);
+      const { planId } = (await created.json()) as { planId: string };
+      expect(planId).toMatch(/^plan-[a-z0-9]+$/);
+
+      const stream = await fetch(`${local.url}/api/plans/${planId}/stream`);
+      expect(stream.status).toBe(200);
+      const frames = await drainSSE(stream);
+      const eventTypes = frames.map((f) => f.event);
+      expect(eventTypes).toContain("token");
+      expect(eventTypes).toContain("step");
+      expect(eventTypes[eventTypes.length - 1]).toBe("done");
+
+      const doneFrame = frames[frames.length - 1]!;
+      expect(doneFrame.data.planId).toBe(planId);
+      expect(doneFrame.data.aborted).toBe(false);
+      expect(doneFrame.data.body).toContain("## Approach");
+      expect(doneFrame.data.body).toContain("## Acceptance");
+
+      const fetched = await (await fetch(`${local.url}/api/plans/${planId}`)).json();
+      expect(fetched.plan.status).toBe("draft");
+      expect(fetched.plan.body).toContain("## Steps");
+
+      const accept = await fetch(`${local.url}/api/plans/${planId}/accept`, { method: "POST" });
+      expect(accept.status).toBe(200);
+      const acceptJson = (await accept.json()) as { ok: boolean; location: string; plan: any };
+      expect(acceptJson.ok).toBe(true);
+      expect(acceptJson.plan.status).toBe("accepted");
+      expect(acceptJson.location).toContain(".mathran/plans/");
+      expect(acceptJson.location).toContain(planId);
+
+      // Double-accept is idempotent (still 200, still accepted).
+      const reAccept = await fetch(`${local.url}/api/plans/${planId}/accept`, { method: "POST" });
+      expect(reAccept.status).toBe(200);
+    } finally {
+      await local.close();
+    }
+  });
+
+  it("POST → SSE → done → reject moves the plan to rejected", async () => {
+    const local = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      goalLlmFactory: () => planLlm(PLAN_MD),
+    });
+    try {
+      const created = await fetch(`${local.url}/api/plans`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ objective: "Reject me." }),
+      });
+      const { planId } = (await created.json()) as { planId: string };
+      await drainSSE(await fetch(`${local.url}/api/plans/${planId}/stream`));
+
+      const reject = await fetch(`${local.url}/api/plans/${planId}/reject`, { method: "POST" });
+      expect(reject.status).toBe(200);
+      const { ok, plan } = (await reject.json()) as { ok: boolean; plan: any };
+      expect(ok).toBe(true);
+      expect(plan.status).toBe("rejected");
+
+      // Cannot accept a rejected plan.
+      const accept = await fetch(`${local.url}/api/plans/${planId}/accept`, { method: "POST" });
+      expect(accept.status).toBe(400);
+    } finally {
+      await local.close();
+    }
+  });
+
+  it("POST /api/plans 400s on missing objective", async () => {
+    const res = await fetch(`${base}/api/plans`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "   " }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("GET /api/plans/:id 404s for unknown plan", async () => {
+    const res = await fetch(`${base}/api/plans/plan-deadbe`);
+    expect(res.status).toBe(404);
+  });
+
+  it("GET /api/plans/:id 400s on a malformed id (no traversal)", async () => {
+    const res = await fetch(`${base}/api/plans/..%2Fetc`);
+    // path-parsing varies but the validator rejects both shapes.
+    expect([400, 404]).toContain(res.status);
+  });
+
+  it("GET /api/plans/:id/stream 404s when no run is in flight", async () => {
+    const res = await fetch(`${base}/api/plans/plan-nostream/stream`);
+    expect(res.status).toBe(404);
+  });
+});

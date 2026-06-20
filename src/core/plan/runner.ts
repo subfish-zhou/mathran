@@ -24,7 +24,7 @@ import type { ChatEvent } from "../chat/index.js";
 import type { LLMProvider } from "../providers/llm.js";
 import { IDENTITY_FRAGMENT, PLAN_MODE_FRAGMENT } from "../prompts/index.js";
 
-import { PlanStore } from "./store.js";
+import { PlanStore, type Plan } from "./store.js";
 
 /**
  * System prompt for plan mode. Exported so tests can assert on its
@@ -64,7 +64,40 @@ export interface RunPlanOpts {
    * should leave this unset so they get {@link PLAN_SYSTEM_PROMPT}.
    */
   systemPrompt?: string;
+  /**
+   * Optional progress sink (v0.16 §9 audit #2). When set, the runner forwards
+   * the in-session text deltas and round transitions so the HTTP layer can
+   * re-emit them as SSE frames. The CLI doesn't pass this; tests don't need
+   * it either. Throwing inside the callback is swallowed — the runner must
+   * not let a flaky sink crash a plan in flight.
+   */
+  onEvent?: (ev: PlanEvent) => void;
+  /**
+   * Pre-existing plan id to reuse instead of minting + creating a fresh one
+   * (v0.16 §9 audit #2). The HTTP layer reserves the record up front so it
+   * can return `{ planId }` synchronously to the SPA, then hands the same id
+   * back here so the runner doesn't create a duplicate. When omitted, the
+   * runner creates its own record as before (CLI / tests path).
+   */
+  planId?: string;
 }
+
+/**
+ * Events emitted during a plan run when `onEvent` is supplied. Shaped after
+ * the chat SSE envelope so the SPA can re-use its event reader patterns.
+ */
+export type PlanEvent =
+  | { type: "token"; delta: string }
+  | { type: "step"; round: number; finishReason: string }
+  | {
+      type: "done";
+      planId: string;
+      body: string;
+      turns: number;
+      truncated: boolean;
+      aborted: boolean;
+    }
+  | { type: "error"; message: string };
 
 export interface PlanResult {
   /** The id of the saved plan record. */
@@ -106,7 +139,16 @@ export async function runPlan(opts: RunPlanOpts): Promise<PlanResult> {
   const maxTurns = opts.maxTurns ?? 10;
   const systemPrompt = opts.systemPrompt ?? PLAN_SYSTEM_PROMPT;
   const store = new PlanStore({ workspace: opts.workspace });
-  const plan = await store.create(opts.objective, opts.model);
+  // Use the caller-supplied draft if it's still around; otherwise mint a new
+  // one. We tolerate a stale `opts.planId` (deleted on disk) by falling back
+  // to `create()` so the runner's contract stays "always produce a record".
+  let plan: Plan;
+  if (opts.planId) {
+    const existing = await store.get(opts.planId);
+    plan = existing ?? (await store.create(opts.objective, opts.model));
+  } else {
+    plan = await store.create(opts.objective, opts.model);
+  }
 
   const session = new ChatSession({
     llm: opts.llm,
@@ -128,6 +170,15 @@ export async function runPlan(opts: RunPlanOpts): Promise<PlanResult> {
   let lastText = "";
   let userMessage: string = opts.objective;
 
+  const safeEmit = (ev: PlanEvent) => {
+    if (!opts.onEvent) return;
+    try {
+      opts.onEvent(ev);
+    } catch {
+      // never let a flaky sink crash an in-flight plan
+    }
+  };
+
   for (let i = 0; i < maxTurns; i++) {
     if (opts.abortSignal?.aborted) {
       aborted = true;
@@ -141,6 +192,7 @@ export async function runPlan(opts: RunPlanOpts): Promise<PlanResult> {
       }) as AsyncIterable<ChatEvent>) {
         if (ev.type === "text") {
           textBuf += ev.delta;
+          safeEmit({ type: "token", delta: ev.delta });
         } else if (ev.type === "done") {
           finishReason = ev.finishReason;
         }
@@ -155,6 +207,7 @@ export async function runPlan(opts: RunPlanOpts): Promise<PlanResult> {
     }
     turns++;
     if (textBuf.length > 0) lastText = textBuf;
+    safeEmit({ type: "step", round: turns, finishReason });
 
     // Plan mode is one-shot in the common case: as soon as the assistant
     // finishes a turn with no further tool calls (finishReason !== "tool_calls"),
@@ -177,11 +230,20 @@ export async function runPlan(opts: RunPlanOpts): Promise<PlanResult> {
   const body = extractPlanBody(lastText);
   await store.setBody(plan.id, body);
 
-  return {
+  const result: PlanResult = {
     planId: plan.id,
     body,
     turns,
     truncated,
     aborted,
   };
+  safeEmit({
+    type: "done",
+    planId: result.planId,
+    body: result.body,
+    turns: result.turns,
+    truncated: result.truncated,
+    aborted: result.aborted,
+  });
+  return result;
 }

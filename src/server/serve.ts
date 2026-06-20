@@ -102,6 +102,8 @@ import {
   type Goal,
 } from "../core/goal/store.js";
 import { runGoalRound } from "../core/goal/runner.js";
+import { PlanStore, type Plan } from "../core/plan/store.js";
+import { runPlan } from "../core/plan/runner.js";
 import type { LLMProvider } from "../core/providers/llm.js";
 import { randomUUID } from "node:crypto";
 import {
@@ -2217,6 +2219,220 @@ function buildApp(
     }
     const ended = await endGoal(workspace, goalId, "cancelled", "user cancelled");
     return c.json({ goal: ended });
+  });
+
+  // Per-plan AbortControllers + a small in-memory queue so an SPA that POSTs
+  // /api/plans and immediately opens /stream picks up every event — the
+  // runner is started synchronously here and may have already emitted some
+  // tokens by the time the SSE consumer attaches.
+  type PlanFrame =
+    | { event: "token"; data: { delta: string } }
+    | { event: "step"; data: { round: number; finishReason: string } }
+    | { event: "done"; data: { planId: string; body: string; turns: number; truncated: boolean; aborted: boolean } }
+    | { event: "error"; data: { message: string } };
+
+  interface PlanRun {
+    planId: string;
+    abort: AbortController;
+    /** Buffered frames not yet flushed to an SSE consumer. */
+    buffer: PlanFrame[];
+    /** Set after the runner emits `done` or `error`. */
+    finished: boolean;
+    /** Notify listeners when new frames arrive. */
+    waiters: Array<() => void>;
+  }
+  const planRuns = new Map<string, PlanRun>();
+
+  function planScopeOk(raw: any): { ok: true } | { ok: false; error: string } {
+    // Plans are workspace-rooted today — there is no per-scope plans store —
+    // so we accept the same shape as goals for forward-compat and ignore the
+    // value. Empty/missing scope is also accepted.
+    if (raw === undefined || raw === null) return { ok: true };
+    if (raw === "global") return { ok: true };
+    if (typeof raw === "object") {
+      const kind = raw.kind;
+      if (kind === "global" || kind === "project" || kind === "effort") return { ok: true };
+      return { ok: false, error: `unknown scope kind: ${String(kind)}` };
+    }
+    return { ok: false, error: "scope must be an object or 'global'" };
+  }
+
+  /** Slug-safe id matcher for plan ids over the wire. */
+  function isSafePlanIdParam(s: string): boolean {
+    return /^plan-[a-z0-9]+$/.test(s) && s.length <= 64;
+  }
+
+  /**
+   * POST /api/plans  body: `{ objective, scope?, model? }`
+   *
+   * Creates a plan record + spawns the planning runner in the background
+   * and returns 202 with `{ planId }`. Clients then open
+   * `GET /api/plans/:planId/stream` to receive SSE progress frames. The
+   * scope field is accepted for forward-compat (the on-disk PlanStore is
+   * workspace-rooted; per-scope plan dirs aren't a thing yet).
+   */
+  app.post("/api/plans", async (c) => {
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const objective = typeof body?.objective === "string" ? body.objective.trim() : "";
+    if (!objective) return c.json({ error: "'objective' is required" }, 400);
+    const scopeCheck = planScopeOk(body?.scope);
+    if (!scopeCheck.ok) return c.json({ error: scopeCheck.error }, 400);
+    const cfg = loadConfig(configPathFor(workspace));
+    const model = typeof body?.model === "string" && body.model.trim().length > 0
+      ? body.model.trim()
+      : cfg.defaultModel ?? DEFAULT_MODEL;
+
+    // Reserve the plan record up front so we have a stable id to hand back
+    // before the runner even queues an LLM call. The runner re-resolves the
+    // record by id when it streams the body in.
+    const store = new PlanStore({ workspace });
+    const plan = await store.create(objective, model);
+
+    // Wire the LLM through the same factory the goal runner uses so tests
+    // can inject a fake LLM via `goalLlmFactory`. (One seam for both modes
+    // keeps the test harness small.)
+    const llm: LLMProvider = goalLlmFactory
+      ? goalLlmFactory({ model })
+      : new ModelRouter(cfg);
+
+    const run: PlanRun = {
+      planId: plan.id,
+      abort: new AbortController(),
+      buffer: [],
+      finished: false,
+      waiters: [],
+    };
+    planRuns.set(plan.id, run);
+
+    const push = (frame: PlanFrame) => {
+      run.buffer.push(frame);
+      const w = run.waiters.splice(0);
+      for (const fn of w) {
+        try { fn(); } catch { /* ignore */ }
+      }
+    };
+
+    // Drive the runner. The runner mutates the same plan record on disk via
+    // its own PlanStore handle, so we don't have to re-write the body here.
+    // Note: we kick this off *without* awaiting so the POST returns 202
+    // immediately; the SSE consumer drains `run.buffer`.
+    (async () => {
+      try {
+        await runPlan({
+          objective,
+          workspace,
+          llm,
+          model,
+          planId: plan.id,
+          abortSignal: run.abort.signal,
+          onEvent: (ev) => {
+            if (ev.type === "token") push({ event: "token", data: { delta: ev.delta } });
+            else if (ev.type === "step") push({ event: "step", data: { round: ev.round, finishReason: ev.finishReason } });
+            else if (ev.type === "done") push({ event: "done", data: { planId: ev.planId, body: ev.body, turns: ev.turns, truncated: ev.truncated, aborted: ev.aborted } });
+            else if (ev.type === "error") push({ event: "error", data: { message: ev.message } });
+          },
+        });
+      } catch (err: any) {
+        push({ event: "error", data: { message: String(err?.message ?? err) } });
+      } finally {
+        run.finished = true;
+        // Wake up any consumer that's still waiting so it can flush + close.
+        const w = run.waiters.splice(0);
+        for (const fn of w) { try { fn(); } catch { /* ignore */ } }
+      }
+    })();
+
+    return c.json({ planId: plan.id }, 202);
+  });
+
+  /**
+   * GET /api/plans/:planId/stream — SSE stream of plan progress.
+   *
+   * Replays whatever has already been buffered (so a consumer that races
+   * the runner doesn't lose the head tokens) and then forwards new frames
+   * as they arrive. Closes when the runner reports `done` or `error`,
+   * **or** when an SPA reconnects to a plan that already finished and we
+   * have nothing left to send.
+   */
+  app.get("/api/plans/:planId/stream", (c) => {
+    const planId = c.req.param("planId");
+    if (!isSafePlanIdParam(planId)) return c.json({ error: "invalid planId" }, 400);
+    const run = planRuns.get(planId);
+    if (!run) return c.json({ error: "no active plan run for this id" }, 404);
+    return streamSSE(c, async (stream) => {
+      let cursor = 0;
+      // Drain loop: emit anything new, then wait for the next push.
+      // The runner sets `finished` after pushing its terminal frame, so we
+      // always flush that final frame before exiting.
+      while (true) {
+        while (cursor < run.buffer.length) {
+          const frame = run.buffer[cursor++];
+          if (!frame) continue;
+          await stream.writeSSE({
+            event: frame.event,
+            data: JSON.stringify(frame.data),
+          });
+        }
+        if (run.finished) break;
+        await new Promise<void>((resolve) => {
+          run.waiters.push(resolve);
+        });
+      }
+    });
+  });
+
+  /**
+   * POST /api/plans/:planId/accept — mark the plan accepted (SPA flavour;
+   * no effort id is created, the CLI's `mathran plan accept` keeps doing
+   * that). Returns `{ ok: true, location }` where `location` is the
+   * relative on-disk path of the plan jsonl — the SPA shows this in its
+   * "Plan saved to <location>" toast.
+   */
+  app.post("/api/plans/:planId/accept", async (c) => {
+    const planId = c.req.param("planId");
+    if (!isSafePlanIdParam(planId)) return c.json({ error: "invalid planId" }, 400);
+    const store = new PlanStore({ workspace });
+    try {
+      const accepted = await store.acceptDraft(planId);
+      const file = path.join(".mathran", "plans", `${accepted.id}.jsonl`);
+      return c.json({ ok: true, plan: accepted, location: file });
+    } catch (err: any) {
+      const msg = String(err?.message ?? err);
+      const status = msg.includes("not found") ? 404 : 400;
+      return c.json({ error: msg }, status);
+    }
+  });
+
+  /**
+   * POST /api/plans/:planId/reject — mark the plan rejected. Same shape
+   * as accept; returns the updated plan record so the SPA can update its
+   * local view without re-fetching.
+   */
+  app.post("/api/plans/:planId/reject", async (c) => {
+    const planId = c.req.param("planId");
+    if (!isSafePlanIdParam(planId)) return c.json({ error: "invalid planId" }, 400);
+    const store = new PlanStore({ workspace });
+    try {
+      const rejected = await store.reject(planId);
+      return c.json({ ok: true, plan: rejected });
+    } catch (err: any) {
+      const msg = String(err?.message ?? err);
+      const status = msg.includes("not found") ? 404 : 400;
+      return c.json({ error: msg }, status);
+    }
+  });
+
+  /** GET /api/plans/:planId — fetch the latest stored snapshot. Useful
+   *  after a /stream `done` event so the SPA can re-load the canonical
+   *  body if it lost any frames. */
+  app.get("/api/plans/:planId", async (c) => {
+    const planId = c.req.param("planId");
+    if (!isSafePlanIdParam(planId)) return c.json({ error: "invalid planId" }, 400);
+    const store = new PlanStore({ workspace });
+    const plan: Plan | null = await store.get(planId);
+    if (!plan) return c.json({ error: "not found" }, 404);
+    return c.json({ plan });
   });
 
   app.get("/api/providers", (c) => c.json(maskProviders(workspace)));
