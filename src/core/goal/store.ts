@@ -76,6 +76,16 @@ export interface Goal {
    * or when the summary round failed (see endReason for details).
    */
   summaryPath?: string | null;
+  /** v0.16 §3 (thread support): when this goal was spawned by another
+   *  goal via `spawn_sub_goal`, the parent's id. Null/omitted for top-level
+   *  goals. Drives the "jump back to parent thread" link in the UI. */
+  parentGoalId?: string | null;
+  /** v0.16 §3: ids of sub-goals this goal spawned, in creation order.
+   *  The SPA reads this to render thread badges on `spawn_sub_goal`
+   *  tool-calls without having to regex sub-goal ids out of tool-result
+   *  content. Append-only; we keep ids even for failed sub-goals because
+   *  the conversation they produced is still worth inspecting. */
+  subGoalIds?: string[];
 }
 
 /** One row in the goal's audit log. */
@@ -155,6 +165,12 @@ export interface CreateGoalInput {
   model: string;
   budgetTokensMax?: number | null;
   budgetRoundsMax?: number | null;
+  /** v0.16 §3: parent goal id when this goal is a sub-goal. The caller is
+   *  responsible for also appending the new id to the parent's
+   *  `subGoalIds` via {@link addSubGoalId}; we keep the two writes
+   *  separate so a parent goal that's currently being read for other
+   *  reasons doesn't race against `createGoal`'s write of the child. */
+  parentGoalId?: string | null;
 }
 
 /**
@@ -181,6 +197,8 @@ export async function createGoal(
     createdAt: now,
     stats: { tokensUsed: 0, roundsRun: 0, toolCallCount: 0 },
     conversationIds: [],
+    parentGoalId: input.parentGoalId ?? null,
+    subGoalIds: [],
     steps: [
       { at: now, kind: "objective", payload: input.objective },
     ],
@@ -262,6 +280,30 @@ export async function attachConversation(
   if (!g) return;
   if (!g.conversationIds.includes(conversationId)) {
     g.conversationIds.push(conversationId);
+    await writeGoal(workspace, g);
+  }
+}
+
+/**
+ * v0.16 §3: register a sub-goal id under its parent. Idempotent.
+ *
+ * Called by `spawn_sub_goal` immediately after `createGoal` returns,
+ * before any rounds run, so the parent's `subGoalIds` is in lock-step
+ * with the existence of sub-goal records on disk. The SPA reads
+ * `subGoalIds` to render thread badges on the parent's `spawn_sub_goal`
+ * tool-call bubbles — without it we'd have to regex sub-goal ids out
+ * of the tool-result strings, which is fragile.
+ */
+export async function addSubGoalId(
+  workspace: string,
+  parentGoalId: string,
+  subGoalId: string,
+): Promise<void> {
+  const g = await readGoal(workspace, parentGoalId);
+  if (!g) return;
+  if (!g.subGoalIds) g.subGoalIds = [];
+  if (!g.subGoalIds.includes(subGoalId)) {
+    g.subGoalIds.push(subGoalId);
     await writeGoal(workspace, g);
   }
 }

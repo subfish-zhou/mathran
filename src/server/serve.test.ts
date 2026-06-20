@@ -1611,6 +1611,69 @@ describe("goal REST (GAP #11)", () => {
   });
 });
 
+// ─── v0.16 §3: thread / by-conversation endpoints ────────────────────────
+describe("Goal thread endpoints (v0.16 §3)", () => {
+  it("GET /api/goals/by-conversation/:id 404s on a plain (non-goal) chat", async () => {
+    const res = await fetch(`${base}/api/goals/by-conversation/never-created-conv`);
+    expect(res.status).toBe(404);
+  });
+
+  it("GET /api/goals/by-conversation finds the owning goal once a round runs", async () => {
+    const created = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        objective: "unit test goal",
+        scope: { kind: "global" },
+        model: "echo",
+      }),
+    })).json();
+    expect(created.goal?.id).toBeTruthy();
+    await fetch(`${base}/api/goals/${created.goal.id}/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "hi" }),
+    });
+    const after = await (await fetch(`${base}/api/goals/${created.goal.id}`)).json();
+    const convId = after.goal.conversationIds[0];
+    expect(convId).toBeTruthy();
+
+    const lookup = await fetch(`${base}/api/goals/by-conversation/${convId}`);
+    expect(lookup.status).toBe(200);
+    const body = await lookup.json();
+    expect(body.goalId).toBe(created.goal.id);
+  });
+
+  it("GET /api/goals/:id/thread returns goal + history + subGoals (empty)", async () => {
+    const created = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        objective: "thread shape test",
+        scope: { kind: "global" },
+        model: "echo",
+      }),
+    })).json();
+    await fetch(`${base}/api/goals/${created.goal.id}/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "hello" }),
+    });
+    const res = await fetch(`${base}/api/goals/${created.goal.id}/thread`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.goal.id).toBe(created.goal.id);
+    expect(body.primaryConversationId).toBeTruthy();
+    expect(Array.isArray(body.history)).toBe(true);
+    expect(body.subGoals).toEqual([]);
+  });
+
+  it("GET /api/goals/:id/thread 404s on unknown id", async () => {
+    const res = await fetch(`${base}/api/goals/does-not-exist/thread`);
+    expect(res.status).toBe(404);
+  });
+});
+
 describe("POST /api/goals/:id/interrupt (v0.2 §7)", () => {
   it("aborts an in-flight round and returns 200, leaving the goal active", async () => {
     // A provider that streams one chunk then blocks until the round is aborted.

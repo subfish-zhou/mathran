@@ -21,6 +21,7 @@ const TOOL_ICONS: Record<string, string> = {
   search: "🔍",
   read_file_summary: "📋",
   dispatch_subagent: "🤖",
+  spawn_sub_goal: "📂",
 };
 
 const TOOL_LABELS: Record<string, string> = {
@@ -32,6 +33,7 @@ const TOOL_LABELS: Record<string, string> = {
   search: "Search",
   read_file_summary: "Read summary",
   dispatch_subagent: "Subagent",
+  spawn_sub_goal: "Sub-goal thread",
 };
 
 // Per-subagent-type icon shown to the right of the parent label.
@@ -124,7 +126,23 @@ function prettyArgs(args?: string): string {
   }
 }
 
-export function ToolCallDisplay({ toolCall }: { toolCall: ToolBubble }): JSX.Element {
+interface ToolCallDisplayProps {
+  toolCall: ToolBubble;
+  /** v0.16 §3: when this tool-call is a `spawn_sub_goal`, this list lets
+   *  the display map its sequential position (Nth spawn_sub_goal in the
+   *  conversation) to the parent's `subGoalIds[N]`. The mapping happens
+   *  in the parent component because *only* the parent knows the global
+   *  ordering of spawn_sub_goal calls; we just receive our slot. */
+  subGoalIdForThisCall?: string | null;
+  /** Called when the user clicks "Open thread" on a spawn_sub_goal card. */
+  onOpenThread?: (goalId: string) => void;
+}
+
+export function ToolCallDisplay({
+  toolCall,
+  subGoalIdForThisCall,
+  onOpenThread,
+}: ToolCallDisplayProps): JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const [startedAt] = useState<number>(() => Date.now());
   const [completedAt, setCompletedAt] = useState<number | null>(null);
@@ -202,6 +220,29 @@ export function ToolCallDisplay({ toolCall }: { toolCall: ToolBubble }): JSX.Ele
             {formatDuration(durationMs)}
           </span>
         )}
+        {/* v0.16 §3: inline thread shortcut on the collapsed strip so the
+            user doesn't have to expand the card to jump into a sub-goal. */}
+        {toolCall.name === "spawn_sub_goal" && subGoalIdForThisCall && onOpenThread && (
+          <span
+            role="button"
+            tabIndex={0}
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenThread(subGoalIdForThisCall);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.stopPropagation();
+                e.preventDefault();
+                onOpenThread(subGoalIdForThisCall);
+              }
+            }}
+            className="shrink-0 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-900 hover:bg-amber-200"
+            title="Open the sub-goal's thread"
+          >
+            📂 Open thread
+          </span>
+        )}
         <span className="ml-auto shrink-0 text-slate-400" aria-hidden="true">
           {expanded ? "▾" : "▸"}
         </span>
@@ -233,6 +274,25 @@ export function ToolCallDisplay({ toolCall }: { toolCall: ToolBubble }): JSX.Ele
                 {toolCall.result}
               </pre>
             </div>
+          )}
+
+          {/* ─── spawn_sub_goal: jump-into-thread button (v0.16 §3) ─────────────
+              When the parent supplied a goal id for this slot, render the
+              affordance. Hidden when we have no id yet (still streaming, or
+              the parent's metadata hasn't loaded) so the user doesn't see
+              a dead button. */}
+          {toolCall.name === "spawn_sub_goal" && subGoalIdForThisCall && onOpenThread && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenThread(subGoalIdForThisCall);
+              }}
+              className="w-full rounded border border-amber-300 bg-white px-3 py-1.5 text-[11px] font-medium text-amber-900 hover:bg-amber-100"
+              title="Open the sub-goal's full conversation in a side panel"
+            >
+              📂 Open thread
+            </button>
           )}
         </div>
       )}

@@ -15,19 +15,45 @@
  * Click it to collapse the whole cluster into one strip; click the strip
  * to re-expand. Pending tools (no result yet) always stay visible inside
  * the group so progress is never hidden.
+ *
+ * v0.16 §3: accepts a thread-context map so spawn_sub_goal calls in the
+ * cluster can show "Open thread" affordances. The mapping is index-based
+ * via `subGoalIdByToolId`, populated by ChatPanel by zipping the parent
+ * goal's `subGoalIds[]` with the conversation's spawn_sub_goal calls in
+ * order. Cleaner than scraping ids out of tool-result strings.
  */
 import { useState } from "react";
 import { ToolCallDisplay } from "./ToolCallDisplay.tsx";
 import type { ToolBubble } from "../lib/history-to-bubbles.ts";
 
-export default function ToolCallGroup({ tools }: { tools: ToolBubble[] }) {
+interface ToolCallGroupProps {
+  tools: ToolBubble[];
+  /** Tool-call id → sub-goal id, for spawn_sub_goal entries (v0.16 §3). */
+  subGoalIdByToolId?: Record<string, string>;
+  onOpenThread?: (goalId: string) => void;
+}
+
+export default function ToolCallGroup({
+  tools,
+  subGoalIdByToolId,
+  onOpenThread,
+}: ToolCallGroupProps) {
   const [collapsed, setCollapsed] = useState(false);
+
+  const renderOne = (t: ToolBubble) => (
+    <ToolCallDisplay
+      key={t.id}
+      toolCall={t}
+      subGoalIdForThisCall={subGoalIdByToolId?.[t.id] ?? null}
+      onOpenThread={onOpenThread}
+    />
+  );
 
   if (tools.length === 0) return null;
   if (tools.length === 1) {
     // Single tool: skip the wrapper entirely, render the card raw so the UX
     // is identical to v0.13 for the common case.
-    return <ToolCallDisplay toolCall={tools[0]!} />;
+    return renderOne(tools[0]!);
   }
 
   const pending = tools.filter((t) => t.ok === undefined);
@@ -37,9 +63,7 @@ export default function ToolCallGroup({ tools }: { tools: ToolBubble[] }) {
     return (
       <div className="space-y-1.5">
         {/* Pending stays visible — collapse only hides what's already done. */}
-        {pending.map((t) => (
-          <ToolCallDisplay key={t.id} toolCall={t} />
-        ))}
+        {pending.map(renderOne)}
         {done.length > 0 && (
           <button
             type="button"
@@ -70,9 +94,7 @@ export default function ToolCallGroup({ tools }: { tools: ToolBubble[] }) {
           Hide {tools.length} tool {tools.length === 1 ? "call" : "calls"}
         </span>
       </button>
-      {tools.map((t) => (
-        <ToolCallDisplay key={t.id} toolCall={t} />
-      ))}
+      {tools.map(renderOne)}
     </div>
   );
 }

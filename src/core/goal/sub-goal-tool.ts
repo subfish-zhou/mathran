@@ -51,7 +51,7 @@
 import type { ToolSpec, ToolExecuteContext } from "../chat/session.js";
 import type { LLMProvider } from "../providers/llm.js";
 
-import { createGoal, readGoal } from "./store.js";
+import { addSubGoalId, createGoal, readGoal } from "./store.js";
 import type { Goal } from "./store.js";
 
 /** Inline byte cap on the formatted sub-goal summary returned to the parent. */
@@ -205,7 +205,19 @@ export function buildSpawnSubGoalTool(ctx: SpawnSubGoalContext): ToolSpec {
           // the audit log. The round cap protects against runaway spend.
           budgetRoundsMax: maxRounds,
           budgetTokensMax: ctx.parent.budget.tokensMax,
+          // v0.16 §3: stamp the parent link so the SPA can navigate up
+          // from a sub-goal back to the conversation that spawned it.
+          parentGoalId: ctx.parent.id,
         });
+        // Best-effort: link the new sub-goal into the parent's
+        // `subGoalIds` so the parent's audit dump is self-describing.
+        // We swallow errors here because the sub-goal record itself
+        // already exists; a missed back-link only affects UI affordances.
+        try {
+          await addSubGoalId(ctx.workspace, ctx.parent.id, subGoal.id);
+        } catch {
+          /* non-fatal — the sub-goal can still run without back-link. */
+        }
       } catch (err: any) {
         return {
           ok: false,

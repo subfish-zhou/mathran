@@ -15,6 +15,7 @@ import {
   updateGoalStats,
   endGoal,
   attachConversation,
+  addSubGoalId,
   withinBudget,
   goalFileFor,
   goalsDirFor,
@@ -225,5 +226,47 @@ describe("writeGoal round-trip", () => {
     });
     const round = await readGoal(workspace, g.id);
     expect(round?.summaryPath).toBeUndefined();
+  });
+});
+
+// ─── v0.16 §3: parent / sub-goal relationships ───────────────────────────
+describe("parent/sub-goal links", () => {
+  it("createGoal stamps parentGoalId when supplied and defaults to null", async () => {
+    const parent = await createGoal(workspace, {
+      objective: "top",
+      scope: { kind: "global" },
+      model: "m",
+    });
+    expect(parent.parentGoalId).toBeNull();
+    expect(parent.subGoalIds).toEqual([]);
+
+    const child = await createGoal(workspace, {
+      objective: "branch",
+      scope: { kind: "global" },
+      model: "m",
+      parentGoalId: parent.id,
+    });
+    expect(child.parentGoalId).toBe(parent.id);
+    // Round-trip from disk too.
+    const reread = await readGoal(workspace, child.id);
+    expect(reread?.parentGoalId).toBe(parent.id);
+  });
+
+  it("addSubGoalId appends in order and is idempotent", async () => {
+    const parent = await createGoal(workspace, {
+      objective: "top",
+      scope: { kind: "global" },
+      model: "m",
+    });
+    await addSubGoalId(workspace, parent.id, "sub-1");
+    await addSubGoalId(workspace, parent.id, "sub-2");
+    // Duplicate — must NOT grow the array.
+    await addSubGoalId(workspace, parent.id, "sub-1");
+    const reread = await readGoal(workspace, parent.id);
+    expect(reread?.subGoalIds).toEqual(["sub-1", "sub-2"]);
+  });
+
+  it("addSubGoalId on a non-existent goal is a no-op (best-effort)", async () => {
+    await expect(addSubGoalId(workspace, "missing-id", "sub-x")).resolves.toBeUndefined();
   });
 });

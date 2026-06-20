@@ -89,6 +89,7 @@ import {
   loadAnnotations,
   saveAnnotations,
   pruneAnnotationsFrom,
+  loadConversationHistory,
   type MessageAnnotation,
 } from "../core/chat/store.js";
 import {
@@ -1978,6 +1979,95 @@ function buildApp(
     const g = await readGoal(workspace, goalId);
     if (!g) return c.json({ error: "not found" }, 404);
     return c.json({ goal: g });
+  });
+
+  // ─── Thread endpoints (v0.16 §3) ─────────────────────────────────────────
+  // Goal-mode sub-goals are mathran's threads: a `spawn_sub_goal` tool
+  // call creates a child Goal record with its own conversation. These
+  // endpoints let the SPA navigate that tree without scraping audit logs.
+
+  /**
+   * Find which Goal owns a given conversationId (top-level lookup so the
+   * chat panel knows whether the conversation it's rendering is a
+   * goal-mode run or a plain chat). Returns 404 when no goal references
+   * the conversation — the caller should treat this as "not a goal".
+   */
+  app.get("/api/goals/by-conversation/:conversationId", async (c) => {
+    const conversationId = c.req.param("conversationId");
+    if (!isSafeSlug(conversationId)) {
+      return c.json({ error: "invalid conversation id" }, 400);
+    }
+    // O(N) scan; acceptable because the goal directory is tiny in
+    // practice (single-user app, dozens at most). If this ever grows we
+    // add a goals-by-conversation index file.
+    const all = await listGoals(workspace);
+    const owner = all.find((g) => g.conversationIds.includes(conversationId));
+    if (!owner) return c.json({ error: "no goal owns this conversation" }, 404);
+    return c.json({ goalId: owner.id, goal: owner });
+  });
+
+  /**
+   * One-shot "open this thread" payload: the goal record, every sub-goal
+   * stub (id/status/objective/parent), and the primary conversation's
+   * full chat history. The SPA uses this to render a Thread drawer
+   * without three sequential round-trips.
+   *
+   * Sub-goals are returned shallow (their conversation history is *not*
+   * inlined) because a deep tree blows up payload size; the SPA opens
+   * each sub-thread lazily by calling /thread again with that sub-goal's
+   * id when the user clicks in.
+   */
+  app.get("/api/goals/:goalId/thread", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const goal = await readGoal(workspace, goalId);
+    if (!goal) return c.json({ error: "not found" }, 404);
+
+    // Primary conversation history. A goal with no rounds run yet (rare,
+    // happens between createGoal and the first runRound) has an empty
+    // conversationIds list; we surface an empty history in that case so
+    // the SPA doesn't error out.
+    const primaryConvId = goal.conversationIds[0];
+    let history: any[] = [];
+    if (primaryConvId) {
+      history = await loadConversationHistory(workspace, goal.scope, primaryConvId);
+    }
+
+    // Shallow sub-goal stubs. We deliberately project a small set of
+    // fields so the response stays compact — the SPA only needs enough
+    // to render the tree node, not to replay it.
+    const subGoalIds = goal.subGoalIds ?? [];
+    const subGoals: Array<{
+      id: string;
+      objective: string;
+      status: string;
+      parentGoalId: string | null;
+      endReason: string | null;
+      conversationId: string | null;
+      roundsRun: number;
+      tokensUsed: number;
+    }> = [];
+    for (const subId of subGoalIds) {
+      const sg = await readGoal(workspace, subId);
+      if (!sg) continue;
+      subGoals.push({
+        id: sg.id,
+        objective: sg.objective,
+        status: sg.status,
+        parentGoalId: sg.parentGoalId ?? null,
+        endReason: sg.endReason ?? null,
+        conversationId: sg.conversationIds[0] ?? null,
+        roundsRun: sg.stats.roundsRun,
+        tokensUsed: sg.stats.tokensUsed,
+      });
+    }
+
+    return c.json({
+      goal,
+      primaryConversationId: primaryConvId ?? null,
+      history,
+      subGoals,
+    });
   });
 
   /**

@@ -273,3 +273,67 @@ export async function toggleReaction(
   const data = (await res.json()) as { reactions: Record<string, number> };
   return data.reactions ?? {};
 }
+
+// ─── Thread / Goal-mode API (v0.16 §3) ─────────────────────────────────
+// In goal mode the assistant may call `spawn_sub_goal` to start an autonomous
+// research branch. That branch is a separate Goal record with its OWN chat
+// conversation; the parent only sees a summary. The SPA navigates the tree
+// by calling these endpoints — the goal record is the source of truth, the
+// SPA doesn't reconstruct it from audit logs.
+
+/** Shape mirrors `Goal` in src/core/goal/store.ts. Only the fields the SPA
+ *  actually reads; the rest are passed through opaquely as `unknown`. */
+export interface GoalRow {
+  id: string;
+  objective: string;
+  scope: { kind: "global" | "project" | "effort"; projectSlug?: string; effortKey?: string };
+  model: string;
+  status: "active" | "paused" | "complete" | "failed" | "cancelled";
+  endReason?: string | null;
+  parentGoalId?: string | null;
+  subGoalIds?: string[];
+  conversationIds: string[];
+  summaryPath?: string | null;
+  budget: { tokensMax: number | null; roundsMax: number | null };
+  stats: { tokensUsed: number; roundsRun: number; toolCallCount: number };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SubGoalStub {
+  id: string;
+  objective: string;
+  status: GoalRow["status"];
+  parentGoalId: string | null;
+  endReason: string | null;
+  conversationId: string | null;
+  roundsRun: number;
+  tokensUsed: number;
+}
+
+export interface ThreadPayload {
+  goal: GoalRow;
+  primaryConversationId: string | null;
+  history: unknown[];
+  subGoals: SubGoalStub[];
+}
+
+/** Reverse lookup: is this conversation owned by a Goal? Returns null on 404
+ *  (plain chat) and throws on other errors so the UI can degrade gracefully. */
+export async function findGoalForConversation(
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<{ goalId: string; goal: GoalRow } | null> {
+  const res = await fetch(`/api/goals/by-conversation/${encodeURIComponent(conversationId)}`, { signal });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`findGoalForConversation failed (${res.status})`);
+  return (await res.json()) as { goalId: string; goal: GoalRow };
+}
+
+/** Open a thread: goal record + history + shallow sub-goal stubs. Used when
+ *  the user clicks "📂 Open thread" on a spawn_sub_goal tool-call. */
+export async function fetchThread(goalId: string, signal?: AbortSignal): Promise<ThreadPayload> {
+  const res = await fetch(`/api/goals/${encodeURIComponent(goalId)}/thread`, { signal });
+  if (!res.ok) throw new Error(`fetchThread failed (${res.status})`);
+  return (await res.json()) as ThreadPayload;
+}

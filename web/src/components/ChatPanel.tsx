@@ -20,9 +20,11 @@ import {
   fetchAnnotations,
   patchAnnotation,
   toggleReaction,
+  findGoalForConversation,
   type ChatEvent,
   type ConversationAnnotations,
   type MessageAnnotation,
+  type GoalRow,
 } from "../lib/chat.ts";
 import { api, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
 import {
@@ -40,6 +42,7 @@ import {
 } from "../lib/chat-export.ts";
 import ContextMeter from "./ContextMeter.tsx";
 import ToolCallGroup from "./ToolCallGroup.tsx";
+import { ThreadDrawer } from "./ThreadDrawer.tsx";
 
 export default function ChatPanel({
   scope,
@@ -91,6 +94,14 @@ export default function ChatPanel({
   const [noteDraft, setNoteDraft] = useState("");
   // Whether the pinned-only filter sidebar drawer is open.
   const [showPinnedOnly, setShowPinnedOnly] = useState(false);
+  // ─── Thread / goal-mode state (v0.16 §3) ───────────────────────────
+  // owningGoal is non-null when this conversation is the primary one of a
+  // Goal. spawn_sub_goal tool-calls inside it become clickable thread
+  // anchors that open ThreadDrawer. threadStack is a navigation history
+  // (parent→child→grandchild) for the drawer's Back button; top is what's
+  // currently shown.
+  const [owningGoal, setOwningGoal] = useState<GoalRow | null>(null);
+  const [threadStack, setThreadStack] = useState<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // ─── Conversation list ─────────────────────────────────────────────────
@@ -123,23 +134,32 @@ export default function ChatPanel({
       setUsage(null);
       setAnnotations({ version: 1, byBubbleIdx: {} });
       setReplyTarget(null);
+      setOwningGoal(null);
+      setThreadStack([]);
       return;
     }
     let cancelled = false;
     setLoadingHistory(true);
-    // Parallel load: history + annotations. Annotation failures are
-    // non-fatal (the SPA renders without them) so we swallow that branch.
+    // Parallel load: history + annotations + owning-goal lookup.
+    // Annotation failures are non-fatal (the SPA renders without them).
+    // Goal lookup 404s on plain (non-goal) chats — we treat that as
+    // "no thread anchors needed" and degrade silently.
     Promise.all([
       api.getChatHistory(scope, conversationId),
       fetchAnnotations(scope, conversationId).catch(() => ({
         version: 1 as const,
         byBubbleIdx: {} as Record<string, MessageAnnotation>,
       })),
+      findGoalForConversation(conversationId).catch(() => null),
     ])
-      .then(([data, ann]) => {
+      .then(([data, ann, goalLookup]) => {
         if (cancelled) return;
         setBubbles(historyToBubbles(data.history));
         setAnnotations(ann);
+        setOwningGoal(goalLookup ? goalLookup.goal : null);
+        // Reset any open thread on conversation switch — stale ids are
+        // worse than no ids.
+        setThreadStack([]);
       })
       .catch((err) => {
         if (cancelled) return;
@@ -430,6 +450,45 @@ export default function ChatPanel({
     flushTools();
     return out;
   }, [bubbles, showPinnedOnly, annotations]);
+
+  // ─── spawn_sub_goal → sub-goal id mapping (v0.16 §3) ───────────────────
+  // Walk all tool bubbles in chronological order and zip them against
+  // the parent goal's `subGoalIds[]`. The Nth spawn_sub_goal call in
+  // history maps to subGoalIds[N]. We choose this rule over scraping
+  // the tool-result text because:
+  //   1) it works even before the result comes back (mid-stream the
+  //      thread button can already point at the right id, since the
+  //      sub-goal record is created by sub-goal-tool BEFORE the round
+  //      loop starts);
+  //   2) the result text format isn't a stable contract.
+  // When subGoalIds is shorter than the count of spawn_sub_goal calls
+  // (race during recovery, etc.) the tail calls get no id and the
+  // thread button stays hidden — acceptable degradation.
+  const subGoalIdByToolId = useMemo<Record<string, string>>(() => {
+    const map: Record<string, string> = {};
+    if (!owningGoal?.subGoalIds || owningGoal.subGoalIds.length === 0) return map;
+    let n = 0;
+    for (const b of bubbles) {
+      if (b.kind !== "tool") continue;
+      if (b.name !== "spawn_sub_goal") continue;
+      const id = owningGoal.subGoalIds[n];
+      if (id) map[b.id] = id;
+      n++;
+    }
+    return map;
+  }, [bubbles, owningGoal]);
+
+  const handleOpenThread = useCallback((goalId: string) => {
+    setThreadStack((prev) => [...prev, goalId]);
+  }, []);
+  const handleCloseThread = useCallback(() => {
+    setThreadStack([]);
+  }, []);
+  const handleBackThread = useCallback(() => {
+    setThreadStack((prev) => prev.slice(0, -1));
+  }, []);
+  const currentThreadGoalId =
+    threadStack.length > 0 ? threadStack[threadStack.length - 1] : null;
 
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
   useEffect(() => {
@@ -930,6 +989,27 @@ export default function ChatPanel({
               </button>
             );
           })()}
+          {/* v0.16 §3: "this conversation is a Goal" indicator. Clicking
+              opens the primary thread (i.e. the goal's own conversation)
+              — useful entry point when you want to see goal status / end
+              reason / round count without scrolling. Hidden when not a
+              goal-mode chat. */}
+          {owningGoal && (
+            <button
+              type="button"
+              onClick={() => handleOpenThread(owningGoal.id)}
+              className={`ml-2 shrink-0 rounded-md border px-2 py-1 text-xs ${
+                owningGoal.status === "active"
+                  ? "border-blue-300 bg-blue-50 text-blue-900"
+                  : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+              }`}
+              title={`Goal mode · ${owningGoal.objective}`}
+            >
+              🎯 Goal{owningGoal.subGoalIds && owningGoal.subGoalIds.length > 0
+                ? ` · ${owningGoal.subGoalIds.length} thread${owningGoal.subGoalIds.length === 1 ? "" : "s"}`
+                : ""}
+            </button>
+          )}
         </div>
 
         {/* ─── Export toolbar ─── */}
@@ -996,7 +1076,12 @@ export default function ChatPanel({
           )}
           {rows.map((row, i) =>
             row.kind === "tools" ? (
-              <ToolCallGroup key={`g${i}`} tools={row.tools} />
+              <ToolCallGroup
+                key={`g${i}`}
+                tools={row.tools}
+                subGoalIdByToolId={subGoalIdByToolId}
+                onOpenThread={handleOpenThread}
+              />
             ) : (
               <div
                 key={i}
@@ -1346,6 +1431,16 @@ export default function ChatPanel({
           )}
         </form>
       </div>
+      {/* v0.16 §3: side-panel thread drawer. Rendered once at the top
+          level so its fixed-position overlay isn't trapped inside the
+          scrollable conversation column. */}
+      <ThreadDrawer
+        goalId={currentThreadGoalId}
+        onClose={handleCloseThread}
+        onPushThread={handleOpenThread}
+        canGoBack={threadStack.length > 1}
+        onBack={handleBackThread}
+      />
     </div>
   );
 }
