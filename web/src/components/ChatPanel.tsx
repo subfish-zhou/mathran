@@ -144,6 +144,19 @@ export default function ChatPanel({
   const [planOverlayOpen, setPlanOverlayOpen] = useState(false);
   const [planSavedToast, setPlanSavedToast] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // W4 (v0.17 mathub parity): composer is a multi-line <textarea> that
+  // auto-grows from 1 to 8 rows. We keep a ref so the IME composition
+  // guard can read .isComposing without prop drilling, and so we can
+  // call form.requestSubmit() for the Enter-to-send shortcut (which
+  // routes through the normal <form onSubmit={send}> path, preserving
+  // disabled-while-busy + reply/quote semantics for free).
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  // IME guard: while a composition is active (e.g. typing Chinese,
+  // Japanese, Korean) Enter should commit the candidate, not submit
+  // the form. Browsers also dispatch a final Enter keydown after
+  // compositionend whose `isComposing` is false but `keyCode === 229`,
+  // which we filter below in the keydown handler.
+  const isComposingRef = useRef(false);
 
   // ─── Conversation list ─────────────────────────────────────────────────
   const refreshList = useCallback(async () => {
@@ -1881,13 +1894,44 @@ export default function ChatPanel({
           </div>
         )}
 
-        <form onSubmit={send} className="flex gap-2 border-t border-slate-200 bg-white p-4">
-          <input
+        <form onSubmit={send} className="flex items-end gap-2 border-t border-slate-200 bg-white p-4">
+          <textarea
+            ref={composerRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Message…"
+            onCompositionStart={() => {
+              isComposingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              isComposingRef.current = false;
+            }}
+            onKeyDown={(e) => {
+              // Enter sends, Shift+Enter inserts a newline. Skip while
+              // an IME composition is active or while a stream is
+              // running. keyCode 229 is the "composition in progress"
+              // sentinel some browsers fire after compositionend.
+              if (
+                e.key === "Enter" &&
+                !e.shiftKey &&
+                !e.nativeEvent.isComposing &&
+                !isComposingRef.current &&
+                e.keyCode !== 229
+              ) {
+                e.preventDefault();
+                if (busy) return;
+                // requestSubmit() dispatches a real submit event so
+                // <form onSubmit={send}> handles preventDefault + the
+                // existing reply/quote/empty-trim logic.
+                e.currentTarget.form?.requestSubmit();
+              }
+            }}
+            placeholder="Type a message… (Shift+Enter for newline)"
             disabled={busy}
-            className="flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
+            rows={Math.min(
+              8,
+              Math.max(1, input.split("\n").length),
+            )}
+            className="flex-1 resize-none rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
           />
           {busy ? (
             // Stop swaps in for Send while a stream is open. Calling stop()
