@@ -13,6 +13,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { marked } from "marked";
+import markedKatex from "marked-katex-extension";
+import "katex/dist/katex.min.css";
+
+// v0.16 §11: register the KaTeX extension exactly once at module load.
+// `$...$` becomes inline math, `$$...$$` becomes display math. throwOnError
+// disabled so a broken expression renders as raw text instead of red
+// banner-blocking the whole bubble.
+marked.use(markedKatex({ throwOnError: false, nonStandard: true }));
 import {
   streamChat,
   rerunChat,
@@ -1509,7 +1517,7 @@ export default function ChatPanel({
                 data-bubble-idx={row.bubbleIdx}
                 className={`group/msg flex ${row.bubble.kind === "user" ? "justify-end" : "justify-start"} rounded-md transition`}
               >
-                <div className="flex max-w-2xl flex-col">
+                <div className={`flex flex-col ${row.bubble.kind === "user" ? "max-w-2xl" : "w-full"}`}>
                   {/* ─── Reply-target badge (v0.16 §2) ───────────────────────
                       Shows above a user bubble when it's a reply to an
                       earlier message. Click jumps to the referenced bubble. */}
@@ -1568,12 +1576,50 @@ export default function ChatPanel({
                         </div>
                       </div>
                     </div>
-                  ) : (
+                  ) : row.bubble.kind === "assistant" && row.bubble.text === "" ? (
+                    /* ─── Streaming-thinking pill (v0.16 §10) ──────────────────
+                       Before any tokens land we used to render a markdown bubble
+                       containing a single horizontal-ellipsis fallback, which
+                       looked like a giant empty card sitting between tool
+                       cards. Replace with a Mathub-style compact status pill:
+                       a spinning loader + a soft "Thinking…" caption in the
+                       violet palette. No border, no padding-block, no markdown
+                       container — it should feel like a transient status line,
+                       not a chat bubble that demands acknowledgement. */
                     <div
-                      className={`relative rounded-lg px-4 py-2 text-sm ${
+                      role="status"
+                      aria-live="polite"
+                      className="inline-flex items-center gap-2 rounded-full bg-violet-50/70 px-3 py-1 text-xs text-violet-700"
+                    >
+                      <svg
+                        className="h-3 w-3 animate-spin text-violet-500"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        aria-hidden="true"
+                      >
+                        <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25" />
+                        <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                      </svg>
+                      <span className="font-medium">Thinking</span>
+                      <span className="inline-flex gap-0.5" aria-hidden="true">
+                        <span className="inline-block h-1 w-1 animate-bounce rounded-full bg-violet-400 [animation-delay:-0.3s]" />
+                        <span className="inline-block h-1 w-1 animate-bounce rounded-full bg-violet-400 [animation-delay:-0.15s]" />
+                        <span className="inline-block h-1 w-1 animate-bounce rounded-full bg-violet-400" />
+                      </span>
+                    </div>
+                  ) : (
+                    /* ─── Message body (v0.16 §11) ──────────────────────────
+                       User messages stay as a slate pill on the right (chat-
+                       app convention), but assistant messages now render
+                       full-width with no border/bubble, matching Mathub /
+                       ChatGPT. The visual asymmetry is intentional: the
+                       assistant’s response is the document, the user’s line
+                       is just a label of "who asked what". */
+                    <div
+                      className={`relative text-sm ${
                         row.bubble.kind === "user"
-                          ? "bg-slate-900 text-white"
-                          : "border border-slate-200 bg-white"
+                          ? "rounded-lg bg-slate-900 px-4 py-2 text-white"
+                          : "px-1 py-1 text-slate-800"
                       } ${
                         annotations.byBubbleIdx[String(row.bubbleIdx)]?.pinned
                           ? "ring-1 ring-amber-400"
@@ -1593,7 +1639,7 @@ export default function ChatPanel({
                         <div
                           className="md"
                           dangerouslySetInnerHTML={{
-                            __html: marked.parse(row.bubble.text || "…") as string,
+                            __html: marked.parse(row.bubble.text) as string,
                           }}
                         />
                       ) : (
