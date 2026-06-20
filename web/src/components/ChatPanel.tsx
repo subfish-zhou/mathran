@@ -33,6 +33,7 @@ import {
   findGoalForConversation,
   runGoalRound,
   type ChatEvent,
+  type ChatAttachmentRef,
   type ConversationAnnotations,
   type MessageAnnotation,
   type GoalRow,
@@ -157,6 +158,138 @@ export default function ChatPanel({
   // compositionend whose `isComposing` is false but `keyCode === 229`,
   // which we filter below in the keydown handler.
   const isComposingRef = useRef(false);
+
+  // ─── Composer attachments (v0.17 mathub parity W2) ─────────────────
+  // Each PendingAttachment tracks one file from picker / drag-drop / paste.
+  // Status flows uploading → ready → (optionally) error. Ready entries
+  // carry the server-returned `path`/`mimeType`/`size`; we forward those
+  // three fields verbatim to `streamChat` on send.
+  //
+  // Why a uuid-ish `id` per entry? React keys + the ✖-remove handler
+  // need a stable identity even before the upload resolves a path. We
+  // also don't trust filename to be unique (user can drop two `notes.txt`).
+  type PendingAttachment =
+    | { id: string; status: "uploading"; filename: string }
+    | {
+        id: string;
+        status: "ready";
+        filename: string;
+        path: string;
+        mimeType: string;
+        size: number;
+      }
+    | { id: string; status: "error"; filename: string; error: string };
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [dragOver, setDragOver] = useState(false);
+  // Hidden <input type="file"> the 📎 button triggers. Kept off-screen so
+  // we can style the button freely.
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // Stable id minter for PendingAttachment.id. crypto.randomUUID is
+  // available in every browser the SPA targets (no IE fallback).
+  const nextAttachId = useCallback(() => {
+    try {
+      return crypto.randomUUID();
+    } catch {
+      return `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+  }, []);
+
+  /**
+   * Kick off uploads for a batch of `File`s and track each one's lifecycle
+   * in `attachments` state. Per file:
+   *   1. Insert a `uploading` chip right away (the user sees it on screen
+   *      before the network round-trip starts).
+   *   2. POST to `/api/uploads` with the file as the `file` field.
+   *   3. On 2xx: flip the chip to `ready` carrying `path/mimeType/size`.
+   *   4. On non-2xx or network error: flip to `error` with a short reason.
+   *
+   * Errors don't bubble — the chip turns red and the rest of the batch
+   * keeps going. The user can ✖ a failed chip to retry by re-attaching.
+   */
+  const uploadFiles = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return;
+      const entries = files.map((f) => ({ id: nextAttachId(), file: f }));
+      setAttachments((prev) => [
+        ...prev,
+        ...entries.map(
+          (e): PendingAttachment => ({
+            id: e.id,
+            status: "uploading",
+            filename: e.file.name,
+          }),
+        ),
+      ]);
+      await Promise.all(
+        entries.map(async ({ id, file }) => {
+          const form = new FormData();
+          form.set("file", file, file.name);
+          try {
+            const res = await fetch("/api/uploads", { method: "POST", body: form });
+            if (!res.ok) {
+              let msg = `upload failed (${res.status})`;
+              try {
+                const data = await res.json();
+                if (data?.error) msg = String(data.error);
+              } catch { /* ignore */ }
+              setAttachments((prev) =>
+                prev.map((a) =>
+                  a.id === id
+                    ? { id, status: "error", filename: file.name, error: msg }
+                    : a,
+                ),
+              );
+              return;
+            }
+            const data = (await res.json()) as {
+              path: string;
+              filename: string;
+              mimeType: string;
+              size: number;
+            };
+            setAttachments((prev) =>
+              prev.map((a) =>
+                a.id === id
+                  ? {
+                      id,
+                      status: "ready",
+                      // Use the server-sanitised filename so the chip and
+                      // the server-side rendering agree.
+                      filename: data.filename,
+                      path: data.path,
+                      mimeType: data.mimeType,
+                      size: data.size,
+                    }
+                  : a,
+              ),
+            );
+          } catch (err: unknown) {
+            setAttachments((prev) =>
+              prev.map((a) =>
+                a.id === id
+                  ? {
+                      id,
+                      status: "error",
+                      filename: file.name,
+                      error: (err as Error)?.message ?? "network error",
+                    }
+                  : a,
+              ),
+            );
+          }
+        }),
+      );
+    },
+    [nextAttachId],
+  );
+
+  /** Remove a single chip (✖ button or successful send). */
+  const removeAttachment = useCallback((id: string) => {
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  /** Are we still waiting on any uploads? Used to disable Send. */
+  const hasUploadingAttachment = attachments.some((a) => a.status === "uploading");
 
   // ─── Conversation list ─────────────────────────────────────────────────
   const refreshList = useCallback(async () => {
@@ -504,7 +637,16 @@ export default function ChatPanel({
   async function send(e: React.FormEvent) {
     e.preventDefault();
     const rawText = input.trim();
-    if (!rawText || busy) return;
+    // v0.17 mathub parity W2: Send is enabled when there's text OR at
+    // least one ready attachment. Uploading attachments block the
+    // send (we don't want to ship `path:undefined` to the server).
+    const readyAttachments = attachments.filter(
+      (a): a is Extract<PendingAttachment, { status: "ready" }> =>
+        a.status === "ready",
+    );
+    if ((!rawText && readyAttachments.length === 0) || busy) return;
+    if (hasUploadingAttachment) return; // wait for in-flight uploads
+
     setInput("");
     setError(null);
     setBusy(true);
@@ -520,14 +662,37 @@ export default function ChatPanel({
       : rawText;
     setReplyTarget(null);
 
+    // The wire-shape attachments the server consumes — just the three
+    // fields the chat-attachment renderer needs. Local `id`/`size` are
+    // SPA-only and don't cross the wire.
+    const wireAttachments: ChatAttachmentRef[] = readyAttachments.map((a) => ({
+      path: a.path,
+      filename: a.filename,
+      mimeType: a.mimeType,
+    }));
+
+    // Render the user bubble with a small inline summary of the
+    // attachments (one line per chip) so the conversation log reflects
+    // what the user shipped, not just the typed text. This is local-only
+    // — the server independently inlines the file contents into the user
+    // message it persists to the LLM history.
+    const bubbleText = readyAttachments.length > 0
+      ? `${rawText}${rawText ? "\n\n" : ""}${readyAttachments
+          .map((a) => `📎 ${a.filename}`)
+          .join("\n")}`
+      : rawText;
+
     // Record the bubble index of the user message we're about to add so
     // we can PATCH its annotation once the SSE round trip starts.
     const userBubbleIdx = bubbles.length;
     setBubbles((b) => [
       ...b,
-      { kind: "user", text: rawText },
+      { kind: "user", text: bubbleText },
       { kind: "assistant", text: "" },
     ]);
+
+    // Clear the chip tray now that the refs are committed to the wire.
+    setAttachments([]);
 
     // Fire the annotation PATCH in parallel — it doesn't need to block
     // the stream. Server resolves conversationId lazily; if conversationId
@@ -551,7 +716,15 @@ export default function ChatPanel({
     }
 
     await runChatStream((onEvent, signal) =>
-      streamChat(scope, promptText, conversationId ?? undefined, model || undefined, onEvent, signal),
+      streamChat(
+        scope,
+        promptText,
+        conversationId ?? undefined,
+        model || undefined,
+        onEvent,
+        signal,
+        wireAttachments.length > 0 ? wireAttachments : undefined,
+      ),
     );
   }
 
@@ -1894,67 +2067,216 @@ export default function ChatPanel({
           </div>
         )}
 
-        <form onSubmit={send} className="flex items-end gap-2 border-t border-slate-200 bg-white p-4">
-          <textarea
-            ref={composerRef}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onCompositionStart={() => {
-              isComposingRef.current = true;
+        {/* W2 (v0.17 mathub parity): drag-and-drop region wraps the
+            entire composer area — chip tray + textarea + buttons — so
+            dropping a file anywhere in the composer triggers an upload.
+            The textarea separately handles paste; the 📎 button below
+            opens the hidden file picker. Upload status is rendered as
+            chips above the textarea. */}
+        <div
+          onDragOver={(e) => {
+            // Only react to dragged *files*. Dragging selected text on
+            // the page also fires dragover, but `types` won't include
+            // "Files" — we don't want the composer to flash for that.
+            if (e.dataTransfer.types.includes("Files")) {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "copy";
+              if (!dragOver) setDragOver(true);
+            }
+          }}
+          onDragLeave={(e) => {
+            // dragleave fires for every child element as the pointer
+            // crosses internal boundaries, so we only clear when the
+            // pointer leaves the composer wrapper entirely. `currentTarget`
+            // is always the wrapper; relatedTarget is the element being
+            // entered (or null on window exit).
+            const next = e.relatedTarget as Node | null;
+            if (!next || !e.currentTarget.contains(next)) {
+              setDragOver(false);
+            }
+          }}
+          onDrop={(e) => {
+            if (!e.dataTransfer.types.includes("Files")) return;
+            e.preventDefault();
+            setDragOver(false);
+            const dropped = Array.from(e.dataTransfer.files);
+            if (dropped.length > 0) void uploadFiles(dropped);
+          }}
+          className={
+            "border-t border-slate-200 bg-white transition-colors " +
+            (dragOver
+              ? "border-violet-400 bg-violet-50/30 ring-2 ring-violet-300"
+              : "")
+          }
+        >
+          {/* Pending attachment chips. One row, wraps if it overflows.
+              Only rendered when there's something to show — we don't
+              want an empty 8px strip eating composer height. */}
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 px-4 pt-3">
+              {attachments.map((a) => {
+                const isUploading = a.status === "uploading";
+                const isError = a.status === "error";
+                const baseClass =
+                  "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs";
+                const statusClass = isError
+                  ? "border-red-300 bg-red-50 text-red-800"
+                  : isUploading
+                    ? "border-slate-300 bg-slate-50 text-slate-600 opacity-75 animate-pulse"
+                    : "border-slate-300 bg-slate-50 text-slate-700";
+                const tooltip = isError
+                  ? `Upload failed: ${a.error}`
+                  : isUploading
+                    ? "Uploading…"
+                    : `${a.filename}${
+                        a.status === "ready"
+                          ? ` (${a.mimeType}, ${Math.max(
+                              1,
+                              Math.round(a.size / 1024),
+                            )} KB)`
+                          : ""
+                      }`;
+                return (
+                  <span key={a.id} className={`${baseClass} ${statusClass}`} title={tooltip}>
+                    <span aria-hidden>📎</span>
+                    <span className="max-w-[16ch] truncate">{a.filename}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeAttachment(a.id)}
+                      className="rounded-full px-1 text-slate-500 hover:bg-slate-200 hover:text-slate-800"
+                      title="Remove attachment"
+                      aria-label={`Remove ${a.filename}`}
+                    >
+                      ✖
+                    </button>
+                  </span>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Hidden file input the 📎 button triggers. `multiple`
+              + un-restricted accept matches the server's allowlist gate
+              (server returns 415 for disallowed types; we surface that
+              as a red chip rather than restricting the picker, so the
+              error story stays in one place). */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              const picked = Array.from(e.target.files ?? []);
+              if (picked.length > 0) void uploadFiles(picked);
+              // Reset so picking the same file again still fires change.
+              e.target.value = "";
             }}
-            onCompositionEnd={() => {
-              isComposingRef.current = false;
-            }}
-            onKeyDown={(e) => {
-              // Enter sends, Shift+Enter inserts a newline. Skip while
-              // an IME composition is active or while a stream is
-              // running. keyCode 229 is the "composition in progress"
-              // sentinel some browsers fire after compositionend.
-              if (
-                e.key === "Enter" &&
-                !e.shiftKey &&
-                !e.nativeEvent.isComposing &&
-                !isComposingRef.current &&
-                e.keyCode !== 229
-              ) {
-                e.preventDefault();
-                if (busy) return;
-                // requestSubmit() dispatches a real submit event so
-                // <form onSubmit={send}> handles preventDefault + the
-                // existing reply/quote/empty-trim logic.
-                e.currentTarget.form?.requestSubmit();
-              }
-            }}
-            placeholder="Type a message… (Shift+Enter for newline)"
-            disabled={busy}
-            rows={Math.min(
-              8,
-              Math.max(1, input.split("\n").length),
-            )}
-            className="flex-1 resize-none rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
           />
-          {busy ? (
-            // Stop swaps in for Send while a stream is open. Calling stop()
-            // .abort()s the underlying fetch so the SSE pump tears down and
-            // runChatStream's finally block flips `busy` back to false.
+
+          <form onSubmit={send} className="flex items-end gap-2 p-4">
             <button
               type="button"
-              onClick={stop}
-              className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
-              title="Stop generating"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={busy}
+              className="rounded-md border border-slate-300 px-2.5 py-2 text-sm text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+              title="Attach file"
+              aria-label="Attach file"
             >
-              ⏹ Stop
+              📎
             </button>
-          ) : (
-            <button
-              type="submit"
-              disabled={!input.trim()}
-              className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-            >
-              Send
-            </button>
-          )}
-        </form>
+            <textarea
+              ref={composerRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onCompositionStart={() => {
+                isComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                isComposingRef.current = false;
+              }}
+              onPaste={(e) => {
+                // W2: capture *image* files from clipboard (e.g.
+                // screenshot pasted from a screenshot tool). Text pastes
+                // pass through untouched — we only preventDefault when
+                // we actually consumed image entries, otherwise the
+                // browser's default paste-into-textarea must win.
+                const items = e.clipboardData?.items;
+                if (!items) return;
+                const images: File[] = [];
+                for (let i = 0; i < items.length; i++) {
+                  const it = items[i];
+                  if (it.kind === "file" && it.type.startsWith("image/")) {
+                    const f = it.getAsFile();
+                    if (f) images.push(f);
+                  }
+                }
+                if (images.length > 0) {
+                  e.preventDefault();
+                  void uploadFiles(images);
+                }
+              }}
+              onKeyDown={(e) => {
+                // Enter sends, Shift+Enter inserts a newline. Skip while
+                // an IME composition is active or while a stream is
+                // running. keyCode 229 is the "composition in progress"
+                // sentinel some browsers fire after compositionend.
+                if (
+                  e.key === "Enter" &&
+                  !e.shiftKey &&
+                  !e.nativeEvent.isComposing &&
+                  !isComposingRef.current &&
+                  e.keyCode !== 229
+                ) {
+                  e.preventDefault();
+                  if (busy) return;
+                  // requestSubmit() dispatches a real submit event so
+                  // <form onSubmit={send}> handles preventDefault + the
+                  // existing reply/quote/empty-trim logic.
+                  e.currentTarget.form?.requestSubmit();
+                }
+              }}
+              placeholder="Type a message… (Shift+Enter for newline; drag/paste files to attach)"
+              disabled={busy}
+              rows={Math.min(
+                8,
+                Math.max(1, input.split("\n").length),
+              )}
+              className="flex-1 resize-none rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
+            />
+            {busy ? (
+              // Stop swaps in for Send while a stream is open. Calling stop()
+              // .abort()s the underlying fetch so the SSE pump tears down and
+              // runChatStream's finally block flips `busy` back to false.
+              <button
+                type="button"
+                onClick={stop}
+                className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+                title="Stop generating"
+              >
+                ⏹ Stop
+              </button>
+            ) : (
+              <button
+                type="submit"
+                // Enable Send when there's text OR at least one ready
+                // attachment, and no uploads are still in-flight.
+                disabled={
+                  hasUploadingAttachment ||
+                  (!input.trim() &&
+                    !attachments.some((a) => a.status === "ready"))
+                }
+                className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+                title={
+                  hasUploadingAttachment
+                    ? "Waiting for uploads to finish…"
+                    : undefined
+                }
+              >
+                Send
+              </button>
+            )}
+          </form>
+        </div>
       </div>
       {/* v0.16 §3: side-panel thread drawer. Rendered once at the top
           level so its fixed-position overlay isn't trapped inside the

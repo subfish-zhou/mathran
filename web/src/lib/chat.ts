@@ -4,6 +4,21 @@
 
 import { chatScopeBase, type ChatScopeSpec } from "./api.ts";
 
+/**
+ * v0.17 mathub parity W2: attachment ref the composer forwards alongside
+ * the prompt body. Server reads each file, inlines text under `[Attachment:
+ * …]`, emits `[Image: … @ path]` markers for images, or `[Binary: …]`
+ * metadata for everything else. See `src/server/chat-attachments.ts`.
+ */
+export interface ChatAttachmentRef {
+  /** Absolute path returned by `POST /api/uploads`. Workspace-internal
+   *  (under `<workspace>/.mathran/uploads/`); server re-validates it on
+   *  every send so the SPA can re-forward it across turns. */
+  path: string;
+  filename: string;
+  mimeType: string;
+}
+
 export type ChatEvent =
   | { type: "session"; sessionId: string; conversationId: string; resumedFromAsk?: boolean }
   | { type: "text"; delta: string }
@@ -28,6 +43,11 @@ export type ChatEvent =
  * `conversationId` is optional — the backend mints one when omitted, and the
  * caller can pick it up from the first `session` event so subsequent turns can
  * reuse it (BUG #6 multi-turn fix).
+ *
+ * `attachments` (v0.17 mathub parity W2) forwards composer-upload refs so the
+ * server can inline file contents / emit `[Image: …]` markers in the user
+ * message. Omit or pass `[]` for plain text-only sends — the wire shape stays
+ * backward-compatible with prior callers.
  */
 export async function streamChat(
   scope: ChatScopeSpec,
@@ -36,10 +56,12 @@ export async function streamChat(
   model: string | undefined,
   onEvent: (ev: ChatEvent) => void,
   signal?: AbortSignal,
+  attachments?: ChatAttachmentRef[],
 ): Promise<void> {
   const body: Record<string, unknown> = { message };
   if (conversationId) body.conversationId = conversationId;
   if (model) body.model = model;
+  if (attachments && attachments.length > 0) body.attachments = attachments;
 
   await pumpSSE(
     chatScopeBase(scope),

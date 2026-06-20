@@ -32,6 +32,11 @@ import {
   makeEmbeddedAssetHandler,
 } from "./static-assets.js";
 import { registerUploadRoutes } from "./upload-routes.js";
+import {
+  buildUserMessageWithAttachments,
+  BadAttachmentError,
+  type AttachmentRef,
+} from "./chat-attachments.js";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import YAML from "yaml";
 import { createTwoFilesPatch } from "diff";
@@ -886,7 +891,41 @@ function registerChatScope(
     let body: any;
     try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
     const message = typeof body?.message === "string" ? body.message : "";
-    if (!message) return c.json({ error: "message is required" }, 400);
+    // v0.17 mathub parity W2: optional attachment refs from the composer
+    // upload flow. Each entry is `{ path, filename, mimeType }` as returned
+    // by `POST /api/uploads`; we re-validate paths against the workspace
+    // sandbox before reading any bytes.
+    const rawAttachments = body?.attachments;
+    const attachments: AttachmentRef[] = Array.isArray(rawAttachments)
+      ? rawAttachments.filter(
+          (a: unknown): a is AttachmentRef =>
+            !!a &&
+            typeof a === "object" &&
+            typeof (a as AttachmentRef).path === "string" &&
+            typeof (a as AttachmentRef).filename === "string" &&
+            typeof (a as AttachmentRef).mimeType === "string",
+        )
+      : [];
+    if (!message && attachments.length === 0) {
+      return c.json({ error: "message is required" }, 400);
+    }
+    // Build the augmented user-message text BEFORE we open the SSE
+    // stream: a bad-path attachment must surface as an HTTP 400, not as
+    // a half-open SSE that emits an error event. Once the stream is
+    // open we can't rewrite the status code.
+    let augmentedMessage: string;
+    try {
+      augmentedMessage = await buildUserMessageWithAttachments(
+        store.getWorkspace(),
+        message,
+        attachments,
+      );
+    } catch (err: unknown) {
+      if (err instanceof BadAttachmentError) {
+        return c.json({ error: err.message }, 400);
+      }
+      return c.json({ error: (err as Error)?.message ?? String(err) }, 500);
+    }
     const model = typeof body?.model === "string" ? body.model : undefined;
     // sessionId / conversationId aliases for back-compat.
     const requested = typeof body?.conversationId === "string" && body.conversationId.length > 0
@@ -909,7 +948,7 @@ function registerChatScope(
           event: "session",
           data: JSON.stringify({ sessionId: conversationId, conversationId, scope }),
         });
-        for await (const ev of session.send(message) as AsyncIterable<ChatEvent>) {
+        for await (const ev of session.send(augmentedMessage) as AsyncIterable<ChatEvent>) {
           await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
         }
         // Flush the freshly-augmented history to disk before closing the stream.
