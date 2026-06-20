@@ -2406,6 +2406,11 @@ function buildApp(
         tools,
         toolContext: { workspace, scope: g.scope },
         signal: controller.signal,
+        // v0.16 §9 audit #4: opt into the plan bootstrap. The HTTP server
+        // drives the SPA; goals here are real user goals (not test runs),
+        // so spending one upfront `runPlan` round is a good trade for
+        // grounding every subsequent round in a stable checklist.
+        bootstrapPlan: "auto",
       });
       return c.json({
         goal: r.goal,

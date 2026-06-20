@@ -76,6 +76,15 @@ export interface Goal {
    * or when the summary round failed (see endReason for details).
    */
   summaryPath?: string | null;
+  /**
+   * v0.16 §9 audit #4: path (relative to workspace) to the goal's active
+   * plan markdown file at `.mathran/goals/<id>.plan.md`. Written by the
+   * runner on the first round ("plan bootstrap") when one doesn't yet
+   * exist; subsequently mutated in-place by the `update_plan_item` tool.
+   * `null` / missing when bootstrap was skipped (sub-goal, opt-out) or
+   * when the bootstrap round failed without producing a usable plan.
+   */
+  planPath?: string | null;
   /** v0.16 §3 (thread support): when this goal was spawned by another
    *  goal via `spawn_sub_goal`, the parent's id. Null/omitted for top-level
    *  goals. Drives the "jump back to parent thread" link in the UI. */
@@ -306,6 +315,25 @@ export async function addSubGoalId(
     g.subGoalIds.push(subGoalId);
     await writeGoal(workspace, g);
   }
+}
+
+/**
+ * v0.16 §9 audit #4: record the goal's plan file path. Called once at
+ * bootstrap time by the runner so subsequent reads of the Goal record
+ * carry the canonical relative path without anyone having to re-derive
+ * it from the goal id. Idempotent: passing the same path again is a
+ * no-op and never re-writes the goal file.
+ */
+export async function setGoalPlanPath(
+  workspace: string,
+  goalId: string,
+  relPath: string,
+): Promise<void> {
+  const g = await readGoal(workspace, goalId);
+  if (!g) return;
+  if (g.planPath === relPath) return;
+  g.planPath = relPath;
+  await writeGoal(workspace, g);
 }
 
 /** Decide whether the goal still has budget to spend. */

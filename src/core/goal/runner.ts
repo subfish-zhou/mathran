@@ -55,6 +55,7 @@ import {
   attachConversation,
   endGoal,
   readGoal,
+  setGoalPlanPath,
   updateGoalStats,
   withinBudget,
   writeGoal,
@@ -62,6 +63,14 @@ import {
 } from "./store.js";
 import { buildGoalTools, createGoalToolHandler } from "./tools.js";
 import { buildSpawnSubGoalTool, DEFAULT_SUB_GOAL_MAX_ROUNDS } from "./sub-goal-tool.js";
+import {
+  formatPlanFragment,
+  goalPlanRelPath,
+  readGoalPlan,
+  writeGoalPlan,
+} from "./plan.js";
+import { buildUpdatePlanItemTool } from "./plan-tool.js";
+import { runPlan } from "../plan/runner.js";
 
 /**
  * Build the per-goal system prompt. Pinning objective + budget at the top
@@ -89,8 +98,17 @@ export function buildGoalSystemPrompt(input: {
    * dominate the bottom of the prompt.
    */
   memoryFragment?: string;
+  /**
+   * v0.16 §9 audit #4: pre-rendered active-plan block. Built by the
+   * caller from the persisted `.mathran/goals/<id>.plan.md` file via
+   * `formatPlanFragment` so this builder stays pure. Spliced AFTER
+   * `goalFragment` (and before `effortFragment`) so the model reads it
+   * once it has already understood its loop-policy / completion tools —
+   * the plan is *what to do*, the goal fragment is *how to behave*.
+   */
+  planFragment?: string;
 }): string {
-  const { goal, systemPromptBase, effortFragment, memoryFragment } = input;
+  const { goal, systemPromptBase, effortFragment, memoryFragment, planFragment } = input;
   const scopeLabel =
     goal.scope.kind === "global"
       ? "global"
@@ -117,6 +135,9 @@ export function buildGoalSystemPrompt(input: {
     parts.push("", memoryFragment);
   }
   parts.push("", goalFragment);
+  if (planFragment && planFragment.trim().length > 0) {
+    parts.push("", planFragment);
+  }
   if (effortFragment && effortFragment.trim().length > 0) {
     parts.push("", effortFragment);
   }
@@ -176,6 +197,34 @@ export interface RunRoundOptions {
    * `builtinTools.dispatch_subagent` is a silent no-op.
    */
   scheduler?: import("../subagent/scheduler.js").SubagentScheduler;
+  /**
+   * v0.16 §9 audit #4: control the goal-mode plan bootstrap.
+   *
+   *   - `"auto"`: on the first round of a depth-0 goal, run `runPlan`
+   *     with the goal's objective to generate an initial
+   *     `.mathran/goals/<id>.plan.md` checklist, and register the
+   *     `update_plan_item` tool from that round onward. Sub-goals
+   *     (`depth >= 1`) skip bootstrap regardless — they're bounded
+   *     side quests, not multi-step plans.
+   *   - `"never"` (default): skip bootstrap entirely. The plan file is
+   *     never created and `update_plan_item` is not registered. Default
+   *     because tests want a one-shot runner without paying for an
+   *     extra `runPlan` LLM round; production callers (CLI / serve)
+   *     opt in explicitly.
+   *
+   * Either way: when a plan file ALREADY exists on disk (resume from a
+   * crash, hand-written plan, prior bootstrap), the runner re-uses it
+   * and registers the tool regardless of this knob.
+   */
+  bootstrapPlan?: "auto" | "never";
+  /**
+   * v0.16 §9 audit #4: optional override for the bootstrap planner's LLM
+   * + model. Defaults to `opts.llm` / `goal.model`. Exposed so callers
+   * that want plan bootstrapping on a cheaper / faster model than the
+   * main goal loop can wire it independently.
+   */
+  bootstrapPlanLlm?: LLMProvider;
+  bootstrapPlanModel?: string;
 }
 
 export interface RunRoundResult {
@@ -361,6 +410,111 @@ async function finalizeWithSummary(opts: {
 }
 
 /**
+ * v0.16 §9 audit #4: plan bootstrap dispatch.
+ *
+ * Returns the plan body the goal runner should splice into the next
+ * round's system prompt (or `null` when the round should run without a
+ * plan), plus an optionally-refreshed Goal record (when `setGoalPlanPath`
+ * mutated it on disk).
+ *
+ * The bootstrap branch is intentionally best-effort: a transport failure
+ * during `runPlan` records a `status` step on the goal and returns
+ * `{ planBody: null }` so the round still runs without a plan. We don't
+ * want a flaky planner to permanently brick a goal.
+ */
+async function maybeBootstrapGoalPlan(input: {
+  workspace: string;
+  goal: Goal;
+  llm: LLMProvider;
+  model: string;
+  bootstrapMode: "auto" | "never";
+  depth: number;
+  signal?: AbortSignal;
+}): Promise<{ planBody: string | null; refreshedGoal?: Goal }> {
+  const { workspace, goal, llm, model, bootstrapMode, depth, signal } = input;
+
+  // 1) Resume / hand-edited path: if a plan file exists, use it as-is.
+  // We do this *before* honouring `bootstrapMode === "never"` so the
+  // "never" knob only suppresses *creation* — a pre-existing plan is
+  // always honoured (otherwise tests that pre-seed a plan would be
+  // surprised by an empty fragment).
+  const existing = await readGoalPlan(workspace, goal.id);
+  if (existing !== null) {
+    let refreshed: Goal | undefined;
+    const relPath = goalPlanRelPath(goal.id);
+    if (goal.planPath !== relPath) {
+      await setGoalPlanPath(workspace, goal.id, relPath);
+      refreshed = (await readGoal(workspace, goal.id)) ?? goal;
+    }
+    return { planBody: existing, refreshedGoal: refreshed };
+  }
+
+  // 2) Suppression paths.
+  if (bootstrapMode === "never") return { planBody: null };
+  if (depth >= 1) return { planBody: null };
+
+  // 3) Generate. We pass an `abortSignal` so a cancelled goal doesn't
+  // leak a planner round. On failure we record + swallow; the round
+  // continues without a plan rather than failing the goal outright.
+  let planBody: string | null = null;
+  try {
+    const result = await runPlan({
+      objective: goal.objective,
+      workspace,
+      llm,
+      model,
+      scope: goal.scope,
+      abortSignal: signal,
+    });
+    if (result.aborted) {
+      // Aborted mid-plan: don't persist a partial body, just bail.
+      await appendStep(workspace, goal.id, {
+        kind: "status",
+        payload: { planBootstrap: "aborted" },
+      });
+      return { planBody: null };
+    }
+    planBody = (result.body ?? "").trim();
+    if (planBody.length === 0) {
+      await appendStep(workspace, goal.id, {
+        kind: "status",
+        payload: { planBootstrap: "empty-body", planId: result.planId },
+      });
+      return { planBody: null };
+    }
+  } catch (err: any) {
+    await appendStep(workspace, goal.id, {
+      kind: "status",
+      payload: { planBootstrapError: String(err?.message ?? err) },
+    });
+    return { planBody: null };
+  }
+
+  // 4) Persist + record. `writeGoalPlan` is atomic; if it fails we treat
+  // it the same as a planner failure and skip the fragment for this round.
+  try {
+    await writeGoalPlan(workspace, goal.id, planBody);
+  } catch (err: any) {
+    await appendStep(workspace, goal.id, {
+      kind: "status",
+      payload: { planBootstrapWriteError: String(err?.message ?? err) },
+    });
+    return { planBody: null };
+  }
+
+  const relPath = goalPlanRelPath(goal.id);
+  await setGoalPlanPath(workspace, goal.id, relPath);
+  const refreshed = (await readGoal(workspace, goal.id)) ?? goal;
+
+  await appendStep(workspace, goal.id, {
+    kind: "status",
+    payload: { planBootstrap: "ok", planPath: relPath },
+  });
+
+  return { planBody, refreshedGoal: refreshed };
+}
+
+/**
  * Run exactly one round (one `ChatSession.send` call). Persists the round's
  * events to the goal's audit log and re-evaluates status + budget on exit.
  */
@@ -443,11 +597,41 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   });
   const memoryFragment = formatScopedMathranMemoryForPrompt(memoryEntries);
 
+  // v0.16 §9 audit #4: plan bootstrap + active-plan fragment.
+  //
+  // On the first round of a depth-0 goal we run a one-shot `runPlan`
+  // pass against the objective to produce an initial checklist, save it
+  // to `.mathran/goals/<id>.plan.md`, and from that point on splice the
+  // plan body into every round's system prompt + register the
+  // `update_plan_item` tool. Skip bootstrap when:
+  //   - caller passed `bootstrapPlan: "never"` (tests, advanced callers)
+  //   - the goal is a sub-goal (`depth >= 1`) — sub-goals are bounded
+  //     side-quests, not multi-step plans
+  //   - a plan file already exists on disk (resume / hand-written /
+  //     prior bootstrap succeeded). We re-use it as-is.
+  const planMode = opts.bootstrapPlan ?? "never";
+  const planBootstrapResult = await maybeBootstrapGoalPlan({
+    workspace,
+    goal,
+    llm: opts.bootstrapPlanLlm ?? llm,
+    model: opts.bootstrapPlanModel ?? goal.model,
+    bootstrapMode: planMode,
+    depth,
+    signal,
+  });
+  if (planBootstrapResult.refreshedGoal) {
+    goal = planBootstrapResult.refreshedGoal;
+  }
+  const planFragment = planBootstrapResult.planBody
+    ? formatPlanFragment(planBootstrapResult.planBody)
+    : "";
+
   const systemPrompt = buildGoalSystemPrompt({
     goal,
     systemPromptBase: systemPromptBase ?? buildBaseSystemPrompt(),
     effortFragment,
     memoryFragment,
+    planFragment,
   });
   const handler = createGoalToolHandler();
   // Compose the per-round tool list:
@@ -459,6 +643,9 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   //     somehow names the tool anyway (memorised name), ChatSession's
   //     own "unknown tool" branch returns a benign error tool-result
   //     (test (b) exercises this path).
+  //   - update_plan_item (ONLY when a plan file exists). Registered
+  //     after bootstrap succeeds so the model never sees the tool for a
+  //     planless goal.
   const subGoalTools: ToolSpec[] =
     depth === 0
       ? [
@@ -476,10 +663,13 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
           }),
         ]
       : [];
+  const planTools: ToolSpec[] = planBootstrapResult.planBody
+    ? [buildUpdatePlanItemTool({ workspace, goalId })]
+    : [];
   const session = new ChatSession({
     llm,
     model: goal.model,
-    tools: [...tools, ...buildGoalTools(handler), ...subGoalTools],
+    tools: [...tools, ...buildGoalTools(handler), ...subGoalTools, ...planTools],
     systemPrompt,
     toolContext,
     workspace: opts.chatWorkspace ?? opts.workspace,

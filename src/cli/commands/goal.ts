@@ -230,6 +230,11 @@ async function driveOneRound(
         edit_file: true,
         dispatch_subagent: true,
       },
+      // v0.16 §9 audit #4: opt into the plan bootstrap. The CLI is the
+      // interactive path — a human kicked off the goal, so spending one
+      // extra LLM round on an upfront checklist is a good trade for the
+      // grounding it gives every subsequent round.
+      bootstrapPlan: "auto",
     });
     if (r.text.trim().length > 0) {
       console.log("");

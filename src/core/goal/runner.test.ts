@@ -1395,3 +1395,285 @@ describe("runGoalRound ask_user goal-mode auto-reply (v0.16 §11)", () => {
     expect(round?.stats.toolCallCount).toBe(1);
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// v0.16 §9 audit #4: plan bootstrap + update_plan_item integration
+//
+// These tests run the *full* runner (not the helpers in plan.test.ts) to
+// verify that bootstrap fires on the first round, that the active-plan
+// fragment lands in the system prompt, that the `update_plan_item` tool
+// is registered when (and only when) a plan exists, and that resume
+// re-uses the on-disk plan without re-bootstrapping.
+// ───────────────────────────────────────────────────────────────────────────
+
+import { readGoalPlan, writeGoalPlan, goalPlanRelPath } from "./plan.js";
+
+describe("runGoalRound plan bootstrap (v0.16 §9 audit #4)", () => {
+  it("bootstrapPlan='auto' on first round writes .plan.md and records a status step", async () => {
+    const g = await createGoal(workspace, { objective: "build a thing", scope: { kind: "global" }, model: "fake" });
+    // Two turns: the FIRST gets consumed by `runPlan` (planner), the SECOND
+    // by the actual goal round. The planner emits a `# Plan` heading so
+    // `extractPlanBody` keeps the whole checklist.
+    const llm = fakeLLM([
+      [
+        { type: "text", delta: "# Plan\n\n## Steps\n- [ ] research the thing\n- [ ] implement the thing\n- [ ] verify\n" },
+        { type: "done", finishReason: "stop" },
+      ],
+      [
+        { type: "text", delta: "starting on step 1" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      bootstrapPlan: "auto",
+    });
+    expect(r.text).toBe("starting on step 1");
+
+    // Plan file exists on disk with the checklist body.
+    const onDisk = await readGoalPlan(workspace, g.id);
+    expect(onDisk).not.toBeNull();
+    expect(onDisk).toContain("- [ ] research the thing");
+    expect(onDisk).toContain("- [ ] implement the thing");
+
+    // Goal record now points at the plan file.
+    const refreshed = await readGoal(workspace, g.id);
+    expect(refreshed?.planPath).toBe(goalPlanRelPath(g.id));
+
+    // Audit log carries a `planBootstrap: "ok"` status step.
+    const bootstrapStep = refreshed?.steps.find(
+      (s) => s.kind === "status" && (s.payload as any).planBootstrap === "ok",
+    );
+    expect(bootstrapStep).toBeDefined();
+  });
+
+  it("bootstrapPlan defaults to 'never' (no plan file, no extra LLM round consumed)", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    // ONE turn: the goal round. If bootstrap were on, this would be eaten
+    // by the planner and the assert below ("hello") would fail.
+    const llm = fakeLLM([
+      [
+        { type: "text", delta: "hello" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    expect(r.text).toBe("hello");
+    expect(await readGoalPlan(workspace, g.id)).toBeNull();
+    const refreshed = await readGoal(workspace, g.id);
+    expect(refreshed?.planPath ?? null).toBeNull();
+  });
+
+  it("bootstrapPlan='auto' is skipped for sub-goals (depth >= 1)", async () => {
+    const g = await createGoal(workspace, { objective: "sub", scope: { kind: "global" }, model: "fake" });
+    const llm = fakeLLM([
+      [
+        { type: "text", delta: "doing the sub thing" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      bootstrapPlan: "auto",
+      depth: 1, // sub-goal: bootstrap suppressed regardless of mode
+    });
+    expect(r.text).toBe("doing the sub thing");
+    expect(await readGoalPlan(workspace, g.id)).toBeNull();
+  });
+
+  it("re-uses an existing on-disk plan without re-running runPlan (resume path)", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    // Pre-seed the plan as if a previous bootstrap had succeeded.
+    await writeGoalPlan(workspace, g.id, "# Plan\n- [ ] pre-existing step");
+    // Queue exactly ONE turn. If the runner re-bootstrapped it would also
+    // try to consume a planner turn, the queue's fallback would kick in,
+    // and the goal round would get an immediate `done` with no text — the
+    // `r.text === "resumed"` assertion below would fail.
+    const llm = fakeLLM([
+      [
+        { type: "text", delta: "resumed" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "resume",
+      llm,
+      tools: [],
+      bootstrapPlan: "auto",
+    });
+    expect(r.text).toBe("resumed");
+    // Plan body is unchanged.
+    const onDisk = await readGoalPlan(workspace, g.id);
+    expect(onDisk).toContain("- [ ] pre-existing step");
+    // No fresh `planBootstrap: "ok"` step — the runner short-circuited.
+    const refreshed = await readGoal(workspace, g.id);
+    const bootstrapStep = refreshed?.steps.find(
+      (s) => s.kind === "status" && (s.payload as any).planBootstrap === "ok",
+    );
+    expect(bootstrapStep).toBeUndefined();
+    // And the goal record was updated with the canonical relPath.
+    expect(refreshed?.planPath).toBe(goalPlanRelPath(g.id));
+  });
+
+  it("a pre-existing plan is honoured even when bootstrapPlan='never'", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    await writeGoalPlan(workspace, g.id, "# Plan\n- [ ] pre-seeded");
+    const llm = fakeLLM([
+      [
+        { type: "text", delta: "running" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      bootstrapPlan: "never",
+    });
+    expect(r.text).toBe("running");
+    // Plan still on disk + linked.
+    expect(await readGoalPlan(workspace, g.id)).toContain("- [ ] pre-seeded");
+    expect((await readGoal(workspace, g.id))?.planPath).toBe(goalPlanRelPath(g.id));
+  });
+
+  it("a planner round that produces empty body records 'empty-body' status and skips wiring", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    const llm = fakeLLM([
+      // Planner: zero text deltas → empty body
+      [{ type: "done", finishReason: "stop" }],
+      // Goal round
+      [{ type: "text", delta: "no plan, proceeding" }, { type: "done", finishReason: "stop" }],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      bootstrapPlan: "auto",
+    });
+    expect(r.text).toBe("no plan, proceeding");
+    // Goal record has no planPath, no plan file written.
+    const refreshed = await readGoal(workspace, g.id);
+    expect(refreshed?.planPath ?? null).toBeNull();
+    expect(await readGoalPlan(workspace, g.id)).toBeNull();
+    const emptyStep = refreshed?.steps.find(
+      (s) => s.kind === "status" && (s.payload as any).planBootstrap === "empty-body",
+    );
+    expect(emptyStep).toBeDefined();
+  });
+});
+
+describe("buildGoalSystemPrompt plan fragment (v0.16 §9 audit #4)", () => {
+  it("splices the active-plan fragment between the goal fragment and the effort fragment", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const prompt = buildGoalSystemPrompt({
+      goal: g,
+      systemPromptBase: "BASE",
+      planFragment: "# Active plan\n\n- [ ] step one\n- [ ] step two",
+      effortFragment: "EFFORT_CONTEXT_BLOCK",
+    });
+    const baseIdx = prompt.indexOf("BASE");
+    const goalIdx = prompt.indexOf("GOAL MODE");
+    const planIdx = prompt.indexOf("Active plan");
+    const effortIdx = prompt.indexOf("EFFORT_CONTEXT_BLOCK");
+    expect(baseIdx).toBeGreaterThanOrEqual(0);
+    expect(goalIdx).toBeGreaterThan(baseIdx);
+    expect(planIdx).toBeGreaterThan(goalIdx);
+    expect(effortIdx).toBeGreaterThan(planIdx);
+    expect(prompt).toContain("- [ ] step one");
+  });
+
+  it("omits the plan fragment entirely when planFragment is empty/whitespace", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    const prompt = buildGoalSystemPrompt({ goal: g, systemPromptBase: "BASE", planFragment: "   " });
+    expect(prompt).not.toContain("Active plan");
+  });
+});
+
+describe("runGoalRound update_plan_item registration (v0.16 §9 audit #4)", () => {
+  it("registers `update_plan_item` once a plan file exists (model can call it)", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    // Pre-seed the plan so the runner skips bootstrap and just registers the tool.
+    await writeGoalPlan(workspace, g.id, "# Plan\n\n- [ ] alpha\n- [ ] beta");
+    const llm = fakeLLM([
+      [
+        // Model calls update_plan_item to mark step 1 done.
+        { type: "tool-call", id: "u1", name: "update_plan_item", argsDelta: JSON.stringify({ index: 1, status: "done" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "alpha is done" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+    });
+    expect(r.text).toBe("alpha is done");
+    // On-disk plan reflects the toggle.
+    const onDisk = await readGoalPlan(workspace, g.id);
+    expect(onDisk).toContain("- [x] alpha");
+    expect(onDisk).toContain("- [ ] beta");
+    // The tool-call landed in the audit log.
+    const round = await readGoal(workspace, g.id);
+    const toolStep = round?.steps.find(
+      (s) => s.kind === "tool-result" && (s.payload as any).name === "update_plan_item",
+    ) as any;
+    expect(toolStep).toBeDefined();
+    expect(toolStep.payload.ok).toBe(true);
+    expect(toolStep.payload.content).toContain("marked item 1 as done");
+  });
+
+  it("does NOT register `update_plan_item` for a goal with no plan file", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
+    const llm = fakeLLM([
+      [
+        // Model tries to call update_plan_item anyway (e.g. from prompt memory).
+        { type: "tool-call", id: "u1", name: "update_plan_item", argsDelta: JSON.stringify({ index: 1, status: "done" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "fell back to text" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+    });
+    // The call resolves to the chat session's "unknown tool" branch and the
+    // round still ends cleanly.
+    expect(r.failed).toBe(false);
+    const round = await readGoal(workspace, g.id);
+    const toolStep = round?.steps.find(
+      (s) => s.kind === "tool-result" && (s.payload as any).name === "update_plan_item",
+    ) as any;
+    expect(toolStep).toBeDefined();
+    expect(toolStep.payload.ok).toBe(false);
+    expect(String(toolStep.payload.content)).toMatch(/unknown tool|not registered/i);
+  });
+});
