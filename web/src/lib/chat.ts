@@ -31,7 +31,50 @@ export async function streamChat(
   if (conversationId) body.conversationId = conversationId;
   if (model) body.model = model;
 
-  const res = await fetch(chatScopeBase(scope), {
+  await pumpSSE(
+    chatScopeBase(scope),
+    body,
+    onEvent,
+    signal,
+  );
+}
+
+/**
+ * Re-run a prior user prompt by ordinal. The server truncates history to
+ * everything before that user message, replays it into the session, then
+ * streams the new assistant turn using the same SSE envelope as `streamChat`,
+ * so callers can reuse one event handler for both flows.
+ *
+ * `userMessageIndex` is the 0-based ordinal *among user messages only*
+ * (matches the server's counting in `POST .../rerun`). The SPA derives it by
+ * counting `kind: "text"` + `role: "user"` bubbles up to the clicked bubble.
+ */
+export async function rerunChat(
+  scope: ChatScopeSpec,
+  conversationId: string,
+  userMessageIndex: number,
+  model: string | undefined,
+  onEvent: (ev: ChatEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const body: Record<string, unknown> = { userMessageIndex };
+  if (model) body.model = model;
+  const url = `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/rerun`;
+  await pumpSSE(url, body, onEvent, signal);
+}
+
+/**
+ * Shared SSE pump: POSTs `body` to `url` and dispatches `event:` / `data:`
+ * frames as typed `ChatEvent`s through `onEvent`. Extracted from `streamChat`
+ * so re-run (and any future chat-shaped endpoint) reuses the same parser.
+ */
+async function pumpSSE(
+  url: string,
+  body: Record<string, unknown>,
+  onEvent: (ev: ChatEvent) => void,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),

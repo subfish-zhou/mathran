@@ -13,7 +13,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { marked } from "marked";
-import { streamChat, type ChatEvent } from "../lib/chat.ts";
+import { streamChat, rerunChat, type ChatEvent } from "../lib/chat.ts";
 import { api, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
 import {
   historyToBubbles,
@@ -156,6 +156,68 @@ export default function ChatPanel({
     void refreshUsage();
   }, [conversationId, refreshUsage]);
 
+  // ─── Stream runner (shared by send + reRun) ───────────────────────────
+  //
+  // Both flows take a `streamPromise` that drives the SSE pump and pipe its
+  // events through the same bubble-mutating handler. Extracting this keeps
+  // re-run's UX (token streaming, tool bubbles, error surface, usage meter)
+  // identical to a fresh send without duplicating the event tape.
+  const runChatStream = useCallback(
+    async (driver: (onEvent: (ev: ChatEvent) => void) => Promise<void>) => {
+      const onEvent = (ev: ChatEvent) => {
+        if (ev.type === "session") {
+          setConversationId(ev.conversationId);
+          return;
+        }
+        setBubbles((prev) => {
+          const next = [...prev];
+          if (ev.type === "text") {
+            const last = next[next.length - 1];
+            if (last && last.kind === "assistant") {
+              next[next.length - 1] = { ...last, text: last.text + ev.delta };
+            } else {
+              next.push({ kind: "assistant", text: ev.delta });
+            }
+          } else if (ev.type === "tool-call") {
+            next.push({ kind: "tool", id: ev.id, name: ev.name, args: ev.args });
+          } else if (ev.type === "tool-result") {
+            const idx = next.findIndex(
+              (x) => x.kind === "tool" && (x as ToolBubble).id === ev.id,
+            );
+            if (idx !== -1) {
+              next[idx] = { ...(next[idx] as ToolBubble), result: ev.content, ok: ev.ok };
+            } else {
+              next.push({ kind: "tool", id: ev.id, name: ev.name, result: ev.content, ok: ev.ok });
+            }
+            next.push({ kind: "assistant", text: "" });
+          } else if (ev.type === "error") {
+            setError(ev.message);
+          }
+          return next;
+        });
+      };
+
+      try {
+        await driver(onEvent);
+      } catch (err) {
+        setError((err as Error).message);
+      } finally {
+        setBusy(false);
+        // Trim a trailing empty assistant bubble that can linger when the
+        // stream errors out before any tokens land. Without this the user
+        // sees an ellipsis-only "…" bubble that they can't get rid of.
+        setBubbles((prev) => {
+          const last = prev[prev.length - 1];
+          if (last && last.kind === "assistant" && last.text === "") return prev.slice(0, -1);
+          return prev;
+        });
+        void refreshUsage();
+        void refreshList(); // pick up the brand-new conv in the sidebar
+      }
+    },
+    [refreshUsage, refreshList],
+  );
+
   // ─── Send a message ────────────────────────────────────────────────────
   async function send(e: React.FormEvent) {
     e.preventDefault();
@@ -166,53 +228,9 @@ export default function ChatPanel({
     setBusy(true);
     setBubbles((b) => [...b, { kind: "user", text }, { kind: "assistant", text: "" }]);
 
-    const onEvent = (ev: ChatEvent) => {
-      if (ev.type === "session") {
-        setConversationId(ev.conversationId);
-        return;
-      }
-      setBubbles((prev) => {
-        const next = [...prev];
-        if (ev.type === "text") {
-          const last = next[next.length - 1];
-          if (last && last.kind === "assistant") {
-            next[next.length - 1] = { ...last, text: last.text + ev.delta };
-          } else {
-            next.push({ kind: "assistant", text: ev.delta });
-          }
-        } else if (ev.type === "tool-call") {
-          next.push({ kind: "tool", id: ev.id, name: ev.name, args: ev.args });
-        } else if (ev.type === "tool-result") {
-          const idx = next.findIndex(
-            (x) => x.kind === "tool" && (x as ToolBubble).id === ev.id,
-          );
-          if (idx !== -1) {
-            next[idx] = { ...(next[idx] as ToolBubble), result: ev.content, ok: ev.ok };
-          } else {
-            next.push({ kind: "tool", id: ev.id, name: ev.name, result: ev.content, ok: ev.ok });
-          }
-          next.push({ kind: "assistant", text: "" });
-        } else if (ev.type === "error") {
-          setError(ev.message);
-        }
-        return next;
-      });
-    };
-
-    try {
-      await streamChat(scope, text, conversationId ?? undefined, model || undefined, onEvent);
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-      setBubbles((prev) => {
-        const last = prev[prev.length - 1];
-        if (last && last.kind === "assistant" && last.text === "") return prev.slice(0, -1);
-        return prev;
-      });
-      void refreshUsage();
-      void refreshList(); // pick up the brand-new conv in the sidebar
-    }
+    await runChatStream((onEvent) =>
+      streamChat(scope, text, conversationId ?? undefined, model || undefined, onEvent),
+    );
   }
 
   // ─── New / Select / Delete ─────────────────────────────────────────────
@@ -264,7 +282,7 @@ export default function ChatPanel({
   // or more consecutive tool bubbles.
   type NonToolBubble = Extract<Bubble, { kind: "user" } | { kind: "assistant" }>;
   type Row =
-    | { kind: "single"; bubble: NonToolBubble }
+    | { kind: "single"; bubble: NonToolBubble; bubbleIdx: number }
     | { kind: "tools"; tools: ToolBubble[] };
   const rows = useMemo<Row[]>(() => {
     const out: Row[] = [];
@@ -275,12 +293,15 @@ export default function ChatPanel({
         buffer = [];
       }
     };
-    for (const b of bubbles) {
+    for (let i = 0; i < bubbles.length; i++) {
+      const b = bubbles[i];
       if (b.kind === "tool") {
         buffer.push(b);
       } else {
         flushTools();
-        out.push({ kind: "single", bubble: b });
+        // Carry the original `bubbles` index so per-row actions (re-run
+        // in particular) can locate the bubble without an O(n) lookup.
+        out.push({ kind: "single", bubble: b, bubbleIdx: i });
       }
     }
     flushTools();
@@ -325,11 +346,54 @@ export default function ChatPanel({
     setCopyFeedback(ok ? "Copied!" : "Copy failed");
   }
 
-  function reRun(text: string) {
+  // Re-run = truncate the conversation to this user prompt and re-stream a
+  //          fresh assistant reply server-side. Old behavior ("paste back
+  //          into the composer") was wrong: it forced an extra Send click,
+  //          kept the stale assistant reply in history, and double-counted
+  //          the prompt's tokens. The new path:
+  //            1. Find this bubble's index in the bubble list.
+  //            2. Count user-text bubbles before it (== the 0-based
+  //               ordinal the server uses to locate the prompt in on-disk
+  //               history; matches POST .../rerun).
+  //            3. Trim the bubble view to everything up to and including
+  //               the clicked user bubble (so the user *keeps* their
+  //               prompt on screen) and append an empty assistant bubble
+  //               that the SSE handler will fill in token-by-token.
+  //            4. Drive the shared stream runner against `rerunChat`.
+  async function reRun(bubbleIdx: number) {
     if (busy) return;
-    setInput(text);
-    // Defer one tick so the user can see what was loaded; they hit Send to commit.
-    // (Auto-submit would lose drafts in the input field.)
+    const bubble = bubbles[bubbleIdx];
+    if (!bubble || bubble.kind !== "user") return;
+    if (!conversationId) {
+      // Without a server-side conversation there is no history to
+      // truncate -- fall back to staging the text in the composer so the
+      // user can hit Send. This only triggers if reRun is wired into a
+      // transient, never-flushed bubble list.
+      setInput(bubble.text);
+      return;
+    }
+
+    // Count user-text bubbles strictly before `bubbleIdx`. Tool bubbles
+    // do not have `kind: "user"`, so this naturally matches the server's
+    // history walk (which skips system / assistant / tool messages).
+    let userMessageIndex = 0;
+    for (let i = 0; i < bubbleIdx; i++) {
+      if (bubbles[i].kind === "user") userMessageIndex++;
+    }
+
+    setError(null);
+    setBusy(true);
+    // Keep the clicked prompt visible; drop everything after it (the
+    // stale assistant reply, follow-up tool calls, later turns). Append
+    // a fresh empty assistant bubble that the stream will hydrate.
+    setBubbles((prev) => [
+      ...prev.slice(0, bubbleIdx + 1),
+      { kind: "assistant", text: "" },
+    ]);
+
+    await runChatStream((onEvent) =>
+      rerunChat(scope, conversationId, userMessageIndex, model || undefined, onEvent),
+    );
   }
 
   // ─── Render ────────────────────────────────────────────────────────────
@@ -542,7 +606,7 @@ export default function ChatPanel({
                     {row.bubble.kind === "user" && (
                       <button
                         type="button"
-                        onClick={() => reRun(row.bubble.text)}
+                        onClick={() => void reRun(row.bubbleIdx)}
                         className="rounded px-1 py-0.5 hover:bg-slate-200"
                         title="Resend this prompt"
                       >

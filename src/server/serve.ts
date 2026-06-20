@@ -990,6 +990,99 @@ function registerChatScope(
     }
   });
 
+  // POST <base>/:conversationId/rerun  — re-run from a prior user prompt (v0.16 §1).
+  //
+  // Body: `{ userMessageIndex: number, model?: string }`.
+  //
+  // `userMessageIndex` is the 0-based ordinal of the target user message *among
+  // user messages only* (system / assistant / tool messages are skipped when
+  // counting). The server truncates history to everything **before** that user
+  // message (so the kernel's own `session.send(text)` re-pushes it), replays
+  // the history into the session, then streams the new assistant turn over SSE
+  // using the exact same envelope as `POST <base>` so the SPA can reuse its
+  // existing stream parser.
+  //
+  // Why an explicit endpoint instead of "client deletes + resends"?
+  //   - One atomic flush, one disk write, one transcript rewrite.
+  //   - The truncate logic lives next to the store so we never split a
+  //     tool-call/tool-result pair (would otherwise break the next LLM call).
+  //   - The client doesn't need messageIds (LLMMessage has none), and the
+  //     user-ordinal protocol is symmetric between SPA and server.
+  app.post(`${basePath}/:conversationId/rerun`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const userMessageIndex = body?.userMessageIndex;
+    if (!Number.isInteger(userMessageIndex) || userMessageIndex < 0) {
+      return c.json({ error: "userMessageIndex must be a non-negative integer" }, 400);
+    }
+    const model = typeof body?.model === "string" ? body.model : undefined;
+
+    // Prefer the live in-memory history (mirrors /usage) so re-running right
+    // after a stream ends sees the latest turn, even before the LRU flush.
+    const live = store.peekLiveHistory(scope, id);
+    const history = live ?? (await store.readHistory(scope, id));
+    if (history === null) return c.json({ error: "conversation not found" }, 404);
+
+    // Walk the on-disk history to find the Nth user message (0-based).
+    let seen = 0;
+    let targetIdx = -1;
+    for (let i = 0; i < history.length; i++) {
+      if (history[i].role === "user") {
+        if (seen === userMessageIndex) { targetIdx = i; break; }
+        seen++;
+      }
+    }
+    if (targetIdx === -1) {
+      return c.json({ error: `user message #${userMessageIndex} not found (only ${seen} user message${seen === 1 ? "" : "s"} exist)` }, 400);
+    }
+    const targetText = history[targetIdx].content;
+    if (!targetText) return c.json({ error: "target user message is empty" }, 400);
+
+    // Truncate to everything strictly before the target user message. The
+    // kernel's `session.send(text)` will push the user message back in, so we
+    // must *not* include it ourselves — that would duplicate it.
+    const truncated = history.slice(0, targetIdx);
+
+    let session: ChatSession;
+    try {
+      session = await store.getOrCreate(scope, id, model);
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 500);
+    }
+    // Overwrite the live session history before we stream the new turn. The
+    // store's `replaceHistory` preserves leading system messages, so the user
+    // never loses memory/persona injections from /context.
+    session.replaceHistory(truncated);
+
+    return streamSSE(c, async (stream) => {
+      try {
+        // Mirror the POST <base> envelope exactly so the SPA's existing SSE
+        // reader handles re-run identically to a fresh send.
+        await stream.writeSSE({
+          event: "session",
+          data: JSON.stringify({ sessionId: id, conversationId: id, scope }),
+        });
+        for await (const ev of session.send(targetText) as AsyncIterable<ChatEvent>) {
+          await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
+        }
+        await store.flush(scope, id);
+      } catch (err: any) {
+        await stream.writeSSE({
+          event: "error",
+          data: JSON.stringify({ message: err?.message ?? String(err) }),
+        });
+      }
+    });
+  });
+
   // GET <base>/:conversationId/usage  — token + context-window stats (v0.3 §19)
   app.get(`${basePath}/:conversationId/usage`, async (c) => {
     const resolved = getScope(c);
