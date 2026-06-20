@@ -114,27 +114,9 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 7878;
 const DEFAULT_MODEL = "copilot/gpt-5.5";
 
-const SYSTEM_PROMPT = `You are mathran, a local mathematician's workstation assistant.
+import { buildBaseSystemPrompt } from "../core/prompts/index.js";
 
-You help with mathematical reasoning and Lean 4 formalization. When you want to
-verify a Lean 4 snippet compiles, call the \`lean_check\` tool with the complete
-source; read its messages and iterate. Keep prose concise.
-
-You have a set of built-in tools for working with the local filesystem and shell.
-In rough order of preference for filesystem work:
-  • \`read_file\` — reads a text file with line numbers (\`cat -n\` style). Supports
-    \`offset\` and \`limit\` for large files; walk the file with successive offsets
-    instead of shelling out to cat/head/tail/sed.
-  • \`write_file\` — creates / overwrites a file (must \`read_file\` it first if it
-    already exists). Prefer over \`echo > ...\` or \`cat <<EOF\`.
-  • \`edit_file\` — does an exact-string find-and-replace (one occurrence at a time).
-    Prefer over in-place sed/awk.
-  • \`bash\` — runs a one-shot \`bash -lc\` command. Use for git / builds / tests /
-    package management / glob+grep search. Not for plain file reads, writes, or edits.
-
-When exploring a large file you have not seen yet, read the first \`limit\` lines
-with \`read_file\`, then either re-call with a new \`offset\` to keep going, or use
-\`bash\` with \`grep -n\` to jump to a specific region.`;
+const SYSTEM_PROMPT = buildBaseSystemPrompt();
 
 /**
  * Factory the chat endpoints use to build a session.

@@ -55,8 +55,11 @@ describe("buildGoalSystemPrompt", () => {
     expect(prompt).toContain("BASE");
     expect(prompt).toContain("x objective");
     expect(prompt).toContain("effort p / e");
-    expect(prompt).toContain("Token budget: 1000");
-    expect(prompt).toContain("Round budget: 5");
+    // v0.16 §9: budget labels are now markdown-bold (e.g. "**Token budget**: 1000")
+    // because the prompt fragment was moved to src/core/prompts/. The substantive
+    // assertion is that the number is present and the label is recognisable.
+    expect(prompt).toMatch(/Token budget\W*:?\s*1000/);
+    expect(prompt).toMatch(/Round budget\W*:?\s*5/);
     expect(prompt).toMatch(/mark_done/);
     expect(prompt).toMatch(/give_up/);
   });

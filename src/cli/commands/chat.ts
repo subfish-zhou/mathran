@@ -47,11 +47,9 @@ import {
 
 const DEFAULT_MODEL = "copilot/gpt-5.5";
 
-const SYSTEM_PROMPT = `You are mathran, a local mathematician's workstation assistant.
+import { buildBaseSystemPrompt } from "../../core/prompts/index.js";
 
-You help with mathematical reasoning and Lean 4 formalization. When you want to
-verify a Lean 4 snippet compiles, call the \`lean_check\` tool with the complete
-source; read its messages and iterate. Keep prose concise.`;
+const SYSTEM_PROMPT = buildBaseSystemPrompt();
 
 export interface BuildSessionOptions {
   model?: string;

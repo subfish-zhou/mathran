@@ -43,6 +43,7 @@ import {
 import { atomicWriteFile } from "../chat/atomic-write.js";
 import { appendEffortDocument } from "../effort/store.js";
 import { loadEffortContext, formatEffortContext } from "../effort/context-builder.js";
+import { buildBaseSystemPrompt, renderGoalModeFragment } from "../prompts/index.js";
 
 import {
   appendStep,
@@ -81,31 +82,26 @@ export function buildGoalSystemPrompt(input: {
       : goal.scope.kind === "project"
       ? `project ${goal.scope.projectSlug}`
       : `effort ${goal.scope.projectSlug} / ${goal.scope.effortSlug}`;
-  const lines: string[] = [
-    systemPromptBase,
-    "",
-    `# Active goal`,
-    "",
-    `Objective:`,
-    goal.objective,
-    "",
-    `Scope: ${scopeLabel}`,
-  ];
-  if (goal.budget.tokensMax !== null) lines.push(`Token budget: ${goal.budget.tokensMax}`);
-  if (goal.budget.roundsMax !== null) lines.push(`Round budget: ${goal.budget.roundsMax}`);
-  lines.push(`Already spent: ${goal.stats.tokensUsed} tokens / ${goal.stats.roundsRun} rounds.`);
-  lines.push("");
-  lines.push(
-    `When the objective is complete, call the \`mark_done(reason)\` tool with a ` +
-      `one-line summary. If you decide the goal cannot be completed, call ` +
-      `\`give_up(reason)\`. Do not announce completion in plain text — only the ` +
-      `tool call counts.`,
-  );
+
+  // v0.16 §9: delegate the *body* to the canonical fragment so wording
+  // (loop policy, anti-loop, budget pressure, sub-goal heuristic) lives
+  // in one place. We still build the final string here because we have
+  // to splice in the per-effort fragment (which is dynamic context
+  // particular to this call site, not a stable prompt fragment).
+  const goalFragment = renderGoalModeFragment({
+    objective: goal.objective,
+    scopeLabel,
+    tokensMax: goal.budget.tokensMax ?? null,
+    roundsMax: goal.budget.roundsMax ?? null,
+    tokensUsed: goal.stats.tokensUsed,
+    roundsRun: goal.stats.roundsRun,
+  });
+
+  const parts: string[] = [systemPromptBase, "", goalFragment];
   if (effortFragment && effortFragment.trim().length > 0) {
-    lines.push("");
-    lines.push(effortFragment);
+    parts.push("", effortFragment);
   }
-  return lines.join("\n");
+  return parts.join("\n");
 }
 
 export interface RunRoundOptions {
@@ -419,7 +415,7 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
 
   const systemPrompt = buildGoalSystemPrompt({
     goal,
-    systemPromptBase: systemPromptBase ?? "You are mathran, a local mathematician's workstation assistant.",
+    systemPromptBase: systemPromptBase ?? buildBaseSystemPrompt(),
     effortFragment,
   });
   const handler = createGoalToolHandler();

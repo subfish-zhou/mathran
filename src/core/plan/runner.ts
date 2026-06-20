@@ -22,18 +22,24 @@
 import { ChatSession } from "../chat/session.js";
 import type { ChatEvent } from "../chat/index.js";
 import type { LLMProvider } from "../providers/llm.js";
+import { IDENTITY_FRAGMENT, PLAN_MODE_FRAGMENT } from "../prompts/index.js";
 
 import { PlanStore } from "./store.js";
 
 /**
  * System prompt for plan mode. Exported so tests can assert on its
  * substance and so the CLI/REST can echo it for transparency.
+ *
+ * Composed from the canonical fragments in `src/core/prompts/`. The
+ * IDENTITY fragment ensures the model still knows it's mathran (some
+ * providers behave differently if identity isn't pinned), and the
+ * PLAN_MODE_FRAGMENT carries the read-only tool policy + required
+ * output schema (## Approach, ## Steps, ## Key files, ## Risks,
+ * ## Acceptance) that downstream plan rendering relies on.
  */
-export const PLAN_SYSTEM_PROMPT = `You are mathran in PLAN MODE.
+export const PLAN_SYSTEM_PROMPT = `${IDENTITY_FRAGMENT}
 
-Your job is to investigate the user's objective and produce a concise, structured markdown PLAN. You CAN call \`search\` to query the workspace and \`read_file_summary\` to read documents, but you CANNOT write files, run shell commands, execute code, or cause any other side effects. None of those tools are available to you.
-
-When you are ready to deliver, end your response with a fenced markdown plan starting with a \`# Plan\` heading. Above that heading you MAY write a short paragraph of context; everything from \`# Plan\` onward is captured verbatim as the plan body. Use bullet steps and brief sub-headings where useful. Keep the plan actionable and focused on the objective.`;
+${PLAN_MODE_FRAGMENT}`;
 
 export interface RunPlanOpts {
   /** What the user asked you to plan. Frozen as the first user message. */
