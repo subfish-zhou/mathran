@@ -143,6 +143,29 @@ export interface ConversationAnnotations {
    *  pruned by truncate — these are user-preference scalars, not
    *  message-coordinate data. */
   uiState?: ConversationUiState;
+  /** v0.16 §11: an `ask_user` round is paused waiting for the user's
+   *  reply. The serve `/answer-ask` endpoint clears this slot once the
+   *  reply lands; SPA / CLI list endpoints can surface a chip so the
+   *  user knows a question is waiting after a tab reload. Pruning the
+   *  history (truncate / rerun) drops it because the placeholder tool
+   *  message it points at gets dropped too. */
+  pendingAsk?: PendingAskAnnotation;
+}
+
+export interface PendingAskAnnotation {
+  /** The question the model asked. Echoed back to the SPA so a tab
+   *  re-opened after the SSE stream closed can still render the prompt. */
+  question: string;
+  /** Tool-call id of the placeholder `ask_user` tool message in history.
+   *  The answer endpoint patches the placeholder's content to the reply
+   *  before resuming the round. */
+  callId: string;
+  /** Mirrors `callId` for code paths that prefer the wire-protocol name. */
+  toolCallId: string;
+  /** Unix epoch ms at which the question was posed. Lets the SPA show
+   *  a relative age ("asked 3 min ago") and lets ops alarms catch
+   *  forgotten pending asks. */
+  ts: number;
 }
 
 export interface ConversationUiState {
@@ -173,7 +196,32 @@ export async function loadAnnotations(
     const raw = await fs.readFile(file, "utf-8");
     const parsed = JSON.parse(raw) as ConversationAnnotations;
     if (parsed && typeof parsed === "object" && parsed.byBubbleIdx) {
-      return { version: 1, byBubbleIdx: parsed.byBubbleIdx };
+      // v0.16 §11: preserve every top-level sidecar field, not just
+      // `byBubbleIdx`. The original load implementation dropped `uiState`
+      // and would have dropped any new sibling we add (pendingAsk). We
+      // pick the known fields explicitly so a malformed extra key (e.g.
+      // half-written by a future migration) never leaks back into save.
+      const out: ConversationAnnotations = {
+        version: 1,
+        byBubbleIdx: parsed.byBubbleIdx,
+      };
+      if (parsed.uiState && typeof parsed.uiState === "object") {
+        out.uiState = parsed.uiState;
+      }
+      if (parsed.pendingAsk && typeof parsed.pendingAsk === "object") {
+        const pa = parsed.pendingAsk;
+        // Defensive shape check — a corrupted sidecar shouldn't take down
+        // the conversation; we just drop the bad slot.
+        if (
+          typeof pa.question === "string" &&
+          typeof pa.callId === "string" &&
+          typeof pa.toolCallId === "string" &&
+          typeof pa.ts === "number"
+        ) {
+          out.pendingAsk = pa;
+        }
+      }
+      return out;
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
@@ -215,11 +263,22 @@ export async function pruneAnnotationsFrom(
     if (Number(k) < fromIdx) next[k] = v;
     else changed = true;
   }
-  if (changed) {
-    await saveAnnotations(workspace, scope, conversationId, {
+  // v0.16 §11: a `pendingAsk` points at a placeholder tool message in the
+  // soon-to-be-truncated tail of history; once that message is gone the
+  // pending slot is meaningless. Drop it on any prune so reload doesn't
+  // resurrect a question whose tool-call no longer exists.
+  const droppingPendingAsk = Boolean(current.pendingAsk);
+  if (changed || droppingPendingAsk) {
+    const saved: ConversationAnnotations = {
       version: 1,
       byBubbleIdx: next,
-    });
+    };
+    // Preserve uiState across prune — it's coordinate-free user prefs,
+    // not message data. (Pre-v0.16 the old load impl stripped it on
+    // read, which made this a no-op; now that we round-trip it we must
+    // re-save it explicitly.)
+    if (current.uiState) saved.uiState = current.uiState;
+    await saveAnnotations(workspace, scope, conversationId, saved);
   }
 }
 

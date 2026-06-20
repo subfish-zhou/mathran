@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import { handleSlashCommand, type SlashContext } from "./chat.js";
+import { handleSlashCommand, createReadlineAskUserResolver, type SlashContext } from "./chat.js";
 import { ChatSession } from "../../core/chat/index.js";
 import type { LLMProvider, LLMRequest, LLMResponse } from "../../core/providers/llm.js";
 
@@ -323,3 +323,43 @@ describe("handleSlashCommand: /memory (v0.3 §14)", () => {
   });
 });
 
+
+describe("createReadlineAskUserResolver (v0.16 §11)", () => {
+  // Build a fake readline interface that records the prompt it was given
+  // and returns a pre-canned answer via the callback. Matches the bits
+  // of the readline.Interface surface the resolver actually touches.
+  function fakeRl(answer: string): {
+    rl: import("node:readline").Interface;
+    seenPrompts: string[];
+  } {
+    const seenPrompts: string[] = [];
+    const rl = {
+      question(prompt: string, cb: (a: string) => void) {
+        seenPrompts.push(prompt);
+        // mimic readline's async behaviour so resolvers awaiting
+        // don't accidentally resolve synchronously.
+        setImmediate(() => cb(answer));
+      },
+    } as unknown as import("node:readline").Interface;
+    return { rl, seenPrompts };
+  }
+
+  it("prompts the user with the question and returns their typed reply", async () => {
+    const { rl, seenPrompts } = fakeRl("src/foo.lean");
+    const resolver = createReadlineAskUserResolver(rl);
+    // ctx.callId is ignored by the CLI resolver — pass an empty stub.
+    const reply = await resolver("Which file?", { callId: "" });
+    expect(reply).toBe("src/foo.lean");
+    // The resolver writes the `❓ <question>` marker to stdout itself
+    // and uses a separate `› ` prompt for rl.question — so the prompt
+    // line passed into readline is the input chevron, not the question.
+    expect(seenPrompts).toEqual(["› "]);
+  });
+
+  it("passes through an empty reply (factory normalises it downstream)", async () => {
+    const { rl } = fakeRl("");
+    const resolver = createReadlineAskUserResolver(rl);
+    const reply = await resolver("?", { callId: "" });
+    expect(reply).toBe("");
+  });
+});

@@ -69,6 +69,9 @@ import {
 import {
   ChatSession,
   createLeanCheckTool,
+  AskUserPending,
+  isAskUserPending,
+  ASK_USER_PENDING_PLACEHOLDER,
   type ChatEvent,
 } from "../core/chat/index.js";
 import {
@@ -92,6 +95,7 @@ import {
   loadConversationHistory,
   type MessageAnnotation,
   type ConversationUiState,
+  type ConversationAnnotations,
 } from "../core/chat/store.js";
 import {
   createGoal,
@@ -679,6 +683,17 @@ export function defaultSessionFactory(workspace: string): ChatSessionFactory {
         write_file: true,
         edit_file: true,
         dispatch_subagent: true,
+        // v0.16 §11: the serve resolver throws `AskUserPending` to escape
+        // the LLM loop. The chat round handler catches it, persists the
+        // `pendingAsk` annotation against the conversation sidecar, and
+        // closes the SSE stream cleanly so the SPA can render the inline
+        // answer box. `POST <chatBase>/:id/answer-ask` patches the
+        // placeholder tool message with the reply and resumes the round.
+        ask_user: {
+          resolver: async (question, { callId }) => {
+            throw new AskUserPending({ question, callId });
+          },
+        },
       },
     });
   };
@@ -894,6 +909,44 @@ function registerChatScope(
         // Flush the freshly-augmented history to disk before closing the stream.
         await store.flush(scope, conversationId);
       } catch (err: any) {
+        // v0.16 §11: an `ask_user` round paused itself — not an error,
+        // intentional escape. The session has already (a) yielded the
+        // `ask_user` ChatEvent (so the SPA saw it on the wire) and
+        // (b) pushed a placeholder `tool` message keyed by `err.callId`.
+        // Persist `pendingAsk` against the conversation sidecar so a
+        // tab reload after this stream closes can still render the
+        // answer box, flush history, and close the stream cleanly
+        // instead of surfacing a misleading `event:error`.
+        if (isAskUserPending(err)) {
+          await store.flush(scope, conversationId);
+          try {
+            const sidecar = await loadAnnotations(
+              store.getWorkspace(),
+              scope,
+              conversationId,
+            );
+            await saveAnnotations(store.getWorkspace(), scope, conversationId, {
+              ...sidecar,
+              pendingAsk: {
+                question: (err as AskUserPending).question,
+                callId: (err as AskUserPending).callId,
+                toolCallId: (err as AskUserPending).callId,
+                ts: Date.now(),
+              },
+            });
+          } catch (annotErr) {
+            // Annotation failure is non-fatal; the SPA already has the
+            // question via the live `ask_user` SSE event. Logging is
+            // enough — we don't want to convert this into a 500 that
+            // would mask the real (intentional) pause.
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[mathran] failed to persist pendingAsk for ${conversationId}:`,
+              annotErr,
+            );
+          }
+          return;
+        }
         await stream.writeSSE({
           event: "error",
           data: JSON.stringify({ message: err?.message ?? String(err) }),
@@ -1085,6 +1138,35 @@ function registerChatScope(
         }
         await store.flush(scope, id);
       } catch (err: any) {
+        if (isAskUserPending(err)) {
+          // v0.16 §11: re-run paused on `ask_user`. Same handling as the
+          // initial POST <base> route — persist pendingAsk, flush, close
+          // cleanly. See that handler for the rationale.
+          await store.flush(scope, id);
+          try {
+            const sidecar = await loadAnnotations(
+              store.getWorkspace(),
+              scope,
+              id,
+            );
+            await saveAnnotations(store.getWorkspace(), scope, id, {
+              ...sidecar,
+              pendingAsk: {
+                question: (err as AskUserPending).question,
+                callId: (err as AskUserPending).callId,
+                toolCallId: (err as AskUserPending).callId,
+                ts: Date.now(),
+              },
+            });
+          } catch (annotErr) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[mathran] failed to persist pendingAsk for ${id} during rerun:`,
+              annotErr,
+            );
+          }
+          return;
+        }
         await stream.writeSSE({
           event: "error",
           data: JSON.stringify({ message: err?.message ?? String(err) }),
@@ -1165,6 +1247,174 @@ function registerChatScope(
       await pruneAnnotationsFrom(store.getWorkspace(), scope, id, pruneFromBubbleIdx);
     }
     return c.json({ ok: true, length: newHistory.length, mode });
+  });
+
+  // POST <base>/:conversationId/answer-ask  — reply to a pending `ask_user`
+  // (v0.16 §11). Body: `{ answer: string, callId?: string }`.
+  //
+  // Flow:
+  //   1. Load the conversation's pendingAsk sidecar slot. 404 if missing.
+  //   2. (If `callId` supplied) validate it matches the recorded one to
+  //      guard against a stale tab posting an answer for a question the
+  //      user already answered from a different tab.
+  //   3. Patch the placeholder `tool` message in history (matched by
+  //      `toolCallId`) to contain the user's reply. The placeholder was
+  //      pushed by ChatSession when `AskUserPending` propagated; without
+  //      this patch the next provider call would replay a useless
+  //      `"[pending: …]"` content for the answer.
+  //   4. Clear the pendingAsk annotation slot.
+  //   5. Stream `session.resume()` over SSE — same envelope as POST <base>
+  //      so the SPA can pump events through its existing reader.
+  app.post(`${basePath}/:conversationId/answer-ask`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+
+    let body: any;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid JSON body" }, 400);
+    }
+    const answer = typeof body?.answer === "string" ? body.answer : "";
+    if (!answer || answer.trim().length === 0) {
+      return c.json({ error: "answer must be a non-empty string" }, 400);
+    }
+    const claimedCallId =
+      typeof body?.callId === "string" && body.callId.length > 0
+        ? body.callId
+        : undefined;
+
+    const sidecar = await loadAnnotations(store.getWorkspace(), scope, id);
+    const pending = sidecar.pendingAsk;
+    if (!pending) {
+      return c.json(
+        { error: "no pending ask_user for this conversation" },
+        404,
+      );
+    }
+    if (claimedCallId && claimedCallId !== pending.callId) {
+      // A tab opened to a stale question; the user has already moved on.
+      // 409 (not 404) so the SPA can show "this question was answered
+      // from another tab" rather than treating it as a missing slot.
+      return c.json(
+        {
+          error: "pending ask_user has a different callId",
+          expectedCallId: pending.callId,
+          gotCallId: claimedCallId,
+        },
+        409,
+      );
+    }
+
+    let session: ChatSession;
+    try {
+      session = await store.getOrCreate(scope, id, undefined);
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 500);
+    }
+
+    // Patch the placeholder tool message to contain the user's reply.
+    // The session's history is the authoritative copy; the on-disk jsonl
+    // is rewritten on the next `store.flush`. Match on `toolCallId` because
+    // the placeholder content string is also a valid (if odd) reply users
+    // could send; matching the id is the only race-free key.
+    const history = session.history();
+    let patched = false;
+    for (let i = history.length - 1; i >= 0; i--) {
+      const msg = history[i];
+      if (
+        msg.role === "tool" &&
+        msg.toolCallId === pending.callId &&
+        msg.content === ASK_USER_PENDING_PLACEHOLDER
+      ) {
+        history[i] = { ...msg, content: answer };
+        patched = true;
+        break;
+      }
+    }
+    if (!patched) {
+      // History was rewound (truncate / rerun) under us; clear the slot
+      // and surface a 409 so the SPA can drop its inline answer UI
+      // gracefully. The annotation's `pruneAnnotationsFrom` already
+      // drops `pendingAsk` on prune, but a concurrent in-memory mutation
+      // can leave a brief window where history changes without the
+      // sidecar being rewritten yet — this is the defensive guard.
+      const cleared: ConversationAnnotations = {
+        ...sidecar,
+        pendingAsk: undefined,
+      };
+      delete (cleared as { pendingAsk?: unknown }).pendingAsk;
+      await saveAnnotations(store.getWorkspace(), scope, id, cleared);
+      return c.json(
+        { error: "placeholder tool message no longer in history" },
+        409,
+      );
+    }
+    // Replace the session's live history so the resume sees the patch.
+    session.replaceHistory(history);
+
+    // Clear the pendingAsk slot BEFORE streaming — if the resume itself
+    // hits a *new* `ask_user`, the chat round handler's catch will write
+    // a fresh pendingAsk on top.
+    const cleared: ConversationAnnotations = { ...sidecar };
+    delete (cleared as { pendingAsk?: unknown }).pendingAsk;
+    await saveAnnotations(store.getWorkspace(), scope, id, cleared);
+
+    return streamSSE(c, async (stream) => {
+      try {
+        await stream.writeSSE({
+          event: "session",
+          data: JSON.stringify({
+            sessionId: id,
+            conversationId: id,
+            scope,
+            resumedFromAsk: true,
+          }),
+        });
+        for await (const ev of session.resume() as AsyncIterable<ChatEvent>) {
+          await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
+        }
+        await store.flush(scope, id);
+      } catch (err: any) {
+        if (isAskUserPending(err)) {
+          // Resume hit a second `ask_user` — same handling as the initial
+          // POST handler. Persist the new pendingAsk and close cleanly.
+          await store.flush(scope, id);
+          try {
+            const next = await loadAnnotations(
+              store.getWorkspace(),
+              scope,
+              id,
+            );
+            await saveAnnotations(store.getWorkspace(), scope, id, {
+              ...next,
+              pendingAsk: {
+                question: (err as AskUserPending).question,
+                callId: (err as AskUserPending).callId,
+                toolCallId: (err as AskUserPending).callId,
+                ts: Date.now(),
+              },
+            });
+          } catch (annotErr) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[mathran] failed to persist nested pendingAsk for ${id}:`,
+              annotErr,
+            );
+          }
+          return;
+        }
+        await stream.writeSSE({
+          event: "error",
+          data: JSON.stringify({ message: err?.message ?? String(err) }),
+        });
+      }
+    });
   });
 
   // ─── Annotations sidecar (v0.16 §2) ────────────────────────────────────────

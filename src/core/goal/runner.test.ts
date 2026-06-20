@@ -1338,3 +1338,60 @@ describe("runGoalRound MATHRAN.md memory injection (v0.16 §9 #5)", () => {
   });
 });
 
+
+describe("runGoalRound ask_user goal-mode auto-reply (v0.16 §11)", () => {
+  it("returns the canned 'no human' reply and continues the round without persisting any pending state", async () => {
+    const g = await createGoal(workspace, {
+      objective: "prove x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+
+    // Round 1 calls ask_user; round 2 echoes the tool message back so we
+    // can assert that the canned reply showed up as the tool result.
+    const llm = fakeLLM([
+      [
+        {
+          type: "tool-call",
+          id: "ask_g1",
+          name: "ask_user",
+          argsDelta: '{"question":"What range?"}',
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "ok, going with 1..10" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+
+    // Goal mode must merge in its own ask_user resolver even when the
+    // caller passes an empty builtinTools (no opt-in needed).
+    const result = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+    });
+
+    // Round produced a final text reply (didn't bail out).
+    expect(result.failed).toBe(false);
+    expect(result.text).toContain("1..10");
+
+    // The persisted step trail should include a `tool-result` step whose
+    // result is the canned reply (no human at the keyboard).
+    const round = await readGoal(workspace, g.id);
+    const toolStep = round?.steps.find(
+      (s) => s.kind === "tool-result" && (s.payload as any).name === "ask_user",
+    ) as any;
+    expect(toolStep).toBeDefined();
+    expect(toolStep.payload.ok).toBe(true);
+    expect(toolStep.payload.content).toContain("no human");
+    expect(toolStep.payload.content).toContain("reasonable assumption");
+    // And the round did finish (vs. paused / pending) — goal mode never
+    // persists a pendingAsk slot because there's no answer-ask UI to
+    // surface it to.
+    expect(round?.stats.toolCallCount).toBe(1);
+  });
+});

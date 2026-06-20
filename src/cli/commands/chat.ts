@@ -62,6 +62,45 @@ export interface BuildSessionOptions {
    * `~/.mathran/MATHRAN.md` are read & prepended to the system prompt.
    */
   memoryWorkspace?: string;
+  /**
+   * v0.16 §11: optional `ask_user` resolver. The REPL pass a
+   * readline-backed resolver (see {@link createReadlineAskUserResolver})
+   * so the model can ask the human a clarifying question mid-turn.
+   *
+   * One-shot (`mathran -p '…'`) and external script callers omit it, in
+   * which case the tool is disabled — there's no human at the terminal
+   * to answer.
+   */
+  askUserResolver?: import("../../core/chat/index.js").AskUserResolver;
+}
+
+/**
+ * Build an `ask_user` resolver bound to a readline interface (v0.16 §11).
+ *
+ * Pauses the live prompt while awaiting input so the user's typed answer
+ * doesn't fight the prompt redraw, then re-prompts after the answer
+ * resolves. Empty input becomes `""` (the `ask_user` factory normalizes
+ * that to `"(no reply)"` for the model).
+ *
+ * Used by the interactive REPL; one-shot / piped `mathran -p` callers
+ * pass no resolver, which leaves the tool unregistered.
+ */
+export function createReadlineAskUserResolver(
+  rl: readline.Interface,
+): import("../../core/chat/index.js").AskUserResolver {
+  return async (question: string): Promise<string> => {
+    // rl.question handles pausing/resuming the prompt internally; we
+    // just have to print the marker line ourselves because the tool
+    // surface in the spec is `❓ <question>` (rl.question would print
+    // the literal `❓ <question>` as a prompt, but we want a visual
+    // newline before it so it's clearly distinct from streamed model
+    // text on the line above).
+    process.stdout.write("\n❓ " + question + "\n");
+    const answer = await new Promise<string>((resolve) => {
+      rl.question("› ", (a) => resolve(a));
+    });
+    return answer;
+  };
 }
 
 /** Build a ChatSession wired to the configured ModelRouter + lean_check tool. */
@@ -111,6 +150,13 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
       write_file: true,
       edit_file: true,
       dispatch_subagent: true,
+      // v0.16 §11: only wire `ask_user` when a resolver was provided
+      // (interactive REPL passes one; one-shot `-p` and external scripts
+      // don't — there's no human there to answer, so the tool is omitted
+      // rather than left dangling against a failing resolver).
+      ...(opts.askUserResolver
+        ? { ask_user: { resolver: opts.askUserResolver } }
+        : {}),
     },
     ...(opts.memoryWorkspace
       ? { memoryFiles: { enabled: true, workspace: opts.memoryWorkspace } }
@@ -153,6 +199,13 @@ async function renderTurn(events: AsyncIterable<ChatEvent>): Promise<void> {
       const status = ev.ok ? "ok" : "error";
       const preview = ev.content.replace(/\n/g, "\n  ");
       process.stdout.write(`\x1b[2m· ${ev.name} → ${status}\x1b[0m\n  ${preview}\n`);
+    } else if (ev.type === "ask_user") {
+      // v0.16 §11: the readline resolver already printed the question and
+      // read the answer by the time we see this event. We don't need to
+      // render anything extra; the event is here so non-CLI hosts can
+      // observe the ask. Suppress the typical tool-call/tool-result pair
+      // for ask_user so the transcript stays clean.
+      sawText = false;
     } else if (ev.type === "done") {
       if (sawText) process.stdout.write("\n");
     }
@@ -548,9 +601,24 @@ export interface ReplOptions {
 export async function runRepl(opts: ReplOptions = {}): Promise<number> {
   const workspace = process.cwd();
   const memInfo = detectMemoryFiles(workspace);
+
+  // v0.16 §11: create the readline interface BEFORE the ChatSession so
+  // we can hand the session an `ask_user` resolver bound to this rl. We
+  // pause the prompt while the resolver awaits input so the user's reply
+  // doesn't get echoed twice with the input cursor.
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: "> ",
+    historySize: 1000,
+  });
+
+  const askUserResolver = createReadlineAskUserResolver(rl);
+
   let { session, model, providerKey } = buildChatSession({
     model: opts.model,
     configPath: opts.configPath,
+    askUserResolver,
     ...(memInfo.anyPresent ? { memoryWorkspace: workspace } : {}),
   });
 
@@ -561,12 +629,6 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
     );
   }
   console.log(`Type your message. /help for commands, /exit to quit.\n`);
-
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: "› ",
-  });
 
   // Reload-prompt helper: pauses the readline, asks the user, resumes.
   const promptReload = async (): Promise<boolean> => {
@@ -601,6 +663,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
         if (result.kind === "rebuild") {
           const built = buildChatSession({
             ...result.nextBuild,
+            askUserResolver,
             ...(memInfo.anyPresent ? { memoryWorkspace: workspace } : {}),
           });
           session = built.session;

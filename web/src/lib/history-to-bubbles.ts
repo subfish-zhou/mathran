@@ -40,6 +40,15 @@ export interface ToolBubble {
   args?: string;
   result?: string;
   ok?: boolean;
+  /** v0.16 §11: this tool call is `ask_user` and is paused waiting for
+   *  the user's reply. Set when the SSE stream emits `ask_user` or when
+   *  the conversation loads with a `pendingAsk` sidecar slot. Cleared
+   *  once the answer is submitted (the placeholder tool message is
+   *  patched with the reply, so this bubble re-renders as a normal
+   *  tool-result). */
+  askPending?: {
+    question: string;
+  };
 }
 
 export interface TextBubble {

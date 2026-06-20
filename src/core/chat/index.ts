@@ -22,4 +22,13 @@ export {
   createDispatchSubagentTool,
   type DispatchSubagentToolOptions,
 } from "./tools/dispatch-subagent.js";
+export {
+  createAskUserTool,
+  AskUserPending,
+  isAskUserPending,
+  ASK_USER_PENDING_PLACEHOLDER,
+  ASK_USER_GOAL_AUTO_REPLY,
+  type AskUserResolver,
+  type AskUserToolOptions,
+} from "./tools/ask-user.js";
 export { renderTranscriptMarkdown, type TranscriptMeta } from "./transcript.js";

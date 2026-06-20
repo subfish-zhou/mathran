@@ -17,6 +17,7 @@ import {
   streamChat,
   rerunChat,
   truncateChat,
+  streamAnswerAsk,
   fetchAnnotations,
   patchAnnotation,
   patchUiState,
@@ -188,7 +189,26 @@ export default function ChatPanel({
     ])
       .then(([data, ann, goalLookup]) => {
         if (cancelled) return;
-        setBubbles(historyToBubbles(data.history));
+        // v0.16 §11: if the conversation paused on an `ask_user`, the
+        // sidecar carries the pending question keyed by tool-call id.
+        // Re-stamp `askPending` onto the matching tool bubble so the
+        // inline answer UI renders on reload (the original SSE event
+        // was consumed by a since-closed stream).
+        const initialBubbles = historyToBubbles(data.history);
+        const pending = ann.pendingAsk;
+        if (pending) {
+          for (let i = 0; i < initialBubbles.length; i++) {
+            const b = initialBubbles[i];
+            if (b.kind === "tool" && b.id === pending.callId) {
+              initialBubbles[i] = {
+                ...b,
+                askPending: { question: pending.question },
+              };
+              break;
+            }
+          }
+        }
+        setBubbles(initialBubbles);
         setAnnotations(ann);
         setOwningGoal(goalLookup ? goalLookup.goal : null);
         // v0.16 §4: restore persisted UI state. Apply scroll on the next
@@ -375,11 +395,46 @@ export default function ChatPanel({
               (x) => x.kind === "tool" && (x as ToolBubble).id === ev.id,
             );
             if (idx !== -1) {
-              next[idx] = { ...(next[idx] as ToolBubble), result: ev.content, ok: ev.ok };
+              // Clear any leftover askPending flag from a prior round that
+              // happened to recycle this tool-call id (paranoia — the
+              // server mints fresh ids per call, but cheap to defend).
+              const prevTool = next[idx] as ToolBubble;
+              const updated: ToolBubble = {
+                ...prevTool,
+                result: ev.content,
+                ok: ev.ok,
+              };
+              delete updated.askPending;
+              next[idx] = updated;
             } else {
               next.push({ kind: "tool", id: ev.id, name: ev.name, result: ev.content, ok: ev.ok });
             }
             next.push({ kind: "assistant", text: "" });
+          } else if (ev.type === "ask_user") {
+            // v0.16 §11: the round is paused waiting for the user's
+            // reply. Mark the matching tool bubble (which arrived as a
+            // `tool-call` SSE event a beat earlier) so the renderer
+            // shows the inline answer box. If for any reason the
+            // tool-call event didn't land first, synthesize a bubble
+            // so the answer UI still shows up.
+            const idx = next.findIndex(
+              (x) => x.kind === "tool" && (x as ToolBubble).id === ev.id,
+            );
+            if (idx !== -1) {
+              const prevTool = next[idx] as ToolBubble;
+              next[idx] = {
+                ...prevTool,
+                askPending: { question: ev.question },
+              };
+            } else {
+              next.push({
+                kind: "tool",
+                id: ev.id,
+                name: ev.name,
+                args: JSON.stringify({ question: ev.question }),
+                askPending: { question: ev.question },
+              });
+            }
           } else if (ev.type === "error") {
             setError(ev.message);
           }
@@ -478,6 +533,36 @@ export default function ChatPanel({
       streamChat(scope, promptText, conversationId ?? undefined, model || undefined, onEvent, signal),
     );
   }
+
+  // v0.16 §11: submit a reply to a paused `ask_user` call. Routed through
+  // the same SSE driver so the UI behaves identically to a fresh send —
+  // tokens stream, tool calls show up, the usage meter refreshes — while
+  // the placeholder tool message gets patched server-side before the
+  // resumed round runs. No-op if the conversation id isn't pinned yet
+  // (shouldn't happen because the ask round itself minted it, but defend).
+  const handleAnswerAsk = useCallback(
+    async (callId: string, answer: string) => {
+      if (!conversationId) return;
+      // Clear the askPending flag optimistically so the textarea unmounts
+      // immediately on Send — if the resume itself produces a *new*
+      // ask_user, the SSE handler will re-stamp the flag on the fresh
+      // tool-call bubble.
+      setBubbles((prev) =>
+        prev.map((b) => {
+          if (b.kind === "tool" && b.id === callId && b.askPending) {
+            const updated: ToolBubble = { ...b, result: answer, ok: true };
+            delete updated.askPending;
+            return updated;
+          }
+          return b;
+        }),
+      );
+      await runChatStream((onEvent, signal) =>
+        streamAnswerAsk(scope, conversationId, callId, answer, onEvent, signal),
+      );
+    },
+    [conversationId, runChatStream, scope],
+  );
 
   // ─── New / Select / Delete ─────────────────────────────────────────────
   function newChat() {
@@ -1394,6 +1479,7 @@ export default function ChatPanel({
                   tools={row.tools}
                   subGoalIdByToolId={subGoalIdByToolId}
                   onOpenThread={handleOpenThread}
+                  onAnswerAsk={handleAnswerAsk}
                 />
               );
             }

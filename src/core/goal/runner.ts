@@ -33,6 +33,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { ChatSession, type ToolExecuteContext, type ToolSpec } from "../chat/session.js";
+import { ASK_USER_GOAL_AUTO_REPLY } from "../chat/tools/ask-user.js";
 import type { LLMMessage, LLMProvider } from "../providers/llm.js";
 import type { ChatEvent } from "../chat/index.js";
 import {
@@ -482,7 +483,17 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     systemPrompt,
     toolContext,
     workspace: opts.chatWorkspace ?? opts.workspace,
-    ...(opts.builtinTools ? { builtinTools: opts.builtinTools } : {}),
+    // v0.16 §11: merge in a goal-mode `ask_user` resolver on top of any
+    // caller-supplied `builtinTools`. Goal mode runs unattended — there's
+    // no human at the keyboard — so the resolver returns the canned
+    // "proceed with assumption" reply, which trains the model to make a
+    // documented assumption rather than block on missing info.
+    builtinTools: {
+      ...(opts.builtinTools ?? {}),
+      ask_user: {
+        resolver: async () => ASK_USER_GOAL_AUTO_REPLY,
+      },
+    },
     ...(opts.scheduler ? { subagentScheduler: opts.scheduler, scheduler: opts.scheduler } : {}),
   });
   if (history.length > 0) session.replaceHistory(history);

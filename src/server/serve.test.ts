@@ -12,7 +12,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 
 import { startServer, defaultSessionFactory, buildScopedSystemPrompt, appendPersistentContext, type RunningServer } from "./serve.js";
-import { ChatSession } from "../core/chat/index.js";
+import { ChatSession, AskUserPending } from "../core/chat/index.js";
 import type { ConversationAnnotations } from "../core/chat/store.js";
 import type {
   LLMProvider,
@@ -2129,5 +2129,229 @@ describe("plan REST (v0.16 §9 audit #2)", () => {
   it("GET /api/plans/:id/stream 404s when no run is in flight", async () => {
     const res = await fetch(`${base}/api/plans/plan-nostream/stream`);
     expect(res.status).toBe(404);
+  });
+});
+
+// ─── ask_user serve flow (v0.16 §11) ────────────────────────────────────
+// End-to-end on the wire: a model that calls `ask_user` triggers the
+// serve resolver's `AskUserPending`, the SSE stream emits `ask_user`
+// then closes, the sidecar carries `pendingAsk`, and POST /answer-ask
+// resumes the round with the reply substituted for the tool result.
+describe("POST /api/chat + /:id/answer-ask (v0.16 §11)", () => {
+  // Two-turn LLM: round 1 calls ask_user; round 2 echoes the reply it
+  // saw in the tool message so we can prove the placeholder was patched
+  // before the resume hit the provider.
+  function askingLlm(): LLMProvider {
+    let turn = 0;
+    return {
+      async describe() {
+        return { name: "asking" };
+      },
+      async chat(req: LLMRequest): Promise<LLMResponse> {
+        const t = turn++;
+        return {
+          async *stream(): AsyncIterable<LLMStreamChunk> {
+            if (t === 0) {
+              yield {
+                type: "tool-call",
+                id: "ask_call_1",
+                name: "ask_user",
+                argsDelta: '{"question":"Which file?"}',
+              };
+              yield { type: "done", finishReason: "tool_calls" };
+              return;
+            }
+            // Round 2: surface whatever reply the server fed back as a
+            // tool message so the test can assert the patch happened.
+            const toolMsg = req.messages.find(
+              (m) => m.role === "tool" && m.toolCallId === "ask_call_1",
+            );
+            yield { type: "text", delta: `you said: ${toolMsg?.content ?? "<none>"}` };
+            yield { type: "done", finishReason: "stop" };
+          },
+        };
+      },
+    };
+  }
+
+  function parseSSE(raw: string): Array<{ event?: string; data: any }> {
+    const out: Array<{ event?: string; data: any }> = [];
+    for (const block of raw.split(/\n\n+/)) {
+      const lines = block.split("\n");
+      let event: string | undefined;
+      let dataLine: string | undefined;
+      for (const l of lines) {
+        if (l.startsWith("event:")) event = l.slice("event:".length).trim();
+        else if (l.startsWith("data:")) dataLine = l.slice("data:".length).trim();
+      }
+      if (dataLine === undefined) continue;
+      try {
+        out.push({ event, data: JSON.parse(dataLine) });
+      } catch {
+        out.push({ event, data: dataLine });
+      }
+    }
+    return out;
+  }
+
+  it("first round emits ask_user + persists pendingAsk; answer-ask resumes with the reply patched in", async () => {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-serve-ask-"));
+    await fs.writeFile(
+      path.join(ws, "config.toml"),
+      'defaultModel = "openai/gpt-4o"\n',
+      "utf-8",
+    );
+    const local = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace: ws,
+      // Mint the session with the serve-mode ask_user resolver wired in
+      // (matches the default factory path; this test asserts behaviour
+      // independent of which factory built the session).
+      chatSessionFactory: ({ model }) =>
+        new ChatSession({
+          llm: askingLlm(),
+          model,
+          builtinTools: {
+            ask_user: {
+              resolver: async (question, { callId }) => {
+                throw new AskUserPending({ question, callId });
+              },
+            },
+          },
+        }),
+    });
+    try {
+      const conversationId = "ask-int-1";
+      const r1 = await fetch(`${local.url}/api/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "go", sessionId: conversationId }),
+      });
+      expect(r1.status).toBe(200);
+      const evts1 = parseSSE(await r1.text());
+      const askEv = evts1.find((e) => e.event === "ask_user");
+      expect(askEv).toBeDefined();
+      expect(askEv!.data.question).toBe("Which file?");
+      expect(askEv!.data.id).toBe("ask_call_1");
+      // No error frame and no done frame — the stream paused intentionally.
+      expect(evts1.find((e) => e.event === "error")).toBeUndefined();
+      expect(evts1.find((e) => e.event === "done")).toBeUndefined();
+
+      // Sidecar must carry pendingAsk so a reload would re-render the box.
+      const annResp = await fetch(
+        `${local.url}/api/chat/${conversationId}/annotations`,
+      );
+      expect(annResp.status).toBe(200);
+      const ann = (await annResp.json()) as any;
+      expect(ann.pendingAsk).toMatchObject({
+        question: "Which file?",
+        callId: "ask_call_1",
+        toolCallId: "ask_call_1",
+      });
+
+      // Reply. Resume should swap the placeholder for the reply text and
+      // surface a text delta that quotes it back.
+      const r2 = await fetch(
+        `${local.url}/api/chat/${conversationId}/answer-ask`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ answer: "src/foo.lean", callId: "ask_call_1" }),
+        },
+      );
+      expect(r2.status).toBe(200);
+      const evts2 = parseSSE(await r2.text());
+      const text = evts2
+        .filter((e) => e.event === "text")
+        .map((e) => e.data.delta)
+        .join("");
+      expect(text).toBe("you said: src/foo.lean");
+      expect(evts2.find((e) => e.event === "done")).toBeDefined();
+
+      // pendingAsk must be cleared after a successful resume.
+      const annResp2 = await fetch(
+        `${local.url}/api/chat/${conversationId}/annotations`,
+      );
+      const ann2 = (await annResp2.json()) as any;
+      expect(ann2.pendingAsk).toBeUndefined();
+    } finally {
+      await local.close();
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("404s when there is no pendingAsk slot", async () => {
+    const res = await fetch(`${base}/api/chat/never-asked/answer-ask`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ answer: "hi" }),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("400s on an empty answer", async () => {
+    const res = await fetch(`${base}/api/chat/whatever/answer-ask`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ answer: "   " }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("409s when a stale tab submits an answer with a different callId", async () => {
+    // Trigger an ask, then POST answer-ask with the wrong callId so the
+    // server can prove its mismatch guard fires (without overwriting
+    // pending state).
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-serve-ask409-"));
+    await fs.writeFile(
+      path.join(ws, "config.toml"),
+      'defaultModel = "openai/gpt-4o"\n',
+      "utf-8",
+    );
+    const local = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace: ws,
+      chatSessionFactory: ({ model }) =>
+        new ChatSession({
+          llm: askingLlm(),
+          model,
+          builtinTools: {
+            ask_user: {
+              resolver: async (question, { callId }) => {
+                throw new AskUserPending({ question, callId });
+              },
+            },
+          },
+        }),
+    });
+    try {
+      const conversationId = "ask-stale-1";
+      const r1 = await fetch(`${local.url}/api/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "go", sessionId: conversationId }),
+      });
+      await r1.text(); // drain
+
+      const r2 = await fetch(
+        `${local.url}/api/chat/${conversationId}/answer-ask`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            answer: "stale tab guess",
+            callId: "someone_elses_call_id",
+          }),
+        },
+      );
+      expect(r2.status).toBe(409);
+      const body = (await r2.json()) as any;
+      expect(body.expectedCallId).toBe("ask_call_1");
+    } finally {
+      await local.close();
+      await fs.rm(ws, { recursive: true, force: true });
+    }
   });
 });

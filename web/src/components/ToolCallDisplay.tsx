@@ -138,16 +138,27 @@ interface ToolCallDisplayProps {
   subGoalIdForThisCall?: string | null;
   /** Called when the user clicks "Open thread" on a spawn_sub_goal card. */
   onOpenThread?: (goalId: string) => void;
+  /** v0.16 §11: called when the user submits a reply to an `ask_user`
+   *  pause. Receives the tool-call id (so the parent can dispatch
+   *  `streamAnswerAsk(…, callId, answer, …)`) and the typed reply.
+   *  When omitted, the answer-box renders disabled — useful for
+   *  history-only views (search results, previews) where resuming
+   *  isn't meaningful. */
+  onAnswerAsk?: (callId: string, answer: string) => void | Promise<void>;
 }
 
 export function ToolCallDisplay({
   toolCall,
   subGoalIdForThisCall,
   onOpenThread,
+  onAnswerAsk,
 }: ToolCallDisplayProps): JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const [startedAt] = useState<number>(() => Date.now());
   const [completedAt, setCompletedAt] = useState<number | null>(null);
+  // v0.16 §11: local draft for the inline ask_user answer.
+  const [askDraft, setAskDraft] = useState("");
+  const [askSubmitting, setAskSubmitting] = useState(false);
 
   useEffect(() => {
     if (toolCall.result !== undefined && completedAt === null) {
@@ -162,13 +173,16 @@ export function ToolCallDisplay({
   const summary = summarize(toolCall.name, toolCall.args);
 
   const isPending = toolCall.ok === undefined && toolCall.result === undefined;
+  const isAskPending = Boolean(toolCall.askPending);
   const isFailed = toolCall.ok === false;
 
   const containerClass = isFailed
     ? "border-red-300 bg-red-50"
-    : isPending
-      ? "border-violet-300 bg-violet-50"
-      : "border-amber-200 bg-amber-50";
+    : isAskPending
+      ? "border-amber-400 bg-amber-50"
+      : isPending
+        ? "border-violet-300 bg-violet-50"
+        : "border-amber-200 bg-amber-50";
 
   return (
     <div className={`my-1.5 overflow-hidden rounded-md border text-xs ${containerClass}`}>
@@ -177,7 +191,7 @@ export function ToolCallDisplay({
         onClick={() => setExpanded((v) => !v)}
         className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-black/5"
       >
-        {isPending ? (
+        {isPending && !isAskPending ? (
           <svg
             className="w-3 h-3 animate-spin text-violet-600 shrink-0"
             viewBox="0 0 24 24"
@@ -214,8 +228,11 @@ export function ToolCallDisplay({
             — {summary}
           </span>
         )}
-        {isPending && (
+        {isPending && !isAskPending && (
           <span className="text-violet-600 italic shrink-0">Running…</span>
+        )}
+        {isAskPending && (
+          <span className="text-amber-700 italic shrink-0">Awaiting reply…</span>
         )}
         {!isPending && durationMs !== null && (
           <span className="text-slate-500 tabular-nums shrink-0 text-[10px]">
@@ -249,6 +266,67 @@ export function ToolCallDisplay({
           {expanded ? "▾" : "▸"}
         </span>
       </button>
+
+      {/* v0.16 §11: inline `ask_user` answer box. Always visible while
+          `askPending` is set so the user doesn't have to expand the card
+          to reply. Submitting calls back into ChatPanel which dispatches
+          `streamAnswerAsk` and clears `askPending` once the resumed
+          round emits its first tool-result. */}
+      {toolCall.askPending && (
+        <div className="border-t border-amber-200 bg-amber-100/40 px-3 py-2 space-y-2">
+          <div className="text-[11px] font-medium text-amber-900">
+            ❓ {toolCall.askPending.question}
+          </div>
+          <textarea
+            value={askDraft}
+            onChange={(e) => setAskDraft(e.target.value)}
+            disabled={askSubmitting || !onAnswerAsk}
+            rows={2}
+            placeholder="Type your reply… (Ctrl+Enter to send)"
+            className="w-full resize-y rounded border border-amber-300 bg-white px-2 py-1 text-[12px] text-slate-800 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:bg-slate-100 disabled:text-slate-500"
+            onKeyDown={(e) => {
+              if (
+                (e.key === "Enter" && (e.ctrlKey || e.metaKey)) &&
+                !askSubmitting &&
+                onAnswerAsk &&
+                askDraft.trim().length > 0
+              ) {
+                e.preventDefault();
+                setAskSubmitting(true);
+                Promise.resolve(onAnswerAsk(toolCall.id, askDraft))
+                  .finally(() => {
+                    // Don't clear the draft on completion — the bubble
+                    // re-renders without `askPending` once the round
+                    // resumes, which unmounts this widget entirely.
+                    setAskSubmitting(false);
+                  });
+              }
+            }}
+          />
+          <div className="flex items-center justify-end gap-2">
+            {!onAnswerAsk && (
+              <span className="text-[10px] text-slate-500 italic">
+                Answering disabled in this view
+              </span>
+            )}
+            <button
+              type="button"
+              disabled={
+                askSubmitting || !onAnswerAsk || askDraft.trim().length === 0
+              }
+              onClick={() => {
+                if (!onAnswerAsk) return;
+                setAskSubmitting(true);
+                Promise.resolve(onAnswerAsk(toolCall.id, askDraft))
+                  .finally(() => setAskSubmitting(false));
+              }}
+              className="rounded bg-amber-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-amber-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+            >
+              {askSubmitting ? "Sending…" : "Send reply"}
+            </button>
+          </div>
+        </div>
+      )}
 
       {expanded && (
         <div className="border-t border-black/10 px-3 py-2 space-y-2">

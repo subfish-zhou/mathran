@@ -44,6 +44,13 @@ import { createReadFileTool } from "./tools/read-file.js";
 import { createWriteFileTool } from "./tools/write-file.js";
 import { createEditFileTool } from "./tools/edit-file.js";
 import { createDispatchSubagentTool } from "./tools/dispatch-subagent.js";
+import {
+  AskUserPending,
+  ASK_USER_PENDING_PLACEHOLDER,
+  createAskUserTool,
+  isAskUserPending,
+  type AskUserResolver,
+} from "./tools/ask-user.js";
 import * as path from "node:path";
 
 /**
@@ -68,6 +75,13 @@ export interface ToolExecuteContext {
   recordRead?: (path: string) => void;
   /** v0.5 §7 — query whether a path has been read this session. */
   hasRead?: (path: string) => boolean;
+  /** v0.16 §11 — provider-emitted tool-call id for this invocation, set
+   *  by the session per call. The `ask_user` tool forwards it to its
+   *  resolver so a serve host can build an `AskUserPending` carrying a
+   *  stable placeholder key the resume endpoint can patch back into
+   *  history. Optional because callers outside the session loop (tests,
+   *  direct `.execute()` probes) may not set it. */
+  toolCallId?: string;
 }
 
 /** A tool the model can invoke. Parameters are a JSON-schema object. */
@@ -93,6 +107,16 @@ export type ChatEvent =
   | { type: "text"; delta: string }
   | { type: "tool-call"; id: string; name: string; args: string }
   | { type: "tool-result"; id: string; name: string; ok: boolean; content: string }
+  | {
+      /** v0.16 §11 — the model called `ask_user`; the host (serve) will
+       *  persist a pending annotation and end the stream so the user can
+       *  reply via `POST /answer-ask`. CLI / goal hosts never see this
+       *  event because their resolvers return synchronously. */
+      type: "ask_user";
+      id: string;
+      name: string;
+      question: string;
+    }
   | {
       type: "done";
       finishReason: Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
@@ -182,6 +206,14 @@ export interface ChatSessionOptions {
     write_file?: boolean;
     edit_file?: boolean;
     dispatch_subagent?: boolean;
+    /**
+     * v0.16 §11 — host-specific `ask_user` resolver. Pass the readline
+     * resolver from CLI, the `throw new AskUserPending` resolver from
+     * serve, the canned-reply resolver from goal mode. Omit (or set
+     * `undefined`) to disable the tool. Unlike the boolean flags above,
+     * this is an object because the resolver differs per host.
+     */
+    ask_user?: { resolver: AskUserResolver };
   };
   /**
    * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
@@ -503,6 +535,13 @@ export class ChatSession {
         );
       }
     }
+    // v0.16 §11: per-host `ask_user` resolver. The factory injects the
+    // host's resolver (CLI: readline; serve: throw `AskUserPending`;
+    // goal: canned reply). Tool description / schema is host-agnostic so
+    // the model sees the same affordance everywhere.
+    if (cfg.ask_user && cfg.ask_user.resolver) {
+      out.push(createAskUserTool({ resolver: cfg.ask_user.resolver }));
+    }
     return out;
   }
 
@@ -782,6 +821,38 @@ export class ChatSession {
 
     this.messages.push({ role: "user", content: userText });
 
+    yield* this.runRounds(opts);
+  }
+
+  /**
+   * Resume the LLM loop *without* pushing a new user message (v0.16 §11).
+   *
+   * Use this after the caller has mutated `messages` in place — the
+   * canonical case is the serve `/answer-ask` endpoint patching the
+   * placeholder tool result for a pending `ask_user` call to the user's
+   * reply, then resuming the same round.
+   *
+   * Skips both auto-compact (the in-place mutation just happened; we'd
+   * lose the freshly-patched tool result) and the user-message push
+   * (resume callers continue mid-round, not at a turn boundary).
+   * Otherwise identical to `send` — same tool-call loop, same event
+   * stream, same abort handling.
+   */
+  async *resume(opts: SendOpts = {}): AsyncIterable<ChatEvent> {
+    const signal = opts.signal;
+    if (signal?.aborted) throw abortError();
+    yield* this.runRounds(opts);
+  }
+
+  /**
+   * Internal shared loop body used by both `send` and `resume`. Keeping
+   * the tool-call round-trip + provider-validation invariants in one
+   * place means adding new entry points (resume, slash-command-driven
+   * LLM call, …) doesn't drift on history bookkeeping.
+   */
+  private async *runRounds(opts: SendOpts): AsyncIterable<ChatEvent> {
+    const signal = opts.signal;
+
     for (let round = 0; round <= this.maxToolRounds; round++) {
       // Abort between rounds (history is well-formed here: every prior
       // assistant tool-call has a paired tool result).
@@ -936,6 +1007,7 @@ export class ChatSession {
             try {
               const callCtx: ToolExecuteContext = {
                 ...this.toolContext,
+                toolCallId: call.id,
                 recordRead: (p: string) =>
                   this.readPaths.add(
                     path.isAbsolute(p)
@@ -951,6 +1023,40 @@ export class ChatSession {
               };
               result = await tool.execute(parsed, callCtx);
             } catch (err: any) {
+              if (isAskUserPending(err)) {
+                // v0.16 §11: bail out of the LLM loop so the serve route can
+                // persist a `pendingAsk` annotation and end the SSE stream.
+                // Before re-throwing we must keep history well-formed: every
+                // assistant `tool_call` MUST be paired with a tool message,
+                // otherwise the next provider call rejects the conversation.
+                // Push a placeholder tool message for this call (the resume
+                // endpoint patches its content to the user's reply) AND for
+                // any not-yet-executed tool calls in the same batch — closing
+                // the batch is the only way to satisfy provider validation
+                // when we abort mid-loop.
+                this.messages.push({
+                  role: "tool",
+                  content: ASK_USER_PENDING_PLACEHOLDER,
+                  toolCallId: call.id,
+                  name: call.name,
+                });
+                for (let ri = ci + 1; ri < toolCalls.length; ri++) {
+                  const pending = toolCalls[ri];
+                  this.messages.push({
+                    role: "tool",
+                    content: "[skipped: prior ask_user pending]",
+                    toolCallId: pending.id,
+                    name: pending.name,
+                  });
+                }
+                yield {
+                  type: "ask_user",
+                  id: call.id,
+                  name: call.name,
+                  question: (err as AskUserPending).question,
+                };
+                throw err;
+              }
               result = { ok: false, content: `error: ${err?.message ?? String(err)}` };
             }
           } else {

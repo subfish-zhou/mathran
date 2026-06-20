@@ -5,10 +5,20 @@
 import { chatScopeBase, type ChatScopeSpec } from "./api.ts";
 
 export type ChatEvent =
-  | { type: "session"; sessionId: string; conversationId: string }
+  | { type: "session"; sessionId: string; conversationId: string; resumedFromAsk?: boolean }
   | { type: "text"; delta: string }
   | { type: "tool-call"; id: string; name: string; args: string }
   | { type: "tool-result"; id: string; name: string; ok: boolean; content: string }
+  | {
+      /** v0.16 §11 — the model called `ask_user`. The serve stream emits
+       *  this just before closing; the SPA renders an inline answer box
+       *  on the matching tool bubble. Resume the round via
+       *  {@link streamAnswerAsk}. */
+      type: "ask_user";
+      id: string;
+      name: string;
+      question: string;
+    }
   | { type: "done"; finishReason: string }
   | { type: "error"; message: string };
 
@@ -73,6 +83,31 @@ export async function rerunChat(
     body.pruneFromBubbleIdx = pruneFromBubbleIdx;
   }
   const url = `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/rerun`;
+  await pumpSSE(url, body, onEvent, signal);
+}
+
+/**
+ * v0.16 §11 — reply to a pending `ask_user` call and resume the round.
+ *
+ * Streams the resumed turn over SSE using the same envelope as
+ * {@link streamChat} / {@link rerunChat}, so the SPA's existing event
+ * reducer handles it without a special branch (besides clearing the
+ * pending-ask UI on the first event — typically `session`).
+ *
+ * `callId` is the tool-call id of the placeholder; the server cross-checks
+ * it against the conversation's persisted `pendingAsk` slot to guard
+ * against stale tabs answering an already-resolved question.
+ */
+export async function streamAnswerAsk(
+  scope: ChatScopeSpec,
+  conversationId: string,
+  callId: string,
+  answer: string,
+  onEvent: (ev: ChatEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const body: Record<string, unknown> = { answer, callId };
+  const url = `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/answer-ask`;
   await pumpSSE(url, body, onEvent, signal);
 }
 
@@ -212,6 +247,20 @@ export interface ConversationAnnotations {
   version: 1;
   byBubbleIdx: Record<string, MessageAnnotation>;
   uiState?: ConversationUiState;
+  /** v0.16 §11 — an `ask_user` round is paused waiting for the user's
+   *  reply. The SPA renders an inline answer box keyed by `callId` on
+   *  the matching tool bubble; submitting the reply hits
+   *  `POST <chatBase>/:id/answer-ask` and clears this slot. Present
+   *  on reload so a tab opened after the original SSE stream closed
+   *  can still render the answer affordance. */
+  pendingAsk?: PendingAskAnnotation;
+}
+
+export interface PendingAskAnnotation {
+  question: string;
+  callId: string;
+  toolCallId: string;
+  ts: number;
 }
 
 export async function fetchAnnotations(

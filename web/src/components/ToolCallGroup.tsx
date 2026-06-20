@@ -31,12 +31,16 @@ interface ToolCallGroupProps {
   /** Tool-call id → sub-goal id, for spawn_sub_goal entries (v0.16 §3). */
   subGoalIdByToolId?: Record<string, string>;
   onOpenThread?: (goalId: string) => void;
+  /** v0.16 §11: passed through to each {@link ToolCallDisplay} so an
+   *  `ask_user` card inside the cluster can render its answer box. */
+  onAnswerAsk?: (callId: string, answer: string) => void | Promise<void>;
 }
 
 export default function ToolCallGroup({
   tools,
   subGoalIdByToolId,
   onOpenThread,
+  onAnswerAsk,
 }: ToolCallGroupProps) {
   const [collapsed, setCollapsed] = useState(false);
 
@@ -46,6 +50,7 @@ export default function ToolCallGroup({
       toolCall={t}
       subGoalIdForThisCall={subGoalIdByToolId?.[t.id] ?? null}
       onOpenThread={onOpenThread}
+      onAnswerAsk={onAnswerAsk}
     />
   );
 
@@ -53,7 +58,14 @@ export default function ToolCallGroup({
   if (tools.length === 1) {
     // Single tool: skip the wrapper entirely, render the card raw so the UX
     // is identical to v0.13 for the common case.
-    return renderOne(tools[0]!);
+    return (
+      <ToolCallDisplay
+        toolCall={tools[0]!}
+        subGoalIdForThisCall={subGoalIdByToolId?.[tools[0]!.id] ?? null}
+        onOpenThread={onOpenThread}
+        onAnswerAsk={onAnswerAsk}
+      />
+    );
   }
 
   const pending = tools.filter((t) => t.ok === undefined);
