@@ -2414,6 +2414,106 @@ function buildApp(
   });
 
   /**
+   * GET /api/goals/:rootId/tree — W10 (v0.17 mathub parity).
+   *
+   * Returns a flat array of every goal reachable from `rootId` via the
+   * `parentGoalId` chain (root included), in pre-order. Each node carries
+   * the minimum the SPA's SubagentTreePanel needs to render a node row
+   * and its status dot: id, parentId, a display `name`, lifecycle status,
+   * cumulative tokens used, and (when terminal-but-not-clean) the
+   * `endReason` surfaced as `errorMessage`.
+   *
+   * The `status` enum here is the SPA-facing one and folds `Goal.status`
+   * into five buckets: `running` (active goal, currently being driven),
+   * `done` (complete), `failed` (failed | cancelled), `aborted`
+   * (exhausted — budget tripped), `pending` (paused, no rounds yet).
+   * This is a UI shape — the underlying record keeps the richer status.
+   *
+   * O(N) over the goals directory; acceptable because the goal directory
+   * is tiny in practice.
+   */
+  app.get("/api/goals/:rootId/tree", async (c) => {
+    const rootId = c.req.param("rootId");
+    if (!isSafeGoalId(rootId)) return c.json({ error: "invalid rootId" }, 400);
+    const root = await readGoal(workspace, rootId);
+    if (!root) return c.json({ error: "not found" }, 404);
+
+    // Scan once, bucket by parentGoalId. Cheap with the goals dir size we
+    // expect (single-user app), and gives O(1) descendant lookup below.
+    const all = await listGoals(workspace);
+    const childrenByParent = new Map<string, Goal[]>();
+    for (const g of all) {
+      const pid = g.parentGoalId ?? null;
+      if (pid === null) continue;
+      const arr = childrenByParent.get(pid);
+      if (arr) arr.push(g);
+      else childrenByParent.set(pid, [g]);
+    }
+    // Stable creation-order within a parent so the SPA's recursive
+    // renderer doesn't reshuffle rows between polls.
+    for (const arr of childrenByParent.values()) {
+      arr.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+    }
+
+    type TreeNode = {
+      id: string;
+      parentId: string | null;
+      name: string;
+      status: "pending" | "running" | "done" | "failed" | "aborted";
+      tokensUsed: number;
+      errorMessage?: string;
+    };
+    function toStatus(g: Goal): TreeNode["status"] {
+      switch (g.status) {
+        case "active":
+          // A freshly-created goal that's never run a round is rendered
+          // as `pending`; once any round records stats it's `running`.
+          return g.stats.roundsRun === 0 ? "pending" : "running";
+        case "paused":
+          return "pending";
+        case "complete":
+          return "done";
+        case "failed":
+        case "cancelled":
+          return "failed";
+        case "exhausted":
+          return "aborted";
+        default:
+          return "pending";
+      }
+    }
+    function nameFor(g: Goal): string {
+      const obj = g.objective.trim();
+      return obj.length <= 60 ? obj : obj.slice(0, 60).trimEnd() + "…";
+    }
+
+    const out: TreeNode[] = [];
+    const seen = new Set<string>();
+    function walk(g: Goal): void {
+      if (seen.has(g.id)) return; // cycle guard — should never happen
+      seen.add(g.id);
+      const node: TreeNode = {
+        id: g.id,
+        parentId: g.parentGoalId ?? null,
+        name: nameFor(g),
+        status: toStatus(g),
+        tokensUsed: g.stats.tokensUsed ?? 0,
+      };
+      // Only surface `endReason` as an error tooltip for the failed
+      // bucket — "done" goals also have an endReason (the mark_done
+      // text) and we don't want it lighting up as red.
+      if ((node.status === "failed" || node.status === "aborted") && g.endReason) {
+        node.errorMessage = g.endReason;
+      }
+      out.push(node);
+      const kids = childrenByParent.get(g.id);
+      if (kids) for (const k of kids) walk(k);
+    }
+    walk(root);
+    return c.json({ nodes: out });
+  });
+
+  /**
    * GET /api/goals/:goalId/plan — v0.16 §9 audit #6.
    *
    * Returns the goal's active plan (parsed) so the SPA can render it in

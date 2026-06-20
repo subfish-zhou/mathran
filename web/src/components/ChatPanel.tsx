@@ -58,6 +58,7 @@ import UsageSparkline from "./UsageSparkline.tsx";
 import ContextMeter from "./ContextMeter.tsx";
 import ToolCallGroup from "./ToolCallGroup.tsx";
 import { ThreadDrawer } from "./ThreadDrawer.tsx";
+import { SubagentTreePanel } from "./SubagentTreePanel.tsx";
 
 /**
  * Build the `GET /api/uploads/<encoded-path>` URL for a persisted
@@ -151,6 +152,11 @@ export default function ChatPanel({
   // currently shown.
   const [owningGoal, setOwningGoal] = useState<GoalRow | null>(null);
   const [threadStack, setThreadStack] = useState<string[]>([]);
+  // W10 (v0.17 mathub parity): SubagentTreePanel collapse state.
+  // Default-collapsed so the goal-control row stays compact; users opt
+  // in by clicking the "🌳 Sub-agent tree (N)" button when they want
+  // the bird's-eye view across the whole forest.
+  const [subagentTreeOpen, setSubagentTreeOpen] = useState(false);
   // v0.16 §9 audit #2: plan-mode overlay state. Lives outside the chat
   // bubble stream so a plan run never pollutes conversation history; only
   // a transient "Plan saved to <path>" toast surfaces back here.
@@ -1630,7 +1636,31 @@ export default function ChatPanel({
                 : ""}
             </button>
           )}
+          {/* W10 (v0.17 mathub parity): forest view toggle. Only surfaces
+              when the goal has at least one sub-goal — a leaf goal has
+              nothing to see in tree form. */}
+          {owningGoal && owningGoal.subGoalIds && owningGoal.subGoalIds.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setSubagentTreeOpen((v) => !v)}
+              className="ml-1 shrink-0 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+              title={subagentTreeOpen ? "Hide sub-agent tree" : "Show sub-agent tree"}
+              aria-expanded={subagentTreeOpen}
+            >
+              🌳 Sub-agent tree ({owningGoal.subGoalIds.length})
+              <span className="ml-1 text-slate-400">{subagentTreeOpen ? "▾" : "▸"}</span>
+            </button>
+          )}
         </div>
+        {owningGoal && subagentTreeOpen && (
+          <div className="border-b border-slate-200 bg-slate-50 px-6 py-2">
+            <SubagentTreePanel
+              scope={scope}
+              rootGoalId={owningGoal.id}
+              onOpenThread={(goalId) => handleOpenThread(goalId)}
+            />
+          </div>
+        )}
 
         {/* ─── Export toolbar ─── */}
         {exportItems.length > 0 && (
