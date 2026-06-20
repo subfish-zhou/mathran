@@ -86,6 +86,10 @@ import {
   ScopedChatSessionStore,
   type ChatScope,
   type ScopedChatSessionFactory,
+  loadAnnotations,
+  saveAnnotations,
+  pruneAnnotationsFrom,
+  type MessageAnnotation,
 } from "../core/chat/store.js";
 import {
   createGoal,
@@ -1061,6 +1065,16 @@ function registerChatScope(
     // to the override-text case: send() pushes the *new* prompt.)
     const truncated = history.slice(0, targetIdx);
 
+    // Wipe annotations on bubbles that are about to be regenerated. The SPA
+    // sends `pruneFromBubbleIdx` = the bubble index of the user message
+    // being re-run; annotations on the anchor user bubble *and* everything
+    // after are dropped (the user prompt content may be edited via
+    // overrideText, and any assistant reply will be replaced wholesale).
+    const pruneFromBubbleIdx = body?.pruneFromBubbleIdx;
+    if (Number.isInteger(pruneFromBubbleIdx) && pruneFromBubbleIdx >= 0) {
+      await pruneAnnotationsFrom(store.getWorkspace(), scope, id, pruneFromBubbleIdx);
+    }
+
     let session: ChatSession;
     try {
       session = await store.getOrCreate(scope, id, model);
@@ -1153,7 +1167,154 @@ function registerChatScope(
     }
     session.replaceHistory(newHistory);
     await store.flush(scope, id);
+
+    // Wipe annotations whose bubbles no longer exist. The SPA passes
+    // bubble-coordinate `pruneFromBubbleIdx`; if omitted, we skip the
+    // prune (safe because over-pruning the SPA bubble list locally on
+    // truncate handles the common case). Annotation keys are SPA bubble
+    // indices, not server history indices — the server doesn't need to
+    // know the mapping, only how far to wipe.
+    const pruneFromBubbleIdx = body?.pruneFromBubbleIdx;
+    if (Number.isInteger(pruneFromBubbleIdx) && pruneFromBubbleIdx >= 0) {
+      await pruneAnnotationsFrom(store.getWorkspace(), scope, id, pruneFromBubbleIdx);
+    }
     return c.json({ ok: true, length: newHistory.length, mode });
+  });
+
+  // ─── Annotations sidecar (v0.16 §2) ────────────────────────────────────────
+  // React / pin / note / reply-target lives in <scope>/annotations/<id>.json,
+  // separately from the LLM-protocol jsonl. Keys are bubble indices (SPA
+  // renderer coords), so the server doesn't need to understand bubble
+  // construction — it just stores keyed records. /rerun and /truncate
+  // accept `pruneFromBubbleIdx` to keep this sidecar in sync.
+
+  // GET annotations for a conversation. Returns the whole sidecar so the
+  // SPA can render with one round trip on load. Missing file -> empty.
+  app.get(`${basePath}/:conversationId/annotations`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+    const data = await loadAnnotations(store.getWorkspace(), scope, id);
+    return c.json(data);
+  });
+
+  // PATCH a single bubble's annotation. Body is a partial MessageAnnotation;
+  // fields are merged into the existing record. Pass `null` to clear a
+  // field (e.g. `pinned: null` to unpin). Returns the post-merge record.
+  app.patch(`${basePath}/:conversationId/annotations/:bubbleIdx`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+    const bubbleIdxStr = c.req.param("bubbleIdx");
+    const bubbleIdx = Number(bubbleIdxStr);
+    if (!Number.isInteger(bubbleIdx) || bubbleIdx < 0) {
+      return c.json({ error: "bubbleIdx must be a non-negative integer" }, 400);
+    }
+
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    if (!body || typeof body !== "object") {
+      return c.json({ error: "body must be an object" }, 400);
+    }
+
+    const current = await loadAnnotations(store.getWorkspace(), scope, id);
+    const existing: MessageAnnotation = current.byBubbleIdx[String(bubbleIdx)] ?? {};
+    const merged: MessageAnnotation = { ...existing };
+
+    // Merge each known field. null clears, undefined leaves alone, any
+    // other value overwrites. Whitelist what we accept so a typo doesn't
+    // pollute the sidecar.
+    if ("reactions" in body) {
+      if (body.reactions === null) delete merged.reactions;
+      else if (body.reactions && typeof body.reactions === "object") {
+        merged.reactions = body.reactions;
+      }
+    }
+    if ("pinned" in body) {
+      if (body.pinned === null || body.pinned === false) delete merged.pinned;
+      else if (body.pinned === true) merged.pinned = true;
+    }
+    if ("note" in body) {
+      if (body.note === null || body.note === "") delete merged.note;
+      else if (typeof body.note === "string") merged.note = body.note;
+    }
+    if ("replyTo" in body) {
+      if (body.replyTo === null) delete merged.replyTo;
+      else if (
+        body.replyTo &&
+        typeof body.replyTo === "object" &&
+        Number.isInteger(body.replyTo.bubbleIdx) &&
+        typeof body.replyTo.snippet === "string"
+      ) {
+        merged.replyTo = {
+          bubbleIdx: body.replyTo.bubbleIdx,
+          snippet: body.replyTo.snippet,
+        };
+      }
+    }
+
+    // If the record went empty (everything cleared) drop the key so the
+    // sidecar stays tidy.
+    const next = { ...current.byBubbleIdx };
+    if (Object.keys(merged).length === 0) {
+      delete next[String(bubbleIdx)];
+    } else {
+      next[String(bubbleIdx)] = merged;
+    }
+    await saveAnnotations(store.getWorkspace(), scope, id, {
+      version: 1,
+      byBubbleIdx: next,
+    });
+    return c.json({ ok: true, bubbleIdx, annotation: merged });
+  });
+
+  // Toggle reaction (convenience: avoids the SPA having to read-modify-write
+  // the reactions object). Body: `{ emoji: string }`. Single-user, so
+  // count is 0 or 1 — we just flip it.
+  app.post(`${basePath}/:conversationId/annotations/:bubbleIdx/react`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+    const bubbleIdx = Number(c.req.param("bubbleIdx"));
+    if (!Number.isInteger(bubbleIdx) || bubbleIdx < 0) {
+      return c.json({ error: "bubbleIdx must be a non-negative integer" }, 400);
+    }
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const emoji = typeof body?.emoji === "string" ? body.emoji.trim() : "";
+    if (!emoji) return c.json({ error: "emoji required" }, 400);
+    // Reasonable cap so a typo'd huge string doesn't blow up the sidecar.
+    if (emoji.length > 32) return c.json({ error: "emoji too long (max 32 chars)" }, 400);
+
+    const current = await loadAnnotations(store.getWorkspace(), scope, id);
+    const existing: MessageAnnotation = current.byBubbleIdx[String(bubbleIdx)] ?? {};
+    const reactions = { ...(existing.reactions ?? {}) };
+    if (reactions[emoji]) delete reactions[emoji];
+    else reactions[emoji] = 1;
+    const merged: MessageAnnotation = { ...existing };
+    if (Object.keys(reactions).length === 0) delete merged.reactions;
+    else merged.reactions = reactions;
+
+    const next = { ...current.byBubbleIdx };
+    if (Object.keys(merged).length === 0) delete next[String(bubbleIdx)];
+    else next[String(bubbleIdx)] = merged;
+    await saveAnnotations(store.getWorkspace(), scope, id, {
+      version: 1,
+      byBubbleIdx: next,
+    });
+    return c.json({ ok: true, bubbleIdx, reactions: merged.reactions ?? {} });
   });
 
   // GET <base>/:conversationId/usage  — token + context-window stats (v0.3 §19)

@@ -61,10 +61,17 @@ export async function rerunChat(
   onEvent: (ev: ChatEvent) => void,
   signal?: AbortSignal,
   overrideText?: string,
+  pruneFromBubbleIdx?: number,
 ): Promise<void> {
   const body: Record<string, unknown> = { userMessageIndex };
   if (model) body.model = model;
   if (overrideText !== undefined) body.overrideText = overrideText;
+  // Tell the server how far to wipe the annotations sidecar. Without this,
+  // re-running an old prompt would leave reactions/pins from the now-stale
+  // assistant reply attached to whatever takes its slot.
+  if (Number.isInteger(pruneFromBubbleIdx) && (pruneFromBubbleIdx as number) >= 0) {
+    body.pruneFromBubbleIdx = pruneFromBubbleIdx;
+  }
   const url = `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/rerun`;
   await pumpSSE(url, body, onEvent, signal);
 }
@@ -85,13 +92,18 @@ export async function truncateChat(
   userMessageIndex: number,
   mode: "include" | "after" = "include",
   signal?: AbortSignal,
+  pruneFromBubbleIdx?: number,
 ): Promise<{ length: number; mode: "include" | "after" }> {
+  const body: Record<string, unknown> = { userMessageIndex, mode };
+  if (Number.isInteger(pruneFromBubbleIdx) && (pruneFromBubbleIdx as number) >= 0) {
+    body.pruneFromBubbleIdx = pruneFromBubbleIdx;
+  }
   const res = await fetch(
     `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/truncate`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ userMessageIndex, mode }),
+      body: JSON.stringify(body),
       signal,
     },
   );
@@ -176,4 +188,88 @@ async function pumpSSE(
     }
   }
   if (buffer.trim()) flushFrame(buffer);
+}
+
+
+// ─── Annotations sidecar (v0.16 §2) ─────────────────────────────────────────
+// React / pin / note / reply-target. Indexed by *bubble* index — the SPA's
+// renderer position — so the client never has to translate to history coords.
+
+export interface MessageAnnotation {
+  reactions?: Record<string, number>;
+  pinned?: boolean;
+  note?: string;
+  replyTo?: { bubbleIdx: number; snippet: string };
+}
+
+export interface ConversationAnnotations {
+  version: 1;
+  byBubbleIdx: Record<string, MessageAnnotation>;
+}
+
+export async function fetchAnnotations(
+  scope: ChatScopeSpec,
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<ConversationAnnotations> {
+  const res = await fetch(
+    `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/annotations`,
+    { signal },
+  );
+  if (!res.ok) throw new Error(`fetchAnnotations failed (${res.status})`);
+  return (await res.json()) as ConversationAnnotations;
+}
+
+/** PATCH a single bubble's annotation with a partial merge. Pass null in
+ *  any field to clear it. Returns the post-merge annotation. */
+export async function patchAnnotation(
+  scope: ChatScopeSpec,
+  conversationId: string,
+  bubbleIdx: number,
+  // Each field is either its normal value or `null` to clear. Modeled as a
+  // mapped type so callers can mix-and-match (e.g. `{ pinned: true, note:
+  // null }`) without union juggling at every call site.
+  patch: { [K in keyof MessageAnnotation]?: MessageAnnotation[K] | null },
+  signal?: AbortSignal,
+): Promise<MessageAnnotation> {
+  const res = await fetch(
+    `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/annotations/${bubbleIdx}`,
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+      signal,
+    },
+  );
+  if (!res.ok) {
+    let msg = `patchAnnotation failed (${res.status})`;
+    try { const d = await res.json(); if (d?.error) msg = d.error; } catch { /* ignore */ }
+    throw new Error(msg);
+  }
+  const data = (await res.json()) as { annotation: MessageAnnotation };
+  return data.annotation;
+}
+
+/** Toggle a single emoji reaction. Convenience wrapper around PATCH that
+ *  does the flip server-side so two clicks racing don't blow each other
+ *  away. Returns the post-toggle reactions record. */
+export async function toggleReaction(
+  scope: ChatScopeSpec,
+  conversationId: string,
+  bubbleIdx: number,
+  emoji: string,
+  signal?: AbortSignal,
+): Promise<Record<string, number>> {
+  const res = await fetch(
+    `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/annotations/${bubbleIdx}/react`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ emoji }),
+      signal,
+    },
+  );
+  if (!res.ok) throw new Error(`toggleReaction failed (${res.status})`);
+  const data = (await res.json()) as { reactions: Record<string, number> };
+  return data.reactions ?? {};
 }

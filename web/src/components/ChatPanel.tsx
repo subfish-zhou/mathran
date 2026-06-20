@@ -13,7 +13,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { marked } from "marked";
-import { streamChat, rerunChat, truncateChat, type ChatEvent } from "../lib/chat.ts";
+import {
+  streamChat,
+  rerunChat,
+  truncateChat,
+  fetchAnnotations,
+  patchAnnotation,
+  toggleReaction,
+  type ChatEvent,
+  type ConversationAnnotations,
+  type MessageAnnotation,
+} from "../lib/chat.ts";
 import { api, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
 import {
   historyToBubbles,
@@ -59,6 +69,28 @@ export default function ChatPanel({
   // that bubble and re-streams with the new prompt body via `rerunChat`.
   const [editingBubbleIdx, setEditingBubbleIdx] = useState<number | null>(null);
   const [editDraft, setEditDraft] = useState("");
+  // ─── Annotations (v0.16 §2) ────────────────────────────────────────
+  // Per-message reactions/pin/note/replyTo. Loaded once per conversation
+  // change; mutated optimistically by reaction/pin/note handlers.
+  const [annotations, setAnnotations] = useState<ConversationAnnotations>({
+    version: 1,
+    byBubbleIdx: {},
+  });
+  // Which message we're replying to (the next send carries it forward).
+  const [replyTarget, setReplyTarget] = useState<
+    | { bubbleIdx: number; snippet: string }
+    | null
+  >(null);
+  // Open emoji picker: bubbleIdx of the message currently showing the
+  // picker, or null when nothing is open. Closed on emoji pick or outside
+  // click.
+  const [pickerOpenFor, setPickerOpenFor] = useState<number | null>(null);
+  // Inline note editor target. Same idea as editingBubbleIdx but for the
+  // per-message margin note instead of the prompt text itself.
+  const [noteEditingIdx, setNoteEditingIdx] = useState<number | null>(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  // Whether the pinned-only filter sidebar drawer is open.
+  const [showPinnedOnly, setShowPinnedOnly] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // ─── Conversation list ─────────────────────────────────────────────────
@@ -89,15 +121,25 @@ export default function ChatPanel({
     if (!conversationId) {
       setBubbles([]);
       setUsage(null);
+      setAnnotations({ version: 1, byBubbleIdx: {} });
+      setReplyTarget(null);
       return;
     }
     let cancelled = false;
     setLoadingHistory(true);
-    api
-      .getChatHistory(scope, conversationId)
-      .then((data) => {
+    // Parallel load: history + annotations. Annotation failures are
+    // non-fatal (the SPA renders without them) so we swallow that branch.
+    Promise.all([
+      api.getChatHistory(scope, conversationId),
+      fetchAnnotations(scope, conversationId).catch(() => ({
+        version: 1 as const,
+        byBubbleIdx: {} as Record<string, MessageAnnotation>,
+      })),
+    ])
+      .then(([data, ann]) => {
         if (cancelled) return;
         setBubbles(historyToBubbles(data.history));
+        setAnnotations(ann);
       })
       .catch((err) => {
         if (cancelled) return;
@@ -252,15 +294,55 @@ export default function ChatPanel({
   // ─── Send a message ────────────────────────────────────────────────────
   async function send(e: React.FormEvent) {
     e.preventDefault();
-    const text = input.trim();
-    if (!text || busy) return;
+    const rawText = input.trim();
+    if (!rawText || busy) return;
     setInput("");
     setError(null);
     setBusy(true);
-    setBubbles((b) => [...b, { kind: "user", text }, { kind: "assistant", text: "" }]);
+
+    // ─── Reply quoting (v0.16 §2) ────────────────────────────────────
+    // When replying, we prepend a markdown blockquote so the LLM sees the
+    // context inline. We *also* drop a replyTo annotation on the new user
+    // bubble so the SPA renders an "↩ replying to… [jump]" badge that's
+    // separate from the prompt body.
+    const reply = replyTarget;
+    const promptText = reply
+      ? `> ${reply.snippet.replace(/\n/g, "\n> ")}\n\n${rawText}`
+      : rawText;
+    setReplyTarget(null);
+
+    // Record the bubble index of the user message we're about to add so
+    // we can PATCH its annotation once the SSE round trip starts.
+    const userBubbleIdx = bubbles.length;
+    setBubbles((b) => [
+      ...b,
+      { kind: "user", text: rawText },
+      { kind: "assistant", text: "" },
+    ]);
+
+    // Fire the annotation PATCH in parallel — it doesn't need to block
+    // the stream. Server resolves conversationId lazily; if conversationId
+    // is still null at this point the PATCH would 400, so we only fire
+    // when we already have one (i.e. follow-up turns).
+    if (reply && conversationId) {
+      void patchAnnotation(scope, conversationId, userBubbleIdx, {
+        replyTo: reply,
+      }).catch(() => {
+        /* annotation is best-effort — stream is what matters */
+      });
+      // Optimistic local update so the badge shows immediately.
+      setAnnotations((prev) => {
+        const next = { ...prev.byBubbleIdx };
+        next[String(userBubbleIdx)] = {
+          ...(next[String(userBubbleIdx)] ?? {}),
+          replyTo: reply,
+        };
+        return { version: 1, byBubbleIdx: next };
+      });
+    }
 
     await runChatStream((onEvent, signal) =>
-      streamChat(scope, text, conversationId ?? undefined, model || undefined, onEvent, signal),
+      streamChat(scope, promptText, conversationId ?? undefined, model || undefined, onEvent, signal),
     );
   }
 
@@ -326,6 +408,16 @@ export default function ChatPanel({
     };
     for (let i = 0; i < bubbles.length; i++) {
       const b = bubbles[i];
+      // v0.16 §2: when filtering to pinned-only, drop both tool bubbles
+      // (they're never standalone-meaningful) and any single bubble that
+      // doesn't have pinned=true in its annotation. The data-bubble-idx
+      // attribute keeps jumpToBubble() working off the original index.
+      if (showPinnedOnly) {
+        if (b.kind === "tool") continue;
+        if (!annotations.byBubbleIdx[String(i)]?.pinned) continue;
+        out.push({ kind: "single", bubble: b, bubbleIdx: i });
+        continue;
+      }
       if (b.kind === "tool") {
         buffer.push(b);
       } else {
@@ -337,7 +429,7 @@ export default function ChatPanel({
     }
     flushTools();
     return out;
-  }, [bubbles]);
+  }, [bubbles, showPinnedOnly, annotations]);
 
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
   useEffect(() => {
@@ -423,7 +515,16 @@ export default function ChatPanel({
     ]);
 
     await runChatStream((onEvent, signal) =>
-      rerunChat(scope, conversationId, userMessageIndex, model || undefined, onEvent, signal),
+      rerunChat(
+        scope,
+        conversationId,
+        userMessageIndex,
+        model || undefined,
+        onEvent,
+        signal,
+        undefined,
+        bubbleIdx,
+      ),
     );
   }
 
@@ -483,6 +584,16 @@ export default function ChatPanel({
       { kind: "user", text: newText },
       { kind: "assistant", text: "" },
     ]);
+    // Same annotation cleanup as deleteFromHere: bubbles >= bubbleIdx are
+    // about to be replaced, so their old reactions/pins shouldn't carry
+    // over.
+    setAnnotations((prev) => {
+      const next: Record<string, MessageAnnotation> = {};
+      for (const [k, v] of Object.entries(prev.byBubbleIdx)) {
+        if (Number(k) < bubbleIdx) next[k] = v;
+      }
+      return { version: 1, byBubbleIdx: next };
+    });
 
     await runChatStream((onEvent, signal) =>
       rerunChat(
@@ -493,6 +604,7 @@ export default function ChatPanel({
         onEvent,
         signal,
         newText,
+        bubbleIdx,
       ),
     );
   }
@@ -522,7 +634,24 @@ export default function ChatPanel({
     setError(null);
     setBusy(true);
     try {
-      await truncateChat(scope, conversationId, userMessageIndex, "include");
+      await truncateChat(
+        scope,
+        conversationId,
+        userMessageIndex,
+        "include",
+        undefined,
+        bubbleIdx,
+      );
+      // Drop locally-cached annotations for the bubbles we just removed,
+      // so reaction/pin/etc don't ghost forward if the next turn reuses
+      // a now-vacant idx.
+      setAnnotations((prev) => {
+        const next: Record<string, MessageAnnotation> = {};
+        for (const [k, v] of Object.entries(prev.byBubbleIdx)) {
+          if (Number(k) < bubbleIdx) next[k] = v;
+        }
+        return { version: 1, byBubbleIdx: next };
+      });
       // Optimistically prune the bubble list. Note we go *to* bubbleIdx,
       // not bubbleIdx+1, because the user message itself is being deleted.
       setBubbles((prev) => prev.slice(0, bubbleIdx));
@@ -533,6 +662,139 @@ export default function ChatPanel({
       void refreshUsage();
       void refreshList();
     }
+  }
+
+  // ─── Reaction / Pin / Note / Reply handlers (v0.16 §2) ────────────────────────
+
+  // Toggle an emoji reaction on a bubble. Optimistic flip locally + POST
+  // to /react which is the server-side flip. We trust the server's
+  // response shape as the source of truth in case of races.
+  async function handleToggleReaction(bubbleIdx: number, emoji: string) {
+    if (!conversationId) return;
+    setPickerOpenFor(null);
+    // Optimistic update: mutate the annotation map immediately so the UI
+    // doesn't lag while the round trip happens.
+    setAnnotations((prev) => {
+      const next: Record<string, MessageAnnotation> = { ...prev.byBubbleIdx };
+      const existing = { ...(next[String(bubbleIdx)] ?? {}) };
+      const reactions = { ...(existing.reactions ?? {}) };
+      if (reactions[emoji]) delete reactions[emoji];
+      else reactions[emoji] = 1;
+      if (Object.keys(reactions).length === 0) delete existing.reactions;
+      else existing.reactions = reactions;
+      if (Object.keys(existing).length === 0) delete next[String(bubbleIdx)];
+      else next[String(bubbleIdx)] = existing;
+      return { version: 1, byBubbleIdx: next };
+    });
+    try {
+      const reactions = await toggleReaction(
+        scope,
+        conversationId,
+        bubbleIdx,
+        emoji,
+      );
+      // Reconcile with the server's view in case our optimistic flip
+      // raced with another tab.
+      setAnnotations((prev) => {
+        const next = { ...prev.byBubbleIdx };
+        const existing = { ...(next[String(bubbleIdx)] ?? {}) };
+        if (Object.keys(reactions).length === 0) delete existing.reactions;
+        else existing.reactions = reactions;
+        if (Object.keys(existing).length === 0) delete next[String(bubbleIdx)];
+        else next[String(bubbleIdx)] = existing;
+        return { version: 1, byBubbleIdx: next };
+      });
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  // Pin / unpin a bubble. "Pin" here means "raise to a saved-messages
+  // view" — it doesn't move the message in history.
+  async function handleTogglePin(bubbleIdx: number) {
+    if (!conversationId) return;
+    const current = annotations.byBubbleIdx[String(bubbleIdx)] ?? {};
+    const nextPinned = !current.pinned;
+    // Optimistic
+    setAnnotations((prev) => {
+      const next = { ...prev.byBubbleIdx };
+      const existing = { ...(next[String(bubbleIdx)] ?? {}) };
+      if (nextPinned) existing.pinned = true;
+      else delete existing.pinned;
+      if (Object.keys(existing).length === 0) delete next[String(bubbleIdx)];
+      else next[String(bubbleIdx)] = existing;
+      return { version: 1, byBubbleIdx: next };
+    });
+    try {
+      await patchAnnotation(scope, conversationId, bubbleIdx, {
+        pinned: nextPinned ? true : null,
+      });
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  function beginNote(bubbleIdx: number) {
+    setNoteEditingIdx(bubbleIdx);
+    setNoteDraft(
+      annotations.byBubbleIdx[String(bubbleIdx)]?.note ?? "",
+    );
+  }
+
+  function cancelNote() {
+    setNoteEditingIdx(null);
+    setNoteDraft("");
+  }
+
+  async function commitNote() {
+    if (noteEditingIdx === null || !conversationId) return;
+    const bubbleIdx = noteEditingIdx;
+    const text = noteDraft.trim();
+    cancelNote();
+    // Optimistic
+    setAnnotations((prev) => {
+      const next = { ...prev.byBubbleIdx };
+      const existing = { ...(next[String(bubbleIdx)] ?? {}) };
+      if (text) existing.note = text;
+      else delete existing.note;
+      if (Object.keys(existing).length === 0) delete next[String(bubbleIdx)];
+      else next[String(bubbleIdx)] = existing;
+      return { version: 1, byBubbleIdx: next };
+    });
+    try {
+      await patchAnnotation(scope, conversationId, bubbleIdx, {
+        note: text || null,
+      });
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  // Start a reply: set the target so the next composer send picks it up.
+  // The actual quote prepend happens in `send`.
+  function beginReply(bubbleIdx: number) {
+    const bubble = bubbles[bubbleIdx];
+    if (!bubble) return;
+    const text =
+      bubble.kind === "user" || bubble.kind === "assistant" ? bubble.text : "";
+    const snippet = text.slice(0, 120) + (text.length > 120 ? "…" : "");
+    setReplyTarget({ bubbleIdx, snippet });
+  }
+
+  function clearReply() {
+    setReplyTarget(null);
+  }
+
+  // Jump-to-message: scrolls to the bubble and briefly highlights it.
+  // Used both by the pinned-only drawer and by reply preview links.
+  function jumpToBubble(bubbleIdx: number) {
+    const el = document.querySelector<HTMLElement>(
+      `[data-bubble-idx="${bubbleIdx}"]`,
+    );
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.classList.add("ring-2", "ring-amber-400");
+    setTimeout(() => el.classList.remove("ring-2", "ring-amber-400"), 1500);
   }
 
   // ─── Render ────────────────────────────────────────────────────────────
@@ -639,6 +901,35 @@ export default function ChatPanel({
             <option value="copilot/o1-mini" />
             <option value="copilot/o3-mini" />
           </datalist>
+          {/* ─── Pinned-only toggle (v0.16 §2) ────────────────────────
+              Compact button in the chat header; flips the rows filter
+              below to render only pinned bubbles. Useful for jumping
+              back to saved fragments without scrolling. Hidden when
+              there's nothing pinned. */}
+          {(() => {
+            const pinnedCount = Object.values(annotations.byBubbleIdx).filter(
+              (a) => a.pinned,
+            ).length;
+            if (pinnedCount === 0 && !showPinnedOnly) return null;
+            return (
+              <button
+                type="button"
+                onClick={() => setShowPinnedOnly((v) => !v)}
+                className={`ml-2 shrink-0 rounded-md border px-2 py-1 text-xs ${
+                  showPinnedOnly
+                    ? "border-amber-400 bg-amber-100 text-amber-900"
+                    : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                }`}
+                title={
+                  showPinnedOnly
+                    ? "Show all messages"
+                    : `Filter to pinned messages (${pinnedCount})`
+                }
+              >
+                📌 {showPinnedOnly ? "All" : `Pinned (${pinnedCount})`}
+              </button>
+            );
+          })()}
         </div>
 
         {/* ─── Export toolbar ─── */}
@@ -709,14 +1000,30 @@ export default function ChatPanel({
             ) : (
               <div
                 key={i}
-                className={`group/msg flex ${row.bubble.kind === "user" ? "justify-end" : "justify-start"}`}
+                data-bubble-idx={row.bubbleIdx}
+                className={`group/msg flex ${row.bubble.kind === "user" ? "justify-end" : "justify-start"} rounded-md transition`}
               >
                 <div className="flex max-w-2xl flex-col">
+                  {/* ─── Reply-target badge (v0.16 §2) ───────────────────────
+                      Shows above a user bubble when it's a reply to an
+                      earlier message. Click jumps to the referenced bubble. */}
+                  {(() => {
+                    const ann = annotations.byBubbleIdx[String(row.bubbleIdx)];
+                    if (!ann?.replyTo) return null;
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => jumpToBubble(ann.replyTo!.bubbleIdx)}
+                        className="mb-0.5 self-end max-w-[28rem] truncate rounded border-l-2 border-amber-400 bg-amber-50 px-2 py-0.5 text-left text-[10px] text-slate-600 hover:bg-amber-100"
+                        title="Jump to the message this was replying to"
+                      >
+                        ↩ replying to: <span className="text-slate-500">{ann.replyTo.snippet}</span>
+                      </button>
+                    );
+                  })()}
+
                   {editingBubbleIdx === row.bubbleIdx && row.bubble.kind === "user" ? (
                     // ─── Inline editor (v0.16 §1) ────────────────────────
-                    // Replaces the bubble body with a textarea while editing.
-                    // Ctrl/Cmd+Enter saves; Escape cancels. Plain Enter
-                    // inserts a newline so multi-line prompts stay editable.
                     <div className="w-[36rem] max-w-[80vw] rounded-lg border border-slate-300 bg-white p-2">
                       <textarea
                         autoFocus
@@ -757,12 +1064,25 @@ export default function ChatPanel({
                     </div>
                   ) : (
                     <div
-                      className={`rounded-lg px-4 py-2 text-sm ${
+                      className={`relative rounded-lg px-4 py-2 text-sm ${
                         row.bubble.kind === "user"
                           ? "bg-slate-900 text-white"
                           : "border border-slate-200 bg-white"
+                      } ${
+                        annotations.byBubbleIdx[String(row.bubbleIdx)]?.pinned
+                          ? "ring-1 ring-amber-400"
+                          : ""
                       }`}
                     >
+                      {/* Pin indicator nipple in the upper corner. */}
+                      {annotations.byBubbleIdx[String(row.bubbleIdx)]?.pinned && (
+                        <span
+                          className="absolute -top-1 -right-1 rounded-full bg-amber-400 px-1 py-px text-[9px] text-amber-900"
+                          title="Pinned"
+                        >
+                          📌
+                        </span>
+                      )}
                       {row.bubble.kind === "assistant" ? (
                         <div
                           className="md"
@@ -775,16 +1095,150 @@ export default function ChatPanel({
                       )}
                     </div>
                   )}
-                  {/* ─── Per-message action bar (v0.14 §2, expanded v0.16 §1) ───────
-                      Copy: any role. Re-run / Edit / Delete from here: user
-                      only, because those flows hinge on the user prompt being
-                      the truncation anchor in /rerun and /truncate. Hidden
-                      while a stream is in flight to avoid racing setBubbles
-                      against the SSE pump. Also hidden while this bubble is
-                      being edited so the bar doesn't sit awkwardly above the
-                      inline editor. */}
-                  {editingBubbleIdx !== row.bubbleIdx && (
+
+                  {/* ─── Reactions strip (v0.16 §2) ───────────────────────────
+                      One pill per emoji with current count. Click to toggle. */}
+                  {(() => {
+                    const reactions =
+                      annotations.byBubbleIdx[String(row.bubbleIdx)]?.reactions;
+                    if (!reactions || Object.keys(reactions).length === 0) return null;
+                    return (
+                      <div
+                        className={`mt-0.5 flex gap-1 ${
+                          row.bubble.kind === "user" ? "justify-end" : "justify-start"
+                        }`}
+                      >
+                        {Object.entries(reactions).map(([emoji, count]) => (
+                          <button
+                            key={emoji}
+                            type="button"
+                            onClick={() => void handleToggleReaction(row.bubbleIdx, emoji)}
+                            className="rounded-full border border-slate-300 bg-slate-50 px-1.5 py-0.5 text-[11px] hover:bg-slate-100"
+                            title="Click to remove your reaction"
+                          >
+                            <span>{emoji}</span>
+                            {count > 1 && <span className="ml-0.5 text-slate-500">{count}</span>}
+                          </button>
+                        ))}
+                      </div>
+                    );
+                  })()}
+
+                  {/* ─── Inline note (v0.16 §2) ─────────────────────────────────
+                      Private user-attached note. Editing in-place when
+                      noteEditingIdx matches; otherwise renders the saved
+                      note text (if any). */}
+                  {noteEditingIdx === row.bubbleIdx ? (
+                    <div
+                      className={`mt-1 flex flex-col gap-1 rounded border border-amber-200 bg-amber-50 p-2 text-[11px] ${
+                        row.bubble.kind === "user" ? "self-end" : "self-start"
+                      } w-[28rem] max-w-[80vw]`}
+                    >
+                      <textarea
+                        autoFocus
+                        value={noteDraft}
+                        onChange={(e) => setNoteDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") cancelNote();
+                          else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void commitNote();
+                        }}
+                        rows={Math.min(6, Math.max(2, noteDraft.split("\n").length))}
+                        placeholder="Private note (not sent to LLM)…"
+                        className="w-full resize-y rounded border border-amber-300 bg-white p-1 text-slate-900 outline-none focus:border-amber-500"
+                      />
+                      <div className="flex justify-between text-[10px] text-slate-500">
+                        <span>⌘/Ctrl + Enter to save · Esc to cancel</span>
+                        <div className="flex gap-1">
+                          <button type="button" onClick={cancelNote} className="rounded px-2 py-0.5 hover:bg-amber-100">
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void commitNote()}
+                            className="rounded bg-amber-500 px-2 py-0.5 text-white"
+                          >
+                            Save
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    (() => {
+                      const note = annotations.byBubbleIdx[String(row.bubbleIdx)]?.note;
+                      if (!note) return null;
+                      return (
+                        <button
+                          type="button"
+                          onClick={() => beginNote(row.bubbleIdx)}
+                          className={`mt-1 max-w-[28rem] whitespace-pre-wrap rounded border-l-2 border-amber-400 bg-amber-50 px-2 py-1 text-left text-[11px] text-slate-700 hover:bg-amber-100 ${
+                            row.bubble.kind === "user" ? "self-end" : "self-start"
+                          }`}
+                          title="Click to edit this private note"
+                        >
+                          📝 {note}
+                        </button>
+                      );
+                    })()
+                  )}
+
+                  {/* ─── Per-message action bar (v0.16 §2 expansion) ──────────────
+                      Hidden during inline edit and during in-flight streams
+                      to avoid racing setBubbles against the SSE pump. */}
+                  {editingBubbleIdx !== row.bubbleIdx && noteEditingIdx !== row.bubbleIdx && (
                     <div className="mt-0.5 flex justify-end gap-1 text-[10px] text-slate-400 opacity-0 transition group-hover/msg:opacity-100">
+                      {/* React picker: tiny inline emoji row, no library. */}
+                      <div className="relative">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setPickerOpenFor(
+                              pickerOpenFor === row.bubbleIdx ? null : row.bubbleIdx,
+                            )
+                          }
+                          className="rounded px-1 py-0.5 hover:bg-slate-200"
+                          title="Add a reaction"
+                        >
+                          😊 React
+                        </button>
+                        {pickerOpenFor === row.bubbleIdx && (
+                          <div className="absolute right-0 bottom-full z-10 mb-1 flex gap-0.5 rounded-md border border-slate-200 bg-white p-1 shadow-md">
+                            {["👍", "❤️", "😂", "🔥", "🤔", "✅", "❌", "🧠", "⚠️", "💫"].map((emoji) => (
+                              <button
+                                key={emoji}
+                                type="button"
+                                onClick={() => void handleToggleReaction(row.bubbleIdx, emoji)}
+                                className="rounded px-1 text-base hover:bg-slate-100"
+                              >
+                                {emoji}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void handleTogglePin(row.bubbleIdx)}
+                        className="rounded px-1 py-0.5 hover:bg-slate-200"
+                        title="Pin/unpin this message"
+                      >
+                        {annotations.byBubbleIdx[String(row.bubbleIdx)]?.pinned ? "📌 Unpin" : "📌 Pin"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => beginNote(row.bubbleIdx)}
+                        className="rounded px-1 py-0.5 hover:bg-slate-200"
+                        title="Attach a private note (not sent to LLM)"
+                      >
+                        📝 Note
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => beginReply(row.bubbleIdx)}
+                        className="rounded px-1 py-0.5 hover:bg-slate-200"
+                        title="Reply to this message: the next prompt will quote it"
+                      >
+                        ↩ Reply
+                      </button>
                       <button
                         type="button"
                         onClick={() => void copyOneMessage(row.bubble.text)}
@@ -832,6 +1286,32 @@ export default function ChatPanel({
         {error && (
           <div className="mx-6 mb-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">
             {error}
+          </div>
+        )}
+
+        {/* ─── Reply preview banner (v0.16 §2) ─────────────────────────
+            Sits just above the composer when the user has clicked Reply
+            on a bubble. Click × to cancel, click the snippet to jump to
+            the referenced message. */}
+        {replyTarget && (
+          <div className="mx-4 mb-2 flex items-start gap-2 rounded border-l-4 border-amber-400 bg-amber-50 px-3 py-2 text-xs">
+            <button
+              type="button"
+              onClick={() => jumpToBubble(replyTarget.bubbleIdx)}
+              className="flex-1 truncate text-left text-slate-700 hover:underline"
+              title="Jump to the message you're replying to"
+            >
+              <span className="font-medium text-amber-700">↩ Replying to:</span>{" "}
+              <span>{replyTarget.snippet}</span>
+            </button>
+            <button
+              type="button"
+              onClick={clearReply}
+              className="shrink-0 rounded px-1 py-0.5 text-slate-500 hover:bg-amber-100"
+              title="Cancel reply"
+            >
+              ×
+            </button>
           </div>
         )}
 

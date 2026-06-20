@@ -105,6 +105,105 @@ function conversationFile(dir: string, conversationId: string): string {
   return path.join(dir, `${conversationId}.jsonl`);
 }
 
+// ─── Per-message annotations sidecar (v0.16 §2) ────────────────────────────────────
+// Reactions / pin / note / reply-target live in a separate JSON file rather
+// than inline in history so the LLM protocol stays clean (LLMMessage is a
+// wire format; bolting on social metadata would poison it). Indexed by
+// bubbleIdx — the SPA's renderer position — because:
+//
+//   1. The SPA already groups raw LLMMessages into renderable bubbles via
+//      `historyToBubbles`. Keying by bubbleIdx means the SPA can talk to
+//      the server without translating coordinates.
+//   2. bubbleIdx is stable under our only mutating operation, /truncate.
+//      We never reorder or insert mid-history.
+//
+// Truncate / rerun must drop annotations for bubbleIdx >= truncateFrom
+// (those bubbles no longer exist) but preserve everything before, including
+// the anchor user bubble itself.
+export interface MessageAnnotation {
+  /** emoji -> count. Single-user app, so values are 0 or 1, but we keep
+   *  the shape future-proof in case multi-user lands. */
+  reactions?: Record<string, number>;
+  pinned?: boolean;
+  /** Private user note pinned under the message. Replaces the "thread"
+   *  concept for a single-user research tool — no separate conversation,
+   *  just a margin scribble that survives reloads. */
+  note?: string;
+  /** When set on a user bubble, indicates which earlier bubble this prompt
+   *  was a reply to. Used by the SPA to render the quoted preview + by the
+   *  server to prepend a quote block to the prompt. */
+  replyTo?: { bubbleIdx: number; snippet: string };
+}
+
+export interface ConversationAnnotations {
+  version: 1;
+  byBubbleIdx: Record<string, MessageAnnotation>;
+}
+
+function annotationsFile(dir: string, conversationId: string): string {
+  return path.join(dir, "annotations", `${conversationId}.json`);
+}
+
+export async function loadAnnotations(
+  workspace: string,
+  scope: ChatScope,
+  conversationId: string,
+): Promise<ConversationAnnotations> {
+  const file = annotationsFile(scopeDir(workspace, scope), conversationId);
+  try {
+    const raw = await fs.readFile(file, "utf-8");
+    const parsed = JSON.parse(raw) as ConversationAnnotations;
+    if (parsed && typeof parsed === "object" && parsed.byBubbleIdx) {
+      return { version: 1, byBubbleIdx: parsed.byBubbleIdx };
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+  return { version: 1, byBubbleIdx: {} };
+}
+
+export async function saveAnnotations(
+  workspace: string,
+  scope: ChatScope,
+  conversationId: string,
+  data: ConversationAnnotations,
+): Promise<void> {
+  const dir = path.join(scopeDir(workspace, scope), "annotations");
+  await fs.mkdir(dir, { recursive: true });
+  await atomicWriteFile(
+    annotationsFile(scopeDir(workspace, scope), conversationId),
+    JSON.stringify(data, null, 2),
+  );
+}
+
+/**
+ * Drop annotations for bubbleIdx >= `fromIdx`. Used by /truncate and /rerun
+ * to keep the sidecar in sync with the now-shortened history. The anchor
+ * bubble itself (fromIdx in mode="after", fromIdx in mode="include" only
+ * when we delete it) is the caller's responsibility — pass the right
+ * fromIdx for the semantics you want.
+ */
+export async function pruneAnnotationsFrom(
+  workspace: string,
+  scope: ChatScope,
+  conversationId: string,
+  fromIdx: number,
+): Promise<void> {
+  const current = await loadAnnotations(workspace, scope, conversationId);
+  let changed = false;
+  const next: Record<string, MessageAnnotation> = {};
+  for (const [k, v] of Object.entries(current.byBubbleIdx)) {
+    if (Number(k) < fromIdx) next[k] = v;
+    else changed = true;
+  }
+  if (changed) {
+    await saveAnnotations(workspace, scope, conversationId, {
+      version: 1,
+      byBubbleIdx: next,
+    });
+  }
+}
+
 /**
  * Public path resolver for a (scope, conversationId) jsonl. Exposed so the
  * goal runner (and any future caller that needs the on-disk location for
@@ -292,6 +391,13 @@ export class ScopedChatSessionStore {
     private readonly maxEntries: number = DEFAULT_MAX_ENTRIES,
     private readonly ttlMs: number = DEFAULT_TTL_MS,
   ) {}
+
+  /** Expose the workspace root so route handlers can pass it into the
+   *  annotations helpers without having to thread it through every layer
+   *  separately. (v0.16 §2) */
+  getWorkspace(): string {
+    return this.workspace;
+  }
 
   private cacheKey(scope: ChatScope, conversationId: string): string {
     return `${scopeKey(scope)}::${conversationId}`;

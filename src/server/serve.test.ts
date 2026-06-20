@@ -13,6 +13,7 @@ import * as os from "node:os";
 
 import { startServer, defaultSessionFactory, buildScopedSystemPrompt, appendPersistentContext, type RunningServer } from "./serve.js";
 import { ChatSession } from "../core/chat/index.js";
+import type { ConversationAnnotations } from "../core/chat/store.js";
 import type {
   LLMProvider,
   LLMRequest,
@@ -667,6 +668,152 @@ describe("POST /api/chat/:id/truncate (v0.16 §1)", () => {
     } finally {
       await localServer.close();
     }
+  });
+});
+
+// ─── v0.16 §2: annotations sidecar (React / Pin / Note / Reply) ──────────────
+describe("Annotations sidecar (v0.16 §2)", () => {
+  it("GET returns an empty sidecar for a fresh conversation", async () => {
+    const res = await fetch(`${base}/api/chat/never-touched/annotations`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as ConversationAnnotations;
+    expect(body.version).toBe(1);
+    expect(body.byBubbleIdx).toEqual({});
+  });
+
+  it("PATCH merges fields and GET round-trips them", async () => {
+    const id = "ann-test-1";
+    // PATCH a couple of fields on bubble 3.
+    const r1 = await fetch(`${base}/api/chat/${id}/annotations/3`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pinned: true, note: "think harder" }),
+    });
+    expect(r1.status).toBe(200);
+
+    // Then PATCH again to add reactions without losing the previous fields.
+    const r2 = await fetch(`${base}/api/chat/${id}/annotations/3`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reactions: { "❤": 1, "🔥": 1 } }),
+    });
+    expect(r2.status).toBe(200);
+
+    const r3 = await fetch(`${base}/api/chat/${id}/annotations`);
+    const body = (await r3.json()) as ConversationAnnotations;
+    expect(body.byBubbleIdx["3"]).toEqual({
+      pinned: true,
+      note: "think harder",
+      reactions: { "❤": 1, "🔥": 1 },
+    });
+  });
+
+  it("PATCH with null clears individual fields", async () => {
+    const id = "ann-test-2";
+    await fetch(`${base}/api/chat/${id}/annotations/0`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pinned: true, note: "keep me" }),
+    });
+    await fetch(`${base}/api/chat/${id}/annotations/0`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pinned: null }),
+    });
+    const get = await fetch(`${base}/api/chat/${id}/annotations`);
+    const body = (await get.json()) as ConversationAnnotations;
+    expect(body.byBubbleIdx["0"]).toEqual({ note: "keep me" });
+  });
+
+  it("PATCH that empties the record drops the bubble key entirely", async () => {
+    const id = "ann-test-3";
+    await fetch(`${base}/api/chat/${id}/annotations/5`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pinned: true }),
+    });
+    await fetch(`${base}/api/chat/${id}/annotations/5`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pinned: null }),
+    });
+    const get = await fetch(`${base}/api/chat/${id}/annotations`);
+    const body = (await get.json()) as ConversationAnnotations;
+    expect(body.byBubbleIdx["5"]).toBeUndefined();
+  });
+
+  it("POST /react toggles an emoji on and off", async () => {
+    const id = "ann-test-4";
+    // First click: add 1.
+    const r1 = await fetch(`${base}/api/chat/${id}/annotations/2/react`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ emoji: "👍" }),
+    });
+    const b1 = (await r1.json()) as { reactions: Record<string, number> };
+    expect(b1.reactions).toEqual({ "👍": 1 });
+
+    // Second click: remove.
+    const r2 = await fetch(`${base}/api/chat/${id}/annotations/2/react`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ emoji: "👍" }),
+    });
+    const b2 = (await r2.json()) as { reactions: Record<string, number> };
+    expect(b2.reactions).toEqual({});
+  });
+
+  it("POST /react rejects missing or oversized emoji", async () => {
+    const r1 = await fetch(`${base}/api/chat/ann-test-5/annotations/0/react`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(r1.status).toBe(400);
+
+    const r2 = await fetch(`${base}/api/chat/ann-test-5/annotations/0/react`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ emoji: "x".repeat(100) }),
+    });
+    expect(r2.status).toBe(400);
+  });
+
+  it("truncate prunes annotations at-and-beyond pruneFromBubbleIdx", async () => {
+    const id = "ann-prune-trunc";
+    // Seed history so /truncate has something to bite on.
+    await fetch(`${base}/api/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "hello", sessionId: id }),
+    }).then((r) => r.text());
+
+    // Drop annotations on bubble 0, 1, 2.
+    for (const idx of [0, 1, 2]) {
+      await fetch(`${base}/api/chat/${id}/annotations/${idx}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ pinned: true }),
+      });
+    }
+
+    // Truncate to user message #0, telling the server to wipe bubbles >=1.
+    const trunc = await fetch(`${base}/api/chat/${id}/truncate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        userMessageIndex: 0,
+        mode: "after",
+        pruneFromBubbleIdx: 1,
+      }),
+    });
+    expect(trunc.status).toBe(200);
+
+    const get = await fetch(`${base}/api/chat/${id}/annotations`);
+    const body = (await get.json()) as ConversationAnnotations;
+    expect(body.byBubbleIdx["0"]).toEqual({ pinned: true });
+    expect(body.byBubbleIdx["1"]).toBeUndefined();
+    expect(body.byBubbleIdx["2"]).toBeUndefined();
   });
 });
 
