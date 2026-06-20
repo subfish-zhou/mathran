@@ -21,8 +21,13 @@
 
 import { ChatSession } from "../chat/session.js";
 import type { ChatEvent } from "../chat/index.js";
+import type { ChatScope } from "../chat/store.js";
 import type { LLMProvider } from "../providers/llm.js";
 import { IDENTITY_FRAGMENT, PLAN_MODE_FRAGMENT } from "../prompts/index.js";
+import {
+  formatScopedMathranMemoryForPrompt,
+  loadScopedMathranMemorySync,
+} from "../memory/index.js";
 
 import { PlanStore, type Plan } from "./store.js";
 
@@ -64,6 +69,22 @@ export interface RunPlanOpts {
    * should leave this unset so they get {@link PLAN_SYSTEM_PROMPT}.
    */
   systemPrompt?: string;
+  /**
+   * v0.16 §9 audit #5: scope to load MATHRAN.md memory for. Defaults to
+   * `{ kind: "global" }`, which picks up `<workspace>/MATHRAN.md` and
+   * `~/.mathran/MATHRAN.md` but no per-project / per-effort overrides.
+   * Passing a `project` or `effort` scope layers in the corresponding
+   * files (see `loadScopedMathranMemorySync`). Optional so existing
+   * callers continue to compile unchanged. Ignored when `systemPrompt`
+   * is set (the override wins, no memory loading).
+   */
+  scope?: ChatScope;
+  /**
+   * Override the memory loader's $HOME (tests only). Pass-through to
+   * `loadScopedMathranMemorySync`; ignored when `systemPrompt` is
+   * explicitly set.
+   */
+  memoryHome?: string;
   /**
    * Optional progress sink (v0.16 §9 audit #2). When set, the runner forwards
    * the in-session text deltas and round transitions so the HTTP layer can
@@ -137,7 +158,27 @@ export function extractPlanBody(text: string): string {
  */
 export async function runPlan(opts: RunPlanOpts): Promise<PlanResult> {
   const maxTurns = opts.maxTurns ?? 10;
-  const systemPrompt = opts.systemPrompt ?? PLAN_SYSTEM_PROMPT;
+  // v0.16 §9 audit #5: build a memory-aware default system prompt by
+  // splicing the MATHRAN.md prompt fragment between IDENTITY_FRAGMENT and
+  // PLAN_MODE_FRAGMENT. When the caller explicitly overrides
+  // `opts.systemPrompt` (tests, advanced callers), we honor it verbatim
+  // and skip memory loading — the override has total control.
+  let systemPrompt: string;
+  if (opts.systemPrompt !== undefined) {
+    systemPrompt = opts.systemPrompt;
+  } else {
+    const memoryEntries = loadScopedMathranMemorySync({
+      workspace: opts.workspace,
+      ...(opts.scope ? { scope: opts.scope } : {}),
+      ...(opts.memoryHome !== undefined ? { home: opts.memoryHome } : {}),
+    });
+    const memoryFragment = formatScopedMathranMemoryForPrompt(memoryEntries);
+    if (memoryFragment.length > 0) {
+      systemPrompt = `${IDENTITY_FRAGMENT}\n\n${memoryFragment}\n\n${PLAN_MODE_FRAGMENT}`;
+    } else {
+      systemPrompt = PLAN_SYSTEM_PROMPT;
+    }
+  }
   const store = new PlanStore({ workspace: opts.workspace });
   // Use the caller-supplied draft if it's still around; otherwise mint a new
   // one. We tolerate a stale `opts.planId` (deleted on disk) by falling back

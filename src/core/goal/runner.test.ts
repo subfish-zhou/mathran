@@ -1184,3 +1184,157 @@ describe("runGoalRound nested sub-goals (v0.3 §15)", () => {
   });
 });
 
+// v0.16 §9 audit #5: MATHRAN.md scope-aware memory injection into goal mode.
+//
+// `runGoalRound` does not expose a `memoryHome` option — it uses the goal's
+// `scope` to load layered MATHRAN.md files and pulls the global one from
+// `os.homedir()` directly. To keep these tests hermetic we temporarily
+// repoint $HOME at a tmpdir for the duration of each test.
+describe("runGoalRound MATHRAN.md memory injection (v0.16 §9 #5)", () => {
+  let savedHome: string | undefined;
+  let fakeHome: string;
+
+  beforeEach(async () => {
+    savedHome = process.env.HOME;
+    fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-goal-home-"));
+    process.env.HOME = fakeHome;
+  });
+
+  it("splices effort + project + workspace memory between base prompt and goal fragment", async () => {
+    try {
+      await fs.mkdir(path.join(workspace, "projects", "proj", "efforts", "eff"), {
+        recursive: true,
+      });
+      await fs.writeFile(
+        path.join(workspace, "MATHRAN.md"),
+        "Repo: prefer rg over grep.\n",
+        "utf-8",
+      );
+      await fs.writeFile(
+        path.join(workspace, "projects", "proj", "MATHRAN.md"),
+        "Project: tests under src/__tests__.\n",
+        "utf-8",
+      );
+      await fs.writeFile(
+        path.join(workspace, "projects", "proj", "efforts", "eff", "MATHRAN.md"),
+        "Use 4-space indent.\n",
+        "utf-8",
+      );
+      const g = await createGoal(workspace, {
+        objective: "prove x",
+        scope: { kind: "effort", projectSlug: "proj", effortSlug: "eff" },
+        model: "fake",
+      });
+
+      const seenRequests: LLMRequest[] = [];
+      const recordingLlm: LLMProvider = {
+        async describe() {
+          return { name: "fake" };
+        },
+        async chat(req: LLMRequest) {
+          seenRequests.push(req);
+          return {
+            async *stream() {
+              yield { type: "text", delta: "ok" };
+              yield { type: "done", finishReason: "stop" };
+            },
+          };
+        },
+      };
+      await runGoalRound({
+        workspace,
+        goalId: g.id,
+        userMessage: "start",
+        llm: recordingLlm,
+        tools: [],
+      });
+
+      const sys = String(
+        seenRequests[0].messages.find((m) => m.role === "system")!.content,
+      );
+      expect(sys).toContain("# User-supplied memory (MATHRAN.md)");
+      expect(sys).toContain("Use 4-space indent.");
+      expect(sys).toContain("Project: tests under src/__tests__.");
+      expect(sys).toContain("Repo: prefer rg over grep.");
+      // Splice ordering: memory block sits between the base prompt and the
+      // goal-mode fragment (which always opens with "GOAL MODE").
+      const memoryIdx = sys.indexOf("# User-supplied memory (MATHRAN.md)");
+      const goalIdx = sys.indexOf("GOAL MODE");
+      expect(memoryIdx).toBeGreaterThanOrEqual(0);
+      expect(goalIdx).toBeGreaterThan(memoryIdx);
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+    }
+  });
+
+  it("truncates combined memory >32 KB with the trailing notice", async () => {
+    try {
+      const big = (label: string) => `${label}: ${"x".repeat(15 * 1024)}\n`;
+      await fs.mkdir(path.join(workspace, "projects", "proj", "efforts", "eff"), {
+        recursive: true,
+      });
+      await fs.writeFile(path.join(workspace, "MATHRAN.md"), big("ws"), "utf-8");
+      await fs.writeFile(
+        path.join(workspace, "projects", "proj", "MATHRAN.md"),
+        big("proj"),
+        "utf-8",
+      );
+      await fs.writeFile(
+        path.join(workspace, "projects", "proj", "efforts", "eff", "MATHRAN.md"),
+        big("eff"),
+        "utf-8",
+      );
+      await fs.mkdir(path.join(fakeHome, ".mathran"), { recursive: true });
+      await fs.writeFile(
+        path.join(fakeHome, ".mathran", "MATHRAN.md"),
+        big("home"),
+        "utf-8",
+      );
+      const g = await createGoal(workspace, {
+        objective: "prove x",
+        scope: { kind: "effort", projectSlug: "proj", effortSlug: "eff" },
+        model: "fake",
+      });
+
+      const seenRequests: LLMRequest[] = [];
+      const recordingLlm: LLMProvider = {
+        async describe() {
+          return { name: "fake" };
+        },
+        async chat(req: LLMRequest) {
+          seenRequests.push(req);
+          return {
+            async *stream() {
+              yield { type: "text", delta: "ok" };
+              yield { type: "done", finishReason: "stop" };
+            },
+          };
+        },
+      };
+      await runGoalRound({
+        workspace,
+        goalId: g.id,
+        userMessage: "start",
+        llm: recordingLlm,
+        tools: [],
+      });
+
+      const sys = String(
+        seenRequests[0].messages.find((m) => m.role === "system")!.content,
+      );
+      expect(sys).toContain("... [memory truncated]");
+      const start = sys.indexOf("# User-supplied memory (MATHRAN.md)");
+      const endNotice = sys.indexOf("... [memory truncated]");
+      const block = sys.slice(
+        start,
+        endNotice + "... [memory truncated]".length,
+      );
+      expect(Buffer.byteLength(block, "utf8")).toBeLessThanOrEqual(32 * 1024 + 64);
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+    }
+  });
+});
+

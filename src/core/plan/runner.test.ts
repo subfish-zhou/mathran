@@ -215,3 +215,148 @@ describe("runPlan system prompt", () => {
     expect(toolNames).toEqual(["read_file_summary", "search"]);
   });
 });
+
+// v0.16 §9 audit #5: MATHRAN.md scope-aware memory injection.
+//
+// These tests stand up real on-disk MATHRAN.md files under a fresh
+// temporary workspace and an isolated $HOME (via `memoryHome`) so the
+// loader has something concrete to find without depending on the host
+// machine's `~/.mathran/MATHRAN.md`.
+describe("runPlan MATHRAN.md memory injection (v0.16 §9 #5)", () => {
+  it("splices effort + project + workspace memory between identity and plan-mode fragments", async () => {
+    // Lay out three layers of MATHRAN.md:
+    //   <workspace>/MATHRAN.md
+    //   <workspace>/projects/proj/MATHRAN.md
+    //   <workspace>/projects/proj/efforts/eff/MATHRAN.md
+    await fs.mkdir(path.join(workspace, "projects", "proj", "efforts", "eff"), {
+      recursive: true,
+    });
+    await fs.writeFile(
+      path.join(workspace, "MATHRAN.md"),
+      "Repo: prefer rg over grep.\n",
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(workspace, "projects", "proj", "MATHRAN.md"),
+      "Project: tests under src/__tests__.\n",
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(workspace, "projects", "proj", "efforts", "eff", "MATHRAN.md"),
+      "Use 4-space indent.\n",
+      "utf-8",
+    );
+    // Empty $HOME so the user-global MATHRAN.md doesn't pollute.
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-plan-home-"));
+
+    const seen: LLMRequest[] = [];
+    const llm: LLMProvider = {
+      async describe() {
+        return { name: "fake" };
+      },
+      async chat(req) {
+        seen.push(req);
+        return {
+          async *stream() {
+            yield { type: "text", delta: "# Plan\nbody" };
+            yield { type: "done", finishReason: "stop" };
+          },
+        };
+      },
+    };
+
+    await runPlan({
+      objective: "x",
+      workspace,
+      llm,
+      model: "fake",
+      scope: { kind: "effort", projectSlug: "proj", effortSlug: "eff" },
+      memoryHome: fakeHome,
+    });
+
+    const sys = seen[0].messages.find((m) => m.role === "system");
+    expect(sys?.content).toBeDefined();
+    const text = String(sys!.content);
+    // The audit-spec'd fenced block header is present.
+    expect(text).toContain("# User-supplied memory (MATHRAN.md)");
+    // All three layers made it in.
+    expect(text).toContain("Use 4-space indent.");
+    expect(text).toContain("Project: tests under src/__tests__.");
+    expect(text).toContain("Repo: prefer rg over grep.");
+    // Splice ordering: memory block sits BETWEEN identity and plan-mode
+    // fragments. We assert this with positional indices.
+    const identityIdx = text.indexOf("You are mathran");
+    const memoryIdx = text.indexOf("# User-supplied memory (MATHRAN.md)");
+    const planIdx = text.indexOf("PLAN MODE");
+    expect(identityIdx).toBeGreaterThanOrEqual(0);
+    expect(memoryIdx).toBeGreaterThan(identityIdx);
+    expect(planIdx).toBeGreaterThan(memoryIdx);
+  });
+
+  it("truncates combined memory >32 KB with the trailing notice", async () => {
+    // Stand up four layers each ~15 KB of distinct content, pushing the
+    // combined block well past the 32 KB prompt budget.
+    const big = (label: string) => `${label}: ${"x".repeat(15 * 1024)}\n`;
+    await fs.mkdir(path.join(workspace, "projects", "proj", "efforts", "eff"), {
+      recursive: true,
+    });
+    await fs.writeFile(path.join(workspace, "MATHRAN.md"), big("ws"), "utf-8");
+    await fs.writeFile(
+      path.join(workspace, "projects", "proj", "MATHRAN.md"),
+      big("proj"),
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(workspace, "projects", "proj", "efforts", "eff", "MATHRAN.md"),
+      big("eff"),
+      "utf-8",
+    );
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-plan-home-"));
+    await fs.mkdir(path.join(fakeHome, ".mathran"), { recursive: true });
+    await fs.writeFile(
+      path.join(fakeHome, ".mathran", "MATHRAN.md"),
+      big("home"),
+      "utf-8",
+    );
+
+    const seen: LLMRequest[] = [];
+    const llm: LLMProvider = {
+      async describe() {
+        return { name: "fake" };
+      },
+      async chat(req) {
+        seen.push(req);
+        return {
+          async *stream() {
+            yield { type: "text", delta: "# Plan\nbody" };
+            yield { type: "done", finishReason: "stop" };
+          },
+        };
+      },
+    };
+    await runPlan({
+      objective: "x",
+      workspace,
+      llm,
+      model: "fake",
+      scope: { kind: "effort", projectSlug: "proj", effortSlug: "eff" },
+      memoryHome: fakeHome,
+    });
+
+    const sys = seen[0].messages.find((m) => m.role === "system");
+    expect(sys?.content).toBeDefined();
+    const text = String(sys!.content);
+    // The trailing notice fires once the combined block is over the
+    // MEMORY_FILES_PROMPT_BUDGET_BYTES (32 KB) cap.
+    expect(text).toContain("... [memory truncated]");
+    // Memory block byte size should be at or under ~32 KB plus a little
+    // slack for the header / notice.
+    const start = text.indexOf("# User-supplied memory (MATHRAN.md)");
+    const endNotice = text.indexOf("... [memory truncated]");
+    const block = text.slice(
+      start,
+      endNotice + "... [memory truncated]".length,
+    );
+    expect(Buffer.byteLength(block, "utf8")).toBeLessThanOrEqual(32 * 1024 + 64);
+  });
+});

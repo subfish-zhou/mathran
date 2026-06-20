@@ -44,6 +44,10 @@ import { atomicWriteFile } from "../chat/atomic-write.js";
 import { appendEffortDocument } from "../effort/store.js";
 import { loadEffortContext, formatEffortContext } from "../effort/context-builder.js";
 import { buildBaseSystemPrompt, renderGoalModeFragment } from "../prompts/index.js";
+import {
+  formatScopedMathranMemoryForPrompt,
+  loadScopedMathranMemorySync,
+} from "../memory/index.js";
 
 import {
   appendStep,
@@ -74,8 +78,18 @@ export function buildGoalSystemPrompt(input: {
   goal: Goal;
   systemPromptBase: string;
   effortFragment?: string;
+  /**
+   * v0.16 §9 audit #5: pre-rendered MATHRAN.md memory block (scope-aware).
+   * Loaded by the caller via `loadScopedMathranMemorySync` +
+   * `formatScopedMathranMemoryForPrompt` so this builder stays sync and
+   * pure. Spliced between `systemPromptBase` and the goal fragment per
+   * the audit spec — user preferences should shape the assistant's
+   * default behavior, but the loop policy / mark_done semantics still
+   * dominate the bottom of the prompt.
+   */
+  memoryFragment?: string;
 }): string {
-  const { goal, systemPromptBase, effortFragment } = input;
+  const { goal, systemPromptBase, effortFragment, memoryFragment } = input;
   const scopeLabel =
     goal.scope.kind === "global"
       ? "global"
@@ -97,7 +111,11 @@ export function buildGoalSystemPrompt(input: {
     roundsRun: goal.stats.roundsRun,
   });
 
-  const parts: string[] = [systemPromptBase, "", goalFragment];
+  const parts: string[] = [systemPromptBase];
+  if (memoryFragment && memoryFragment.trim().length > 0) {
+    parts.push("", memoryFragment);
+  }
+  parts.push("", goalFragment);
   if (effortFragment && effortFragment.trim().length > 0) {
     parts.push("", effortFragment);
   }
@@ -413,10 +431,22 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     }
   }
 
+  // v0.16 §9 audit #5: layered MATHRAN.md memory (effort → project →
+  // workspace → ~/.mathran). Loaded synchronously — underlying I/O is
+  // small and the chat-session loader is sync too — then formatted into
+  // the shared fenced block and handed to `buildGoalSystemPrompt`,
+  // which splices it between the base prompt and the goal fragment.
+  const memoryEntries = loadScopedMathranMemorySync({
+    workspace,
+    scope: goal.scope,
+  });
+  const memoryFragment = formatScopedMathranMemoryForPrompt(memoryEntries);
+
   const systemPrompt = buildGoalSystemPrompt({
     goal,
     systemPromptBase: systemPromptBase ?? buildBaseSystemPrompt(),
     effortFragment,
+    memoryFragment,
   });
   const handler = createGoalToolHandler();
   // Compose the per-round tool list:
