@@ -13,7 +13,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { marked } from "marked";
-import { streamChat, rerunChat, type ChatEvent } from "../lib/chat.ts";
+import { streamChat, rerunChat, truncateChat, type ChatEvent } from "../lib/chat.ts";
 import { api, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
 import {
   historyToBubbles,
@@ -50,6 +50,15 @@ export default function ChatPanel({
   const [usage, setUsage] = useState<UsageStats | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  // Abort controller for the in-flight chat stream. `send` / `reRun` set it
+  // before kicking off pumpSSE; the Stop button calls `.abort()` to interrupt.
+  // Cleared in `runChatStream`'s finally block so the next turn starts fresh.
+  const abortRef = useRef<AbortController | null>(null);
+  // Bubble index currently being edited in-place (null = no inline editor).
+  // Only user bubbles are editable; committing the edit truncates history at
+  // that bubble and re-streams with the new prompt body via `rerunChat`.
+  const [editingBubbleIdx, setEditingBubbleIdx] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // ─── Conversation list ─────────────────────────────────────────────────
@@ -163,7 +172,13 @@ export default function ChatPanel({
   // re-run's UX (token streaming, tool bubbles, error surface, usage meter)
   // identical to a fresh send without duplicating the event tape.
   const runChatStream = useCallback(
-    async (driver: (onEvent: (ev: ChatEvent) => void) => Promise<void>) => {
+    async (driver: (onEvent: (ev: ChatEvent) => void, signal: AbortSignal) => Promise<void>) => {
+      // Wire up a fresh AbortController for this stream so the Stop button has
+      // something to .abort(). Stash on a ref so React state churn doesn't
+      // invalidate it mid-stream.
+      const controller = new AbortController();
+      abortRef.current = controller;
+
       const onEvent = (ev: ChatEvent) => {
         if (ev.type === "session") {
           setConversationId(ev.conversationId);
@@ -198,14 +213,18 @@ export default function ChatPanel({
       };
 
       try {
-        await driver(onEvent);
+        await driver(onEvent, controller.signal);
       } catch (err) {
-        setError((err as Error).message);
+        // AbortError is the Stop button doing its job, not a real failure.
+        const e = err as Error;
+        if (e?.name !== "AbortError") setError(e.message);
       } finally {
+        if (abortRef.current === controller) abortRef.current = null;
         setBusy(false);
         // Trim a trailing empty assistant bubble that can linger when the
-        // stream errors out before any tokens land. Without this the user
-        // sees an ellipsis-only "…" bubble that they can't get rid of.
+        // stream errors out (or is stopped) before any tokens land. Without
+        // this the user sees an ellipsis-only "…" bubble that they can't
+        // get rid of.
         setBubbles((prev) => {
           const last = prev[prev.length - 1];
           if (last && last.kind === "assistant" && last.text === "") return prev.slice(0, -1);
@@ -218,6 +237,18 @@ export default function ChatPanel({
     [refreshUsage, refreshList],
   );
 
+  // ─── Stop the in-flight stream (v0.16 §1) ────────────────────────────────────
+  // Calling .abort() rejects the in-flight fetch with AbortError, which
+  // bubbles up through pumpSSE -> runChatStream's catch (silenced) and
+  // triggers the finally block above. Partial assistant text already in the
+  // bubble list survives; the server-side flush still runs because the SSE
+  // handler's `finally` calls store.flush() before returning.
+  function stop() {
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+  }
+
   // ─── Send a message ────────────────────────────────────────────────────
   async function send(e: React.FormEvent) {
     e.preventDefault();
@@ -228,8 +259,8 @@ export default function ChatPanel({
     setBusy(true);
     setBubbles((b) => [...b, { kind: "user", text }, { kind: "assistant", text: "" }]);
 
-    await runChatStream((onEvent) =>
-      streamChat(scope, text, conversationId ?? undefined, model || undefined, onEvent),
+    await runChatStream((onEvent, signal) =>
+      streamChat(scope, text, conversationId ?? undefined, model || undefined, onEvent, signal),
     );
   }
 
@@ -391,9 +422,117 @@ export default function ChatPanel({
       { kind: "assistant", text: "" },
     ]);
 
-    await runChatStream((onEvent) =>
-      rerunChat(scope, conversationId, userMessageIndex, model || undefined, onEvent),
+    await runChatStream((onEvent, signal) =>
+      rerunChat(scope, conversationId, userMessageIndex, model || undefined, onEvent, signal),
     );
+  }
+
+  // ─── Edit a user prompt + re-stream (v0.16 §1) ────────────────────────────
+  // Click ✏ Edit on a user bubble -> inline <textarea> swaps in. Hitting
+  // Save commits the new text by piggy-backing on /rerun's truncate-then-
+  // resend pipeline with overrideText set. Cancel just drops the editor.
+  function beginEditBubble(bubbleIdx: number) {
+    const bubble = bubbles[bubbleIdx];
+    if (!bubble || bubble.kind !== "user") return;
+    setEditingBubbleIdx(bubbleIdx);
+    setEditDraft(bubble.text);
+  }
+
+  function cancelEditBubble() {
+    setEditingBubbleIdx(null);
+    setEditDraft("");
+  }
+
+  async function commitEditBubble() {
+    if (editingBubbleIdx === null) return;
+    const bubbleIdx = editingBubbleIdx;
+    const newText = editDraft.trim();
+    if (!newText) return; // empty edit = no-op; user should hit Cancel
+    const bubble = bubbles[bubbleIdx];
+    if (!bubble || bubble.kind !== "user") {
+      cancelEditBubble();
+      return;
+    }
+    if (!conversationId) {
+      // No server conversation yet: just rewrite the local bubble. The user
+      // would have to hit Send themselves, but this branch is unreachable
+      // in normal use because the Edit button only renders after a turn
+      // has streamed (which mints a conversationId).
+      setBubbles((prev) => {
+        const next = [...prev];
+        next[bubbleIdx] = { kind: "user", text: newText };
+        return next;
+      });
+      cancelEditBubble();
+      return;
+    }
+
+    let userMessageIndex = 0;
+    for (let i = 0; i < bubbleIdx; i++) {
+      if (bubbles[i].kind === "user") userMessageIndex++;
+    }
+
+    setError(null);
+    setBusy(true);
+    cancelEditBubble();
+    // Replace the clicked bubble's text optimistically + drop everything
+    // after it. The server will push the new (override) prompt back into
+    // history when session.send fires, so on-disk and on-screen agree.
+    setBubbles((prev) => [
+      ...prev.slice(0, bubbleIdx),
+      { kind: "user", text: newText },
+      { kind: "assistant", text: "" },
+    ]);
+
+    await runChatStream((onEvent, signal) =>
+      rerunChat(
+        scope,
+        conversationId,
+        userMessageIndex,
+        model || undefined,
+        onEvent,
+        signal,
+        newText,
+      ),
+    );
+  }
+
+  // ─── Delete from here (v0.16 §1) ────────────────────────────────────────────────
+  // Drop a user bubble *and* every message that came after it (the stale
+  // assistant reply, tool calls, later turns). Uses /truncate which writes
+  // to disk synchronously — no SSE, no new turn.
+  async function deleteFromHere(bubbleIdx: number) {
+    if (busy) return;
+    const bubble = bubbles[bubbleIdx];
+    if (!bubble || bubble.kind !== "user") return;
+    if (!conversationId) {
+      // Local-only conversation: just trim the bubble list.
+      setBubbles((prev) => prev.slice(0, bubbleIdx));
+      return;
+    }
+    if (!confirm("Delete this message and every reply after it? This rewrites the conversation history.")) {
+      return;
+    }
+
+    let userMessageIndex = 0;
+    for (let i = 0; i < bubbleIdx; i++) {
+      if (bubbles[i].kind === "user") userMessageIndex++;
+    }
+
+    setError(null);
+    setBusy(true);
+    try {
+      await truncateChat(scope, conversationId, userMessageIndex, "include");
+      // Optimistically prune the bubble list. Note we go *to* bubbleIdx,
+      // not bubbleIdx+1, because the user message itself is being deleted.
+      setBubbles((prev) => prev.slice(0, bubbleIdx));
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+      void refreshUsage();
+      void refreshList();
+    }
   }
 
   // ─── Render ────────────────────────────────────────────────────────────
@@ -573,47 +712,117 @@ export default function ChatPanel({
                 className={`group/msg flex ${row.bubble.kind === "user" ? "justify-end" : "justify-start"}`}
               >
                 <div className="flex max-w-2xl flex-col">
-                  <div
-                    className={`rounded-lg px-4 py-2 text-sm ${
-                      row.bubble.kind === "user"
-                        ? "bg-slate-900 text-white"
-                        : "border border-slate-200 bg-white"
-                    }`}
-                  >
-                    {row.bubble.kind === "assistant" ? (
-                      <div
-                        className="md"
-                        dangerouslySetInnerHTML={{
-                          __html: marked.parse(row.bubble.text || "…") as string,
+                  {editingBubbleIdx === row.bubbleIdx && row.bubble.kind === "user" ? (
+                    // ─── Inline editor (v0.16 §1) ────────────────────────
+                    // Replaces the bubble body with a textarea while editing.
+                    // Ctrl/Cmd+Enter saves; Escape cancels. Plain Enter
+                    // inserts a newline so multi-line prompts stay editable.
+                    <div className="w-[36rem] max-w-[80vw] rounded-lg border border-slate-300 bg-white p-2">
+                      <textarea
+                        autoFocus
+                        value={editDraft}
+                        onChange={(e) => setEditDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") {
+                            e.preventDefault();
+                            cancelEditBubble();
+                          } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                            e.preventDefault();
+                            void commitEditBubble();
+                          }
                         }}
+                        rows={Math.min(12, Math.max(2, editDraft.split("\n").length))}
+                        className="w-full resize-y rounded border border-slate-200 p-2 text-sm text-slate-900 outline-none focus:border-slate-500"
                       />
-                    ) : (
-                      <span className="whitespace-pre-wrap">{row.bubble.text}</span>
-                    )}
-                  </div>
-                  {/* ─── v0.14 §2: per-message copy + re-run (assistant only).
-                      Re-run only makes sense from a user message — it resends
-                      the user's text into the LLM, so we expose it there too. */}
-                  <div className="mt-0.5 flex justify-end gap-1 text-[10px] text-slate-400 opacity-0 transition group-hover/msg:opacity-100">
-                    <button
-                      type="button"
-                      onClick={() => void copyOneMessage(row.bubble.text)}
-                      className="rounded px-1 py-0.5 hover:bg-slate-200"
-                      title="Copy this message to clipboard"
+                      <div className="mt-1 flex items-center justify-between text-[10px] text-slate-500">
+                        <span>⌘/Ctrl + Enter to save · Esc to cancel</span>
+                        <div className="flex gap-1">
+                          <button
+                            type="button"
+                            onClick={cancelEditBubble}
+                            className="rounded px-2 py-0.5 hover:bg-slate-100"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!editDraft.trim() || busy}
+                            onClick={() => void commitEditBubble()}
+                            className="rounded bg-slate-900 px-2 py-0.5 text-white disabled:opacity-50"
+                          >
+                            Save & Re-run
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div
+                      className={`rounded-lg px-4 py-2 text-sm ${
+                        row.bubble.kind === "user"
+                          ? "bg-slate-900 text-white"
+                          : "border border-slate-200 bg-white"
+                      }`}
                     >
-                      📋 Copy
-                    </button>
-                    {row.bubble.kind === "user" && (
+                      {row.bubble.kind === "assistant" ? (
+                        <div
+                          className="md"
+                          dangerouslySetInnerHTML={{
+                            __html: marked.parse(row.bubble.text || "…") as string,
+                          }}
+                        />
+                      ) : (
+                        <span className="whitespace-pre-wrap">{row.bubble.text}</span>
+                      )}
+                    </div>
+                  )}
+                  {/* ─── Per-message action bar (v0.14 §2, expanded v0.16 §1) ───────
+                      Copy: any role. Re-run / Edit / Delete from here: user
+                      only, because those flows hinge on the user prompt being
+                      the truncation anchor in /rerun and /truncate. Hidden
+                      while a stream is in flight to avoid racing setBubbles
+                      against the SSE pump. Also hidden while this bubble is
+                      being edited so the bar doesn't sit awkwardly above the
+                      inline editor. */}
+                  {editingBubbleIdx !== row.bubbleIdx && (
+                    <div className="mt-0.5 flex justify-end gap-1 text-[10px] text-slate-400 opacity-0 transition group-hover/msg:opacity-100">
                       <button
                         type="button"
-                        onClick={() => void reRun(row.bubbleIdx)}
+                        onClick={() => void copyOneMessage(row.bubble.text)}
                         className="rounded px-1 py-0.5 hover:bg-slate-200"
-                        title="Resend this prompt"
+                        title="Copy this message to clipboard"
                       >
-                        🔁 Re-run
+                        📋 Copy
                       </button>
-                    )}
-                  </div>
+                      {row.bubble.kind === "user" && !busy && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => void reRun(row.bubbleIdx)}
+                            className="rounded px-1 py-0.5 hover:bg-slate-200"
+                            title="Re-run this prompt: truncate history here and stream a fresh assistant reply"
+                          >
+                            🔁 Re-run
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => beginEditBubble(row.bubbleIdx)}
+                            className="rounded px-1 py-0.5 hover:bg-slate-200"
+                            title="Edit this prompt and re-run with the new text"
+                          >
+                            ✏ Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void deleteFromHere(row.bubbleIdx)}
+                            className="rounded px-1 py-0.5 text-red-500 hover:bg-red-50"
+                            title="Delete this message and everything after it"
+                          >
+                            🗑 Delete from here
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             ),
@@ -634,13 +843,27 @@ export default function ChatPanel({
             disabled={busy}
             className="flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
           />
-          <button
-            type="submit"
-            disabled={busy || !input.trim()}
-            className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-          >
-            {busy ? "…" : "Send"}
-          </button>
+          {busy ? (
+            // Stop swaps in for Send while a stream is open. Calling stop()
+            // .abort()s the underlying fetch so the SSE pump tears down and
+            // runChatStream's finally block flips `busy` back to false.
+            <button
+              type="button"
+              onClick={stop}
+              className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+              title="Stop generating"
+            >
+              ⏹ Stop
+            </button>
+          ) : (
+            <button
+              type="submit"
+              disabled={!input.trim()}
+              className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+            >
+              Send
+            </button>
+          )}
         </form>
       </div>
     </div>

@@ -1024,6 +1024,15 @@ function registerChatScope(
       return c.json({ error: "userMessageIndex must be a non-negative integer" }, 400);
     }
     const model = typeof body?.model === "string" ? body.model : undefined;
+    // Optional `overrideText`: when set, the streamed turn uses this string
+    // instead of the original prompt content. This is how the SPA implements
+    // "edit and resend" without needing a second endpoint -- semantically
+    // identical to rerun, just with a different prompt body.
+    const overrideText =
+      typeof body?.overrideText === "string" ? body.overrideText : undefined;
+    if (overrideText !== undefined && overrideText.length === 0) {
+      return c.json({ error: "overrideText must be non-empty when provided" }, 400);
+    }
 
     // Prefer the live in-memory history (mirrors /usage) so re-running right
     // after a stream ends sees the latest turn, even before the LRU flush.
@@ -1043,12 +1052,13 @@ function registerChatScope(
     if (targetIdx === -1) {
       return c.json({ error: `user message #${userMessageIndex} not found (only ${seen} user message${seen === 1 ? "" : "s"} exist)` }, 400);
     }
-    const targetText = history[targetIdx].content;
-    if (!targetText) return c.json({ error: "target user message is empty" }, 400);
+    const promptText = overrideText ?? history[targetIdx].content;
+    if (!promptText) return c.json({ error: "target user message is empty" }, 400);
 
     // Truncate to everything strictly before the target user message. The
     // kernel's `session.send(text)` will push the user message back in, so we
-    // must *not* include it ourselves — that would duplicate it.
+    // must *not* include it ourselves — that would duplicate it. (Also applies
+    // to the override-text case: send() pushes the *new* prompt.)
     const truncated = history.slice(0, targetIdx);
 
     let session: ChatSession;
@@ -1070,7 +1080,7 @@ function registerChatScope(
           event: "session",
           data: JSON.stringify({ sessionId: id, conversationId: id, scope }),
         });
-        for await (const ev of session.send(targetText) as AsyncIterable<ChatEvent>) {
+        for await (const ev of session.send(promptText) as AsyncIterable<ChatEvent>) {
           await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
         }
         await store.flush(scope, id);
@@ -1081,6 +1091,69 @@ function registerChatScope(
         });
       }
     });
+  });
+
+  // POST <base>/:conversationId/truncate  — drop a tail of the conversation
+  // history (v0.16 §1). Body: `{ userMessageIndex, mode }`.
+  //
+  // `userMessageIndex` uses the same 0-based ordinal as /rerun (counted
+  // among user messages only). `mode` controls what survives:
+  //   - "include" (default): drop the target user message *and* everything
+  //     after it. Used by "Delete from here" on a user bubble — wipes a
+  //     whole turn (and any follow-up turns) in one shot.
+  //   - "after": keep the target user message, drop only what comes after
+  //     it (the stale assistant reply, tool bubbles, later turns). Used by
+  //     "Delete reply" so the user can edit/rerun without re-typing.
+  //
+  // Synchronous: writes the new history to disk and returns the new length.
+  // No SSE, no new turn — the SPA's `setBubbles` reflects the truncation
+  // optimistically and a usage refresh follows.
+  app.post(`${basePath}/:conversationId/truncate`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const userMessageIndex = body?.userMessageIndex;
+    if (!Number.isInteger(userMessageIndex) || userMessageIndex < 0) {
+      return c.json({ error: "userMessageIndex must be a non-negative integer" }, 400);
+    }
+    const mode = body?.mode === "after" ? "after" : "include";
+
+    const live = store.peekLiveHistory(scope, id);
+    const history = live ?? (await store.readHistory(scope, id));
+    if (history === null) return c.json({ error: "conversation not found" }, 404);
+
+    let seen = 0;
+    let targetIdx = -1;
+    for (let i = 0; i < history.length; i++) {
+      if (history[i].role === "user") {
+        if (seen === userMessageIndex) { targetIdx = i; break; }
+        seen++;
+      }
+    }
+    if (targetIdx === -1) {
+      return c.json({ error: `user message #${userMessageIndex} not found (only ${seen} user message${seen === 1 ? "" : "s"} exist)` }, 400);
+    }
+
+    const newHistory = mode === "after"
+      ? history.slice(0, targetIdx + 1)
+      : history.slice(0, targetIdx);
+
+    let session: ChatSession;
+    try {
+      session = await store.getOrCreate(scope, id, undefined);
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 500);
+    }
+    session.replaceHistory(newHistory);
+    await store.flush(scope, id);
+    return c.json({ ok: true, length: newHistory.length, mode });
   });
 
   // GET <base>/:conversationId/usage  — token + context-window stats (v0.3 §19)

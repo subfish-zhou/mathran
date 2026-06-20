@@ -48,6 +48,10 @@ export async function streamChat(
  * `userMessageIndex` is the 0-based ordinal *among user messages only*
  * (matches the server's counting in `POST .../rerun`). The SPA derives it by
  * counting `kind: "text"` + `role: "user"` bubbles up to the clicked bubble.
+ *
+ * `overrideText` (optional) lets callers replace the prompt body without
+ * needing a separate "edit + resend" endpoint. The server still truncates to
+ * the same position; only the text fed into `session.send()` changes.
  */
 export async function rerunChat(
   scope: ChatScopeSpec,
@@ -56,11 +60,53 @@ export async function rerunChat(
   model: string | undefined,
   onEvent: (ev: ChatEvent) => void,
   signal?: AbortSignal,
+  overrideText?: string,
 ): Promise<void> {
   const body: Record<string, unknown> = { userMessageIndex };
   if (model) body.model = model;
+  if (overrideText !== undefined) body.overrideText = overrideText;
   const url = `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/rerun`;
   await pumpSSE(url, body, onEvent, signal);
+}
+
+/**
+ * Drop a tail of a conversation's history (server-side; no SSE).
+ *
+ * `mode: "include"` (default) wipes the target user message + everything
+ * after it. `mode: "after"` keeps the target user message and only drops
+ * what comes after it (used by "Delete this reply").
+ *
+ * Returns the new history length so callers can refresh meters. The SPA
+ * keeps its bubble list in sync optimistically.
+ */
+export async function truncateChat(
+  scope: ChatScopeSpec,
+  conversationId: string,
+  userMessageIndex: number,
+  mode: "include" | "after" = "include",
+  signal?: AbortSignal,
+): Promise<{ length: number; mode: "include" | "after" }> {
+  const res = await fetch(
+    `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/truncate`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ userMessageIndex, mode }),
+      signal,
+    },
+  );
+  if (!res.ok) {
+    let msg = `truncate failed (${res.status})`;
+    try {
+      const data = await res.json();
+      if (data?.error) msg = data.error;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(msg);
+  }
+  const data = (await res.json()) as { length: number; mode: "include" | "after" };
+  return data;
 }
 
 /**

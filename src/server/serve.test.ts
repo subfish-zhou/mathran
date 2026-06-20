@@ -415,6 +415,261 @@ describe("ChatSessionStore (BUG #6)", () => {
   });
 });
 
+// ─── v0.16 §1 ──────────────────────────────────────────────────────────────
+// Re-run / Truncate were added because the original Re-run button just
+// stuffed the prompt back into the composer (BUG #11 / subfish review
+// 2026-06-20). These tests pin the behavior the SPA depends on: the server
+// must truncate to the right anchor, replay history, and stream a fresh
+// assistant turn over the same SSE envelope as POST /api/chat.
+describe("POST /api/chat/:id/rerun (v0.16 §1)", () => {
+  it("truncates to the Nth user message and streams a fresh reply", async () => {
+    // A fake LLM that reports how many user turns it observed *and* which
+    // assistant counter it should emit. Without explicit state we couldn't
+    // tell a fresh rerun apart from the original turn.
+    let assistantTurn = 0;
+    const countingSession = new ChatSession({
+      llm: {
+        async describe() { return { name: "counter" }; },
+        async chat(req: LLMRequest): Promise<LLMResponse> {
+          const users = req.messages.filter((m) => m.role === "user").length;
+          assistantTurn++;
+          const turn = assistantTurn;
+          return {
+            async *stream(): AsyncIterable<LLMStreamChunk> {
+              yield { type: "text", delta: `turn=${turn} users=${users}` };
+              yield { type: "done", finishReason: "stop" };
+            },
+          };
+        },
+      },
+      model: "counter",
+    });
+
+    const localServer = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      chatSessionFactory: () => countingSession,
+    });
+    try {
+      const sessionId = "rerun-test-1";
+      const post = (msg: string) =>
+        fetch(`${localServer.url}/api/chat`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ message: msg, sessionId }),
+        });
+
+      // Build up two turns: prompt #0 and prompt #1.
+      const r1 = await post("first");
+      expect(await r1.text()).toContain('"delta":"turn=1 users=1"');
+      const r2 = await post("second");
+      expect(await r2.text()).toContain('"delta":"turn=2 users=2"');
+
+      // Re-run prompt #0. Server should drop everything from prompt #0
+      // onward, replay nothing, then session.send("first") which makes
+      // users=1 again. The assistant turn counter ticks to 3 (proving
+      // the LLM was invoked fresh, not just rehydrated).
+      const rerun = await fetch(
+        `${localServer.url}/api/chat/${sessionId}/rerun`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ userMessageIndex: 0 }),
+        },
+      );
+      expect(rerun.status).toBe(200);
+      const rerunText = await rerun.text();
+      expect(rerunText).toContain('"delta":"turn=3 users=1"');
+      expect(rerunText).toMatch(/event:\s*session/);
+    } finally {
+      await localServer.close();
+    }
+  });
+
+  it("uses overrideText when provided (edit + resend flow)", async () => {
+    let lastUserText = "";
+    const captureSession = new ChatSession({
+      llm: {
+        async describe() { return { name: "capture" }; },
+        async chat(req: LLMRequest): Promise<LLMResponse> {
+          const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
+          lastUserText = lastUser?.content ?? "";
+          return {
+            async *stream(): AsyncIterable<LLMStreamChunk> {
+              yield { type: "text", delta: `saw=${lastUserText}` };
+              yield { type: "done", finishReason: "stop" };
+            },
+          };
+        },
+      },
+      model: "capture",
+    });
+    const localServer = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      chatSessionFactory: () => captureSession,
+    });
+    try {
+      const sessionId = "rerun-test-2";
+      const post = (msg: string) =>
+        fetch(`${localServer.url}/api/chat`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ message: msg, sessionId }),
+        });
+      await (await post("original prompt")).text();
+
+      const rerun = await fetch(
+        `${localServer.url}/api/chat/${sessionId}/rerun`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ userMessageIndex: 0, overrideText: "edited prompt" }),
+        },
+      );
+      expect(rerun.status).toBe(200);
+      const text = await rerun.text();
+      expect(text).toContain('"delta":"saw=edited prompt"');
+      // Sanity check that we actually overrode it on the wire.
+      expect(lastUserText).toBe("edited prompt");
+    } finally {
+      await localServer.close();
+    }
+  });
+
+  it("400s when userMessageIndex is missing/negative", async () => {
+    const res = await fetch(`${base}/api/chat/whatever/rerun`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("404s an unknown conversation", async () => {
+    const res = await fetch(`${base}/api/chat/does-not-exist-12345/rerun`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ userMessageIndex: 0 }),
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /api/chat/:id/truncate (v0.16 §1)", () => {
+  it("mode=include drops the target user message and everything after", async () => {
+    const session = new ChatSession({
+      llm: {
+        async describe() { return { name: "trunc" }; },
+        async chat(req: LLMRequest): Promise<LLMResponse> {
+          const users = req.messages.filter((m) => m.role === "user").length;
+          return {
+            async *stream(): AsyncIterable<LLMStreamChunk> {
+              yield { type: "text", delta: `users=${users}` };
+              yield { type: "done", finishReason: "stop" };
+            },
+          };
+        },
+      },
+      model: "trunc",
+    });
+    const localServer = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      chatSessionFactory: () => session,
+    });
+    try {
+      const sessionId = "trunc-test-1";
+      const post = (msg: string) =>
+        fetch(`${localServer.url}/api/chat`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ message: msg, sessionId }),
+        });
+      await (await post("a")).text();
+      await (await post("b")).text();
+      await (await post("c")).text();
+
+      // Drop user #1 ("b") and everything after. Should leave just the
+      // user/assistant pair from prompt "a".
+      const trunc = await fetch(
+        `${localServer.url}/api/chat/${sessionId}/truncate`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ userMessageIndex: 1, mode: "include" }),
+        },
+      );
+      expect(trunc.status).toBe(200);
+      const body = (await trunc.json()) as { length: number; mode: string };
+      expect(body.mode).toBe("include");
+      // History should now be [user "a", assistant "users=1"] = length 2.
+      expect(body.length).toBe(2);
+
+      // The next send must see 1 prior user turn (just "a"), then +1 = 2.
+      const r = await post("d");
+      expect(await r.text()).toContain('"delta":"users=2"');
+    } finally {
+      await localServer.close();
+    }
+  });
+
+  it("mode=after keeps the target user message and drops only what follows", async () => {
+    const session = new ChatSession({
+      llm: {
+        async describe() { return { name: "trunc-after" }; },
+        async chat(req: LLMRequest): Promise<LLMResponse> {
+          const users = req.messages.filter((m) => m.role === "user").length;
+          return {
+            async *stream(): AsyncIterable<LLMStreamChunk> {
+              yield { type: "text", delta: `users=${users}` };
+              yield { type: "done", finishReason: "stop" };
+            },
+          };
+        },
+      },
+      model: "trunc-after",
+    });
+    const localServer = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      chatSessionFactory: () => session,
+    });
+    try {
+      const sessionId = "trunc-test-2";
+      const post = (msg: string) =>
+        fetch(`${localServer.url}/api/chat`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ message: msg, sessionId }),
+        });
+      await (await post("a")).text();
+      await (await post("b")).text();
+
+      // mode=after on user #0 ("a"): keep "a", drop everything else.
+      // Leaves just one user message in history, length 1.
+      const trunc = await fetch(
+        `${localServer.url}/api/chat/${sessionId}/truncate`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ userMessageIndex: 0, mode: "after" }),
+        },
+      );
+      expect(trunc.status).toBe(200);
+      const body = (await trunc.json()) as { length: number; mode: string };
+      expect(body.mode).toBe("after");
+      expect(body.length).toBe(1);
+    } finally {
+      await localServer.close();
+    }
+  });
+});
+
 
 describe("wiki versioning (T1-A)", () => {
   beforeAll(async () => {
