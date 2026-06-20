@@ -34,6 +34,27 @@ export type ChatEvent =
       name: string;
       question: string;
     }
+  | {
+      /** v0.17 mathub parity W7 — emitted by the *goal* runner at the
+       *  top of every goal round (NOT by plain chat). The SPA's
+       *  AgentStatusPanel uses it to render `🔄 Step N/MAX · ⏱ Xs` as
+       *  soon as the round begins. `maxRounds` is omitted when the goal
+       *  has no round-budget cap. */
+      type: "round-start";
+      round: number;
+      maxRounds?: number;
+    }
+  | {
+      /** v0.17 mathub parity W9 — emitted whenever a queued steer is
+       *  picked up at a round boundary inside `ChatSession.runRounds`.
+       *  The SPA uses it to dismiss its "⏳ Steer queued…" toast and
+       *  attach a "📣 Steered: …" badge to the next round bubble. The
+       *  injected `[Steer from user: …]` user message also appears in
+       *  the persisted history so a tab reload sees what the user
+       *  actually steered with. */
+      type: "steer-received";
+      text: string;
+    }
   | { type: "done"; finishReason: string }
   | { type: "error"; message: string };
 
@@ -377,6 +398,87 @@ export async function toggleReaction(
   return data.reactions ?? {};
 }
 
+/**
+ * v0.17 mathub parity W9 — Live Steering.
+ *
+ * Queue a free-form steer text against a chat conversation whose SSE
+ * stream is currently in flight. The server validates that there's an
+ * active stream for the conversationId; the next round-top inside
+ * `ChatSession.runRounds` consumes the text, injects a synthetic
+ * `[Steer from user: …]` user message, and emits a `steer-received`
+ * SSE frame the SPA can hook to dismiss its "queued" toast.
+ *
+ * Contract:
+ *   - 200: `{ ok, queued: true, conversationId, scope }` — the steer is
+ *     in the registry and will be picked up at the next round
+ *     boundary.
+ *   - 409: no in-flight stream → caller should ignore / surface a
+ *     gentle error ("the agent is not currently thinking").
+ *   - 400: empty / whitespace-only `text`.
+ *
+ * Mirrors `interruptChat` semantics (per-scope, per-conversationId).
+ */
+export interface SteerResult {
+  ok: true;
+  queued: true;
+  conversationId: string;
+  scope: unknown;
+}
+export async function steerChatConversation(
+  scope: ChatScopeSpec,
+  conversationId: string,
+  text: string,
+  signal?: AbortSignal,
+): Promise<SteerResult> {
+  const res = await fetch(
+    `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/steer`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+      signal,
+    },
+  );
+  if (res.status === 409) {
+    // Lifted to a typed error so callers can distinguish "no stream" from
+    // network errors and silently no-op instead of toasting.
+    const err = new Error("no in-flight stream to steer") as Error & { status?: number };
+    err.status = 409;
+    throw err;
+  }
+  if (!res.ok) {
+    throw new Error(`steerChatConversation failed (${res.status}): ${await res.text()}`);
+  }
+  return (await res.json()) as SteerResult;
+}
+
+/**
+ * v0.17 mathub parity W9 — goal-mode variant. The SPA's goal panel
+ * doesn't track the inner conversationId, so this wrapper resolves it
+ * server-side from the goal record. Same 200 / 409 / 400 contract.
+ */
+export async function steerGoal(
+  goalId: string,
+  text: string,
+  signal?: AbortSignal,
+): Promise<{ ok: true; queued: true; goalId: string; conversationId: string }> {
+  const res = await fetch(`/api/goals/${encodeURIComponent(goalId)}/steer`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text }),
+    signal,
+  });
+  if (res.status === 409) {
+    const err = new Error("no in-flight round to steer") as Error & { status?: number };
+    err.status = 409;
+    throw err;
+  }
+  if (!res.ok) {
+    throw new Error(`steerGoal failed (${res.status}): ${await res.text()}`);
+  }
+  return (await res.json()) as { ok: true; queued: true; goalId: string; conversationId: string };
+}
+
 // ─── Thread / Goal-mode API (v0.16 §3) ─────────────────────────────────
 // In goal mode the assistant may call `spawn_sub_goal` to start an autonomous
 // research branch. That branch is a separate Goal record with its OWN chat
@@ -391,7 +493,7 @@ export interface GoalRow {
   objective: string;
   scope: { kind: "global" | "project" | "effort"; projectSlug?: string; effortKey?: string };
   model: string;
-  status: "active" | "paused" | "complete" | "failed" | "cancelled";
+  status: "active" | "paused" | "complete" | "failed" | "cancelled" | "exhausted";
   endReason?: string | null;
   parentGoalId?: string | null;
   subGoalIds?: string[];
@@ -563,4 +665,66 @@ export async function cancelGoal(goalId: string): Promise<void> {
     method: "POST",
   });
   if (!res.ok) throw new Error(`cancelGoal failed (${res.status})`);
+}
+
+// ─── v0.17 W8: GoalRunStatusPanel helpers ─────────────────────────────
+//
+// Backed by the `/api/goals/:id/status|abort|resume` routes the server
+// added in the same task. `getGoalStatus` is the polling probe; the
+// other two mutate the goal record.
+
+/** Wire shape returned by `GET /api/goals/:id/status`. Stays narrow on
+ *  purpose so a future schema change won't silently break the panel. */
+export interface GoalStatus {
+  id: string;
+  objective: string;
+  status: "active" | "paused" | "complete" | "failed" | "cancelled" | "exhausted";
+  endReason: string | null;
+  round: number;
+  roundsMax: number | null;
+  tokensUsed: number;
+  tokensMax: number | null;
+  toolCount: number;
+  resumeCount: number;
+  heartbeatAt: number | null;
+  latestSummary: string | null;
+  abortRequested: boolean;
+  conversationId: string | null;
+  summaryPath: string | null;
+  planPath: string | null;
+  parentGoalId: string | null;
+  subGoalCount: number;
+}
+
+/** GET /api/goals/:id/status — cheap polling probe; never throws on 404
+ *  (returns null so the panel can decide to stop polling). */
+export async function getGoalStatus(
+  goalId: string,
+  signal?: AbortSignal,
+): Promise<GoalStatus | null> {
+  const res = await fetch(`/api/goals/${encodeURIComponent(goalId)}/status`, { signal });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`getGoalStatus failed (${res.status})`);
+  return (await res.json()) as GoalStatus;
+}
+
+/** POST /api/goals/:id/abort — cooperative abort. The runner picks up the
+ *  flag at the top of the next round; if a round is currently in-flight
+ *  the server also calls its AbortController so the stream unwinds. */
+export async function abortGoal(goalId: string): Promise<void> {
+  const res = await fetch(`/api/goals/${encodeURIComponent(goalId)}/abort`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`abortGoal failed (${res.status})`);
+}
+
+/** POST /api/goals/:id/resume — clear a pending abortRequested flag and
+ *  (if paused) flip the goal back to active so the caller can /run again. */
+export async function resumeGoal(goalId: string): Promise<GoalRow> {
+  const res = await fetch(`/api/goals/${encodeURIComponent(goalId)}/resume`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`resumeGoal failed (${res.status})`);
+  const body = await res.json();
+  return body.goal as GoalRow;
 }

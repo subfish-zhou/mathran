@@ -56,6 +56,7 @@ import {
   endGoal,
   readGoal,
   setGoalPlanPath,
+  touchHeartbeat,
   updateGoalStats,
   withinBudget,
   writeGoal,
@@ -225,6 +226,27 @@ export interface RunRoundOptions {
    */
   bootstrapPlanLlm?: LLMProvider;
   bootstrapPlanModel?: string;
+  /**
+   * v0.17 mathub parity W7 — optional hook that receives every
+   * `ChatEvent` produced inside this round (including a synthetic
+   * `round-start` emitted right before `session.send`). The runner uses
+   * this exclusively for streaming the round to an HTTP SSE response;
+   * audit-log persistence is unchanged and still happens internally.
+   *
+   * Errors thrown from the callback are swallowed (we never let a UI
+   * subscriber kill a goal round). Plain JSON callers (`POST /run`, CLI,
+   * tests) simply omit this option — backward-compatible.
+   */
+  onEvent?: (ev: import("../chat/session.js").ChatEvent) => void;
+  /**
+   * v0.17 mathub parity W9 — Live Steering probe. Forwarded straight
+   * into `ChatSession.send` so the inner `runRounds` loop checks for a
+   * pending steer at every round-top, injects it as a `[Steer from
+   * user: …]` user message, and yields a `steer-received` ChatEvent
+   * the goal runner forwards to `onEvent`. The probe is consume-on-read
+   * (see `src/server/steer-registry.ts`); plain JSON callers omit it.
+   */
+  steerProbe?: () => string | null | undefined;
 }
 
 export interface RunRoundResult {
@@ -545,6 +567,28 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     return { goal, text: "", completed: false, exhausted: false, failed: false, aborted: true };
   }
 
+  // v0.17 W8: cooperative-abort check. The /api/goals/:id/abort endpoint
+  // sets `meta.abortRequested` so background loops that aren't holding an
+  // AbortController (e.g. a daemonised runner that picks up the flag on
+  // its next iteration) can still be terminated cleanly. We DO NOT touch
+  // the goal's status here — the round just bails out as aborted and
+  // leaves the goal active so the user can resume after clearing the
+  // flag (via POST /resume, which clearGoalAbortRequest()s and re-runs).
+  if (goal.meta?.abortRequested) {
+    await appendStep(workspace, goalId, {
+      kind: "status",
+      payload: { aborted: true, reason: "meta.abortRequested flag set at round top" },
+    });
+    return { goal, text: "", completed: false, exhausted: false, failed: false, aborted: true };
+  }
+
+  // v0.17 W8: stamp heartbeat so the SPA's GoalRunStatusPanel can tell
+  // a background round is still ticking even after the SSE stream is
+  // closed. Persisted to disk on every round-top so a page refresh has
+  // the latest tick. Errors are swallowed inside `touchHeartbeat`.
+  await touchHeartbeat(workspace, goalId);
+  goal = (await readGoal(workspace, goalId)) ?? goal;
+
   const before = withinBudget(goal);
   if (!before.ok) {
     const ended = await endGoal(workspace, goalId, "exhausted", before.reason);
@@ -691,10 +735,40 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   // Audit the user's prompt for this round before driving the LLM.
   await appendStep(workspace, goalId, { kind: "plan", payload: { userMessage } });
 
+  // v0.17 mathub parity W7: emit `round-start` BEFORE we open the inner
+  // chat stream so SSE consumers (AgentStatusPanel) can show
+  // `🔄 Step N/MAX` as soon as the round begins, not after the first
+  // assistant token lands. `roundsRun` is the cumulative count of
+  // *finished* rounds (incremented post-`session.send` via
+  // `updateGoalStats`), so the round we're about to run is `+ 1`. We use
+  // the persisted budget cap so the cap matches what the goal store sees
+  // (CLI hand-edits, GoalControls modal, etc).
+  const emit = (ev: ChatEvent): void => {
+    if (!opts.onEvent) return;
+    try {
+      opts.onEvent(ev);
+    } catch {
+      // Never let a subscriber kill the round. Audit logging is unchanged.
+    }
+  };
+  {
+    const roundNum = goal.stats.roundsRun + 1;
+    const maxRounds = goal.budget.roundsMax;
+    emit({
+      type: "round-start",
+      round: roundNum,
+      ...(typeof maxRounds === "number" ? { maxRounds } : {}),
+    });
+  }
+
   let textBuf = "";
   let toolCallCount = 0;
   try {
-    for await (const ev of session.send(userMessage, { signal }) as AsyncIterable<ChatEvent>) {
+    for await (const ev of session.send(userMessage, {
+      signal,
+      ...(opts.steerProbe ? { steerProbe: opts.steerProbe } : {}),
+    }) as AsyncIterable<ChatEvent>) {
+      emit(ev);
       if (ev.type === "text") {
         textBuf += ev.delta;
       } else if (ev.type === "tool-call") {
@@ -708,6 +782,16 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
         await appendStep(workspace, goalId, {
           kind: "tool-result",
           payload: { id: ev.id, name: ev.name, ok: ev.ok, content: trimmed },
+        });
+      } else if (ev.type === "steer-received") {
+        // v0.17 mathub parity W9 — record the steer in the audit log so
+        // post-hoc inspection (and the SubagentTreePanel) sees that the
+        // user nudged the agent mid-round. We use `status` kind because
+        // GoalStep doesn't (yet) have a dedicated `steer` variant; the
+        // payload carries `reason: "steer"` so consumers can filter.
+        await appendStep(workspace, goalId, {
+          kind: "status",
+          payload: { reason: "steer", text: ev.text },
         });
       } else if (ev.type === "done") {
         /* recorded below via stats */

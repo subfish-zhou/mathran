@@ -32,6 +32,10 @@ const STATUS_BADGE: Record<GoalRow["status"], { className: string; label: string
   complete: { className: "bg-emerald-100 text-emerald-800", label: "done" },
   failed: { className: "bg-red-100 text-red-800", label: "failed" },
   cancelled: { className: "bg-slate-200 text-slate-700", label: "cancelled" },
+  // v0.17 W8: a goal that tripped its token/round budget. Same visual
+  // shape as "failed" (terminal, the user must start fresh) but a
+  // distinct label so the user knows it wasn't a tool error.
+  exhausted: { className: "bg-amber-200 text-amber-900", label: "budget-exceeded" },
 };
 
 interface ThreadDrawerProps {

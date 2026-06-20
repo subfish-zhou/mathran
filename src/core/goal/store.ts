@@ -95,6 +95,35 @@ export interface Goal {
    *  content. Append-only; we keep ids even for failed sub-goals because
    *  the conversation they produced is still worth inspecting. */
   subGoalIds?: string[];
+  /**
+   * v0.17 W8: monotonic unix-ms timestamp the runner stamps at the top of
+   * every round. The SPA's `GoalRunStatusPanel` uses this to render a
+   * "heartbeat freshness" indicator ("active 12s ago" / "stale") so users
+   * can tell at a glance whether a background goal-loop is still ticking,
+   * even after the SSE stream has been closed. Optional/missing on legacy
+   * goal records that pre-date the field. Persisted to disk so a page
+   * refresh still has it.
+   */
+  heartbeatAt?: number;
+  /**
+   * v0.17 W8: free-form metadata bag the runner/REST layer can poke at
+   * without having to evolve the top-level Goal shape every time we add a
+   * runtime knob. Currently used for:
+   *   - `abortRequested`: set by `POST /api/goals/:id/abort`. The runner
+   *     checks this at the top of every round and bails out as an
+   *     "aborted" round (NOT a failure) when it's true.
+   * Optional / missing on legacy records.
+   */
+  meta?: GoalMeta;
+}
+
+/** v0.17 W8: runtime metadata bag. Kept narrow on purpose — anything that
+ *  belongs on the canonical Goal record gets promoted to a top-level field. */
+export interface GoalMeta {
+  /** Set by `POST /api/goals/:id/abort`; cleared by `POST /api/goals/:id/resume`
+   *  (and by `runGoalRound` itself when a fresh round starts) so a previously
+   *  aborted goal can be retried without a stale flag. */
+  abortRequested?: boolean;
 }
 
 /** One row in the goal's audit log. */
@@ -345,4 +374,65 @@ export function withinBudget(g: Goal): { ok: true } | { ok: false; reason: strin
     return { ok: false, reason: `round budget exhausted (${g.stats.roundsRun}/${g.budget.roundsMax})` };
   }
   return { ok: true };
+}
+
+/**
+ * v0.17 W8: stamp the goal's heartbeat with `Date.now()` and persist.
+ *
+ * Called by the runner at the top of every round so the SPA can tell
+ * whether a background goal loop is still ticking even after its SSE
+ * stream has been closed ("active 12s ago" / "stale"). All errors are
+ * swallowed — a missed heartbeat must not kill the round.
+ */
+export async function touchHeartbeat(workspace: string, goalId: string): Promise<void> {
+  try {
+    const g = await readGoal(workspace, goalId);
+    if (!g) return;
+    g.heartbeatAt = Date.now();
+    await writeGoal(workspace, g);
+  } catch {
+    /* swallow — heartbeat is advisory */
+  }
+}
+
+/**
+ * v0.17 W8: request that the runner abort the next round it sees.
+ *
+ * The runner checks `meta.abortRequested` at the top of every round and
+ * bails out as an `aborted` round (NOT a failure) when set. Idempotent:
+ * calling twice is a no-op. Returns the updated goal (or null when
+ * not found).
+ */
+export async function requestGoalAbort(
+  workspace: string,
+  goalId: string,
+): Promise<Goal | null> {
+  const g = await readGoal(workspace, goalId);
+  if (!g) return null;
+  if (!g.meta) g.meta = {};
+  if (g.meta.abortRequested) return g;
+  g.meta.abortRequested = true;
+  g.steps.push({
+    at: new Date().toISOString(),
+    kind: "status",
+    payload: { abortRequested: true, reason: "user abort" },
+  });
+  await writeGoal(workspace, g);
+  return g;
+}
+
+/**
+ * v0.17 W8: clear a previously-set abort request. Called when a fresh
+ * round starts so a stale flag from a prior abort doesn't kill the
+ * new round before it has a chance to run.
+ */
+export async function clearGoalAbortRequest(
+  workspace: string,
+  goalId: string,
+): Promise<void> {
+  const g = await readGoal(workspace, goalId);
+  if (!g) return;
+  if (!g.meta?.abortRequested) return;
+  g.meta.abortRequested = false;
+  await writeGoal(workspace, g);
 }

@@ -1855,6 +1855,189 @@ describe("POST /api/goals/:id/interrupt (v0.2 §7)", () => {
   });
 });
 
+// v0.17 W8: GoalRunStatusPanel support — status projection, abort flag,
+// resume, and heartbeat stamping. These endpoints power the status panel
+// that the SPA polls every ~3s while a goal-loop is active.
+describe("goal status + abort/resume (v0.17 W8)", () => {
+  it("GET /api/goals/:id/status returns the projected status payload", async () => {
+    const { goal } = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        objective: "projected status fields",
+        scope: "global",
+        budgetTokens: 5000,
+        maxRounds: 8,
+      }),
+    })).json();
+
+    const res = await fetch(`${base}/api/goals/${goal.id}/status`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toMatchObject({
+      id: goal.id,
+      objective: "projected status fields",
+      status: "active",
+      round: 0,
+      roundsMax: 8,
+      tokensUsed: 0,
+      tokensMax: 5000,
+      toolCount: 0,
+      resumeCount: 0,
+      abortRequested: false,
+    });
+    // Heartbeat hasn't been stamped yet (no round has run) so it's null.
+    expect(body.heartbeatAt).toBeNull();
+    expect(body.latestSummary).toBeNull();
+  });
+
+  it("GET /api/goals/:id/status 404s on unknown goal", async () => {
+    const res = await fetch(
+      `${base}/api/goals/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/status`,
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("GET /api/goals/:id/status 400s on a path-traversing id", async () => {
+    const res = await fetch(`${base}/api/goals/..%2Fetc/status`);
+    expect(res.status).toBe(400);
+  });
+
+  it("runner stamps heartbeatAt at the top of every round", async () => {
+    // Use a dedicated server with a fake LLM so the heartbeat test
+    // doesn't depend on the real ModelRouter (which would fail with the
+    // dummy `sk-secret` key seeded in the outer beforeAll).
+    const local = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace,
+      goalLlmFactory: () => fakeLlm("ok"),
+    });
+    try {
+      const { goal } = await (await fetch(`${local.url}/api/goals`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ objective: "heartbeat round", scope: "global" }),
+      })).json();
+      const before = Date.now();
+      const runRes = await fetch(`${local.url}/api/goals/${goal.id}/run`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(runRes.status).toBe(200);
+      const status = await (
+        await fetch(`${local.url}/api/goals/${goal.id}/status`)
+      ).json();
+      expect(typeof status.heartbeatAt).toBe("number");
+      // Heartbeat is stamped at the top of the round; the window we accept
+      // is generous so a slow CI host can't flake the test.
+      expect(status.heartbeatAt).toBeGreaterThanOrEqual(before - 1000);
+      expect(status.heartbeatAt).toBeLessThanOrEqual(Date.now() + 1000);
+      // latestSummary is best-effort — the fake LLM emits a single token
+      // but the runner may finish the round before any `text` step lands
+      // depending on plan-bootstrap behaviour. We only assert the field
+      // is present in the response payload.
+      expect("latestSummary" in status).toBe(true);
+    } finally {
+      await local.close();
+    }
+  });
+
+  it("POST /api/goals/:id/abort sets meta.abortRequested + reports inflight: false when idle", async () => {
+    const { goal } = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "abort idle goal", scope: "global" }),
+    })).json();
+
+    const abort = await fetch(`${base}/api/goals/${goal.id}/abort`, {
+      method: "POST",
+    });
+    expect(abort.status).toBe(200);
+    const abortBody = await abort.json();
+    expect(abortBody).toMatchObject({ aborted: true, inflight: false });
+    expect(abortBody.goal.meta?.abortRequested).toBe(true);
+
+    // GET status reflects the flag; the goal is still "active" (not
+    // terminal) but the panel will see abortRequested === true.
+    const status = await (await fetch(`${base}/api/goals/${goal.id}/status`)).json();
+    expect(status.abortRequested).toBe(true);
+    expect(status.status).toBe("active");
+  });
+
+  it("POST /api/goals/:id/abort 404s on unknown id", async () => {
+    const res = await fetch(
+      `${base}/api/goals/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/abort`,
+      { method: "POST" },
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("POST /api/goals/:id/abort 400s on a path-traversing id", async () => {
+    const res = await fetch(`${base}/api/goals/..%2Fetc/abort`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /api/goals/:id/resume clears abortRequested cleanly", async () => {
+    const { goal } = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "resume after abort", scope: "global" }),
+    })).json();
+
+    // Abort before any round runs.
+    await fetch(`${base}/api/goals/${goal.id}/abort`, { method: "POST" });
+    let status = await (await fetch(`${base}/api/goals/${goal.id}/status`)).json();
+    expect(status.abortRequested).toBe(true);
+
+    // Resume clears the flag.
+    const resume = await fetch(`${base}/api/goals/${goal.id}/resume`, {
+      method: "POST",
+    });
+    expect(resume.status).toBe(200);
+    const resumeBody = await resume.json();
+    expect(resumeBody.goal.meta?.abortRequested).toBe(false);
+
+    // GET status confirms the flag is cleared.
+    status = await (await fetch(`${base}/api/goals/${goal.id}/status`)).json();
+    expect(status.abortRequested).toBe(false);
+  });
+
+  it("POST /api/goals/:id/resume rejects terminal statuses", async () => {
+    const { goal } = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "resume terminal", scope: "global" }),
+    })).json();
+    await fetch(`${base}/api/goals/${goal.id}/cancel`, { method: "POST" });
+    const res = await fetch(`${base}/api/goals/${goal.id}/resume`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /api/goals/:id/resume flips paused goals back to active", async () => {
+    const { goal } = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "resume paused", scope: "global" }),
+    })).json();
+    await fetch(`${base}/api/goals/${goal.id}/pause`, { method: "POST" });
+    const before = await (await fetch(`${base}/api/goals/${goal.id}`)).json();
+    expect(before.goal.status).toBe("paused");
+
+    const resume = await fetch(`${base}/api/goals/${goal.id}/resume`, {
+      method: "POST",
+    });
+    expect(resume.status).toBe(200);
+    const resumeBody = await resume.json();
+    expect(resumeBody.goal.status).toBe("active");
+  });
+});
+
 describe("POST /api/global-chat/:id/compact (v0.2 §5)", () => {
   it("returns 404 for an unknown conversation", async () => {
     const res = await fetch(`${base}/api/global-chat/no-such-conv/compact`, {

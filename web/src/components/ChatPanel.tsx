@@ -32,6 +32,7 @@ import {
   toggleReaction,
   findGoalForConversation,
   runGoalRound,
+  steerChatConversation,
   type ChatEvent,
   type ChatAttachmentRef,
   type ConversationAnnotations,
@@ -39,7 +40,9 @@ import {
   type GoalRow,
 } from "../lib/chat.ts";
 import GoalControls from "./GoalControls.tsx";
+import GoalRunStatusPanel from "./GoalRunStatusPanel.tsx";
 import PlanRunOverlay from "./PlanRunOverlay.tsx";
+import { AgentStatusPanel, type ChatEventPhase } from "./AgentStatusPanel.tsx";
 import { api, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
 import {
   historyToBubbles,
@@ -86,6 +89,16 @@ export default function ChatPanel({
   const [conversationId, setConversationId] = useState<string | null>(urlConvId);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  // v0.17 mathub parity W9 — Live Steering. `steerToast` holds the most
+  // recently queued steer text while the SPA waits for the server's
+  // `steer-received` SSE frame; it clears on receipt. `steerLastReceived`
+  // is a one-shot badge text the next round bubble renders to show what
+  // the user steered with (mirrors mathub's "📣 Steered: …" hint).
+  const [steerToast, setSteerToast] = useState<string | null>(null);
+  const [steerLastReceived, setSteerLastReceived] = useState<string | null>(null);
+  // The composer doubles as the steer textarea: while `busy`, the
+  // Send button is replaced by Stop + Steer, and submitting via
+  // Steer sends the current `input` as a steer instead of a new turn.
   // v0.16 §4: bump to force the conversation-load effect to re-run when the
   // id didn't change but the underlying history did (e.g. after a goal
   // round on the *same* conversation).
@@ -104,6 +117,46 @@ export default function ChatPanel({
   // before kicking off pumpSSE; the Stop button calls `.abort()` to interrupt.
   // Cleared in `runChatStream`'s finally block so the next turn starts fresh.
   const abortRef = useRef<AbortController | null>(null);
+
+  // ─── AgentStatusPanel state (v0.17 mathub parity W7) ─────────────────
+  //
+  // We mirror the SSE event tape into a compact set of presentational
+  // signals so the panel can render a `🧠 thinking / 🔧 calling tool / 🔄
+  // Step N/M / ⏱ Xs` strip without re-walking the bubble array on every
+  // tick. All four states reset to their idle values in `runChatStream`'s
+  // `finally` block, alongside `setBusy(false)`, so the panel disappears
+  // the moment the stream ends — no stale `⏱ 12s` left dangling.
+  const [latestEventType, setLatestEventType] = useState<ChatEventPhase>(null);
+  // Active tool calls: `tool-call` id -> name. We need a map (not a
+  // plain count) because tool-result events come back keyed by id and
+  // we have to remove the right entry, not the most-recent one.
+  const [activeToolCalls, setActiveToolCalls] = useState<Record<string, string>>({});
+  // True while at least one of the in-flight tool calls is a sub-agent
+  // dispatch. The renderer flips the phase pill to `🌿 Sub-agent
+  // running` to make it obvious the parent agent isn't stuck.
+  const [subAgentActive, setSubAgentActive] = useState(false);
+  // Unix ms when the current stream began (set in `runChatStream`'s
+  // controller setup, cleared on stream end). Drives `⏱ elapsed`.
+  const sendStartMsRef = useRef<number>(0);
+  const [sendStartMs, setSendStartMs] = useState<number>(0);
+  // Goal-mode round counter, fed from the `round-start` SSE event.
+  // `null` for plain chat (which never emits round-start) so the
+  // panel hides its `Step N/M` segment.
+  const [round, setRound] = useState<{ current: number; max?: number } | null>(null);
+  // Tick state for the 1Hz elapsed-time refresh while `busy` is true.
+  // Without this React would only re-render when an SSE event arrives,
+  // so a slow tool call would freeze the `⏱ Xs` counter visually.
+  const [statusTick, setStatusTick] = useState(0);
+  useEffect(() => {
+    if (!busy) return;
+    const id = setInterval(() => setStatusTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [busy]);
+  // Reading `statusTick` here keeps it from being a dead state — React
+  // strips unused setters in production builds but the read makes the
+  // dependency intent explicit for any future eslint sweep.
+  void statusTick;
+
   // Bubble index currently being edited in-place (null = no inline editor).
   // Only user bubbles are editable; committing the edit truncates history at
   // that bubble and re-streams with the new prompt body via `rerunChat`.
@@ -551,11 +604,86 @@ export default function ChatPanel({
       const controller = new AbortController();
       abortRef.current = controller;
 
+      // v0.17 mathub parity W7: reset AgentStatusPanel state for the new
+      // turn. We pin the start timestamp on a ref AND in state because
+      // the panel re-renders on every `statusTick` (1Hz) and needs a
+      // stable wall-clock origin, while the ref keeps the timestamp
+      // available to the SSE callback without re-reading state.
+      const startedAt = Date.now();
+      sendStartMsRef.current = startedAt;
+      setSendStartMs(startedAt);
+      setLatestEventType(null);
+      setActiveToolCalls({});
+      setSubAgentActive(false);
+      setRound(null);
+
       const onEvent = (ev: ChatEvent) => {
         if (ev.type === "session") {
           setConversationId(ev.conversationId);
           return;
         }
+
+        // v0.17 mathub parity W7: feed AgentStatusPanel state from the
+        // SAME event tape that drives the bubble list. We do this
+        // BEFORE the setBubbles call so a re-render that picks up the
+        // new bubble also picks up the new phase pill in one paint.
+        if (
+          ev.type === "text" ||
+          ev.type === "tool-call" ||
+          ev.type === "tool-result" ||
+          ev.type === "round-start" ||
+          ev.type === "ask_user"
+        ) {
+          setLatestEventType(ev.type);
+        }
+        if (ev.type === "round-start") {
+          setRound({
+            current: ev.round,
+            ...(typeof ev.maxRounds === "number" ? { max: ev.maxRounds } : {}),
+          });
+        }
+        // v0.17 mathub parity W9 — the server confirms it consumed our
+        // queued steer at a round boundary. Dismiss the "⏳ Steer
+        // queued…" toast and stash the text on `steerLastReceived` so
+        // the next round bubble can render a "📣 Steered" badge. We
+        // don't push the steer into the bubble list ourselves — the
+        // synthetic `[Steer from user: …]` message lives in history
+        // already, and a reload picks it up naturally. The badge is a
+        // one-shot affordance for the live session.
+        if (ev.type === "steer-received") {
+          setSteerToast(null);
+          setSteerLastReceived(ev.text);
+          // Auto-clear after a few seconds so the badge doesn't stick
+          // forever; mirrors mathub's "toast" approach.
+          window.setTimeout(() => {
+            setSteerLastReceived((cur) => (cur === ev.text ? null : cur));
+          }, 6000);
+        }
+        if (ev.type === "tool-call") {
+          // Track the in-flight call by id so the matching tool-result
+          // removes the right entry even if calls arrive interleaved.
+          setActiveToolCalls((prev) => ({ ...prev, [ev.id]: ev.name }));
+          if (ev.name === "dispatch_subagent" || ev.name === "spawn_sub_goal") {
+            setSubAgentActive(true);
+          }
+        } else if (ev.type === "tool-result") {
+          setActiveToolCalls((prev) => {
+            if (!(ev.id in prev)) return prev;
+            const next = { ...prev };
+            delete next[ev.id];
+            return next;
+          });
+          // Recompute sub-agent flag from the remaining in-flight set.
+          // (We can't use the just-set `next` here because `setActiveToolCalls`
+          // is async; instead we read the latest via a functional update.)
+          setSubAgentActive((wasActive) => {
+            if (!wasActive) return false;
+            // Will be re-derived on the next render via activeToolCalls;
+            // optimistically clear when the closed call was a sub-agent.
+            return ev.name !== "dispatch_subagent" && ev.name !== "spawn_sub_goal";
+          });
+        }
+
         setBubbles((prev) => {
           const next = [...prev];
           if (ev.type === "text") {
@@ -628,6 +756,15 @@ export default function ChatPanel({
       } finally {
         if (abortRef.current === controller) abortRef.current = null;
         setBusy(false);
+        // v0.17 mathub parity W7: clear AgentStatusPanel state once the
+        // stream is over. The panel itself returns `null` when
+        // `busy === false`, but we still reset so a subsequent turn
+        // doesn't briefly flash `Step 3/8` from the prior round before
+        // its own `round-start` lands.
+        setLatestEventType(null);
+        setActiveToolCalls({});
+        setSubAgentActive(false);
+        setRound(null);
         // Trim a trailing empty assistant bubble that can linger when the
         // stream errors out (or is stopped) before any tokens land. Without
         // this the user sees an ellipsis-only "…" bubble that they can't
@@ -653,6 +790,40 @@ export default function ChatPanel({
   function stop() {
     if (abortRef.current) {
       abortRef.current.abort();
+    }
+  }
+
+  // ─── Send a Live Steer (v0.17 mathub parity W9) ────────────────────
+  //
+  // Queue a free-form nudge against the in-flight stream. The composer
+  // is repurposed as the steer textarea while `busy === true`; this
+  // handler POSTs the text to `<chatBase>/:cid/steer` (or the goal
+  // wrapper when a goal is associated). The runner consumes the text
+  // at the next round-top inside `ChatSession.runRounds`, injects a
+  // synthetic `[Steer from user: …]` user message, and emits a
+  // `steer-received` SSE frame; the SPA dismisses the toast on receipt
+  // (see the SSE handler in `runChatStream` / `streamChat` callbacks).
+  //
+  // Failures we silently swallow: 409 (no in-flight stream — a race
+  // where the agent finished between the click and the POST), and any
+  // abort. Real network errors flip the toast text but don't surface
+  // an error bubble — steering is best-effort.
+  async function handleSteer() {
+    const text = input.trim();
+    if (!text || !busy || !conversationId) return;
+    // Show toast immediately for snappy feedback; clear on receipt.
+    setSteerToast(text);
+    setInput("");
+    try {
+      await steerChatConversation(scope, conversationId, text);
+    } catch (err: any) {
+      if (err?.status === 409) {
+        // The agent finished after we clicked; just drop the toast.
+        setSteerToast(null);
+      } else {
+        setSteerToast(`⚠ Could not queue steer: ${err?.message ?? String(err)}`);
+        window.setTimeout(() => setSteerToast(null), 4000);
+      }
     }
   }
 
@@ -1662,6 +1833,33 @@ export default function ChatPanel({
           </div>
         )}
 
+        {/* v0.17 W8: mathub-parity status strip. Only mounts when this
+            conversation is the primary one of a goal-loop — plain chats
+            don't need a status panel. The panel polls /api/goals/:id/status
+            every 3s for round counters, budget pressure, heartbeat
+            freshness, and the latest plan/text summary, and exposes
+            Abort / Resume so the user can steer the loop without
+            opening the thread drawer. */}
+        {owningGoal && (
+          <div className="border-b border-slate-200 bg-slate-50 px-6 py-1.5">
+            <GoalRunStatusPanel
+              goalId={owningGoal.id}
+              pollKey={reloadTick}
+              onStatus={(s) => {
+                // Keep the in-memory goal row's status field roughly in
+                // sync with the panel — GoalControls reads `goal.status`
+                // to decide which buttons to surface. We only flip the
+                // local copy when the projected status actually changed.
+                setOwningGoal((prev) => {
+                  if (!prev) return prev;
+                  if (prev.status === s.status) return prev;
+                  return { ...prev, status: s.status, endReason: s.endReason ?? prev.endReason };
+                });
+              }}
+            />
+          </div>
+        )}
+
         {/* ─── Export toolbar ─── */}
         {exportItems.length > 0 && (
           <div className="flex items-center gap-1 border-b border-slate-200 bg-slate-50 px-6 py-1.5 text-xs">
@@ -2171,6 +2369,22 @@ export default function ChatPanel({
           })}
         </div>
 
+        {/* ─── AgentStatusPanel (v0.17 mathub parity W7) ───────────────────────
+            Compact status strip rendered just BELOW the bubble list
+            while the chat / goal round is streaming. Hides itself when
+            `busy === false` so the chat surface stays clean between
+            turns. Phase / tools / sub-agent / round / elapsed all wire
+            off the same SSE event tape that fills `bubbles`, so a
+            single source of truth drives both views. */}
+        <AgentStatusPanel
+          busy={busy}
+          latestEventType={latestEventType}
+          activeTools={Object.values(activeToolCalls)}
+          subAgentActive={subAgentActive}
+          elapsedMs={sendStartMs > 0 ? Date.now() - sendStartMs : 0}
+          round={round}
+        />
+
         {error && (
           <div className="mx-6 mb-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">
             {error}
@@ -2364,15 +2578,29 @@ export default function ChatPanel({
                   e.keyCode !== 229
                 ) {
                   e.preventDefault();
-                  if (busy) return;
+                  if (busy) {
+                    // v0.17 mathub parity W9 — while a stream is open,
+                    // Enter sends the input as a Live Steer instead of
+                    // a brand-new turn. Mirrors clicking the 📣 Steer
+                    // button.
+                    void handleSteer();
+                    return;
+                  }
                   // requestSubmit() dispatches a real submit event so
                   // <form onSubmit={send}> handles preventDefault + the
                   // existing reply/quote/empty-trim logic.
                   e.currentTarget.form?.requestSubmit();
                 }
               }}
-              placeholder="Type a message… (Shift+Enter for newline; drag/paste files to attach)"
-              disabled={busy}
+              placeholder={
+                busy
+                  ? "Type a steer… (Enter to queue, Shift+Enter for newline)"
+                  : "Type a message… (Shift+Enter for newline; drag/paste files to attach)"
+              }
+              // v0.17 mathub parity W9 — keep the textarea enabled while
+              // busy so the user can type their Live Steer. The visual
+              // "busy" cue is the button swap (Stop + Steer replacing
+              // Send), not a greyed-out textarea.
               rows={Math.min(
                 8,
                 Math.max(1, input.split("\n").length),
@@ -2380,17 +2608,40 @@ export default function ChatPanel({
               className="flex-1 resize-none rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
             />
             {busy ? (
-              // Stop swaps in for Send while a stream is open. Calling stop()
-              // .abort()s the underlying fetch so the SSE pump tears down and
-              // runChatStream's finally block flips `busy` back to false.
-              <button
-                type="button"
-                onClick={stop}
-                className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
-                title="Stop generating"
-              >
-                ⏹ Stop
-              </button>
+              // While a stream is open the composer offers two actions:
+              //   - Steer (v0.17 mathub parity W9): post the current
+              //     `input` as a free-form nudge that the runner picks
+              //     up at the next round boundary. Enabled iff there's
+              //     text + a known conversationId. Doesn't cancel the
+              //     stream.
+              //   - Stop: .abort()s the underlying fetch so the SSE
+              //     pump tears down and runChatStream's finally block
+              //     flips `busy` back to false.
+              <>
+                <button
+                  type="button"
+                  onClick={() => void handleSteer()}
+                  disabled={!input.trim() || !conversationId}
+                  className="rounded-md bg-amber-500 px-3 py-2 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50"
+                  title={
+                    !conversationId
+                      ? "Waiting for stream…"
+                      : !input.trim()
+                        ? "Type a nudge first"
+                        : "Queue this text as a steer for the in-flight stream"
+                  }
+                >
+                  📣 Steer
+                </button>
+                <button
+                  type="button"
+                  onClick={stop}
+                  className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+                  title="Stop generating"
+                >
+                  ⏹ Stop
+                </button>
+              </>
             ) : (
               <button
                 type="submit"
@@ -2445,6 +2696,37 @@ export default function ChatPanel({
         >
           {planSavedToast}
         </div>
+      )}
+      {/* v0.17 mathub parity W9 — Live Steering toasts.
+          - `steerToast`: "⏳ Steer queued… «…first 80 chars»". Visible
+            from the moment the user clicks Steer until the server
+            confirms with `steer-received`.
+          - `steerLastReceived`: "📣 Steered: …". One-shot confirmation
+            shown for a few seconds after the runner picks up the
+            steer. Stacked above `planSavedToast` when both are
+            visible.
+          Both are dismissible by clicking the toast. Bottom-right
+          placement matches the existing plan toast so the user's eye
+          isn't pulled away from the composer. */}
+      {steerToast && (
+        <button
+          type="button"
+          onClick={() => setSteerToast(null)}
+          className="fixed bottom-16 right-4 z-50 max-w-sm rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-left text-xs text-amber-900 shadow hover:bg-amber-100"
+          title="Click to dismiss"
+        >
+          ⏳ Steer queued… “{steerToast.length > 80 ? steerToast.slice(0, 80) + "…" : steerToast}”
+        </button>
+      )}
+      {steerLastReceived && !steerToast && (
+        <button
+          type="button"
+          onClick={() => setSteerLastReceived(null)}
+          className="fixed bottom-16 right-4 z-50 max-w-sm rounded-md border border-indigo-300 bg-indigo-50 px-3 py-2 text-left text-xs text-indigo-900 shadow hover:bg-indigo-100"
+          title="Click to dismiss"
+        >
+          📣 Steered: “{steerLastReceived.length > 80 ? steerLastReceived.slice(0, 80) + "…" : steerLastReceived}”
+        </button>
       )}
 
       {/* ─── Image lightbox (v0.17 mathub parity) ───────────────────

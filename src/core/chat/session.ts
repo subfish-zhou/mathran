@@ -118,6 +118,31 @@ export type ChatEvent =
       question: string;
     }
   | {
+      /** v0.17 mathub parity W7 — emitted by the *goal* runner (NOT the
+       *  chat session) at the top of every goal round so the SPA can
+       *  render the `Step N/MAX · ⏱ Xs` status strip. `maxRounds` is
+       *  optional: plain chat (single-round semantics) never emits this
+       *  event; goal runs with no `roundsMax` budget emit `round` without
+       *  a cap. W9 (Live Steering) extends ChatEvent further with
+       *  `steer-received` — this case stays additive and unaffected. */
+      type: "round-start";
+      round: number;
+      maxRounds?: number;
+    }
+  | {
+      /** v0.17 mathub parity W9 — emitted by `runRounds` whenever a
+       *  `SendOpts.steerProbe` returns a non-empty string at a round
+       *  boundary. The runner injects the steer text as a synthetic
+       *  `[Steer from user: …]` user message into history BEFORE the
+       *  next LLM request, then yields this event so the SPA can
+       *  dismiss its "queued" toast + render a "📣 Steered" badge on
+       *  the next round bubble. The injected user message also lands
+       *  in the persisted conversation jsonl as a normal user turn so
+       *  reloads see what the user actually steered with. */
+      type: "steer-received";
+      text: string;
+    }
+  | {
       type: "done";
       finishReason: Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
     };
@@ -273,6 +298,27 @@ export interface SendOpts {
    * bubble. Providers ignore the field — see `LLMMessage.attachments`.
    */
   attachments?: Array<{ path: string; filename: string; mimeType: string }>;
+  /**
+   * v0.17 mathub parity W9 — Live Steering probe.
+   *
+   * Called at the top of every round inside `runRounds` (BEFORE the
+   * LLM request). When the probe returns a non-empty string, the
+   * runner:
+   *
+   *   1. injects a synthetic `{ role: "user", content: "[Steer from
+   *      user: …]" }` message into history (so the LLM sees the
+   *      steer on the next request AND the persisted jsonl shows it),
+   *   2. yields a `{ type: "steer-received", text }` ChatEvent so
+   *      the SSE stream forwards it to the SPA.
+   *
+   * The probe is responsible for clearing whatever underlying queue
+   * it pulled from (it's a consume-on-read callback). Errors thrown
+   * from the probe propagate; route handlers wrap their own try/catch
+   * around `send()` so a bad probe doesn't kill history bookkeeping.
+   *
+   * Default unset = no steering (CLI / tests are unaffected).
+   */
+  steerProbe?: () => string | null | undefined;
 }
 
 /** Construct the canonical abort error (matches the Fetch/Streams convention). */
@@ -864,11 +910,34 @@ export class ChatSession {
    */
   private async *runRounds(opts: SendOpts): AsyncIterable<ChatEvent> {
     const signal = opts.signal;
+    const steerProbe = opts.steerProbe;
 
     for (let round = 0; round <= this.maxToolRounds; round++) {
       // Abort between rounds (history is well-formed here: every prior
       // assistant tool-call has a paired tool result).
       if (signal?.aborted) throw abortError();
+
+      // v0.17 mathub parity W9 — Live Steering. Probe BEFORE we build
+      // the LLM request so the steered user message is part of `messages`
+      // when we ship the next request, AND so the persisted history
+      // (history() = this.messages) shows the steer between rounds. The
+      // probe is consume-on-read: if it returns a non-empty string, we
+      // own it. The synthetic user message is intentionally a plain
+      // text turn (no tool_calls) so provider validation stays happy at
+      // any round-boundary (after an assistant message with no tool
+      // calls, or after a tool result from the previous round). Errors
+      // from the probe propagate — a misbehaving server callback should
+      // fail loudly, not silently swallow user input.
+      if (steerProbe) {
+        const steered = steerProbe();
+        if (typeof steered === "string" && steered.length > 0) {
+          this.messages.push({
+            role: "user",
+            content: `[Steer from user: ${steered}]`,
+          });
+          yield { type: "steer-received", text: steered };
+        }
+      }
 
       const req: LLMRequest = {
         messages: this.messages.map((m) => ({ ...m })),

@@ -104,10 +104,12 @@ import {
   type ConversationAnnotations,
 } from "../core/chat/store.js";
 import {
+  clearGoalAbortRequest,
   createGoal,
   endGoal,
   listGoals,
   readGoal,
+  requestGoalAbort,
   writeGoal,
   type Goal,
 } from "../core/goal/store.js";
@@ -126,6 +128,12 @@ import {
   LocalLeanProvider,
   resolveApiKey,
 } from "../providers/index.js";
+import {
+  consumePendingSteer,
+  hasActiveStream,
+  markStreamActive,
+  setPendingSteer,
+} from "./steer-registry.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 7878;
@@ -943,6 +951,12 @@ function registerChatScope(
     }
 
     return streamSSE(c, async (stream) => {
+      // v0.17 mathub parity W9 — register this conversation as having an
+      // in-flight stream so `POST .../:cid/steer` knows where to queue.
+      // Paired with the `finally` release below; ref-counted so a
+      // concurrent rerun on the same conversationId still releases
+      // cleanly when one of them ends.
+      const releaseSteerSlot = markStreamActive(conversationId);
       try {
         await stream.writeSSE({
           event: "session",
@@ -950,6 +964,7 @@ function registerChatScope(
         });
         for await (const ev of session.send(augmentedMessage, {
           attachments: attachments && attachments.length > 0 ? attachments : undefined,
+          steerProbe: () => consumePendingSteer(conversationId),
         }) as AsyncIterable<ChatEvent>) {
           await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
         }
@@ -998,6 +1013,13 @@ function registerChatScope(
           event: "error",
           data: JSON.stringify({ message: err?.message ?? String(err) }),
         });
+      } finally {
+        // v0.17 mathub parity W9 — always release the steer slot so a
+        // future POST .../steer for this conversation doesn't 200 into
+        // the void (the registry refuses with 409 once the slot is
+        // gone). Also clears any unread steer on the way out so a fresh
+        // stream on the same conversationId doesn't pick up a stale one.
+        releaseSteerSlot();
       }
     });
   });
@@ -1173,6 +1195,9 @@ function registerChatScope(
     session.replaceHistory(truncated);
 
     return streamSSE(c, async (stream) => {
+      // v0.17 mathub parity W9 — same active-stream tracking as POST <base>
+      // so the user can steer a rerun mid-flight.
+      const releaseSteerSlot = markStreamActive(id);
       try {
         // Mirror the POST <base> envelope exactly so the SPA's existing SSE
         // reader handles re-run identically to a fresh send.
@@ -1180,7 +1205,9 @@ function registerChatScope(
           event: "session",
           data: JSON.stringify({ sessionId: id, conversationId: id, scope }),
         });
-        for await (const ev of session.send(promptText) as AsyncIterable<ChatEvent>) {
+        for await (const ev of session.send(promptText, {
+          steerProbe: () => consumePendingSteer(id),
+        }) as AsyncIterable<ChatEvent>) {
           await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
         }
         await store.flush(scope, id);
@@ -1218,8 +1245,60 @@ function registerChatScope(
           event: "error",
           data: JSON.stringify({ message: err?.message ?? String(err) }),
         });
+      } finally {
+        releaseSteerSlot();
       }
     });
+  });
+
+  // POST <base>/:conversationId/steer  — v0.17 mathub parity W9 (Live
+  // Steering). Queue a free-form steer text against an in-flight stream
+  // for this conversation. The currently-running `ChatSession.runRounds`
+  // loop probes `steer-registry.consumePendingSteer` at every round
+  // boundary (before issuing the next LLM request); on a hit it injects
+  // a synthetic `[Steer from user: …]` user message into history AND
+  // yields a `{ type: "steer-received" }` SSE event so the SPA can
+  // dismiss its "queued" toast.
+  //
+  // Contract:
+  //   - Body: `{ text: string }`. Empty or whitespace-only → 400.
+  //   - If no stream is in-flight for this conversation → 409. Steers
+  //     are tied to the round they steer; we refuse to queue them into
+  //     the void where they'd be picked up by a later (possibly
+  //     unrelated) stream on the same conversationId.
+  //   - Otherwise: 200 `{ ok: true, queued: true, conversationId }`.
+  //     Last-write-wins — a second POST overwrites the first.
+  //
+  // Designed to be safe under the same scope-resolver as every other
+  // chat route, so e.g. an effort-scoped steer can't bleed into global
+  // chat: `getScope(c)` runs first, and we 404 on an unknown
+  // `effortSlug` before touching the registry.
+  app.post(`${basePath}/:conversationId/steer`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const raw = typeof body?.text === "string" ? body.text : "";
+    const text = raw.trim();
+    if (text.length === 0) return c.json({ error: "text is required" }, 400);
+
+    // Refuse to queue when no stream is in flight — the steer would
+    // never be read. The SPA also gates its Steer button on the local
+    // `busy` flag, but we double-check on the server because tabs can
+    // drift and clients shouldn't be the trust boundary.
+    if (!hasActiveStream(id)) {
+      return c.json(
+        { error: "no in-flight stream to steer", conversationId: id, scope },
+        409,
+      );
+    }
+    setPendingSteer(id, text);
+    return c.json({ ok: true, queued: true, conversationId: id, scope });
   });
 
   // POST <base>/:conversationId/truncate  — drop a tail of the conversation
@@ -1413,6 +1492,10 @@ function registerChatScope(
     await saveAnnotations(store.getWorkspace(), scope, id, cleared);
 
     return streamSSE(c, async (stream) => {
+      // v0.17 mathub parity W9 — the user can steer a resumed-from-ask
+      // round mid-flight too. Track active stream + pipe the probe into
+      // `resume`, which forwards it straight into `runRounds`.
+      const releaseSteerSlot = markStreamActive(id);
       try {
         await stream.writeSSE({
           event: "session",
@@ -1423,7 +1506,9 @@ function registerChatScope(
             resumedFromAsk: true,
           }),
         });
-        for await (const ev of session.resume() as AsyncIterable<ChatEvent>) {
+        for await (const ev of session.resume({
+          steerProbe: () => consumePendingSteer(id),
+        }) as AsyncIterable<ChatEvent>) {
           await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
         }
         await store.flush(scope, id);
@@ -1460,6 +1545,8 @@ function registerChatScope(
           event: "error",
           data: JSON.stringify({ message: err?.message ?? String(err) }),
         });
+      } finally {
+        releaseSteerSlot();
       }
     });
   });
@@ -2582,6 +2669,13 @@ function buildApp(
         ? body.message
         : "Continue with the current objective.";
 
+    // v0.17 W8: clear any stale abortRequested flag from a previous round
+    // (e.g. the user clicked Abort then Resume / Run). The runner checks
+    // this flag at round-top and bails out as aborted, so we MUST clear
+    // it before driving the round or the very first iteration will
+    // immediately abort itself.
+    await clearGoalAbortRequest(workspace, goalId);
+
     const cfg = loadConfig(configPathFor(workspace));
     const llm: LLMProvider = goalLlmFactory
       ? goalLlmFactory({ model: g.model })
@@ -2625,6 +2719,165 @@ function buildApp(
   });
 
   /**
+   * POST /api/goals/:id/run/stream
+   *   body: { message?: string }
+   *
+   * v0.17 mathub parity W7 — SSE-streaming variant of `POST /run`.
+   *
+   * Identical scheduling semantics to `/run` (one round per request,
+   * cooperative-abort check, plan bootstrap, AbortController registration),
+   * BUT the inner `ChatSession.send` events are forwarded onto the response
+   * stream as `text:` / `tool-call:` / `tool-result:` / `ask_user:` /
+   * `done:` SSE frames, plus a leading `round-start:` frame the goal runner
+   * synthesises so the SPA's AgentStatusPanel can render `🔄 Step N/MAX`
+   * before the model has produced its first token. A terminal `result:`
+   * frame carries the same JSON envelope the non-streaming `/run` endpoint
+   * returns, so callers don't need a second round-trip to find out whether
+   * the goal completed / failed / exhausted.
+   *
+   * The legacy JSON endpoint is preserved unchanged so existing CLI / SPA
+   * callers (`runGoalRound` in `web/src/lib/chat.ts`) keep working without
+   * a coordinated migration.
+   */
+  app.post("/api/goals/:goalId/run/stream", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const g = await readGoal(workspace, goalId);
+    if (!g) return c.json({ error: "not found" }, 404);
+    if (g.status !== "active") {
+      return c.json({ error: `goal is ${g.status}; not runnable` }, 400);
+    }
+    let body: any = {};
+    try { body = await c.req.json(); } catch { /* empty body is fine */ }
+    const userMessage =
+      typeof body?.message === "string" && body.message.trim().length > 0
+        ? body.message
+        : "Continue with the current objective.";
+
+    await clearGoalAbortRequest(workspace, goalId);
+
+    const cfg = loadConfig(configPathFor(workspace));
+    const llm: LLMProvider = goalLlmFactory
+      ? goalLlmFactory({ model: g.model })
+      : new ModelRouter(cfg);
+    const lean = new LocalLeanProvider();
+    const tools = [createLeanCheckTool(lean)];
+
+    const controller = new AbortController();
+    inflightGoals.set(goalId, controller);
+
+    // v0.17 mathub parity W9 — Live Steering. The goal's first
+    // conversationId is the key into the in-memory steer registry
+    // (chat + goal share the same conversationId namespace, so the
+    // SPA can target either by id). We register the slot as soon as
+    // we know the id and release it in `finally`, ref-counted via the
+    // returned closure so concurrent /run/stream calls on the same
+    // goal (rare but possible during reload races) don't double-free.
+    // The conversationId may not exist yet if this is the very first
+    // round of the goal — mirror the runner's logic that mints one on
+    // demand. We can't actually pre-mint without persisting, so we
+    // accept this gap: the user's first steer for a brand-new goal
+    // would 404 client-side and they retry once a round is live. In
+    // practice the SPA only enables the Steer button once it has seen
+    // the `session` SSE frame, which carries the conversationId.
+    const steerConversationId = g.conversationIds[0] ?? null;
+    const releaseSteerSlot = steerConversationId
+      ? markStreamActive(steerConversationId)
+      : () => undefined;
+
+    return streamSSE(c, async (stream) => {
+      // Stream events live (rather than buffering until the round finishes)
+      // so the AgentStatusPanel can render `round-start` + phase changes as
+      // they happen. `onEvent` is sync but `stream.writeSSE` is async, so we
+      // run a small pump task in parallel with `runGoalRound`: events get
+      // pushed onto `queue` synchronously from the runner, and the pump
+      // drains them on every tick. Ordering is preserved (single producer,
+      // single consumer, FIFO array).
+      const queue: { event: string; data: string }[] = [];
+      let done = false;
+      let wake: (() => void) | null = null;
+      const wakePump = () => {
+        const w = wake;
+        wake = null;
+        if (w) w();
+      };
+
+      const pump = (async () => {
+        while (!done || queue.length > 0) {
+          while (queue.length > 0) {
+            const frame = queue.shift()!;
+            await stream.writeSSE(frame);
+          }
+          if (done) return;
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+        }
+      })();
+
+      try {
+        const r = await runGoalRound({
+          workspace,
+          goalId,
+          userMessage,
+          llm,
+          tools,
+          toolContext: { workspace, scope: g.scope },
+          signal: controller.signal,
+          bootstrapPlan: "auto",
+          onEvent: (ev) => {
+            queue.push({ event: ev.type, data: JSON.stringify(ev) });
+            wakePump();
+          },
+          // v0.17 mathub parity W9 — forward the registry probe into
+          // the inner `ChatSession.runRounds`. The runner re-emits
+          // any `steer-received` event via `onEvent` so the SSE pump
+          // ships the frame to the SPA.
+          ...(steerConversationId
+            ? { steerProbe: () => consumePendingSteer(steerConversationId) }
+            : {}),
+        });
+        queue.push({
+          event: "result",
+          data: JSON.stringify({
+            goal: r.goal,
+            text: r.text,
+            completed: r.completed,
+            failed: r.failed,
+            exhausted: r.exhausted,
+            aborted: r.aborted,
+            endReason: r.endReason,
+          }),
+        });
+      } catch (err: any) {
+        if (isAskUserPending(err)) {
+          queue.push({
+            event: "ask_user",
+            data: JSON.stringify({
+              type: "ask_user",
+              id: (err as any).callId,
+              name: "ask_user",
+              question: (err as any).question,
+            }),
+          });
+        } else {
+          await endGoal(workspace, goalId, "failed", String(err?.message ?? err));
+          queue.push({
+            event: "error",
+            data: JSON.stringify({ message: err?.message ?? String(err) }),
+          });
+        }
+      } finally {
+        inflightGoals.delete(goalId);
+        releaseSteerSlot();
+        done = true;
+        wakePump();
+        await pump;
+      }
+    });
+  });
+
+  /**
    * POST /api/goals/:id/interrupt — abort the in-flight round for this goal.
    *
    * Returns 200 (with `{ interrupted: true }`) when a controller was found and
@@ -2639,6 +2892,45 @@ function buildApp(
     if (!controller) return c.json({ error: "no in-flight round" }, 404);
     controller.abort();
     return c.json({ interrupted: true });
+  });
+
+  /**
+   * POST /api/goals/:id/steer — v0.17 mathub parity W9 (Live Steering).
+   *
+   * Goal-flavoured wrapper around the scoped chat-side
+   * `POST <basePath>/:conversationId/steer` route. The SPA's goal-mode
+   * panel doesn't know (and shouldn't need to know) the underlying
+   * conversationId of the running round; this route resolves the goal
+   * record, picks `conversationIds[0]` (the canonical chat the runner
+   * uses for the goal), and queues the steer there.
+   *
+   * Contract:
+   *   - Body: `{ text: string }`. Empty / whitespace-only → 400.
+   *   - Goal must exist and be running an in-flight stream → else 409.
+   *   - Returns 200 `{ ok: true, queued: true, goalId, conversationId }`.
+   *
+   * Mirrors the chat-side contract so the SPA can pick which endpoint
+   * to hit by URL pattern, never by special-casing types.
+   */
+  app.post("/api/goals/:goalId/steer", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const g = await readGoal(workspace, goalId);
+    if (!g) return c.json({ error: "not found" }, 404);
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+    const raw = typeof body?.text === "string" ? body.text : "";
+    const text = raw.trim();
+    if (text.length === 0) return c.json({ error: "text is required" }, 400);
+    const conversationId = g.conversationIds[0];
+    if (!conversationId || !hasActiveStream(conversationId)) {
+      return c.json(
+        { error: "no in-flight round to steer", goalId },
+        409,
+      );
+    }
+    setPendingSteer(conversationId, text);
+    return c.json({ ok: true, queued: true, goalId, conversationId });
   });
 
   app.post("/api/goals/:goalId/pause", async (c) => {
@@ -2669,6 +2961,149 @@ function buildApp(
     }
     const ended = await endGoal(workspace, goalId, "cancelled", "user cancelled");
     return c.json({ goal: ended });
+  });
+
+  // ─── v0.17 W8: GoalRunStatusPanel support (status / abort / resume) ─
+  //
+  // The status panel polls `/status` every ~3s while a goal is active so
+  // it can render heartbeat freshness, budget bars, and the latest
+  // round/tool counts without keeping the SSE stream open. /abort and
+  // /resume let the user terminate or restart a goal-loop from that same
+  // panel.
+
+  /**
+   * GET /api/goals/:id/status — denormalised projection of `goal.json`
+   * suited for a 3-second polling loop. Returns *just* the fields the
+   * SPA needs (no audit log) so the response is small and never blocks
+   * on jsonl loads. Returns 404 when the goal doesn't exist; never
+   * mutates state.
+   */
+  app.get("/api/goals/:goalId/status", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const g = await readGoal(workspace, goalId);
+    if (!g) return c.json({ error: "not found" }, 404);
+
+    // Pull the latest assistant text from the audit log as a cheap
+    // `latestSummary` proxy (avoids loading the full conversation
+    // jsonl just to render the panel's one-line preview). The store
+    // already records every assistant turn as a `text` step.
+    let latestSummary: string | null = null;
+    for (let i = g.steps.length - 1; i >= 0; i--) {
+      const s = g.steps[i];
+      if (s.kind === "text" && typeof s.payload === "string" && s.payload.trim().length > 0) {
+        latestSummary = s.payload.trim().slice(0, 240);
+        break;
+      }
+    }
+
+    // Resume counter: how many times has a fresh `/run` cleared an
+    // abortRequested flag? Cheap to derive from the audit log: each
+    // user-abort + subsequent round-start cycle leaves a paired pair
+    // of `status` steps (`abortRequested:true` then a new `plan`
+    // step). We just count the `abortRequested:true` rows.
+    let resumeCount = 0;
+    for (const s of g.steps) {
+      if (
+        s.kind === "status" &&
+        typeof s.payload === "object" &&
+        s.payload !== null &&
+        (s.payload as Record<string, unknown>).abortRequested === true
+      ) {
+        resumeCount++;
+      }
+    }
+
+    return c.json({
+      id: g.id,
+      objective: g.objective,
+      status: g.status,
+      endReason: g.endReason ?? null,
+      round: g.stats.roundsRun,
+      roundsMax: g.budget.roundsMax,
+      tokensUsed: g.stats.tokensUsed,
+      tokensMax: g.budget.tokensMax,
+      toolCount: g.stats.toolCallCount,
+      resumeCount,
+      heartbeatAt: g.heartbeatAt ?? null,
+      latestSummary,
+      abortRequested: g.meta?.abortRequested === true,
+      // Echo IDs the panel may want to deep-link to.
+      conversationId: g.conversationIds[0] ?? null,
+      summaryPath: g.summaryPath ?? null,
+      planPath: g.planPath ?? null,
+      parentGoalId: g.parentGoalId ?? null,
+      subGoalCount: (g.subGoalIds ?? []).length,
+    });
+  });
+
+  /**
+   * POST /api/goals/:id/abort — request a cooperative abort of the
+   * goal loop. Sets `meta.abortRequested = true` (which the runner
+   * checks at round-top) AND aborts any in-flight AbortController
+   * registered for this goal so the current round unwinds promptly.
+   *
+   * Distinct from POST /interrupt: /interrupt is a single-round
+   * cancellation that leaves the goal's status untouched; /abort is
+   * the same gesture plus a *persisted* flag so a daemonised /
+   * background runner that picks up the goal later still sees the
+   * abort. The goal's status is NOT changed here — the runner / next
+   * round decides. POST /resume clears the flag and re-runs.
+   */
+  app.post("/api/goals/:goalId/abort", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const g = await readGoal(workspace, goalId);
+    if (!g) return c.json({ error: "not found" }, 404);
+    const updated = await requestGoalAbort(workspace, goalId);
+    // Best-effort: if a round is currently mid-stream, abort its
+    // AbortController so the SSE/stream unwinds immediately. We do
+    // this AFTER setting the flag so a runner that races to read the
+    // flag at round-top will see it.
+    const controller = inflightGoals.get(goalId);
+    let inflight = false;
+    if (controller) {
+      controller.abort();
+      inflight = true;
+    }
+    return c.json({ aborted: true, inflight, goal: updated });
+  });
+
+  /**
+   * POST /api/goals/:id/resume — clear a pending abortRequested flag
+   * and (when status === "paused") flip the goal back to active so
+   * the SPA can immediately POST /run.
+   *
+   * Terminal statuses (complete / failed / cancelled / exhausted) are
+   * not resumable; the caller should start a fresh goal instead.
+   * Returns 200 + the updated goal record so the panel can refresh
+   * without an extra round-trip.
+   */
+  app.post("/api/goals/:goalId/resume", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const g = await readGoal(workspace, goalId);
+    if (!g) return c.json({ error: "not found" }, 404);
+    if (
+      g.status === "complete" ||
+      g.status === "failed" ||
+      g.status === "cancelled" ||
+      g.status === "exhausted"
+    ) {
+      return c.json({ error: `goal is ${g.status}; not resumable` }, 400);
+    }
+    await clearGoalAbortRequest(workspace, goalId);
+    if (g.status === "paused") {
+      g.status = "active";
+      g.steps.push({
+        at: new Date().toISOString(),
+        kind: "status",
+        payload: { to: "active", reason: "user resume" },
+      });
+      await writeGoal(workspace, g);
+    }
+    const fresh = await readGoal(workspace, goalId);
+    return c.json({ goal: fresh });
   });
 
   // Per-plan AbortControllers + a small in-memory queue so an SPA that POSTs
