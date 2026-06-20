@@ -31,6 +31,7 @@ import {
   embeddedAssetCount,
   makeEmbeddedAssetHandler,
 } from "./static-assets.js";
+import { registerUploadRoutes } from "./upload-routes.js";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import YAML from "yaml";
 import { createTwoFilesPatch } from "diff";
@@ -1721,6 +1722,9 @@ function buildApp(
   app.get("/api/health", async (c) => {
     return c.json({ ok: true, version: await readPackageVersion(), workspace });
   });
+
+  // v0.17 mathub parity: file-upload endpoint for the SPA attachments flow.
+  registerUploadRoutes(app, workspace);
 
   app.get("/api/projects", async (c) => {
     return c.json({ projects: await listProjects(workspace) });
