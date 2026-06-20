@@ -11,6 +11,8 @@
  */
 import { useEffect, useState } from "react";
 import type { ToolBubble } from "../lib/history-to-bubbles.ts";
+import { fetchThread, type ThreadPayload } from "../lib/chat.ts";
+import { historyToBubbles, type Bubble } from "../lib/history-to-bubbles.ts";
 
 const TOOL_ICONS: Record<string, string> = {
   bash: "🛠",
@@ -276,6 +278,16 @@ export function ToolCallDisplay({
             </div>
           )}
 
+          {/* ─── spawn_sub_goal: inline preview (v0.16 §5) ─────────────────
+              Lazy-loaded mini-history under the spawn card, so the user
+              gets the gist ("what did the sub-agent do?") without opening
+              the full drawer. Fetched only when toggled on, then cached
+              in component state. Capped at the most recent 6 bubbles to
+              keep the parent transcript scannable. */}
+          {toolCall.name === "spawn_sub_goal" && subGoalIdForThisCall && (
+            <SubGoalInlinePreview goalId={subGoalIdForThisCall} />
+          )}
+
           {/* ─── spawn_sub_goal: jump-into-thread button (v0.16 §3) ─────────────
               When the parent supplied a goal id for this slot, render the
               affordance. Hidden when we have no id yet (still streaming, or
@@ -293,6 +305,124 @@ export function ToolCallDisplay({
             >
               📂 Open thread
             </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// v0.16 §5: SubGoalInlinePreview
+//
+// Lazy mini-history under a spawn_sub_goal card. Stays compact so the
+// parent transcript doesn't explode when there are many sub-goals.
+//
+// Lifecycle:
+//   • Renders a "▸ Preview" toggle by default (no fetch).
+//   • On first expand, fetches /thread once; caches in state.
+//   • Subsequent toggles are local.
+//   • Polling is intentionally OFF here — the full drawer is the place
+//     for a live view. Inline preview is a one-shot snapshot.
+//
+// We render at most 6 latest non-tool bubbles + a "(N tool calls)" line
+// so a sub-agent that did a lot of read/grep/write doesn't drown the
+// preview in low-signal tool noise.
+// ───────────────────────────────────────────────────────────────────────
+function SubGoalInlinePreview({ goalId }: { goalId: string }): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const [thread, setThread] = useState<ThreadPayload | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open || thread || loading) return;
+    let cancelled = false;
+    setLoading(true);
+    fetchThread(goalId)
+      .then((p) => {
+        if (cancelled) return;
+        setThread(p);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(String((e as Error).message ?? e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, thread, loading, goalId]);
+
+  // Trim noise: keep last 6 non-tool bubbles + tool count.
+  const bubbles: Bubble[] = thread ? historyToBubbles(thread.history as never) : [];
+  const nonTool = bubbles.filter((b) => b.kind !== "tool").slice(-6);
+  const toolCount = bubbles.filter((b) => b.kind === "tool").length;
+
+  return (
+    <div className="rounded border border-amber-200 bg-amber-50/60">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen((v) => !v);
+        }}
+        className="flex w-full items-center gap-2 px-2 py-1 text-left text-[11px] text-amber-900 hover:bg-amber-100"
+      >
+        <span aria-hidden>{open ? "▾" : "▸"}</span>
+        <span className="font-medium">Preview sub-goal</span>
+        {thread && (
+          <span className="ml-2 text-[10px] text-slate-600">
+            · {thread.goal.status} · {thread.goal.stats.roundsRun} round
+            {thread.goal.stats.roundsRun === 1 ? "" : "s"}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="border-t border-amber-200 px-2 py-1.5">
+          {loading && <div className="text-[11px] text-slate-500">Loading…</div>}
+          {error && (
+            <div className="text-[11px] text-red-700">Failed: {error}</div>
+          )}
+          {thread && !loading && (
+            <div className="space-y-1">
+              <div className="text-[10px] uppercase tracking-wider text-slate-500">
+                Objective
+              </div>
+              <div className="text-[11px] text-slate-800">{thread.goal.objective}</div>
+              {nonTool.length > 0 && (
+                <>
+                  <div className="mt-1 text-[10px] uppercase tracking-wider text-slate-500">
+                    Last {nonTool.length} {nonTool.length === 1 ? "turn" : "turns"}
+                  </div>
+                  <div className="space-y-0.5">
+                    {nonTool.map((b, i) => (
+                      <div
+                        key={i}
+                        className={`truncate rounded px-1.5 py-0.5 text-[11px] ${
+                          b.kind === "user"
+                            ? "bg-slate-200/60 text-slate-800"
+                            : "bg-white/80 text-slate-800"
+                        }`}
+                        title={b.text}
+                      >
+                        <span className="mr-1 font-medium uppercase text-[9px] text-slate-500">
+                          {b.kind === "user" ? "U" : "A"}
+                        </span>
+                        {b.text.length > 200 ? b.text.slice(0, 200) + "…" : b.text}
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+              {toolCount > 0 && (
+                <div className="mt-1 text-[10px] italic text-slate-500">
+                  ({toolCount} tool call{toolCount === 1 ? "" : "s"} omitted — open the full thread to see them)
+                </div>
+              )}
+            </div>
           )}
         </div>
       )}

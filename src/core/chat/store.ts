@@ -138,6 +138,25 @@ export interface MessageAnnotation {
 export interface ConversationAnnotations {
   version: 1;
   byBubbleIdx: Record<string, MessageAnnotation>;
+  /** v0.16 §4: per-conversation UI state. Survives reload, conversation
+   *  switch, and (eventually) cross-tab via the standard sidecar. Not
+   *  pruned by truncate — these are user-preference scalars, not
+   *  message-coordinate data. */
+  uiState?: ConversationUiState;
+}
+
+export interface ConversationUiState {
+  /** Last known scroll position in the chat scroller, in pixels from top.
+   *  Restored on conversation switch. We persist *raw* pixels (not a %)
+   *  because content reflow on reload is small for a stable history. */
+  scrollTop?: number;
+  /** Tool-call ids the user has explicitly expanded. Stored as a list
+   *  rather than a Set because JSON doesn't have Set. */
+  expandedToolCallIds?: string[];
+  /** Whether the pinned-only filter was on when the conversation was
+   *  last viewed. Persisted so a research session resumes with the same
+   *  filter applied. */
+  showPinnedOnly?: boolean;
 }
 
 function annotationsFile(dir: string, conversationId: string): string {

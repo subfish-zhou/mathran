@@ -202,9 +202,16 @@ export interface MessageAnnotation {
   replyTo?: { bubbleIdx: number; snippet: string };
 }
 
+export interface ConversationUiState {
+  scrollTop?: number;
+  expandedToolCallIds?: string[];
+  showPinnedOnly?: boolean;
+}
+
 export interface ConversationAnnotations {
   version: 1;
   byBubbleIdx: Record<string, MessageAnnotation>;
+  uiState?: ConversationUiState;
 }
 
 export async function fetchAnnotations(
@@ -248,6 +255,31 @@ export async function patchAnnotation(
   }
   const data = (await res.json()) as { annotation: MessageAnnotation };
   return data.annotation;
+}
+
+/** v0.16 §4: persist per-conversation UI state (scroll, expanded tool
+ *  cards, pinned-only filter) to the same sidecar so a reload resumes.
+ *
+ *  Fields omitted from `patch` keep their previous server-side value;
+ *  `null` clears the field. Server returns the post-merge state. */
+export async function patchUiState(
+  scope: ChatScopeSpec,
+  conversationId: string,
+  patch: { [K in keyof ConversationUiState]?: ConversationUiState[K] | null },
+  signal?: AbortSignal,
+): Promise<ConversationUiState> {
+  const res = await fetch(
+    `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/uistate`,
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+      signal,
+    },
+  );
+  if (!res.ok) throw new Error(`patchUiState failed (${res.status})`);
+  const data = (await res.json()) as { uiState: ConversationUiState };
+  return data.uiState ?? {};
 }
 
 /** Toggle a single emoji reaction. Convenience wrapper around PATCH that
@@ -336,4 +368,83 @@ export async function fetchThread(goalId: string, signal?: AbortSignal): Promise
   const res = await fetch(`/api/goals/${encodeURIComponent(goalId)}/thread`, { signal });
   if (!res.ok) throw new Error(`fetchThread failed (${res.status})`);
   return (await res.json()) as ThreadPayload;
+}
+
+// ─── v0.16 §4: Goal-mode chat entry (create / run / interrupt / cancel) ──────
+export interface CreateGoalInput {
+  objective: string;
+  /** Either { kind: "global" } or { kind: "project", projectSlug } /
+   *  { kind: "effort", projectSlug, effortSlug } — matches the shape the
+   *  server's parseGoalScope() expects. SPA forwards its ChatScopeSpec
+   *  directly. */
+  scope:
+    | { kind: "global" }
+    | { kind: "project"; projectSlug: string }
+    | { kind: "effort"; projectSlug: string; effortSlug: string };
+  model?: string;
+  /** Hard token cap for the whole goal (sum across rounds). null/omitted
+   *  = no cap. */
+  budgetTokens?: number | null;
+  /** Hard round cap. null/omitted = no cap. */
+  maxRounds?: number | null;
+}
+
+export async function createGoal(input: CreateGoalInput): Promise<GoalRow> {
+  const res = await fetch("/api/goals", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(`createGoal failed (${res.status}): ${await res.text()}`);
+  const data = (await res.json()) as { goal: GoalRow };
+  return data.goal;
+}
+
+/** Run one round of an active goal. Server returns the updated goal record
+ *  + the round's summary text. The chat panel uses the goal's primary
+ *  conversation as the surface, so the panel will refresh-load that
+ *  conversation's history after the round completes. */
+export interface GoalRoundResult {
+  goal: GoalRow;
+  /** Round transcript / summary text. May be empty when the round produced
+   *  no assistant text (e.g. ended immediately on a tool error). */
+  text?: string;
+  /** Lifecycle flags emitted by the runner. `aborted` is set when the
+   *  round was interrupted; the goal stays active. `completed`/`failed`/
+   *  `exhausted` mean the goal itself ended (status moved to a terminal
+   *  state) and the SPA should refresh its goal info. */
+  completed?: boolean;
+  failed?: boolean;
+  exhausted?: boolean;
+  aborted?: boolean;
+  endReason?: string | null;
+}
+
+export async function runGoalRound(
+  goalId: string,
+  userMessage?: string,
+  signal?: AbortSignal,
+): Promise<GoalRoundResult> {
+  const res = await fetch(`/api/goals/${encodeURIComponent(goalId)}/run`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(userMessage ? { message: userMessage } : {}),
+    signal,
+  });
+  if (!res.ok) throw new Error(`runGoalRound failed (${res.status}): ${await res.text()}`);
+  return (await res.json()) as GoalRoundResult;
+}
+
+export async function interruptGoal(goalId: string): Promise<void> {
+  const res = await fetch(`/api/goals/${encodeURIComponent(goalId)}/interrupt`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`interruptGoal failed (${res.status})`);
+}
+
+export async function cancelGoal(goalId: string): Promise<void> {
+  const res = await fetch(`/api/goals/${encodeURIComponent(goalId)}/cancel`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`cancelGoal failed (${res.status})`);
 }

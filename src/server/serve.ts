@@ -91,6 +91,7 @@ import {
   pruneAnnotationsFrom,
   loadConversationHistory,
   type MessageAnnotation,
+  type ConversationUiState,
 } from "../core/chat/store.js";
 import {
   createGoal,
@@ -1277,6 +1278,59 @@ function registerChatScope(
     return c.json({ ok: true, bubbleIdx, annotation: merged });
   });
 
+  // ─── UI state PATCH (v0.16 §4) ─────────────────────────────────────
+  // Persist per-conversation UI scalars (scroll pos, expanded tool ids,
+  // pinned-only filter) so a reload restores where the user was. Lives
+  // in the same annotations sidecar to keep "things to remember about
+  // this conversation" in one file. Body fields are merged — omitted
+  // fields keep their previous value, `null` clears a field.
+  app.patch(`${basePath}/:conversationId/uistate`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+
+    const current = await loadAnnotations(store.getWorkspace(), scope, id);
+    const prev: ConversationUiState = current.uiState ?? {};
+    const next: ConversationUiState = { ...prev };
+
+    // Whitelist + light validation. Anything else is silently ignored
+    // so a hostile/typo'd field can't trash the sidecar.
+    if ("scrollTop" in body) {
+      if (body.scrollTop === null) delete next.scrollTop;
+      else if (typeof body.scrollTop === "number" && Number.isFinite(body.scrollTop) && body.scrollTop >= 0) {
+        next.scrollTop = Math.floor(body.scrollTop);
+      }
+    }
+    if ("expandedToolCallIds" in body) {
+      if (body.expandedToolCallIds === null) delete next.expandedToolCallIds;
+      else if (Array.isArray(body.expandedToolCallIds)) {
+        // Cap list size; tool-call ids are short. 500 covers any realistic
+        // research session, and bounds the sidecar growth.
+        const ids = body.expandedToolCallIds
+          .filter((x: unknown) => typeof x === "string" && x.length > 0 && x.length <= 128)
+          .slice(0, 500);
+        next.expandedToolCallIds = ids;
+      }
+    }
+    if ("showPinnedOnly" in body) {
+      if (body.showPinnedOnly === null) delete next.showPinnedOnly;
+      else if (typeof body.showPinnedOnly === "boolean") next.showPinnedOnly = body.showPinnedOnly;
+    }
+
+    await saveAnnotations(store.getWorkspace(), scope, id, {
+      version: 1,
+      byBubbleIdx: current.byBubbleIdx,
+      uiState: Object.keys(next).length === 0 ? undefined : next,
+    });
+    return c.json({ ok: true, uiState: next });
+  });
+
   // Toggle reaction (convenience: avoids the SPA having to read-modify-write
   // the reactions object). Body: `{ emoji: string }`. Single-user, so
   // count is 0 or 1 — we just flip it.
@@ -1296,8 +1350,13 @@ function registerChatScope(
     try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
     const emoji = typeof body?.emoji === "string" ? body.emoji.trim() : "";
     if (!emoji) return c.json({ error: "emoji required" }, 400);
-    // Reasonable cap so a typo'd huge string doesn't blow up the sidecar.
-    if (emoji.length > 32) return c.json({ error: "emoji too long (max 32 chars)" }, 400);
+    // v0.16 §4: reactions narrowed to 👍/👎. The sidecar shape still supports
+    // arbitrary emoji (so old data round-trips), but new writes are
+    // gated to keep the personal-research-log UX simple.
+    const ALLOWED = new Set(["👍", "👎"]);
+    if (!ALLOWED.has(emoji)) {
+      return c.json({ error: "emoji must be 👍 or 👎" }, 400);
+    }
 
     const current = await loadAnnotations(store.getWorkspace(), scope, id);
     const existing: MessageAnnotation = current.byBubbleIdx[String(bubbleIdx)] ?? {};

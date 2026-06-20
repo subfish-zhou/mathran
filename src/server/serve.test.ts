@@ -763,7 +763,7 @@ describe("Annotations sidecar (v0.16 §2)", () => {
     expect(b2.reactions).toEqual({});
   });
 
-  it("POST /react rejects missing or oversized emoji", async () => {
+  it("POST /react rejects missing emoji and non-thumb emojis (v0.16 §4)", async () => {
     const r1 = await fetch(`${base}/api/chat/ann-test-5/annotations/0/react`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -771,12 +771,36 @@ describe("Annotations sidecar (v0.16 §2)", () => {
     });
     expect(r1.status).toBe(400);
 
+    // Anything that isn't 👍 / 👎 is rejected, including the previously-
+    // allowed picker emojis like ❤️. Keeps the UX intent enforced server-side.
     const r2 = await fetch(`${base}/api/chat/ann-test-5/annotations/0/react`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ emoji: "❤️" }),
+    });
+    expect(r2.status).toBe(400);
+
+    const r3 = await fetch(`${base}/api/chat/ann-test-5/annotations/0/react`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ emoji: "x".repeat(100) }),
     });
-    expect(r2.status).toBe(400);
+    expect(r3.status).toBe(400);
+  });
+
+  it("POST /react accepts 👍 and 👎 (v0.16 §4)", async () => {
+    const up = await fetch(`${base}/api/chat/ann-thumb/annotations/0/react`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ emoji: "👍" }),
+    });
+    expect(up.status).toBe(200);
+    const down = await fetch(`${base}/api/chat/ann-thumb/annotations/0/react`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ emoji: "👎" }),
+    });
+    expect(down.status).toBe(200);
   });
 
   it("truncate prunes annotations at-and-beyond pruneFromBubbleIdx", async () => {

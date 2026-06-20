@@ -19,13 +19,16 @@ import {
   truncateChat,
   fetchAnnotations,
   patchAnnotation,
+  patchUiState,
   toggleReaction,
   findGoalForConversation,
+  runGoalRound,
   type ChatEvent,
   type ConversationAnnotations,
   type MessageAnnotation,
   type GoalRow,
 } from "../lib/chat.ts";
+import GoalControls from "./GoalControls.tsx";
 import { api, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
 import {
   historyToBubbles,
@@ -40,6 +43,7 @@ import {
   downloadText,
   type ExportTimelineItem,
 } from "../lib/chat-export.ts";
+import UsageSparkline from "./UsageSparkline.tsx";
 import ContextMeter from "./ContextMeter.tsx";
 import ToolCallGroup from "./ToolCallGroup.tsx";
 import { ThreadDrawer } from "./ThreadDrawer.tsx";
@@ -58,9 +62,18 @@ export default function ChatPanel({
   const [conversationId, setConversationId] = useState<string | null>(urlConvId);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  // v0.16 §4: bump to force the conversation-load effect to re-run when the
+  // id didn't change but the underlying history did (e.g. after a goal
+  // round on the *same* conversation).
+  const [reloadTick, setReloadTick] = useState(0);
   const [model, setModel] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [usage, setUsage] = useState<UsageStats | null>(null);
+  // v0.16 §8: rolling token-usage history for an inline sparkline. Each
+  // entry is a snapshot of `tokens` recorded after a successful refresh.
+  // Capped at 50 points; reset on conversation switch (it's a glance
+  // metric, not load-bearing data, so no need to persist).
+  const [usageHistory, setUsageHistory] = useState<number[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   // Abort controller for the in-flight chat stream. `send` / `reRun` set it
@@ -87,13 +100,26 @@ export default function ChatPanel({
   // Open emoji picker: bubbleIdx of the message currently showing the
   // picker, or null when nothing is open. Closed on emoji pick or outside
   // click.
-  const [pickerOpenFor, setPickerOpenFor] = useState<number | null>(null);
+  // Picker removed in v0.16 §4: reactions simplified to 👍/👎, the
+  // hover bar now toggles directly without a popup.
   // Inline note editor target. Same idea as editingBubbleIdx but for the
   // per-message margin note instead of the prompt text itself.
   const [noteEditingIdx, setNoteEditingIdx] = useState<number | null>(null);
   const [noteDraft, setNoteDraft] = useState("");
   // Whether the pinned-only filter sidebar drawer is open.
   const [showPinnedOnly, setShowPinnedOnly] = useState(false);
+  // v0.16 §6: in-conversation search. Empty string = inactive (no filter,
+  // no highlight). When set, bubble matches are highlighted via a wrap
+  // <mark> at render time and the pinned-only filter is bypassed (the user
+  // wants to find a thing, not also be filtered).
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  // v0.16 §7: long-conversation compaction. When a conversation grows
+  // past COMPACT_THRESHOLD bubbles we collapse the early prefix into a
+  // single "📜 N earlier turns" strip; clicking it sets this to true
+  // and the prefix renders inline. Reset on conversation switch so we
+  // don't bleed state across tabs.
+  const [compactionExpanded, setCompactionExpanded] = useState(false);
   // ─── Thread / goal-mode state (v0.16 §3) ───────────────────────────
   // owningGoal is non-null when this conversation is the primary one of a
   // Goal. spawn_sub_goal tool-calls inside it become clickable thread
@@ -120,6 +146,7 @@ export default function ChatPanel({
     setError(null);
     setInput("");
     setUsage(null);
+    setUsageHistory([]);
     setConversationId(urlConvId);
     void refreshList();
     // We intentionally re-run when scope changes; urlConvId is read once per
@@ -132,6 +159,7 @@ export default function ChatPanel({
     if (!conversationId) {
       setBubbles([]);
       setUsage(null);
+      setUsageHistory([]);
       setAnnotations({ version: 1, byBubbleIdx: {} });
       setReplyTarget(null);
       setOwningGoal(null);
@@ -146,7 +174,7 @@ export default function ChatPanel({
     // "no thread anchors needed" and degrade silently.
     Promise.all([
       api.getChatHistory(scope, conversationId),
-      fetchAnnotations(scope, conversationId).catch(() => ({
+      fetchAnnotations(scope, conversationId).catch<ConversationAnnotations>(() => ({
         version: 1 as const,
         byBubbleIdx: {} as Record<string, MessageAnnotation>,
       })),
@@ -157,9 +185,52 @@ export default function ChatPanel({
         setBubbles(historyToBubbles(data.history));
         setAnnotations(ann);
         setOwningGoal(goalLookup ? goalLookup.goal : null);
+        // v0.16 §4: restore persisted UI state. Apply scroll on the next
+        // animation frame so the bubbles have laid out first; otherwise
+        // scrollTop would clamp to (smaller) prior content height.
+        const ui = ann.uiState;
+        if (ui) {
+          if (typeof ui.showPinnedOnly === "boolean") setShowPinnedOnly(ui.showPinnedOnly);
+          if (typeof ui.scrollTop === "number") {
+            requestAnimationFrame(() => {
+              if (cancelled) return;
+              if (scrollRef.current) scrollRef.current.scrollTop = ui.scrollTop!;
+            });
+          }
+        } else {
+          // Conversation has no persisted UI state — reset filter so a
+          // previously open "Pinned only" state doesn't bleed across.
+          setShowPinnedOnly(false);
+        }
+        // v0.16 §7: always collapse compaction on conversation switch.
+        // "Always show full history" isn't a per-conversation preference
+        // — it's a per-glance decision.
+        setCompactionExpanded(false);
         // Reset any open thread on conversation switch — stale ids are
         // worse than no ids.
         setThreadStack([]);
+
+        // v0.16 §4: deep-link via `#bubble-N`. Hash wins over the
+        // restored scrollTop — the user explicitly pointed us at a
+        // bubble, that's a stronger signal than "resume where you left
+        // off". Two RAFs so layout settles + content height stabilises
+        // before we measure the bubble offset.
+        if (typeof window !== "undefined") {
+          const m = /^#bubble-(\d+)$/.exec(window.location.hash);
+          if (m) {
+            const target = Number(m[1]);
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                if (cancelled) return;
+                const el = document.querySelector<HTMLElement>(`[data-bubble-idx="${target}"]`);
+                if (!el) return;
+                el.scrollIntoView({ behavior: "auto", block: "center" });
+                el.classList.add("ring-2", "ring-amber-400");
+                setTimeout(() => el.classList.remove("ring-2", "ring-amber-400"), 1500);
+              });
+            });
+          }
+        }
       })
       .catch((err) => {
         if (cancelled) return;
@@ -176,7 +247,7 @@ export default function ChatPanel({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conversationId, scope.kind, (scope as any).projectSlug, (scope as any).effortSlug]);
+  }, [conversationId, scope.kind, (scope as any).projectSlug, (scope as any).effortSlug, reloadTick]);
 
   // ─── Selection change: keep URL in sync ────────────────────────────────
   useEffect(() => {
@@ -209,6 +280,42 @@ export default function ChatPanel({
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [bubbles]);
+
+  // ─── Persist UI state (v0.16 §4) ────────────────────────────────
+  // Scroll: throttle via a trailing-edge timer; the user can scroll fast,
+  // we don't want a fetch per pixel. The timer ref survives renders and
+  // is cleared on conversation switch so a stale write can't trample the
+  // next conversation's restored scroll.
+  const scrollPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onChatScroll = useCallback(() => {
+    if (!conversationId) return;
+    if (scrollPersistTimerRef.current) clearTimeout(scrollPersistTimerRef.current);
+    scrollPersistTimerRef.current = setTimeout(() => {
+      const top = scrollRef.current?.scrollTop ?? 0;
+      patchUiState(scope, conversationId, { scrollTop: top }).catch(() => undefined);
+    }, 600);
+  }, [conversationId, scope]);
+  useEffect(() => {
+    return () => {
+      if (scrollPersistTimerRef.current) clearTimeout(scrollPersistTimerRef.current);
+    };
+  }, [conversationId]);
+
+  // showPinnedOnly: write-through; one fetch per click is fine, no throttle.
+  // Skip the very first run after conversation switch because that's the
+  // *restore* path, not a user action.
+  const showPinnedFirstRunRef = useRef(true);
+  useEffect(() => {
+    if (!conversationId) return;
+    if (showPinnedFirstRunRef.current) {
+      showPinnedFirstRunRef.current = false;
+      return;
+    }
+    patchUiState(scope, conversationId, { showPinnedOnly }).catch(() => undefined);
+  }, [showPinnedOnly, conversationId, scope]);
+  useEffect(() => {
+    showPinnedFirstRunRef.current = true;
+  }, [conversationId]);
 
   // ─── Usage meter: refetch whenever conversationId changes ──────────────
   const refreshUsage = useCallback(async () => {
@@ -372,6 +479,7 @@ export default function ChatPanel({
     setBubbles([]);
     setError(null);
     setUsage(null);
+    setUsageHistory([]);
   }
 
   function selectConv(id: string) {
@@ -416,7 +524,15 @@ export default function ChatPanel({
   type NonToolBubble = Extract<Bubble, { kind: "user" } | { kind: "assistant" }>;
   type Row =
     | { kind: "single"; bubble: NonToolBubble; bubbleIdx: number }
-    | { kind: "tools"; tools: ToolBubble[] };
+    | { kind: "tools"; tools: ToolBubble[] }
+    // v0.16 §7: collapsed-prefix marker. `count` = bubble count hidden,
+    // `until` = exclusive bubble index where the visible tail starts.
+    | { kind: "compact"; count: number; until: number };
+  // Compaction kicks in past this many bubbles. Picked empirically: any
+  // less and short chats get a useless toggle; any more and a research
+  // session starts feeling laggy to scroll. Easily tweakable.
+  const COMPACT_THRESHOLD = 60;
+  const COMPACT_TAIL = 20;
   const rows = useMemo<Row[]>(() => {
     const out: Row[] = [];
     let buffer: ToolBubble[] = [];
@@ -426,13 +542,65 @@ export default function ChatPanel({
         buffer = [];
       }
     };
+    const q = searchQuery.trim().toLowerCase();
+    // v0.16 §7: Compaction only when not searching / not filtering and the
+    // user hasn't manually expanded. We hide the *prefix*, keeping the last
+    // COMPACT_TAIL bubbles + any pinned bubble visible — pinned messages are
+    // exactly the "important enough to keep in sight" signal.
+    let compactSkipUntil = -1;
+    if (
+      !q &&
+      !showPinnedOnly &&
+      !compactionExpanded &&
+      bubbles.length > COMPACT_THRESHOLD
+    ) {
+      compactSkipUntil = bubbles.length - COMPACT_TAIL;
+      // Count of bubbles we'll actually hide (some pinned ones in the prefix
+      // are still rendered, so report the *effective* hidden count for the
+      // strip's label).
+      let hidden = 0;
+      for (let i = 0; i < compactSkipUntil; i++) {
+        if (!annotations.byBubbleIdx[String(i)]?.pinned) hidden++;
+      }
+      if (hidden > 0) {
+        out.push({ kind: "compact", count: hidden, until: compactSkipUntil });
+      }
+    }
+    const matchesSearch = (b: Bubble): boolean => {
+      if (!q) return true;
+      if (b.kind === "tool") {
+        // Match tool name + args + result text. Useful when looking for
+        // "that lean_check that mentioned Frobenius".
+        return (
+          b.name.toLowerCase().includes(q) ||
+          JSON.stringify(b.args).toLowerCase().includes(q) ||
+          (b.result ?? "").toLowerCase().includes(q)
+        );
+      }
+      return b.text.toLowerCase().includes(q);
+    };
     for (let i = 0; i < bubbles.length; i++) {
       const b = bubbles[i];
+      // v0.16 §7: in compacted prefix, hide everything except pinned
+      // bubbles (which stay visible as anchors).
+      if (
+        i < compactSkipUntil &&
+        !annotations.byBubbleIdx[String(i)]?.pinned
+      ) {
+        // Still flush any buffered tool bubbles so a tool group doesn't
+        // straddle the compact boundary in a confusing way.
+        if (b.kind === "tool") continue;
+        flushTools();
+        continue;
+      }
+      // v0.16 §6: when searching, drop non-matching bubbles. Search
+      // overrides the pinned filter — the user wants to find a thing.
+      if (q && !matchesSearch(b)) continue;
       // v0.16 §2: when filtering to pinned-only, drop both tool bubbles
       // (they're never standalone-meaningful) and any single bubble that
       // doesn't have pinned=true in its annotation. The data-bubble-idx
       // attribute keeps jumpToBubble() working off the original index.
-      if (showPinnedOnly) {
+      if (showPinnedOnly && !q) {
         if (b.kind === "tool") continue;
         if (!annotations.byBubbleIdx[String(i)]?.pinned) continue;
         out.push({ kind: "single", bubble: b, bubbleIdx: i });
@@ -449,7 +617,31 @@ export default function ChatPanel({
     }
     flushTools();
     return out;
-  }, [bubbles, showPinnedOnly, annotations]);
+  }, [bubbles, showPinnedOnly, annotations, searchQuery, compactionExpanded]);
+
+  // v0.16 §6: visible row count (single bubbles only) for the search
+  // "N matches" indicator. Tool groups count as one row but are
+  // usually 1–6 calls; users care about “how many bubbles I see” here,
+  // not exact tool count.
+  const visibleMatchCount = useMemo(
+    () => rows.filter((r) => r.kind === "single").length,
+    [rows],
+  );
+
+  // v0.16 §6: global Ctrl/Cmd+F to open the in-chat search. We capture
+  // before the browser's native find so the user gets *our* search
+  // (which knows about pinned, scope, tool args) instead of just the
+  // DOM text. Esc inside the search box closes it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const isFind = (e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F");
+      if (!isFind) return;
+      e.preventDefault();
+      setSearchOpen(true);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // ─── spawn_sub_goal → sub-goal id mapping (v0.16 §3) ───────────────────
   // Walk all tool bubbles in chronological order and zip them against
@@ -730,7 +922,7 @@ export default function ChatPanel({
   // response shape as the source of truth in case of races.
   async function handleToggleReaction(bubbleIdx: number, emoji: string) {
     if (!conversationId) return;
-    setPickerOpenFor(null);
+    // v0.16 §4: picker was removed; no popup to close here.
     // Optimistic update: mutate the annotation map immediately so the UI
     // doesn't lag while the round trip happens.
     setAnnotations((prev) => {
@@ -846,6 +1038,8 @@ export default function ChatPanel({
 
   // Jump-to-message: scrolls to the bubble and briefly highlights it.
   // Used both by the pinned-only drawer and by reply preview links.
+  // v0.16 §4: also updates `location.hash` so the address bar mirrors
+  // the position — paste-able into chat / docs as a permalink.
   function jumpToBubble(bubbleIdx: number) {
     const el = document.querySelector<HTMLElement>(
       `[data-bubble-idx="${bubbleIdx}"]`,
@@ -854,6 +1048,12 @@ export default function ChatPanel({
     el.scrollIntoView({ behavior: "smooth", block: "center" });
     el.classList.add("ring-2", "ring-amber-400");
     setTimeout(() => el.classList.remove("ring-2", "ring-amber-400"), 1500);
+    // Use replaceState so the back button doesn't fill with every nav jump.
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.hash = `bubble-${bubbleIdx}`;
+      window.history.replaceState(null, "", url.toString());
+    }
   }
 
   // ─── Render ────────────────────────────────────────────────────────────
@@ -989,24 +1189,108 @@ export default function ChatPanel({
               </button>
             );
           })()}
+          {/* v0.16 §6: in-conversation search. Toggle with the 🔍 button
+              or Ctrl/Cmd+F when the chat panel has focus. Live-filters
+              visible bubbles + highlights matches inside the bubble text. */}
+          <div className="ml-2 flex shrink-0 items-center">
+            {searchOpen ? (
+              <div className="flex items-center gap-1 rounded-md border border-slate-300 bg-white px-1 py-0.5">
+                <input
+                  autoFocus
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      setSearchOpen(false);
+                      setSearchQuery("");
+                    }
+                  }}
+                  placeholder="Search this chat…"
+                  className="w-44 rounded px-1 py-0.5 text-xs focus:outline-none"
+                />
+                {searchQuery && (
+                  <span className="text-[10px] text-slate-500">
+                    {visibleMatchCount}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchOpen(false);
+                    setSearchQuery("");
+                  }}
+                  className="rounded px-1 text-slate-500 hover:bg-slate-100"
+                  title="Close search (Esc)"
+                >
+                  ✕
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setSearchOpen(true)}
+                className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                title="Search this conversation (Ctrl/Cmd+F)"
+              >
+                🔍
+              </button>
+            )}
+          </div>
           {/* v0.16 §3: "this conversation is a Goal" indicator. Clicking
               opens the primary thread (i.e. the goal's own conversation)
               — useful entry point when you want to see goal status / end
               reason / round count without scrolling. Hidden when not a
               goal-mode chat. */}
+          {/* v0.16 §4: GoalControls handles BOTH non-goal (Start) and goal
+              (Run / Interrupt / Cancel / budget meter) states. The thread
+              shortcut is kept as a separate button so users can pop the
+              drawer without disturbing run controls. */}
+          <GoalControls
+            scope={scope}
+            goal={owningGoal}
+            defaultModel={model}
+            busy={busy}
+            onGoalCreated={(g) => {
+              // Switch to the new goal's primary conversation. The goal
+              // record's conversationIds[0] is created the first time a
+              // round runs; until then we just stash the goal so the
+              // header reflects status. We also kick the first round
+              // immediately on the user's behalf — fits "Start goal"
+              // semantics better than landing in an empty chat.
+              setOwningGoal(g);
+              // Fire-and-forget; round completion will refresh history.
+              runGoalRound(g.id)
+                .then((r) => {
+                  setOwningGoal(r.goal);
+                  // Switch into the conversation the goal just produced.
+                  if (r.goal.conversationIds[0]) {
+                    setConversationId(r.goal.conversationIds[0]);
+                  }
+                })
+                .catch((e) => setError(String((e as Error).message ?? e)));
+            }}
+            onRoundRan={(r) => {
+              setOwningGoal(r.goal);
+              // Refresh the conversation history so new bubbles appear.
+              if (r.goal.conversationIds[0]) {
+                if (r.goal.conversationIds[0] !== conversationId) {
+                  setConversationId(r.goal.conversationIds[0]);
+                } else {
+                  setReloadTick((t) => t + 1);
+                }
+              }
+            }}
+          />
           {owningGoal && (
             <button
               type="button"
               onClick={() => handleOpenThread(owningGoal.id)}
-              className={`ml-2 shrink-0 rounded-md border px-2 py-1 text-xs ${
-                owningGoal.status === "active"
-                  ? "border-blue-300 bg-blue-50 text-blue-900"
-                  : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
-              }`}
-              title={`Goal mode · ${owningGoal.objective}`}
+              className="ml-1 shrink-0 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+              title={`Open thread · ${owningGoal.objective}`}
             >
-              🎯 Goal{owningGoal.subGoalIds && owningGoal.subGoalIds.length > 0
-                ? ` · ${owningGoal.subGoalIds.length} thread${owningGoal.subGoalIds.length === 1 ? "" : "s"}`
+              📂 Thread{owningGoal.subGoalIds && owningGoal.subGoalIds.length > 0
+                ? ` · ${owningGoal.subGoalIds.length} sub${owningGoal.subGoalIds.length === 1 ? "" : "s"}`
                 : ""}
             </button>
           )}
@@ -1047,12 +1331,22 @@ export default function ChatPanel({
         )}
 
         {usage ? (
-          <ContextMeter
-            tokens={usage.tokens}
-            contextWindow={usage.contextWindow}
-            warning={usage.warning}
-            percentage={usage.percentage}
-          />
+          <div className="flex items-center gap-2">
+            <ContextMeter
+              tokens={usage.tokens}
+              contextWindow={usage.contextWindow}
+              warning={usage.warning}
+              percentage={usage.percentage}
+            />
+            {/* v0.16 §8: tiny token-usage sparkline. Shows the trajectory of
+                this chat's token count across recent refreshes — lets you
+                see at a glance whether the conversation is creeping toward
+                the context window. Hidden until ≥2 points so a brand-new
+                chat doesn't render a useless dot. */}
+            {usageHistory.length >= 2 && (
+              <UsageSparkline points={usageHistory} contextWindow={usage.contextWindow} />
+            )}
+          </div>
         ) : conversationId ? (
           <ContextMeter
             tokens={0}
@@ -1063,7 +1357,7 @@ export default function ChatPanel({
           />
         ) : null}
 
-        <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-6">
+        <div ref={scrollRef} onScroll={onChatScroll} className="flex-1 space-y-3 overflow-y-auto p-6">
           {loadingHistory && (
             <p className="text-sm text-slate-400">Loading history…</p>
           )}
@@ -1074,15 +1368,38 @@ export default function ChatPanel({
                 : "Ask a math or Lean question to start a new chat."}
             </p>
           )}
-          {rows.map((row, i) =>
-            row.kind === "tools" ? (
-              <ToolCallGroup
-                key={`g${i}`}
-                tools={row.tools}
-                subGoalIdByToolId={subGoalIdByToolId}
-                onOpenThread={handleOpenThread}
-              />
-            ) : (
+          {rows.map((row, i) => {
+            if (row.kind === "tools") {
+              return (
+                <ToolCallGroup
+                  key={`g${i}`}
+                  tools={row.tools}
+                  subGoalIdByToolId={subGoalIdByToolId}
+                  onOpenThread={handleOpenThread}
+                />
+              );
+            }
+            if (row.kind === "compact") {
+              // v0.16 §7: collapsed-prefix strip. One click expands the
+              // entire conversation — the user explicitly chose to see
+              // history, so we don't ask twice.
+              return (
+                <button
+                  key={`c${i}`}
+                  type="button"
+                  onClick={() => setCompactionExpanded(true)}
+                  className="flex w-full items-center gap-2 rounded-md border border-dashed border-slate-300 bg-slate-50 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-100"
+                  title="Show the earlier turns of this conversation"
+                >
+                  <span>📜</span>
+                  <span>
+                    {row.count} earlier turn{row.count === 1 ? "" : "s"} hidden — click to show
+                  </span>
+                  <span className="ml-auto text-slate-400">▾</span>
+                </button>
+              );
+            }
+            return (
               <div
                 key={i}
                 data-bubble-idx={row.bubbleIdx}
@@ -1181,28 +1498,36 @@ export default function ChatPanel({
                     </div>
                   )}
 
-                  {/* ─── Reactions strip (v0.16 §2) ───────────────────────────
-                      One pill per emoji with current count. Click to toggle. */}
+                  {/* ─── Reactions strip (v0.16 §2; simplified §4) ─────────────
+                      Sticky 👍/👎 indicators that stay visible after the
+                      hover bar fades — so a thumbs-down on a bad answer
+                      remains obvious when you scroll past. Click to clear. */}
                   {(() => {
                     const reactions =
                       annotations.byBubbleIdx[String(row.bubbleIdx)]?.reactions;
-                    if (!reactions || Object.keys(reactions).length === 0) return null;
+                    const entries = reactions ? Object.entries(reactions).filter(([, n]) => n > 0) : [];
+                    if (entries.length === 0) return null;
                     return (
                       <div
                         className={`mt-0.5 flex gap-1 ${
                           row.bubble.kind === "user" ? "justify-end" : "justify-start"
                         }`}
                       >
-                        {Object.entries(reactions).map(([emoji, count]) => (
+                        {entries.map(([emoji]) => (
                           <button
                             key={emoji}
                             type="button"
                             onClick={() => void handleToggleReaction(row.bubbleIdx, emoji)}
-                            className="rounded-full border border-slate-300 bg-slate-50 px-1.5 py-0.5 text-[11px] hover:bg-slate-100"
-                            title="Click to remove your reaction"
+                            className={`rounded-full border px-1.5 py-0.5 text-[11px] hover:opacity-80 ${
+                              emoji === "👍"
+                                ? "border-emerald-300 bg-emerald-50"
+                                : emoji === "👎"
+                                  ? "border-red-300 bg-red-50"
+                                  : "border-slate-300 bg-slate-50"
+                            }`}
+                            title="Click to clear"
                           >
-                            <span>{emoji}</span>
-                            {count > 1 && <span className="ml-0.5 text-slate-500">{count}</span>}
+                            {emoji}
                           </button>
                         ))}
                       </div>
@@ -1271,35 +1596,41 @@ export default function ChatPanel({
                       to avoid racing setBubbles against the SSE pump. */}
                   {editingBubbleIdx !== row.bubbleIdx && noteEditingIdx !== row.bubbleIdx && (
                     <div className="mt-0.5 flex justify-end gap-1 text-[10px] text-slate-400 opacity-0 transition group-hover/msg:opacity-100">
-                      {/* React picker: tiny inline emoji row, no library. */}
-                      <div className="relative">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setPickerOpenFor(
-                              pickerOpenFor === row.bubbleIdx ? null : row.bubbleIdx,
-                            )
-                          }
-                          className="rounded px-1 py-0.5 hover:bg-slate-200"
-                          title="Add a reaction"
-                        >
-                          😊 React
-                        </button>
-                        {pickerOpenFor === row.bubbleIdx && (
-                          <div className="absolute right-0 bottom-full z-10 mb-1 flex gap-0.5 rounded-md border border-slate-200 bg-white p-1 shadow-md">
-                            {["👍", "❤️", "😂", "🔥", "🤔", "✅", "❌", "🧠", "⚠️", "💫"].map((emoji) => (
-                              <button
-                                key={emoji}
-                                type="button"
-                                onClick={() => void handleToggleReaction(row.bubbleIdx, emoji)}
-                                className="rounded px-1 text-base hover:bg-slate-100"
-                              >
-                                {emoji}
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                      </div>
+                      {/* 👍 / 👎 thumbs (v0.16 §4 simplification).
+                          Replaced the 10-emoji picker; this is a personal
+                          research log, the only useful signal is "good answer"
+                          vs "bad answer". State is rendered live from
+                          annotations so the pressed look is sticky across
+                          sessions / tabs. */}
+                      {(() => {
+                        const r = annotations.byBubbleIdx[String(row.bubbleIdx)]?.reactions ?? {};
+                        const upActive = (r["👍"] ?? 0) > 0;
+                        const downActive = (r["👎"] ?? 0) > 0;
+                        return (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => void handleToggleReaction(row.bubbleIdx, "👍")}
+                              className={`rounded px-1 py-0.5 hover:bg-slate-200 ${
+                                upActive ? "bg-emerald-100 text-emerald-700" : ""
+                              }`}
+                              title={upActive ? "Remove thumbs up" : "Thumbs up"}
+                            >
+                              👍
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void handleToggleReaction(row.bubbleIdx, "👎")}
+                              className={`rounded px-1 py-0.5 hover:bg-slate-200 ${
+                                downActive ? "bg-red-100 text-red-700" : ""
+                              }`}
+                              title={downActive ? "Remove thumbs down" : "Thumbs down"}
+                            >
+                              👎
+                            </button>
+                          </>
+                        );
+                      })()}
                       <button
                         type="button"
                         onClick={() => void handleTogglePin(row.bubbleIdx)}
@@ -1364,8 +1695,8 @@ export default function ChatPanel({
                   )}
                 </div>
               </div>
-            ),
-          )}
+            );
+          })}
         </div>
 
         {error && (
