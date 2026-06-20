@@ -265,6 +265,14 @@ export interface SendOpts {
    * underlying transport.
    */
   signal?: AbortSignal;
+  /**
+   * Attachment refs to stash on the user message we're about to push
+   * (v0.17 mathub parity). The file contents/markers are already inlined in
+   * `userText` by the route handler; this metadata is round-tripped through
+   * the JSONL so a tab reload can rebuild the chip strip under the user
+   * bubble. Providers ignore the field — see `LLMMessage.attachments`.
+   */
+  attachments?: Array<{ path: string; filename: string; mimeType: string }>;
 }
 
 /** Construct the canonical abort error (matches the Fetch/Streams convention). */
@@ -819,7 +827,11 @@ export class ChatSession {
     // message, so we don't immediately discard it. Silent on failure.
     await this.maybeAutoCompact();
 
-    this.messages.push({ role: "user", content: userText });
+    this.messages.push(
+      opts.attachments && opts.attachments.length > 0
+        ? { role: "user", content: userText, attachments: opts.attachments }
+        : { role: "user", content: userText },
+    );
 
     yield* this.runRounds(opts);
   }

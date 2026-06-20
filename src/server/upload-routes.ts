@@ -24,6 +24,28 @@ import { randomUUID } from "node:crypto";
 
 import type { Hono } from "hono";
 
+/**
+ * File-extension → MIME map for `GET /api/uploads/*`. We only need to
+ * cover the extensions that `ALLOWED_UPLOAD_TYPES` accepts on the POST
+ * side; everything else falls back to `application/octet-stream` so the
+ * browser triggers a download instead of trying to render the bytes.
+ */
+const EXT_TO_MIME: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+  ".pdf": "application/pdf",
+  ".txt": "text/plain; charset=utf-8",
+  ".md": "text/markdown; charset=utf-8",
+  ".tex": "application/x-tex",
+  ".json": "application/json",
+  ".zip": "application/zip",
+  ".csv": "text/csv; charset=utf-8",
+};
+
 /** Maximum accepted upload size, in bytes. 25 MiB matches the task spec. */
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
@@ -124,6 +146,94 @@ export function registerUploadRoutes(app: Hono, workspace: string): void {
       filename: safeName,
       mimeType,
       size: file.size,
+    });
+  });
+
+  // GET /api/uploads/<encoded-absolute-path> — fetch a previously uploaded
+  // file for chip preview (image lightbox) or download (binary/textual).
+  // The path is the absolute on-disk location returned by the POST above,
+  // URL-encoded once on the wire. We re-validate against the uploads
+  // sandbox to make sure the SPA can't ask for `/etc/passwd` by hand-
+  // crafting a URL.
+  //
+  // Responses:
+  //   - 200 + correct `Content-Type` + raw bytes when the path resolves
+  //     inside `<workspace>/.mathran/uploads/` and the file exists
+  //   - 403 `{ error: "outside uploads sandbox" }` when the path escapes
+  //   - 404 `{ error: "not found" }` when the file is missing
+  //   - 400 `{ error: "missing path" }` when the URL has no path segment
+  //
+  // We use a wildcard catch-all so any character (including `/`, which
+  // appears in absolute paths) survives Hono's pattern matcher. The handler
+  // calls `decodeURIComponent` itself; Hono only does it once on the raw
+  // segment which still leaves `%2F` decoded to `/` before we see it.
+  app.get("/api/uploads/*", async (c) => {
+    // Strip the route prefix; the remainder is the URL-encoded absolute
+    // path. Use `c.req.path` (already-decoded) so `%2F` becomes `/` etc.
+    const prefix = "/api/uploads/";
+    const raw = c.req.path.slice(prefix.length);
+    if (raw.length === 0) {
+      return c.json({ error: "missing path" }, 400);
+    }
+    // Hono's router decodes the path once. Apply a second decodeURIComponent
+    // so SPA callers can encodeURIComponent the absolute path before
+    // dropping it into the URL (matches the wire contract documented in
+    // the SKILL/route docstring).
+    let target: string;
+    try {
+      target = decodeURIComponent(raw);
+    } catch {
+      return c.json({ error: "invalid path encoding" }, 400);
+    }
+    if (!path.isAbsolute(target)) {
+      return c.json({ error: "path must be absolute" }, 400);
+    }
+
+    // Resolve realpaths on both sides so a symlink can't smuggle the file
+    // out of `.mathran/uploads/`. Missing file → 404; sandbox escape → 403.
+    let realFile: string;
+    let realRoot: string;
+    try {
+      realFile = await fs.realpath(target);
+    } catch {
+      return c.json({ error: "not found" }, 404);
+    }
+    try {
+      realRoot = await fs.realpath(uploadsDir(workspace));
+    } catch {
+      // No uploads dir at all → nothing valid can possibly exist.
+      return c.json({ error: "not found" }, 404);
+    }
+    const withSep = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+    if (!(realFile === realRoot || realFile.startsWith(withSep))) {
+      return c.json({ error: "outside uploads sandbox" }, 403);
+    }
+
+    let bytes: Buffer;
+    try {
+      bytes = await fs.readFile(realFile);
+    } catch {
+      return c.json({ error: "not found" }, 404);
+    }
+
+    // Reconstruct the content-type from the on-disk extension. We don't
+    // persist the original MIME alongside the file (POST infers it from
+    // the browser's File.type and the allowlist), so the extension is
+    // our only ground truth on read-back. Fall back to octet-stream so
+    // unknown extensions still download safely.
+    const ext = path.extname(realFile).toLowerCase();
+    const mime = EXT_TO_MIME[ext] ?? "application/octet-stream";
+
+    // Wrap the Buffer in a fresh Uint8Array so it satisfies the BodyInit
+    // type that c.body() expects (Node's Buffer is structurally a
+    // Uint8Array but TS narrows them apart in some lib targets).
+    return c.body(new Uint8Array(bytes), 200, {
+      "Content-Type": mime,
+      "Content-Length": String(bytes.byteLength),
+      // Make the response cacheable inside the browser tab — these files
+      // are content-addressed (UUID prefix + sanitised name) so the URL
+      // is effectively immutable.
+      "Cache-Control": "private, max-age=31536000, immutable",
     });
   });
 }

@@ -26,6 +26,19 @@ export interface LLMMessage {
    * never `undefined`, never an object — to make the round-trip lossless.
    */
   toolCalls?: Array<{ id: string; name: string; arguments: string }>;
+  /**
+   * Attachment refs originally posted by the SPA alongside this user message
+   * (v0.17 mathub parity). Populated only on `role === "user"` messages
+   * that came in via `POST /api/<scope>-chat` with a non-empty `attachments`
+   * array; persisted to the JSONL so a tab reload can re-render the chips
+   * below the user bubble.
+   *
+   * Providers MUST ignore this field — the file contents (textual) or `@
+   * /path` markers (image/binary) are already inlined into `content` by
+   * `buildUserMessageWithAttachments`. Carrying the raw refs is purely a
+   * UI hint for history hydration.
+   */
+  attachments?: Array<{ path: string; filename: string; mimeType: string }>;
 }
 
 export interface LLMRequest {

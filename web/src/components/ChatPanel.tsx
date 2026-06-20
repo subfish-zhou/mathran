@@ -59,6 +59,18 @@ import ContextMeter from "./ContextMeter.tsx";
 import ToolCallGroup from "./ToolCallGroup.tsx";
 import { ThreadDrawer } from "./ThreadDrawer.tsx";
 
+/**
+ * Build the `GET /api/uploads/<encoded-path>` URL for a persisted
+ * attachment ref (v0.17 mathub parity). The on-disk `path` is absolute
+ * (workspace-internal), so we encodeURIComponent the whole thing and let
+ * the server re-validate the prefix. Used for both `<img src>` and `<a
+ * href>` chip targets, so a single helper keeps the wire contract in one
+ * place.
+ */
+function uploadsUrlFor(ref: ChatAttachmentRef): string {
+  return `/api/uploads/${encodeURIComponent(ref.path)}`;
+}
+
 export default function ChatPanel({
   scope,
   scopeLabel,
@@ -181,6 +193,11 @@ export default function ChatPanel({
     | { id: string; status: "error"; filename: string; error: string };
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
+  // Lightbox state for clicking an image chip in a user bubble. Holds the
+  // attachment ref we're previewing; null = closed. Escape / backdrop
+  // click clears it. Decoupled from the chip render so any image chip,
+  // from any bubble, can drive the same modal.
+  const [lightbox, setLightbox] = useState<ChatAttachmentRef | null>(null);
   // Hidden <input type="file"> the 📎 button triggers. Kept off-screen so
   // we can style the button freely.
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -676,18 +693,23 @@ export default function ChatPanel({
     // what the user shipped, not just the typed text. This is local-only
     // — the server independently inlines the file contents into the user
     // message it persists to the LLM history.
-    const bubbleText = readyAttachments.length > 0
-      ? `${rawText}${rawText ? "\n\n" : ""}${readyAttachments
-          .map((a) => `📎 ${a.filename}`)
-          .join("\n")}`
-      : rawText;
+    // The user bubble text is just the typed message body — the chip
+    // strip below the bubble (v0.17 mathub parity, rendered from
+    // `bubble.attachments`) carries the filename badges, so we no
+    // longer need the inline `📎 filename` summary that earlier W2
+    // sketches put inside the bubble text. Keeping the bubble body
+    // verbatim also matches what `historyToBubbles()` will produce on
+    // reload, so a tab refresh and a live send render identically.
+    const bubbleText = rawText;
 
     // Record the bubble index of the user message we're about to add so
     // we can PATCH its annotation once the SSE round trip starts.
     const userBubbleIdx = bubbles.length;
     setBubbles((b) => [
       ...b,
-      { kind: "user", text: bubbleText },
+      wireAttachments.length > 0
+        ? { kind: "user", text: bubbleText, attachments: wireAttachments }
+        : { kind: "user", text: bubbleText },
       { kind: "assistant", text: "" },
     ]);
 
@@ -927,6 +949,23 @@ export default function ChatPanel({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // v0.17 mathub parity: Esc closes the image lightbox even when no
+  // element inside the modal has focus (the backdrop click works too,
+  // but Esc is the standard exit shortcut and screen-readers expect
+  // it). Only attached while a lightbox is open so we don't shadow
+  // Esc handling in other modals.
+  useEffect(() => {
+    if (!lightbox) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setLightbox(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [lightbox]);
 
   // ─── spawn_sub_goal → sub-goal id mapping (v0.16 §3) ───────────────────
   // Walk all tool bubbles in chronological order and zip them against
@@ -1793,6 +1832,16 @@ export default function ChatPanel({
                         <span className="inline-block h-1 w-1 animate-bounce rounded-full bg-violet-400" />
                       </span>
                     </div>
+                  ) : row.bubble.kind === "user" &&
+                    row.bubble.text === "" &&
+                    row.bubble.attachments &&
+                    row.bubble.attachments.length > 0 ? (
+                    /* Attachment-only user send (v0.17 mathub parity):
+                       the composer permits Send with empty text when at
+                       least one file is queued. Skip the empty slate pill
+                       so the chip strip below stands on its own; otherwise
+                       we'd render an awkward zero-width black rectangle. */
+                    null
                   ) : (
                     /* ─── Message body (v0.16 §11) ──────────────────────────
                        User messages stay as a slate pill on the right (chat-
@@ -1833,6 +1882,63 @@ export default function ChatPanel({
                       )}
                     </div>
                   )}
+
+                  {/* ─── Attachment chips strip (v0.17 mathub parity) ────────
+                      Renders below the user bubble whenever the persisted
+                      message carried an `attachments:[…]` array. Two flavours:
+                        - image/* → 80×80 thumbnail; click opens a modal
+                          lightbox so the user can see the full-res image
+                          without leaving the conversation.
+                        - everything else → small `📎 filename` text chip;
+                          click downloads (the link `download` attribute
+                          + matching Content-Disposition on the server side
+                          would be ideal, but the immutable Cache-Control on
+                          the GET makes a plain anchor good enough).
+                      We hide this whole block when the bubble has no
+                      attachments so streaming-edit cases (no attachments)
+                      stay visually identical to pre-v0.17 ChatPanel. */}
+                  {row.bubble.kind === "user" &&
+                  row.bubble.attachments &&
+                  row.bubble.attachments.length > 0 ? (
+                    <div className="mt-1 flex flex-wrap justify-end gap-1">
+                      {row.bubble.attachments.map((att, ai) => {
+                        const url = uploadsUrlFor(att);
+                        const isImage = att.mimeType.startsWith("image/");
+                        if (isImage) {
+                          return (
+                            <button
+                              key={`${att.path}-${ai}`}
+                              type="button"
+                              onClick={() => setLightbox(att)}
+                              className="overflow-hidden rounded border border-slate-300 bg-slate-50 hover:opacity-90"
+                              title={att.filename}
+                            >
+                              <img
+                                src={url}
+                                alt={att.filename}
+                                className="block h-20 w-20 object-cover"
+                                loading="lazy"
+                              />
+                            </button>
+                          );
+                        }
+                        return (
+                          <a
+                            key={`${att.path}-${ai}`}
+                            href={url}
+                            download={att.filename}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex max-w-[20rem] items-center gap-1 truncate rounded border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-700 hover:bg-slate-100"
+                            title={`${att.filename} — click to download`}
+                          >
+                            <span aria-hidden="true">📎</span>
+                            <span className="truncate">{att.filename}</span>
+                          </a>
+                        );
+                      })}
+                    </div>
+                  ) : null}
 
                   {/* ─── Reactions strip (v0.16 §2; simplified §4) ─────────────
                       Sticky 👍/👎 indicators that stay visible after the
@@ -2308,6 +2414,43 @@ export default function ChatPanel({
           role="status"
         >
           {planSavedToast}
+        </div>
+      )}
+
+      {/* ─── Image lightbox (v0.17 mathub parity) ───────────────────
+          A minimal modal: backdrop click or Escape closes; nothing else.
+          Driven by `lightbox` state set when a user clicks an image
+          attachment chip. We intentionally don't add zoom/pan/keyboard
+          paging — the goal is "see the full image without a download",
+          not a full-blown gallery. If multiple-image cycling is wanted
+          later, it slots in here without touching the chip render. */}
+      {lightbox && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setLightbox(null)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") setLightbox(null);
+          }}
+        >
+          <img
+            src={uploadsUrlFor(lightbox)}
+            alt={lightbox.filename}
+            className="max-h-[90vh] max-w-[90vw] rounded shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          />
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setLightbox(null);
+            }}
+            className="absolute top-4 right-4 rounded-full bg-white/90 px-3 py-1 text-sm text-slate-900 shadow hover:bg-white"
+            aria-label="Close image preview"
+          >
+            ✕ Close
+          </button>
         </div>
       )}
     </div>

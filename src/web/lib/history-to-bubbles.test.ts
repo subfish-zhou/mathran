@@ -106,4 +106,49 @@ describe("historyToBubbles", () => {
     expect((out[0] as any).result).toBe("stranded result");
     expect((out[0] as any).ok).toBe(true);
   });
+
+  it("surfaces user-message attachments on the resulting bubble (v0.17 mathub parity)", () => {
+    // The persisted JSONL keeps an `attachments:[…]` array on the user
+    // message when the SPA sent files via `POST /api/uploads`. The
+    // hydrator forwards that metadata onto the bubble so ChatPanel can
+    // render the chip strip below the user pill on reload.
+    const hist: LLMMessageWire[] = [
+      {
+        role: "user",
+        content: "look at these\n\n[Image: diagram.png @ /tmp/uploads/abc-diagram.png]",
+        attachments: [
+          {
+            path: "/tmp/uploads/abc-diagram.png",
+            filename: "diagram.png",
+            mimeType: "image/png",
+          },
+        ],
+      },
+      { role: "assistant", content: "got it" },
+    ];
+    const out = historyToBubbles(hist);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toEqual({
+      kind: "user",
+      text: "look at these\n\n[Image: diagram.png @ /tmp/uploads/abc-diagram.png]",
+      attachments: [
+        {
+          path: "/tmp/uploads/abc-diagram.png",
+          filename: "diagram.png",
+          mimeType: "image/png",
+        },
+      ],
+    });
+  });
+
+  it("omits the attachments field when the user message has an empty array", () => {
+    // Empty arrays mean "no attachments" — the renderer wants `undefined`
+    // so the chip-strip block is skipped cleanly with a single nullish check.
+    const hist: LLMMessageWire[] = [
+      { role: "user", content: "hi", attachments: [] },
+    ];
+    const out = historyToBubbles(hist);
+    expect(out).toEqual([{ kind: "user", text: "hi" }]);
+    expect((out[0] as any).attachments).toBeUndefined();
+  });
 });

@@ -948,7 +948,9 @@ function registerChatScope(
           event: "session",
           data: JSON.stringify({ sessionId: conversationId, conversationId, scope }),
         });
-        for await (const ev of session.send(augmentedMessage) as AsyncIterable<ChatEvent>) {
+        for await (const ev of session.send(augmentedMessage, {
+          attachments: attachments && attachments.length > 0 ? attachments : undefined,
+        }) as AsyncIterable<ChatEvent>) {
           await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
         }
         // Flush the freshly-augmented history to disk before closing the stream.

@@ -45,6 +45,15 @@ export interface ToolBubble {
 export interface TextBubble {
   kind: "user" | "assistant";
   text: string;
+  /**
+   * Attachment chips to render under a user bubble (v0.17 mathub parity).
+   * Populated only on `kind === "user"` rows whose persisted `LLMMessage`
+   * carried an `attachments:[…]` array — i.e. messages originally sent
+   * with files attached via `POST /api/uploads`. ChatPanel renders an 80×80
+   * `<img>` preview for images and a `📎 filename` chip for everything else;
+   * both link out to `GET /api/uploads/<encoded-path>`.
+   */
+  attachments?: Array<{ path: string; filename: string; mimeType: string }>;
 }
 
 export type Bubble = ToolBubble | TextBubble;
@@ -55,6 +64,7 @@ export interface LLMMessageWire {
   toolCallId?: string;
   name?: string;
   toolCalls?: Array<{ id: string; name: string; arguments: string }>;
+  attachments?: Array<{ path: string; filename: string; mimeType: string }>;
 }
 
 function isErrorResult(s: string): boolean {
@@ -67,7 +77,11 @@ export function historyToBubbles(history: LLMMessageWire[]): Bubble[] {
     if (m.role === "system") continue;
 
     if (m.role === "user") {
-      out.push({ kind: "user", text: m.content });
+      const bubble: TextBubble = { kind: "user", text: m.content };
+      if (m.attachments && m.attachments.length > 0) {
+        bubble.attachments = m.attachments;
+      }
+      out.push(bubble);
       continue;
     }
 
