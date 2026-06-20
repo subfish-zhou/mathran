@@ -1698,6 +1698,89 @@ describe("Goal thread endpoints (v0.16 §3)", () => {
   });
 });
 
+// ─── v0.16 §9 audit #6: active-plan endpoint for the goal drawer ────────────
+describe("GET /api/goals/:goalId/plan (v0.16 §9 audit #6)", () => {
+  it("400s on a malformed goal id (no traversal)", async () => {
+    const res = await fetch(`${base}/api/goals/..%2Fetc/plan`);
+    // The router applies the safe-id regex before touching the filesystem,
+    // so the response is a JSON 400, not a 404 / silent disk error.
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/invalid goalId/);
+  });
+
+  it("404s on an unknown but well-formed goal id", async () => {
+    const res = await fetch(`${base}/api/goals/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/plan`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns hasPlan=false when the goal exists but no plan file was written", async () => {
+    // Created goal has no .plan.md on disk (no round has run; bootstrap
+    // wouldn't have fired yet anyway because /api/goals doesn't drive one).
+    const { goal } = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "plan endpoint: no file yet" }),
+    })).json();
+
+    const res = await fetch(`${base}/api/goals/${goal.id}/plan`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.hasPlan).toBe(false);
+    expect(body.planPath).toBeNull();
+    expect(body.body).toBeNull();
+    expect(body.steps).toEqual([]);
+  });
+
+  it("returns parsed steps when a plan file is on disk", async () => {
+    const { goal } = await (await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "plan endpoint: seeded plan" }),
+    })).json();
+
+    // Seed a plan file directly on disk — same path layout the runner uses.
+    // We hand-craft a body covering both "done" and "todo" markers across
+    // two sections to verify the parser numbers items globally (not per
+    // section) as documented in src/core/goal/plan.ts.
+    const planRel = path.join(".mathran", "goals", `${goal.id}.plan.md`);
+    const planAbs = path.join(workspace, planRel);
+    await fs.mkdir(path.dirname(planAbs), { recursive: true });
+    await fs.writeFile(
+      planAbs,
+      [
+        "# Plan",
+        "",
+        "## Steps",
+        "",
+        "- [x] read the spec",
+        "- [ ] write the code",
+        "",
+        "## Acceptance",
+        "",
+        "- [ ] tests pass",
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const res = await fetch(`${base}/api/goals/${goal.id}/plan`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.hasPlan).toBe(true);
+    expect(typeof body.body).toBe("string");
+    expect(body.body).toContain("## Steps");
+    expect(body.body).toContain("## Acceptance");
+    // Path is workspace-relative, not absolute.
+    expect(body.planPath).toBe(planRel);
+    // Global 1-based indexing across both sections.
+    expect(body.steps).toHaveLength(3);
+    expect(body.steps[0]).toMatchObject({ index: 1, status: "done", text: "read the spec" });
+    expect(body.steps[1]).toMatchObject({ index: 2, status: "todo", text: "write the code" });
+    expect(body.steps[2]).toMatchObject({ index: 3, status: "todo", text: "tests pass" });
+  });
+});
+
 describe("POST /api/goals/:id/interrupt (v0.2 §7)", () => {
   it("aborts an in-flight round and returns 200, leaving the goal active", async () => {
     // A provider that streams one chunk then blocks until the round is aborted.

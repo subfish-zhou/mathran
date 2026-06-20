@@ -106,6 +106,11 @@ import {
   type Goal,
 } from "../core/goal/store.js";
 import { runGoalRound } from "../core/goal/runner.js";
+import {
+  readGoalPlan,
+  parsePlanSteps,
+  goalPlanRelPath,
+} from "../core/goal/plan.js";
 import { PlanStore, type Plan } from "../core/plan/store.js";
 import { runPlan } from "../core/plan/runner.js";
 import type { LLMProvider } from "../core/providers/llm.js";
@@ -2360,6 +2365,51 @@ function buildApp(
       primaryConversationId: primaryConvId ?? null,
       history,
       subGoals,
+    });
+  });
+
+  /**
+   * GET /api/goals/:goalId/plan — v0.16 §9 audit #6.
+   *
+   * Returns the goal's active plan (parsed) so the SPA can render it in
+   * the thread drawer. Two distinct "no plan" states share a 200 response:
+   *
+   *   • `hasPlan: false` + `body: null` + empty `steps` — the goal exists
+   *     but no plan file has been written yet (sub-goal, bootstrap opted
+   *     out, or bootstrap failed). The SPA renders a quiet placeholder
+   *     rather than an error.
+   *   • Goal itself missing → 404 (mirrors the rest of /api/goals/:id).
+   *
+   * `steps` mirrors `PlanStep` from src/core/goal/plan.ts (1-based global
+   * index, status `todo`/`done`, text, source line). The SPA renders the
+   * raw markdown body but also has the parsed steps available for any
+   * future interactive checkbox UI.
+   */
+  app.get("/api/goals/:goalId/plan", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const goal = await readGoal(workspace, goalId);
+    if (!goal) return c.json({ error: "not found" }, 404);
+
+    const body = await readGoalPlan(workspace, goalId);
+    if (body === null) {
+      return c.json({
+        hasPlan: false,
+        planPath: null,
+        body: null,
+        steps: [],
+      });
+    }
+    const steps = parsePlanSteps(body);
+    return c.json({
+      hasPlan: true,
+      // Prefer the stamped `goal.planPath` for display (it's relative to
+      // workspace and matches what the goal record advertises), but fall
+      // back to the canonical relative path so older records that never
+      // ran a round under W4+ still render correctly.
+      planPath: goal.planPath ?? goalPlanRelPath(goalId),
+      body,
+      steps,
     });
   });
 

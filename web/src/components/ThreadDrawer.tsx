@@ -24,6 +24,7 @@ import {
 } from "../lib/chat.ts";
 import { historyToBubbles, type Bubble } from "../lib/history-to-bubbles.ts";
 import ToolCallGroup from "./ToolCallGroup.tsx";
+import ActivePlanPanel from "./ActivePlanPanel.tsx";
 
 const STATUS_BADGE: Record<GoalRow["status"], { className: string; label: string }> = {
   active: { className: "bg-blue-100 text-blue-800 animate-pulse", label: "running" },
@@ -61,6 +62,10 @@ export function ThreadDrawer({
   const [payload, setPayload] = useState<ThreadPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // Bumped on every successful thread reload so child panels (currently
+  // ActivePlanPanel) can piggy-back on the same poll cadence without
+  // having to re-implement their own timer.
+  const [pollKey, setPollKey] = useState(0);
   const reloadTokenRef = useRef(0);
 
   // ─── Load + poll ────────────────────────────────────────────────────────
@@ -81,6 +86,7 @@ export function ThreadDrawer({
         if (cancelled || reloadTokenRef.current !== myToken) return;
         setPayload(next);
         setError(null);
+        setPollKey((k) => k + 1);
         // Only poll while live. Terminal states freeze the panel so the
         // user sees a stable snapshot.
         if (next.goal.status === "active") {
@@ -213,6 +219,18 @@ export function ThreadDrawer({
           <div className="shrink-0 border-b border-red-200 bg-red-50 px-4 py-2 text-[11px] text-red-700">
             {error}
           </div>
+        )}
+
+        {/* ─── Active plan panel (v0.16 §9 audit #6) ───────────────
+            Shown for every goal (the panel itself handles the "no plan
+            file yet" empty state). Sub-goals never get a plan (W4 skips
+            bootstrap at depth >= 1), so they'll render quietly here. */}
+        {payload && (
+          <ActivePlanPanel
+            goalId={payload.goal.id}
+            planPath={payload.goal.planPath ?? null}
+            pollKey={pollKey}
+          />
         )}
 
         {/* ─── Conversation body ───────────────────────────────────── */}

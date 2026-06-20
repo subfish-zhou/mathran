@@ -375,6 +375,12 @@ export interface GoalRow {
   subGoalIds?: string[];
   conversationIds: string[];
   summaryPath?: string | null;
+  /** v0.16 §9 audit #4 (added W4): workspace-relative path to the active
+   *  plan markdown file (`.mathran/goals/<id>.plan.md`). null/missing when
+   *  bootstrap hasn't run, was skipped (sub-goal), or failed. The SPA uses
+   *  presence of this field to decide whether to show the Active Plan
+   *  section in ThreadDrawer. */
+  planPath?: string | null;
   budget: { tokensMax: number | null; roundsMax: number | null };
   stats: { tokensUsed: number; roundsRun: number; toolCallCount: number };
   createdAt: string;
@@ -417,6 +423,45 @@ export async function fetchThread(goalId: string, signal?: AbortSignal): Promise
   const res = await fetch(`/api/goals/${encodeURIComponent(goalId)}/thread`, { signal });
   if (!res.ok) throw new Error(`fetchThread failed (${res.status})`);
   return (await res.json()) as ThreadPayload;
+}
+
+// ─── v0.16 §9 audit #6: active-plan fetch for the goal drawer ──────────────────
+//
+// `goal.planPath` is on every `GoalRow`, but the plan body lives in a file
+// on the server's workspace — the SPA needs to fetch it separately. This
+// is a passive read; the runner is the only writer (bootstrap + the
+// `update_plan_item` tool), so a poll-on-status-change pattern in the
+// drawer is plenty.
+
+/** One parsed checklist item, mirrors `PlanStep` in src/core/goal/plan.ts. */
+export interface GoalPlanStep {
+  /** 1-based global index across the whole plan document. */
+  index: number;
+  status: "todo" | "done";
+  text: string;
+  /** Zero-based line in the source markdown body. */
+  line: number;
+}
+
+export interface GoalPlanPayload {
+  /** `false` when the goal has no `.plan.md` file on disk yet. */
+  hasPlan: boolean;
+  /** Workspace-relative path to the plan file when `hasPlan`, else null. */
+  planPath: string | null;
+  /** Raw markdown body of the plan (rendered as-is by the drawer), or null. */
+  body: string | null;
+  /** Parsed checklist steps. Empty when `hasPlan` is false or the plan has
+   *  no checklist items (e.g. prose-only `## Approach`). */
+  steps: GoalPlanStep[];
+}
+
+export async function fetchGoalPlan(
+  goalId: string,
+  signal?: AbortSignal,
+): Promise<GoalPlanPayload> {
+  const res = await fetch(`/api/goals/${encodeURIComponent(goalId)}/plan`, { signal });
+  if (!res.ok) throw new Error(`fetchGoalPlan failed (${res.status})`);
+  return (await res.json()) as GoalPlanPayload;
 }
 
 // ─── v0.16 §4: Goal-mode chat entry (create / run / interrupt / cancel) ──────
