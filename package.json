@@ -20,7 +20,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "build:web": "cd web && npm ci && npm run build",
-    "build:all": "npm run build && npm run build:web",
+    "build:embedded-assets": "tsx scripts/build-static-assets.ts",
+    "build:all": "npm run build:web && npm run build:embedded-assets && npm run build",
     "prepublishOnly": "npm run build:all",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
