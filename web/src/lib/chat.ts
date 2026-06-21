@@ -19,6 +19,30 @@ export interface ChatAttachmentRef {
   mimeType: string;
 }
 
+// ─────────────────────────────────────────────────────────────────
+// v0.17 mathub parity W12: in-conversation TODO tracker.
+//
+// Mirrored from `src/core/chat/tools/todo-write.ts`. The on-disk schema is
+// versioned (`version: 1`) so the SPA can stay forward-compatible if the
+// server bumps it later.
+// ─────────────────────────────────────────────────────────────────
+
+export type TodoStatus = "pending" | "in_progress" | "done" | "cancelled";
+
+export interface TodoItem {
+  id: string;
+  text: string;
+  status: TodoStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TodoList {
+  version: 1;
+  items: TodoItem[];
+  updatedAt: string;
+}
+
 export type ChatEvent =
   | { type: "session"; sessionId: string; conversationId: string; resumedFromAsk?: boolean }
   | { type: "text"; delta: string }
@@ -54,6 +78,17 @@ export type ChatEvent =
        *  actually steered with. */
       type: "steer-received";
       text: string;
+    }
+  | {
+      /** v0.17 mathub parity W12 — emitted by the host SSE layer after
+       *  every successful `todo_write` tool call. The kernel can't yield
+       *  arbitrary events from inside a tool, so `serve.ts` synthesises
+       *  this frame right after the `tool-result` event by reading the
+       *  freshly-persisted file from disk. Carries the *current* full
+       *  list — the SPA replaces its local state with `list.items`
+       *  rather than trying to diff. */
+      type: "todos";
+      list: TodoList;
     }
   | { type: "done"; finishReason: string }
   | { type: "error"; message: string };
@@ -317,6 +352,27 @@ export async function fetchAnnotations(
   );
   if (!res.ok) throw new Error(`fetchAnnotations failed (${res.status})`);
   return (await res.json()) as ConversationAnnotations;
+}
+
+/**
+ * v0.17 mathub parity W12 — fetch the persisted TODO list for a conversation.
+ *
+ * Used to seed the ActivePlanPanel on conversation load / tab switch, before
+ * any SSE stream has run. During an active stream the same panel is updated
+ * in real time via the `todos` ChatEvent. An empty list is returned for
+ * conversations that have never called `todo_write`.
+ */
+export async function fetchTodos(
+  scope: ChatScopeSpec,
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<TodoList> {
+  const res = await fetch(
+    `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/todos`,
+    { signal },
+  );
+  if (!res.ok) throw new Error(`fetchTodos failed (${res.status})`);
+  return (await res.json()) as TodoList;
 }
 
 /** PATCH a single bubble's annotation with a partial merge. Pass null in

@@ -78,6 +78,8 @@ import {
   AskUserPending,
   isAskUserPending,
   ASK_USER_PENDING_PLACEHOLDER,
+  createTodoWriteTool,
+  loadTodos,
   type ChatEvent,
 } from "../core/chat/index.js";
 import {
@@ -161,6 +163,11 @@ const SYSTEM_PROMPT = buildBaseSystemPrompt();
 export type ChatSessionFactory = (opts: {
   model?: string;
   scope?: ChatScope;
+  /** v0.17 W12 — conversation id so per-conversation tools (e.g.
+   *  `todo_write`) can persist to a file keyed by it. Optional for
+   *  back-compat with existing tests; the default factory wires the
+   *  TODO tool only when present. */
+  conversationId?: string;
 }) => ChatSession;
 
 /**
@@ -661,7 +668,7 @@ async function writeProviders(workspace: string, payload: any): Promise<Record<s
 // ─── Chat (SSE) ──────────────────────────────────────────────────────────────
 
 export function defaultSessionFactory(workspace: string): ChatSessionFactory {
-  return ({ model, scope }) => {
+  return ({ model, scope, conversationId }) => {
     const config = loadConfig(configPathFor(workspace));
     const resolvedModel = model ?? config.defaultModel ?? DEFAULT_MODEL;
     const router = new ModelRouter(config);
@@ -699,7 +706,20 @@ export function defaultSessionFactory(workspace: string): ChatSessionFactory {
       workspace: scopedWorkspace,
       toolContext: { workspace: scopedWorkspace, scope },
       systemPrompt: buildScopedSystemPrompt(scope, scopedWorkspace),
-      tools: [createLeanCheckTool(lean)],
+      // v0.17 W12 — wire `todo_write` per-conversation so each thread has
+      // its own persisted plan file. The factory closes over the scope +
+      // conversation id so the SSE pump can find the same file after each
+      // tool result and emit a `todos` event for the SPA panel.
+      tools: conversationId
+        ? [
+            createLeanCheckTool(lean),
+            createTodoWriteTool({
+              workspace: scopedWorkspace,
+              scope: scope ?? { kind: "global" },
+              conversationId,
+            }),
+          ]
+        : [createLeanCheckTool(lean)],
       subagentScheduler: scheduler,
       scheduler,
       builtinTools: {
@@ -975,8 +995,29 @@ function registerChatScope(
           steerProbe: () => consumePendingSteer(conversationId),
         }) as AsyncIterable<ChatEvent>) {
           await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
+          // v0.17 W12 — after a successful `todo_write` tool result, ship
+          // the freshly persisted TODO list so the SPA can render the
+          // ActivePlanPanel without a follow-up GET. We synthesise the
+          // frame in the host layer (not the kernel) because ChatSession
+          // can't yield arbitrary events from inside a tool.
+          if (
+            ev.type === "tool-result" &&
+            ev.name === "todo_write" &&
+            ev.ok
+          ) {
+            try {
+              const list = await loadTodos(store.getWorkspace(), scope, conversationId);
+              await stream.writeSSE({
+                event: "todos",
+                data: JSON.stringify({ type: "todos", list }),
+              });
+            } catch {
+              /* best-effort — a missing file shouldn't break the stream */
+            }
+          }
         }
         // Flush the freshly-augmented history to disk before closing the stream.
+        await store.flush(scope, conversationId);
         await store.flush(scope, conversationId);
       } catch (err: any) {
         // v0.16 §11: an `ask_user` round paused itself — not an error,
@@ -1217,6 +1258,24 @@ function registerChatScope(
           steerProbe: () => consumePendingSteer(id),
         }) as AsyncIterable<ChatEvent>) {
           await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
+          // v0.17 W12 — mirror the new-message pump: emit a `todos`
+          // frame after every successful `todo_write` so the rerun path
+          // updates the SPA panel just like an initial send.
+          if (
+            ev.type === "tool-result" &&
+            ev.name === "todo_write" &&
+            ev.ok
+          ) {
+            try {
+              const list = await loadTodos(store.getWorkspace(), scope, id);
+              await stream.writeSSE({
+                event: "todos",
+                data: JSON.stringify({ type: "todos", list }),
+              });
+            } catch {
+              /* best-effort */
+            }
+          }
         }
         await store.flush(scope, id);
       } catch (err: any) {
@@ -1518,6 +1577,24 @@ function registerChatScope(
           steerProbe: () => consumePendingSteer(id),
         }) as AsyncIterable<ChatEvent>) {
           await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });
+          // v0.17 W12 — same `todos` synthesis as the regular send pump,
+          // mirrored here so a resumed-from-ask round that calls
+          // `todo_write` still pushes the latest list to the SPA panel.
+          if (
+            ev.type === "tool-result" &&
+            ev.name === "todo_write" &&
+            ev.ok
+          ) {
+            try {
+              const list = await loadTodos(store.getWorkspace(), scope, id);
+              await stream.writeSSE({
+                event: "todos",
+                data: JSON.stringify({ type: "todos", list }),
+              });
+            } catch {
+              /* best-effort */
+            }
+          }
         }
         await store.flush(scope, id);
       } catch (err: any) {
@@ -1779,6 +1856,31 @@ function registerChatScope(
     const stats = computeUsageStats(history, fallbackModel);
     return c.json(stats);
   });
+
+  // ─── v0.17 W12 (mathub parity): TODO tracker routes ─────────────────
+  //
+  // The `todo_write` built-in tool persists a per-conversation TODO list to
+  // `<scopeDir>/<conversationId>.todos.json`. The SSE pump above emits a
+  // `todos` event after each successful tool call so live streams stay in
+  // sync; this GET endpoint covers the cold-start case (tab reload, switch
+  // conversation) where the SPA needs to seed the panel before any stream
+  // is running. A missing file returns an empty list — same semantics as
+  // the rest of the chat surface.
+  app.get(`${basePath}/:conversationId/todos`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const scope = resolved.scope!;
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+    try {
+      const list = await loadTodos(store.getWorkspace(), scope, id);
+      return c.json(list);
+    } catch (err: any) {
+      return c.json({ error: String(err?.message ?? err) }, 500);
+    }
+  });
 }
 
 /** Register all three chat scopes + the legacy `/api/chat` alias. */
@@ -1847,7 +1949,7 @@ function buildApp(
   const app = new Hono();
   // Adapt the test-friendly `ChatSessionFactory(opts)` to the store's
   // `ScopedChatSessionFactory({ scope, model })` signature.
-  const scopedFactory: ScopedChatSessionFactory = ({ scope, model }) => factory({ scope, model });
+  const scopedFactory: ScopedChatSessionFactory = ({ scope, model, conversationId }) => factory({ scope, model, conversationId });
   const sessions = new ScopedChatSessionStore(workspace, scopedFactory);
 
   // Per-goal AbortControllers for in-flight rounds. POST /interrupt aborts the
@@ -2854,6 +2956,40 @@ function buildApp(
           onEvent: (ev) => {
             queue.push({ event: ev.type, data: JSON.stringify(ev) });
             wakePump();
+            // v0.17 W12 — after a successful `todo_write` tool result,
+            // synthesise a `todos` frame so the SPA's ActivePlanPanel
+            // stays in sync. Goals always have a conversationId by the
+            // time the inner ChatSession runs — the runner mints one on
+            // first call — but `steerConversationId` captured the
+            // pre-call value which may be empty for a brand-new goal.
+            // We re-read the goal's conversationIds[0] off `g` to cover
+            // that edge: the runner attaches the new id synchronously
+            // before yielding any tool events.
+            if (
+              ev.type === "tool-result" &&
+              ev.name === "todo_write" &&
+              ev.ok
+            ) {
+              void (async () => {
+                try {
+                  // Re-read the goal so we pick up the runner-minted
+                  // conversationId on the very first round (when
+                  // `g.conversationIds[0]` was empty at request time).
+                  const fresh = await readGoal(workspace, goalId);
+                  const cid =
+                    fresh?.conversationIds[0] ?? steerConversationId ?? undefined;
+                  if (!cid) return;
+                  const list = await loadTodos(workspace, g.scope, cid);
+                  queue.push({
+                    event: "todos",
+                    data: JSON.stringify({ type: "todos", list }),
+                  });
+                  wakePump();
+                } catch {
+                  /* best-effort */
+                }
+              })();
+            }
           },
           // v0.17 mathub parity W9 — forward the registry probe into
           // the inner `ChatSession.runRounds`. The runner re-emits

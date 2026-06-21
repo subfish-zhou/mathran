@@ -34,6 +34,7 @@ import { randomUUID } from "node:crypto";
 
 import { ChatSession, type ToolExecuteContext, type ToolSpec } from "../chat/session.js";
 import { ASK_USER_GOAL_AUTO_REPLY } from "../chat/tools/ask-user.js";
+import { createTodoWriteTool } from "../chat/tools/todo-write.js";
 import type { LLMMessage, LLMProvider } from "../providers/llm.js";
 import type { ChatEvent } from "../chat/index.js";
 import {
@@ -734,10 +735,17 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   const planTools: ToolSpec[] = planBootstrapResult.planBody
     ? [buildUpdatePlanItemTool({ workspace, goalId })]
     : [];
+  // v0.17 W12 — wire `todo_write` per-goal-conversation so the model can
+  // maintain a short visible TODO list. The runner already knows the
+  // workspace + scope + conversation id, so we mint the tool here rather
+  // than threading another option through the runner surface.
+  const todoTools: ToolSpec[] = [
+    createTodoWriteTool({ workspace, scope: goal.scope, conversationId }),
+  ];
   const session = new ChatSession({
     llm,
     model: goal.model,
-    tools: [...tools, ...buildGoalTools(handler), ...subGoalTools, ...planTools],
+    tools: [...tools, ...buildGoalTools(handler), ...subGoalTools, ...planTools, ...todoTools],
     systemPrompt,
     toolContext,
     workspace: opts.chatWorkspace ?? opts.workspace,

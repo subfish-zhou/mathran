@@ -31,4 +31,14 @@ export {
   type AskUserResolver,
   type AskUserToolOptions,
 } from "./tools/ask-user.js";
+export {
+  createTodoWriteTool,
+  loadTodos,
+  saveTodos,
+  applyTodoPatch,
+  type TodoItem,
+  type TodoList,
+  type TodoStatus,
+  type CreateTodoWriteToolOptions,
+} from "./tools/todo-write.js";
 export { renderTranscriptMarkdown, type TranscriptMeta } from "./transcript.js";

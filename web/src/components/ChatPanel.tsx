@@ -27,6 +27,7 @@ import {
   truncateChat,
   streamAnswerAsk,
   fetchAnnotations,
+  fetchTodos,
   patchAnnotation,
   patchUiState,
   toggleReaction,
@@ -38,10 +39,12 @@ import {
   type ConversationAnnotations,
   type MessageAnnotation,
   type GoalRow,
+  type TodoList,
 } from "../lib/chat.ts";
 import GoalControls from "./GoalControls.tsx";
 import GoalRunStatusPanel from "./GoalRunStatusPanel.tsx";
 import GoalAutonomyCard from "./GoalAutonomyCard.tsx";
+import { TodoListPanel } from "./TodoListPanel.tsx";
 import PlanRunOverlay from "./PlanRunOverlay.tsx";
 import { AgentStatusPanel, type ChatEventPhase } from "./AgentStatusPanel.tsx";
 import { api, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
@@ -211,6 +214,14 @@ export default function ChatPanel({
   // in by clicking the "🌳 Sub-agent tree (N)" button when they want
   // the bird's-eye view across the whole forest.
   const [subagentTreeOpen, setSubagentTreeOpen] = useState(false);
+  // v0.17 mathub parity W12: in-conversation TODO tracker maintained by
+  // the `todo_write` built-in tool. Seeded by `fetchTodos` whenever the
+  // active conversation changes, then live-updated by `todos` SSE frames
+  // synthesised in the host layer after every successful tool call.
+  // We keep collapsed state in a separate slot so it survives state
+  // churn within one conversation but resets on conversation switch.
+  const [todos, setTodos] = useState<TodoList | null>(null);
+  const [todosCollapsed, setTodosCollapsed] = useState(false);
   // v0.16 §9 audit #2: plan-mode overlay state. Lives outside the chat
   // bubble stream so a plan run never pollutes conversation history; only
   // a transient "Plan saved to <path>" toast surfaces back here.
@@ -402,6 +413,11 @@ export default function ChatPanel({
       setReplyTarget(null);
       setOwningGoal(null);
       setThreadStack([]);
+      // v0.17 mathub parity W12 — clear TODO list when no conversation
+      // is selected so the panel doesn't show stale items from a prior
+      // selection while the sidebar loads.
+      setTodos(null);
+      setTodosCollapsed(false);
       return;
     }
     let cancelled = false;
@@ -417,8 +433,11 @@ export default function ChatPanel({
         byBubbleIdx: {} as Record<string, MessageAnnotation>,
       })),
       findGoalForConversation(conversationId).catch(() => null),
+      // v0.17 W12: seed the TODO panel before any stream runs. Empty
+      // list on first-ever load is normal; failures are non-fatal.
+      fetchTodos(scope, conversationId).catch<TodoList | null>(() => null),
     ])
-      .then(([data, ann, goalLookup]) => {
+      .then(([data, ann, goalLookup, todoList]) => {
         if (cancelled) return;
         // v0.16 §11: if the conversation paused on an `ask_user`, the
         // sidecar carries the pending question keyed by tool-call id.
@@ -442,6 +461,11 @@ export default function ChatPanel({
         setBubbles(initialBubbles);
         setAnnotations(ann);
         setOwningGoal(goalLookup ? goalLookup.goal : null);
+        // v0.17 W12 — seed the TODO panel from disk. Reset the
+        // collapsed flag too so switching to a fresh conversation
+        // starts with the panel visible (matches first-load UX).
+        setTodos(todoList ?? null);
+        setTodosCollapsed(false);
         // v0.16 §4: restore persisted UI state. Apply scroll on the next
         // animation frame so the bubbles have laid out first; otherwise
         // scrollTop would clamp to (smaller) prior content height.
@@ -659,6 +683,14 @@ export default function ChatPanel({
           window.setTimeout(() => {
             setSteerLastReceived((cur) => (cur === ev.text ? null : cur));
           }, 6000);
+        }
+        // v0.17 mathub parity W12 — the host SSE layer synthesises one
+        // `todos` frame after every successful `todo_write` tool call.
+        // We replace state outright (the payload is the *full* current
+        // list, not a delta) so a partial in-flight stream that was
+        // dropped + retried still converges to the right view.
+        if (ev.type === "todos") {
+          setTodos(ev.list);
         }
         if (ev.type === "tool-call") {
           // Track the in-flight call by id so the matching tool-result
@@ -2377,7 +2409,21 @@ export default function ChatPanel({
           })}
         </div>
 
-        {/* ─── AgentStatusPanel (v0.17 mathub parity W7) ───────────────────────
+        {/* ─── TodoListPanel (v0.17 mathub parity W12) ─────────────────────────
+            In-conversation TODO tracker maintained by the `todo_write`
+            built-in tool. Seeded from disk on conversation load, then
+            live-updated by `todos` SSE frames during a stream. The
+            panel is self-hiding when the list is empty, so simple Q&A
+            turns stay quiet. We render it ABOVE AgentStatusPanel so it
+            stays visible between turns (the status panel disappears
+            when `busy === false`). */}
+        <TodoListPanel
+          list={todos}
+          collapsed={todosCollapsed}
+          onToggleCollapsed={() => setTodosCollapsed((c) => !c)}
+        />
+
+        {/* ─── AgentStatusPanel (v0.17 mathub parity W7) ─────────────────────────
             Compact status strip rendered just BELOW the bubble list
             while the chat / goal round is streaming. Hides itself when
             `busy === false` so the chat surface stays clean between

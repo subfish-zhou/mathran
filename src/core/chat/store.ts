@@ -428,6 +428,10 @@ async function loadHistory(dir: string, conversationId: string): Promise<LLMMess
 export type ScopedChatSessionFactory = (args: {
   scope: ChatScope;
   model?: string;
+  /** v0.17 W12 — conversation id, passed so the factory can construct
+   *  per-conversation tools (e.g. `todo_write`) that persist to a file
+   *  keyed by conversationId. Older factories may ignore this field. */
+  conversationId?: string;
 }) => ChatSession;
 
 interface SessionEntry {
@@ -550,7 +554,7 @@ export class ScopedChatSessionStore {
     if (this.entries.size >= this.maxEntries) await this.evictLRU();
 
     const dir = scopeDir(this.workspace, scope);
-    const session = this.factory({ scope, model });
+    const session = this.factory({ scope, model, conversationId });
     const history = await loadHistory(dir, conversationId);
     if (history && history.length > 0) {
       // Replay each message via the kernel's `replayHistory` hook so the

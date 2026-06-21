@@ -85,6 +85,27 @@ truly ambiguous goals. Do NOT use it for stylistic preferences you can
 reasonably guess, or to acknowledge requests. Asking is more expensive than
 making a reasonable assumption and naming it.`;
 
+// ───────────────────────────────────────────────────────────────────
+// In-conversation TODO tracker (v0.17 W12, mathub parity)
+// ───────────────────────────────────────────────────────────────────
+
+export const TODO_TRACKER_FRAGMENT = `When the user's task has MULTIPLE concrete steps (rule of thumb: 4 or more),
+use the \`todo_write\` tool to maintain a short, ordered TODO list so the user
+can see your plan unfold in real time. Skip it for single-shot edits, simple
+questions, or one-tool answers — the overhead isn't worth it there.
+
+Rules of thumb:
+  - Plan once at the top of the turn with \`replace: true\` and a fresh list
+    of 3–7 short items (one line each, verb-first, concrete).
+  - As you work, mark items \`in_progress\` BEFORE you start them and
+    \`done\` (or \`cancelled\` if scrapped) as soon as you finish. Keep at
+    most ONE item \`in_progress\` at a time.
+  - To update an item, send only its \`id\` plus the new \`status\` (or
+    new \`text\`); omitted fields are preserved. To add a new step, pass
+    a new item with \`text\` (no \`id\`).
+  - Don't narrate the list in chat — the SPA renders it from the tool.
+    Brief one-line acknowledgments are fine.`;
+
 // ────────────────────────────────────────────────────────────────────
 // Plan mode (v0.3 §13, rewritten v0.16 §9)
 // ────────────────────────────────────────────────────────────────────
@@ -262,6 +283,8 @@ export interface BaseSystemPromptOpts {
   includeSubagentDispatch?: boolean;
   /** Default true. */
   includeAskUser?: boolean;
+  /** Default true. v0.17 W12 — the in-conversation TODO tracker. */
+  includeTodoTracker?: boolean;
 }
 
 /** Single source of truth for "what's the system prompt for a normal chat?". */
@@ -271,5 +294,6 @@ export function buildBaseSystemPrompt(opts: BaseSystemPromptOpts = {}): string {
   if (opts.includeLean !== false) sections.push(LEAN_FRAGMENT);
   if (opts.includeSubagentDispatch !== false) sections.push(SUBAGENT_DISPATCH_FRAGMENT);
   if (opts.includeAskUser !== false) sections.push(ASK_USER_FRAGMENT);
+  if (opts.includeTodoTracker !== false) sections.push(TODO_TRACKER_FRAGMENT);
   return sections.join("\n\n");
 }
