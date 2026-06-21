@@ -218,6 +218,23 @@ export default function ChatPanel({
   // churn within one conversation but resets on conversation switch.
   const [todos, setTodos] = useState<TodoList | null>(null);
   const [todosCollapsed, setTodosCollapsed] = useState(false);
+  // v0.17 P2 — the most-recent propose_goal confirmation. Cleared by
+  // user dismiss (X button) or by a scope/conversation reset. When
+  // `autoRun=true` the banner also triggers a 800-ms-delayed page
+  // navigate (handled in the goal-proposed event branch below).
+  const [goalProposed, setGoalProposed] = useState<null | {
+    goalId: string;
+    objective: string;
+    maxRounds: number;
+    tokensCap: number | null;
+    autoRun: boolean;
+  }>(null);
+  // v0.17 P2 sibling — propose_plan banner state.
+  const [planProposed, setPlanProposed] = useState<null | {
+    planId: string;
+    objective: string;
+    autoRun: boolean;
+  }>(null);
   // v0.16 §9 audit #2: plan-mode overlay state. Lives outside the chat
   // bubble stream so a plan run never pollutes conversation history; only
   // a transient "Plan saved to <path>" toast surfaces back here.
@@ -414,6 +431,9 @@ export default function ChatPanel({
       // selection while the sidebar loads.
       setTodos(null);
       setTodosCollapsed(false);
+      // v0.17 P2 — scope/conversation reset also clears the banner.
+      setGoalProposed(null);
+      setPlanProposed(null);
       return;
     }
     let cancelled = false;
@@ -687,6 +707,48 @@ export default function ChatPanel({
         // dropped + retried still converges to the right view.
         if (ev.type === "todos") {
           setTodos(ev.list);
+        }
+        // v0.17 P2 — propose_goal confirmation produced a real Goal.
+        // Show a banner notification, and when the model + user opted
+        // for autoRun, navigate the SPA to the goal page so they can
+        // watch the round stream live. The goal-mode SSE pump is
+        // separate from the chat SSE pump, so the page switch is the
+        // honest way to surface progress without forking two streams.
+        if (ev.type === "goal-proposed") {
+          setGoalProposed({
+            goalId: ev.goalId,
+            objective: ev.objective,
+            maxRounds: ev.maxRounds,
+            tokensCap: ev.tokensCap,
+            autoRun: ev.autoRun,
+          });
+          if (ev.autoRun) {
+            const scopeQS =
+              ev.scope.kind === "project"
+                ? `?scope=project:${encodeURIComponent(ev.scope.projectSlug ?? "")}`
+                : ev.scope.kind === "effort"
+                  ? `?scope=effort:${encodeURIComponent(ev.scope.projectSlug ?? "")}/${encodeURIComponent(ev.scope.effortSlug ?? "")}`
+                  : "";
+            // Small delay so the user sees the banner update before the
+            // navigation rips it away. 800 ms is empirically just long
+            // enough to register the message without feeling sluggish.
+            window.setTimeout(() => {
+              window.location.assign(`/goals/${encodeURIComponent(ev.goalId)}${scopeQS}`);
+            }, 800);
+          }
+        }
+        // v0.17 P2 sibling — plan-proposed banner + optional auto-navigate.
+        if (ev.type === "plan-proposed") {
+          setPlanProposed({
+            planId: ev.planId,
+            objective: ev.objective,
+            autoRun: ev.autoRun,
+          });
+          if (ev.autoRun) {
+            window.setTimeout(() => {
+              window.location.assign(`/plans/${encodeURIComponent(ev.planId)}`);
+            }, 800);
+          }
         }
         if (ev.type === "tool-call") {
           // Track the in-flight call by id so the matching tool-result
@@ -2434,6 +2496,89 @@ export default function ChatPanel({
           elapsedMs={sendStartMs > 0 ? Date.now() - sendStartMs : 0}
           round={round}
         />
+
+        {/* ─── GoalProposalBanner (v0.17 follow-up P2) ───────────────────────────
+            Shown immediately after a successful `propose_goal` tool
+            result. When `autoRun=true` the banner also signals an
+            imminent navigate (the chat handler triggers a 800-ms-
+            delayed location.assign to the goal page). Manual mode (no
+            autoRun) shows a plain link so the user can open the goal
+            on their schedule. */}
+        {goalProposed && (
+          <div className="mx-6 mb-2 rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex-1">
+                <div className="font-medium">
+                  🎯 Goal created
+                  {goalProposed.autoRun && (
+                    <span className="ml-2 inline-block rounded-full bg-emerald-200 px-2 py-0.5 text-xs font-normal">
+                      auto-starting…
+                    </span>
+                  )}
+                </div>
+                <div className="mt-0.5 text-xs text-emerald-800">
+                  <span className="font-medium">{goalProposed.objective}</span>
+                  {" · "}
+                  maxRounds {goalProposed.maxRounds}
+                  {goalProposed.tokensCap ? `, tokensCap ${goalProposed.tokensCap}` : ", unbounded tokens"}
+                </div>
+                <a
+                  href={`/goals/${encodeURIComponent(goalProposed.goalId)}`}
+                  className="mt-1 inline-block text-xs underline hover:no-underline"
+                >
+                  {goalProposed.autoRun ? "Open goal now" : "Open goal page"}
+                </a>
+              </div>
+              <button
+                type="button"
+                aria-label="Dismiss"
+                onClick={() => setGoalProposed(null)}
+                className="shrink-0 rounded p-1 text-emerald-700 hover:bg-emerald-100"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ─── PlanProposalBanner (v0.17 follow-up P2 sibling) ──────────────
+            Shown after a successful `propose_plan` tool result. Plan
+            mode runs are one-shot and short — `autoRun=true` is the
+            default, so the banner is almost always a brief "opening
+            plan…" before the SPA navigates. */}
+        {planProposed && (
+          <div className="mx-6 mb-2 rounded-md border border-indigo-300 bg-indigo-50 px-3 py-2 text-sm text-indigo-900 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex-1">
+                <div className="font-medium">
+                  📋 Plan reserved
+                  {planProposed.autoRun && (
+                    <span className="ml-2 inline-block rounded-full bg-indigo-200 px-2 py-0.5 text-xs font-normal">
+                      auto-running…
+                    </span>
+                  )}
+                </div>
+                <div className="mt-0.5 text-xs text-indigo-800">
+                  <span className="font-medium">{planProposed.objective}</span>
+                </div>
+                <a
+                  href={`/plans/${encodeURIComponent(planProposed.planId)}`}
+                  className="mt-1 inline-block text-xs underline hover:no-underline"
+                >
+                  {planProposed.autoRun ? "Open plan now" : "Open plan page"}
+                </a>
+              </div>
+              <button
+                type="button"
+                aria-label="Dismiss"
+                onClick={() => setPlanProposed(null)}
+                className="shrink-0 rounded p-1 text-indigo-700 hover:bg-indigo-100"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        )}
 
         {error && (
           <div className="mx-6 mb-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">

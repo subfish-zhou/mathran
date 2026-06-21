@@ -432,6 +432,12 @@ export type ScopedChatSessionFactory = (args: {
    *  per-conversation tools (e.g. `todo_write`) that persist to a file
    *  keyed by conversationId. Older factories may ignore this field. */
   conversationId?: string;
+  /** v0.17 P2 — optional fire-and-forget goal-kickoff hook forwarded to
+   *  the `propose_goal` builtin tool. Older factories may ignore. */
+  autoRunGoal?: (goalId: string, userMessage: string) => void;
+  /** v0.17 P2 — optional fire-and-forget plan-kickoff hook forwarded to
+   *  the `propose_plan` builtin tool. Older factories may ignore. */
+  autoRunPlan?: (planId: string, objective: string) => void;
 }) => ChatSession;
 
 interface SessionEntry {

@@ -75,6 +75,23 @@ export interface ProposeGoalToolOptions {
    * the same model the chat session is currently using).
    */
   model: string;
+  /**
+   * v0.17 follow-up P2 — optional auto-run hook. When provided, after the
+   * user confirms the proposal, the tool invokes this callback to kick
+   * off `runGoalRound` immediately (so the user doesn't have to manually
+   * click "Run" in the goal panel). The serve host wires this with all
+   * its closure-scoped deps (LLM, scheduler, lean) so the tool itself
+   * stays dep-light.
+   *
+   * The callback is FIRE-AND-FORGET: the tool does NOT await it. The
+   * actual goal round runs in the background while the current chat
+   * round returns its tool-result. A separate SSE frame
+   * (`goal-started`) is emitted so the SPA can render the running goal
+   * (typically by auto-opening the goal page).
+   *
+   * If omitted, the tool ships in seed-only mode — Phase 1 behaviour.
+   */
+  autoRunner?: (goalId: string, userMessage: string) => void;
 }
 
 export interface ProposeGoalToolResult {
@@ -164,7 +181,7 @@ export function formatProposeGoalQuestion(input: {
 }
 
 export function createProposeGoalTool(opts: ProposeGoalToolOptions): ToolSpec {
-  const { resolver, workspace, scope, model } = opts;
+  const { resolver, workspace, scope, model, autoRunner } = opts;
   return {
     name: "propose_goal",
     description: DESCRIPTION,
@@ -264,6 +281,20 @@ export function createProposeGoalTool(opts: ProposeGoalToolOptions): ToolSpec {
         };
       }
 
+      // v0.17 P2 — fire-and-forget auto-run if the host provided a runner.
+      // We pass the original objective as the kickoff message; the runner
+      // will issue the first plan-bootstrap + round-1 chain. Errors from
+      // the background runner are swallowed here — the goal record IS
+      // written (so the user can manually re-kick from the goal panel),
+      // and the runner writes its own failure state via `endGoal`.
+      if (autoRunner) {
+        try {
+          autoRunner(goal.id, objective);
+        } catch {
+          /* host implementation must not throw; defensive only */
+        }
+      }
+
       return {
         ok: true,
         content: JSON.stringify({
@@ -273,8 +304,10 @@ export function createProposeGoalTool(opts: ProposeGoalToolOptions): ToolSpec {
           maxRounds: decision.maxRounds,
           tokensCap: decision.tokensCap,
           scope,
-          hint:
-            "Goal created. The SPA will surface a notification with a 'open goal' link; you may continue this chat round or stop here and let the user kick off the goal from the goal panel.",
+          autoRun: Boolean(autoRunner),
+          hint: autoRunner
+            ? "Goal created and kicked off in the background. The SPA will auto-open the goal page; you may stop here so the user can watch progress unfold."
+            : "Goal created. The SPA will surface a notification with a 'open goal' link; you may continue this chat round or stop here and let the user kick off the goal from the goal panel.",
         }),
       };
     },

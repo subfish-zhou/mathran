@@ -168,6 +168,21 @@ export type ChatSessionFactory = (opts: {
    *  back-compat with existing tests; the default factory wires the
    *  TODO tool only when present. */
   conversationId?: string;
+  /**
+   * v0.17 follow-up P2 — fire-and-forget background goal kickoff after
+   * `propose_goal` confirmation. The serve host owns `runGoalRound` +
+   * deps (LLM, scheduler, lean, inflightGoals) inside its closure and
+   * passes this lambda so the tool can trigger a goal run without
+   * pulling those deps through five interfaces. Optional: when omitted
+   * the propose_goal tool ships in seed-only mode and the user must
+   * click "Run" in the goal panel manually.
+   */
+  autoRunGoal?: (goalId: string, userMessage: string) => void;
+  /**
+   * v0.17 P2 — see ScopedChatSessionFactory.autoRunPlan. Forwarded to
+   * the `propose_plan` builtin tool by the default factory.
+   */
+  autoRunPlan?: (planId: string, objective: string) => void;
 }) => ChatSession;
 
 /**
@@ -668,7 +683,7 @@ async function writeProviders(workspace: string, payload: any): Promise<Record<s
 // ─── Chat (SSE) ──────────────────────────────────────────────────────────────
 
 export function defaultSessionFactory(workspace: string): ChatSessionFactory {
-  return ({ model, scope, conversationId }) => {
+  return ({ model, scope, conversationId, autoRunGoal, autoRunPlan }) => {
     const config = loadConfig(configPathFor(workspace));
     const resolvedModel = model ?? config.defaultModel ?? DEFAULT_MODEL;
     const router = new ModelRouter(config);
@@ -754,6 +769,15 @@ export function defaultSessionFactory(workspace: string): ChatSessionFactory {
           workspace: scopedWorkspace,
           scope: scope ?? { kind: "global" },
           model: resolvedModel,
+          autoRunner: autoRunGoal,
+        },
+        propose_plan: {
+          resolver: async (question, { callId }) => {
+            throw new AskUserPending({ question, callId });
+          },
+          workspace: scopedWorkspace,
+          model: resolvedModel,
+          autoRunner: autoRunPlan,
         },
       },
     });
@@ -1052,11 +1076,35 @@ function registerChatScope(
                     maxRounds: payload.maxRounds,
                     tokensCap: payload.tokensCap,
                     scope: payload.scope ?? scope,
+                    autoRun: Boolean(payload.autoRun),
                   }),
                 });
               }
             } catch {
               /* best-effort — a malformed payload shouldn't break the stream */
+            }
+          }
+          // v0.17 P2 sibling — propose_plan emits plan-proposed on confirm.
+          if (
+            ev.type === "tool-result" &&
+            ev.name === "propose_plan" &&
+            ev.ok
+          ) {
+            try {
+              const payload = JSON.parse((ev as { content?: string }).content ?? "{}");
+              if (payload && payload.ok && payload.planId) {
+                await stream.writeSSE({
+                  event: "plan-proposed",
+                  data: JSON.stringify({
+                    type: "plan-proposed",
+                    planId: payload.planId,
+                    objective: payload.objective,
+                    autoRun: Boolean(payload.autoRun),
+                  }),
+                });
+              }
+            } catch {
+              /* best-effort */
             }
           }
         }
@@ -1338,6 +1386,30 @@ function registerChatScope(
                     maxRounds: payload.maxRounds,
                     tokensCap: payload.tokensCap,
                     scope: payload.scope ?? scope,
+                    autoRun: Boolean(payload.autoRun),
+                  }),
+                });
+              }
+            } catch {
+              /* best-effort */
+            }
+          }
+          // v0.17 P2 sibling — propose_plan mirror in rerun path.
+          if (
+            ev.type === "tool-result" &&
+            ev.name === "propose_plan" &&
+            ev.ok
+          ) {
+            try {
+              const payload = JSON.parse((ev as { content?: string }).content ?? "{}");
+              if (payload && payload.ok && payload.planId) {
+                await stream.writeSSE({
+                  event: "plan-proposed",
+                  data: JSON.stringify({
+                    type: "plan-proposed",
+                    planId: payload.planId,
+                    objective: payload.objective,
+                    autoRun: Boolean(payload.autoRun),
                   }),
                 });
               }
@@ -1682,6 +1754,30 @@ function registerChatScope(
                     maxRounds: payload.maxRounds,
                     tokensCap: payload.tokensCap,
                     scope: payload.scope ?? scope,
+                    autoRun: Boolean(payload.autoRun),
+                  }),
+                });
+              }
+            } catch {
+              /* best-effort */
+            }
+          }
+          // v0.17 P2 sibling — propose_plan mirror in resume-from-ask path.
+          if (
+            ev.type === "tool-result" &&
+            ev.name === "propose_plan" &&
+            ev.ok
+          ) {
+            try {
+              const payload = JSON.parse((ev as { content?: string }).content ?? "{}");
+              if (payload && payload.ok && payload.planId) {
+                await stream.writeSSE({
+                  event: "plan-proposed",
+                  data: JSON.stringify({
+                    type: "plan-proposed",
+                    planId: payload.planId,
+                    objective: payload.objective,
+                    autoRun: Boolean(payload.autoRun),
                   }),
                 });
               }
@@ -2042,14 +2138,135 @@ function buildApp(
 ): Hono {
   const app = new Hono();
   // Adapt the test-friendly `ChatSessionFactory(opts)` to the store's
-  // `ScopedChatSessionFactory({ scope, model })` signature.
-  const scopedFactory: ScopedChatSessionFactory = ({ scope, model, conversationId }) => factory({ scope, model, conversationId });
+  // `ScopedChatSessionFactory({ scope, model })` signature. We pre-bind
+  // the buildApp-scoped `autoRunGoal` lambda so the propose_goal builtin
+  // tool can fire-and-forget a kickoff with all deps wired.
+  const scopedFactory: ScopedChatSessionFactory = ({ scope, model, conversationId }) =>
+    factory({ scope, model, conversationId, autoRunGoal, autoRunPlan });
   const sessions = new ScopedChatSessionStore(workspace, scopedFactory);
 
   // Per-goal AbortControllers for in-flight rounds. POST /interrupt aborts the
   // matching controller. Single-process only — a multi-process deployment would
   // need IPC (or the `<id>.stop` file-marker poll) to reach the right worker.
   const inflightGoals = new Map<string, AbortController>();
+
+  /**
+   * v0.17 P2 — forward to the same `runGoalRound` machinery POST
+   * /api/goals/:id/run uses, but fire-and-forget. Used by the `propose_goal`
+   * chat-mode tool to auto-kickoff a goal the moment the user confirms.
+   *
+   * Captures buildApp's closure deps (config loader, goalLlmFactory,
+   * `inflightGoals`, `LocalLeanProvider`, `runGoalRound`) so the
+   * propose_goal tool itself can stay dep-light.
+   *
+   * Errors are swallowed and logged — the goal record IS persisted (the
+   * tool wrote it before calling us) so the user can manually re-kick
+   * from the goal panel if the background run dies.
+   */
+  const autoRunGoal = (goalId: string, userMessage: string): void => {
+    // Fire the round in a microtask so the current chat tool-result
+    // returns first, the SSE pump emits its `goal-proposed` frame, and
+    // THEN the goal round starts (so the SPA gets the notification
+    // *before* the goal panel starts streaming).
+    void (async () => {
+      try {
+        const g = await readGoal(workspace, goalId);
+        if (!g || g.status !== "active") return;
+        await clearGoalAbortRequest(workspace, goalId);
+        const cfg = loadConfig(configPathFor(workspace));
+        const llm: LLMProvider = goalLlmFactory
+          ? goalLlmFactory({ model: g.model })
+          : new ModelRouter(cfg);
+        const lean = new LocalLeanProvider();
+        const tools = [createLeanCheckTool(lean)];
+        const controller = new AbortController();
+        inflightGoals.set(goalId, controller);
+        try {
+          await runGoalRound({
+            workspace,
+            goalId,
+            userMessage,
+            llm,
+            tools,
+            toolContext: { workspace, scope: g.scope },
+            signal: controller.signal,
+            bootstrapPlan: "auto",
+          });
+        } finally {
+          inflightGoals.delete(goalId);
+        }
+      } catch (err: any) {
+        // Best-effort: mark the goal failed so the SPA shows the right state.
+        try {
+          await endGoal(workspace, goalId, "failed", String(err?.message ?? err));
+        } catch {
+          /* swallow */
+        }
+      }
+    })();
+  };
+
+  /**
+   * v0.17 P2 — fire-and-forget plan-run kickoff. The `propose_plan`
+   * builtin tool reserved a Plan record on disk and got a stable id;
+   * we now drive `runPlan` and push frames into `planRuns` so the SPA
+   * GET /api/plans/:planId/stream consumer (opened right after the
+   * navigation triggered by the `plan-proposed` SSE frame) drains the
+   * same in-memory queue as the manual POST /api/plans path.
+   *
+   * Best-effort: errors push an `error` frame onto the buffer; the
+   * Plan record stays on disk so the panel still renders the draft.
+   */
+  const autoRunPlan = (planId: string, objective: string): void => {
+    void (async () => {
+      try {
+        const cfg = loadConfig(configPathFor(workspace));
+        const llm: LLMProvider = goalLlmFactory
+          ? goalLlmFactory({})
+          : new ModelRouter(cfg);
+        const model = cfg.defaultModel ?? "copilot/gpt-5.5";
+        const run = {
+          planId,
+          abort: new AbortController(),
+          buffer: [] as any[],
+          finished: false,
+          waiters: [] as Array<() => void>,
+        };
+        planRuns.set(planId, run as any);
+        const push = (frame: { event: string; data: any }) => {
+          run.buffer.push(frame);
+          const w = run.waiters.splice(0);
+          for (const fn of w) {
+            try { fn(); } catch { /* ignore */ }
+          }
+        };
+        try {
+          await runPlan({
+            objective,
+            workspace,
+            llm,
+            model,
+            planId,
+            abortSignal: run.abort.signal,
+            onEvent: (ev) => {
+              if (ev.type === "token") push({ event: "token", data: { delta: ev.delta } });
+              else if (ev.type === "step") push({ event: "step", data: { round: ev.round, finishReason: ev.finishReason } });
+              else if (ev.type === "done") push({ event: "done", data: { planId: ev.planId, body: ev.body, turns: ev.turns, truncated: ev.truncated, aborted: ev.aborted } });
+              else if (ev.type === "error") push({ event: "error", data: { message: ev.message } });
+            },
+          });
+        } catch (err: any) {
+          push({ event: "error", data: { message: String(err?.message ?? err) } });
+        } finally {
+          run.finished = true;
+          const w = run.waiters.splice(0);
+          for (const fn of w) { try { fn(); } catch { /* ignore */ } }
+        }
+      } catch {
+        /* best-effort: SPA shows partial body, user can manually rerun */
+      }
+    })();
+  };
 
   app.get("/api/health", async (c) => {
     return c.json({ ok: true, version: await readPackageVersion(), workspace });

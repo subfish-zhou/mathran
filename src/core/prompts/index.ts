@@ -159,6 +159,45 @@ Suggesting budget: pick \`suggestedMaxRounds\` from 50 (small refactor)
 to 200 (whole-repo audit). Omit \`suggestedTokensCap\` unless the task
 clearly needs a hard ceiling.`;
 
+/**
+ * Plan-mode counterpart to PROPOSE_GOAL_FRAGMENT (v0.17 follow-up P2).
+ *
+ * Distinct from goal mode: the *user* is asking for a written PLAN
+ * ("sketch the approach", "what's the plan for X", "before you touch
+ * the code, plan it out") rather than the work itself. Plan mode
+ * produces a markdown document (## Approach / ## Steps / ## Key files /
+ * ## Risks / ## Acceptance) in one short run — then the user reads it
+ * and decides what to do next.
+ *
+ * The fragment teaches the model to recognise the trigger, call
+ * \`propose_plan\`, and NOT confuse it with goal-mode work-execution.
+ */
+export const PROPOSE_PLAN_FRAGMENT = `If the user asks for a PLAN, sketch, or approach BEFORE the work itself
+— examples: "what's the plan for refactoring X", "sketch the steps to
+add feature Y", "before you touch the code, plan it out", "how would
+you approach Z" — call the \`propose_plan\` tool. The user confirms,
+and by default the planner runs immediately and the SPA navigates to
+the live plan page so they can watch the markdown stream.
+
+When to call \`propose_plan\`:
+  - User explicitly says "plan" / "sketch" / "approach" / "design doc".
+  - User wants to review the strategy BEFORE you change any code.
+  - The work is scoped enough for one good written plan (refactor a
+    module, add one feature) — not whole-repo overhaul (that's a goal).
+
+When NOT to call \`propose_plan\`:
+  - User asked you to *do* the work, not to plan it (use \`propose_goal\`
+    for long-horizon execution, or just do it for short tasks).
+  - Quick questions or single-file answers — plan mode is overkill.
+  - The user has already declined a plan proposal this conversation.
+
+Difference from \`propose_goal\`:
+  - propose_plan = write a markdown plan, then stop (one-shot, ~1 round).
+  - propose_goal = execute the work end-to-end (long-running, many rounds).
+
+Do NOT tell the user to run \`mathran plan create\` manually — invoke
+the tool.`;
+
 export const PLAN_MODE_FRAGMENT = `You are in PLAN MODE.
 
 Your job is to investigate the user's objective and produce a concise,
@@ -323,6 +362,10 @@ export interface BaseSystemPromptOpts {
   /** Default true. v0.17 follow-up — the `propose_goal` chat-mode tool
    *  for auto-promoting long-horizon tasks into goal mode. */
   includeProposeGoal?: boolean;
+  /** Default true. v0.17 P2 — the `propose_plan` chat-mode tool for
+   *  auto-drafting a plan when the user asks for a plan/sketch/approach
+   *  BEFORE the work itself. */
+  includeProposePlan?: boolean;
 }
 
 /** Single source of truth for "what's the system prompt for a normal chat?". */
@@ -334,5 +377,6 @@ export function buildBaseSystemPrompt(opts: BaseSystemPromptOpts = {}): string {
   if (opts.includeAskUser !== false) sections.push(ASK_USER_FRAGMENT);
   if (opts.includeTodoTracker !== false) sections.push(TODO_TRACKER_FRAGMENT);
   if (opts.includeProposeGoal !== false) sections.push(PROPOSE_GOAL_FRAGMENT);
+  if (opts.includeProposePlan !== false) sections.push(PROPOSE_PLAN_FRAGMENT);
   return sections.join("\n\n");
 }

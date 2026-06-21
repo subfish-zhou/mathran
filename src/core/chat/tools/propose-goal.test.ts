@@ -154,6 +154,7 @@ describe("createProposeGoalTool — end-to-end", () => {
       objective: "audit every site of X across the repo",
       maxRounds: 50,
       tokensCap: 25000,
+      autoRun: false,
     });
     expect(typeof payload.goalId).toBe("string");
     expect(payload.goalId.length).toBeGreaterThan(0);
@@ -268,5 +269,90 @@ describe("createProposeGoalTool — end-to-end", () => {
     expect(captured).toMatch(/tokensCap=12345/);
     expect(captured).toMatch(/`confirm`/);
     expect(captured).toMatch(/`cancel`/);
+  });
+
+  // ───────────────────────────────────────────────────────────────────
+  // v0.17 P2 — autoRunner integration
+  // ───────────────────────────────────────────────────────────────────
+
+  it("on confirm with autoRunner: invokes autoRunner with goalId + objective", async () => {
+    const calls: Array<{ goalId: string; userMessage: string }> = [];
+    const tool = createProposeGoalTool({
+      resolver: async () => "confirm 80",
+      workspace,
+      scope,
+      model: "copilot/gpt-5.5",
+      autoRunner: (goalId, userMessage) => {
+        calls.push({ goalId, userMessage });
+      },
+    });
+    const res = await tool.execute({
+      objective: "implement feature X end-to-end",
+      reasoning: "5+ files + tests + build verification",
+    });
+    expect(res.ok).toBe(true);
+    const payload = JSON.parse(res.content);
+    expect(payload.autoRun).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].goalId).toBe(payload.goalId);
+    expect(calls[0].userMessage).toBe("implement feature X end-to-end");
+  });
+
+  it("on cancel with autoRunner: does NOT invoke autoRunner", async () => {
+    const calls: Array<{ goalId: string; userMessage: string }> = [];
+    const tool = createProposeGoalTool({
+      resolver: async () => "cancel",
+      workspace,
+      scope,
+      model: "copilot/gpt-5.5",
+      autoRunner: (goalId, userMessage) => {
+        calls.push({ goalId, userMessage });
+      },
+    });
+    const res = await tool.execute({
+      objective: "do thing",
+      reasoning: "because",
+    });
+    expect(res.ok).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("autoRunner throw does NOT propagate — goal stays seeded", async () => {
+    const tool = createProposeGoalTool({
+      resolver: async () => "confirm",
+      workspace,
+      scope,
+      model: "copilot/gpt-5.5",
+      autoRunner: () => {
+        throw new Error("runner host blew up");
+      },
+    });
+    const res = await tool.execute({
+      objective: "do thing",
+      reasoning: "because",
+    });
+    expect(res.ok).toBe(true);
+    const payload = JSON.parse(res.content);
+    expect(payload.autoRun).toBe(true);
+    // Goal must still be on disk despite the runner throw.
+    const goals = await listGoals(workspace);
+    expect(goals).toHaveLength(1);
+    expect(goals[0].id).toBe(payload.goalId);
+  });
+
+  it("hint text changes based on autoRunner presence", async () => {
+    const tWithout = makeTool("confirm");
+    const r1 = await tWithout.execute({ objective: "x", reasoning: "y" });
+    expect(JSON.parse(r1.content).hint).toMatch(/kick off the goal from the goal panel/i);
+
+    const tWith = createProposeGoalTool({
+      resolver: async () => "confirm",
+      workspace,
+      scope,
+      model: "copilot/gpt-5.5",
+      autoRunner: () => {},
+    });
+    const r2 = await tWith.execute({ objective: "x", reasoning: "y" });
+    expect(JSON.parse(r2.content).hint).toMatch(/kicked off in the background/i);
   });
 });

@@ -52,6 +52,7 @@ import {
   type AskUserResolver,
 } from "./tools/ask-user.js";
 import { createProposeGoalTool } from "./tools/propose-goal.js";
+import { createProposePlanTool } from "./tools/propose-plan.js";
 import * as path from "node:path";
 
 /**
@@ -254,6 +255,21 @@ export interface ChatSessionOptions {
       workspace: string;
       scope: { kind: "global" | "project" | "effort"; projectSlug?: string; effortSlug?: string };
       model: string;
+      /** v0.17 P2 — see ProposeGoalToolOptions.autoRunner. */
+      autoRunner?: (goalId: string, userMessage: string) => void;
+    };
+    /**
+     * v0.17 P2 — chat-mode plan proposal. Same shape as propose_goal but
+     * routes to {@link createProposePlanTool}; the LLM uses this when the
+     * user asked for a plan / sketch / approach BEFORE the work itself.
+     * `autoRunner` is the host-provided fire-and-forget kickoff that
+     * calls `runPlan` with full closure deps.
+     */
+    propose_plan?: {
+      resolver: AskUserResolver;
+      workspace: string;
+      model: string;
+      autoRunner?: (planId: string, objective: string) => void;
     };
   };
   /**
@@ -623,6 +639,17 @@ export class ChatSession {
           workspace: cfg.propose_goal.workspace,
           scope: cfg.propose_goal.scope,
           model: cfg.propose_goal.model,
+          autoRunner: cfg.propose_goal.autoRunner,
+        }),
+      );
+    }
+    if (cfg.propose_plan && cfg.propose_plan.resolver) {
+      out.push(
+        createProposePlanTool({
+          resolver: cfg.propose_plan.resolver,
+          workspace: cfg.propose_plan.workspace,
+          model: cfg.propose_plan.model,
+          autoRunner: cfg.propose_plan.autoRunner,
         }),
       );
     }

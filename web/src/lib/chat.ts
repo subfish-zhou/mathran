@@ -90,6 +90,34 @@ export type ChatEvent =
       type: "todos";
       list: TodoList;
     }
+  | {
+      /** v0.17 follow-up P2 — emitted by the host SSE layer after a
+       *  successful `propose_goal` tool result. Carries the freshly-
+       *  created goal's id + objective + budget so the SPA can render
+       *  an inline "goal created" notification and (when
+       *  `autoRun === true`) auto-navigate to the goal page.
+       *
+       *  scope mirrors the chat's own scope so the goal page can be
+       *  opened at the right `/goals/:id` route under the right
+       *  project / effort. */
+      type: "goal-proposed";
+      goalId: string;
+      objective: string;
+      maxRounds: number;
+      tokensCap: number | null;
+      scope: { kind: "global" | "project" | "effort"; projectSlug?: string; effortSlug?: string };
+      autoRun: boolean;
+    }
+  | {
+      /** v0.17 follow-up P2 sibling — emitted after a successful
+       *  `propose_plan` tool result. Plan mode is workspace-rooted (no
+       *  per-scope plans store today) so we don't repeat the scope on
+       *  the wire — the SPA just navigates to `/plans/:planId`. */
+      type: "plan-proposed";
+      planId: string;
+      objective: string;
+      autoRun: boolean;
+    }
   | { type: "done"; finishReason: string }
   | { type: "error"; message: string };
 
