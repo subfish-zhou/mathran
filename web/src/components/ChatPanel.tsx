@@ -41,6 +41,7 @@ import {
 } from "../lib/chat.ts";
 import GoalControls from "./GoalControls.tsx";
 import GoalRunStatusPanel from "./GoalRunStatusPanel.tsx";
+import GoalAutonomyCard from "./GoalAutonomyCard.tsx";
 import PlanRunOverlay from "./PlanRunOverlay.tsx";
 import { AgentStatusPanel, type ChatEventPhase } from "./AgentStatusPanel.tsx";
 import { api, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
@@ -1832,6 +1833,13 @@ export default function ChatPanel({
             />
           </div>
         )}
+
+        {/* v0.17 W11: per-scope goal-autonomy defaults card. Collapsed
+            by default; expands inline so the user can pin autonomy /
+            budget defaults without leaving the chat surface. */}
+        <div className="border-b border-slate-200 bg-slate-50 px-6 py-1.5">
+          <GoalAutonomyCard scope={scope} />
+        </div>
 
         {/* v0.17 W8: mathub-parity status strip. Only mounts when this
             conversation is the primary one of a goal-loop — plain chats

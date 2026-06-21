@@ -115,6 +115,14 @@ import {
 } from "../core/goal/store.js";
 import { runGoalRound } from "../core/goal/runner.js";
 import {
+  DEFAULT_GOAL_AUTONOMY,
+  deleteGoalAutonomyLayer,
+  loadGoalAutonomy,
+  saveGoalAutonomy,
+  validateGoalAutonomyPatch,
+  type GoalAutonomyLayer,
+} from "../core/config/goal-autonomy.js";
+import {
   readGoalPlan,
   parsePlanSteps,
   goalPlanRelPath,
@@ -2381,14 +2389,32 @@ function buildApp(
     if (!parsed.ok) return c.json({ error: parsed.error }, 400);
     const cfg = loadConfig(configPathFor(workspace));
     const model = typeof body?.model === "string" ? body.model : cfg.defaultModel ?? DEFAULT_MODEL;
+    // v0.17 W11: per-scope autonomy defaults fill in missing budgets,
+    // but ONLY when an on-disk layer (project or global) actually
+    // configured a value. We don't synthesise budgets from the
+    // in-code DEFAULT_GOAL_AUTONOMY — a goal with no caller budget
+    // and no user-pinned default should remain uncapped, matching the
+    // pre-W11 contract exercised by sse-round-start.test.ts.
+    const auto = await loadGoalAutonomy({ workspace }).catch(() => null);
+    const layerHas = (k: "defaultMaxRounds" | "defaultTokensCap"): boolean =>
+      Boolean(
+        (auto?.project && k in auto.project) ||
+          (auto?.global && k in auto.global),
+      );
+    const effRounds = layerHas("defaultMaxRounds") ? auto!.effective.defaultMaxRounds : undefined;
+    const effTokens = layerHas("defaultTokensCap") ? auto!.effective.defaultTokensCap : undefined;
     const goal = await createGoal(workspace, {
       objective,
       scope: parsed.scope,
       model,
       budgetTokensMax:
-        typeof body?.budgetTokens === "number" && body.budgetTokens > 0 ? body.budgetTokens : null,
+        typeof body?.budgetTokens === "number" && body.budgetTokens > 0
+          ? body.budgetTokens
+          : (typeof effTokens === "number" && effTokens > 0 ? effTokens : null),
       budgetRoundsMax:
-        typeof body?.maxRounds === "number" && body.maxRounds > 0 ? body.maxRounds : null,
+        typeof body?.maxRounds === "number" && body.maxRounds > 0
+          ? body.maxRounds
+          : (typeof effRounds === "number" && effRounds > 0 ? effRounds : null),
     });
     return c.json({ goal }, 201);
   });
@@ -3337,6 +3363,89 @@ function buildApp(
   });
 
   app.get("/api/config", (c) => c.json(safeConfig(workspace)));
+
+  // ─── Goal autonomy config (v0.17 mathub parity W11) ─────────────────────
+  // Per-scope persistent defaults for goal-loop behaviour:
+  // autonomy level, summary cadence, fallback budget caps, and an
+  // `enabled` gate for any future auto-promote flow. Two on-disk
+  // layers (project = workspace-local, global = HOME) with a sparse
+  // overlay so an unspecified key in `project` inherits from `global`,
+  // then from `DEFAULT_GOAL_AUTONOMY`.
+  //
+  // `scopeId` is accepted-and-validated for forward-compat (e.g. a
+  // future per-project file layout), but storage today is keyed by
+  // workspace + HOME alone, so the value is effectively opaque past
+  // the validator. Accepted forms:
+  //   - "global"
+  //   - "project~<slug>"
+  //   - "effort~<projectSlug>~<effortSlug>"
+  // Anything else gets a 400. URL `~` (unreserved) avoids collisions
+  // with Hono path segments.
+  function isValidAutonomyScopeId(s: string): boolean {
+    if (s === "global") return true;
+    const parts = s.split("~");
+    if (parts.length === 2 && parts[0] === "project") return isSafeSlug(parts[1]);
+    if (parts.length === 3 && parts[0] === "effort")
+      return isSafeSlug(parts[1]) && isSafeSlug(parts[2]);
+    return false;
+  }
+  function isAutonomyLayer(s: unknown): s is GoalAutonomyLayer {
+    return s === "global" || s === "project";
+  }
+
+  app.get("/api/scopes/:scopeId/goal-autonomy", async (c) => {
+    const scopeId = c.req.param("scopeId");
+    if (!isValidAutonomyScopeId(scopeId)) {
+      return c.json({ error: "invalid scopeId" }, 400);
+    }
+    const r = await loadGoalAutonomy({ workspace });
+    return c.json({
+      effective: r.effective,
+      global: r.global,
+      project: r.project,
+      defaults: DEFAULT_GOAL_AUTONOMY,
+    });
+  });
+
+  app.patch("/api/scopes/:scopeId/goal-autonomy", async (c) => {
+    const scopeId = c.req.param("scopeId");
+    if (!isValidAutonomyScopeId(scopeId)) {
+      return c.json({ error: "invalid scopeId" }, 400);
+    }
+    let body: any;
+    try { body = await c.req.json(); }
+    catch { return c.json({ error: "invalid JSON body" }, 400); }
+    if (!isAutonomyLayer(body?.scope)) {
+      return c.json({ error: "'scope' must be 'global' or 'project'" }, 400);
+    }
+    const v = validateGoalAutonomyPatch(body?.patch);
+    if (!v.ok) return c.json({ error: v.error }, 400);
+    const r = await saveGoalAutonomy({ workspace }, body.scope, v.patch);
+    return c.json({
+      effective: r.effective,
+      global: r.global,
+      project: r.project,
+      defaults: DEFAULT_GOAL_AUTONOMY,
+    });
+  });
+
+  app.delete("/api/scopes/:scopeId/goal-autonomy", async (c) => {
+    const scopeId = c.req.param("scopeId");
+    if (!isValidAutonomyScopeId(scopeId)) {
+      return c.json({ error: "invalid scopeId" }, 400);
+    }
+    const layer = c.req.query("scope");
+    if (!isAutonomyLayer(layer)) {
+      return c.json({ error: "'scope' query must be 'global' or 'project'" }, 400);
+    }
+    const r = await deleteGoalAutonomyLayer({ workspace }, layer);
+    return c.json({
+      effective: r.effective,
+      global: r.global,
+      project: r.project,
+      defaults: DEFAULT_GOAL_AUTONOMY,
+    });
+  });
 
   // ─── Chat (T1-C) ────────────────────────────────────────────────────────────────────────
   registerChatRoutes(app, workspace, sessions);

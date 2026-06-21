@@ -46,6 +46,10 @@ import { appendEffortDocument } from "../effort/store.js";
 import { loadEffortContext, formatEffortContext } from "../effort/context-builder.js";
 import { buildBaseSystemPrompt, renderGoalModeFragment } from "../prompts/index.js";
 import {
+  loadGoalAutonomy,
+  renderAutonomyLevelFragment,
+} from "../config/goal-autonomy.js";
+import {
   formatScopedMathranMemoryForPrompt,
   loadScopedMathranMemorySync,
 } from "../memory/index.js";
@@ -108,8 +112,15 @@ export function buildGoalSystemPrompt(input: {
    * the plan is *what to do*, the goal fragment is *how to behave*.
    */
   planFragment?: string;
+  /**
+   * v0.17 mathub parity W11: optional per-scope autonomy-level guidance
+   * (one short paragraph). Spliced right after the goal fragment so the
+   * tone hint sits next to the loop policy it's modifying. Empty string
+   * (the `balanced` default) is silently skipped.
+   */
+  autonomyFragment?: string;
 }): string {
-  const { goal, systemPromptBase, effortFragment, memoryFragment, planFragment } = input;
+  const { goal, systemPromptBase, effortFragment, memoryFragment, planFragment, autonomyFragment } = input;
   const scopeLabel =
     goal.scope.kind === "global"
       ? "global"
@@ -136,6 +147,9 @@ export function buildGoalSystemPrompt(input: {
     parts.push("", memoryFragment);
   }
   parts.push("", goalFragment);
+  if (autonomyFragment && autonomyFragment.trim().length > 0) {
+    parts.push("", autonomyFragment);
+  }
   if (planFragment && planFragment.trim().length > 0) {
     parts.push("", planFragment);
   }
@@ -641,6 +655,15 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   });
   const memoryFragment = formatScopedMathranMemoryForPrompt(memoryEntries);
 
+  // v0.17 mathub parity W11: load per-scope autonomy config so the
+  // selected `autonomyLevel` can flavour the prompt. Best-effort: a
+  // corrupt or missing file falls back to DEFAULT, and `balanced`
+  // produces an empty fragment (no prompt bloat).
+  const autonomyResult = await loadGoalAutonomy({ workspace }).catch(() => null);
+  const autonomyFragment = autonomyResult
+    ? renderAutonomyLevelFragment(autonomyResult.effective.autonomyLevel)
+    : "";
+
   // v0.16 §9 audit #4: plan bootstrap + active-plan fragment.
   //
   // On the first round of a depth-0 goal we run a one-shot `runPlan`
@@ -676,6 +699,7 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     effortFragment,
     memoryFragment,
     planFragment,
+    autonomyFragment,
   });
   const handler = createGoalToolHandler();
   // Compose the per-round tool list:
