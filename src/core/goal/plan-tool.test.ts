@@ -32,7 +32,7 @@ describe("buildUpdatePlanItemTool: ToolSpec shape", () => {
     const tool = buildUpdatePlanItemTool({ workspace, goalId });
     expect(tool.name).toBe("update_plan_item");
     expect(typeof tool.description).toBe("string");
-    expect(tool.description.length).toBeGreaterThan(50);
+    expect((tool.description ?? "").length).toBeGreaterThan(50);
     expect(tool.parameters).toMatchObject({
       type: "object",
       properties: {

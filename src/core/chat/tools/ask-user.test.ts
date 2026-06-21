@@ -49,6 +49,9 @@ class ScriptedLLM implements LLMProvider {
   constructor(turns: LLMStreamChunk[][]) {
     this.turns = turns;
   }
+  async describe(): Promise<{ name: string; defaultModel?: string }> {
+    return { name: "scripted-llm" };
+  }
   async chat(req: LLMRequest): Promise<LLMResponse> {
     this.requests.push(req);
     const turn = this.turns[this.i++] ?? [{ type: "done", finishReason: "stop" } as LLMStreamChunk];

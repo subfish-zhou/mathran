@@ -24,16 +24,13 @@ function makeGoal(): Goal {
     scope: { kind: "global" },
     status: "active",
     model: "fake-model",
-    createdAt: 0,
-    updatedAt: 0,
+    createdAt: new Date(0).toISOString(),
     budget: { tokensMax: 1000, roundsMax: 5 },
-    stats: { tokensUsed: 0, roundsRun: 0, toolCalls: 0, resumeCount: 0 },
+    stats: { tokensUsed: 0, roundsRun: 0, toolCallCount: 0 },
+    steps: [],
+    conversationIds: ["c_test"],
     parentGoalId: null,
-    endReason: null,
-    abortRequested: false,
     heartbeatAt: 0,
-    conversationId: "c_test",
-    threadConversationIds: ["c_test"],
   };
 }
 
