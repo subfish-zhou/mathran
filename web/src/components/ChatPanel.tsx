@@ -13,14 +13,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { marked } from "marked";
-import markedKatex from "marked-katex-extension";
-import "katex/dist/katex.min.css";
-
-// v0.16 §11: register the KaTeX extension exactly once at module load.
-// `$...$` becomes inline math, `$$...$$` becomes display math. throwOnError
-// disabled so a broken expression renders as raw text instead of red
-// banner-blocking the whole bubble.
-marked.use(markedKatex({ throwOnError: false, nonStandard: true }));
+// v0.17 follow-up: KaTeX + LLM-math-delimiter preprocess registration
+// has moved to `lib/markdown.ts` which is imported once from `main.tsx`.
+// This component no longer needs to register it (was a duplicate /
+// load-ordering trap).
 import {
   streamChat,
   rerunChat,

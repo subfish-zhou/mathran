@@ -8,11 +8,16 @@ export default defineConfig({
     },
   },
   test: {
-    include: ["src/**/*.{test,spec}.{js,ts,tsx}"],
+    include: [
+      "src/**/*.{test,spec}.{js,ts,tsx}",
+      // v0.17 follow-up: include the SPA's own lib tests (`web/src/lib/*.test.ts`)
+      // so KaTeX / markdown preprocess behaviour stays covered.
+      "web/src/**/*.{test,spec}.{js,ts,tsx}",
+    ],
     exclude: [
       "**/node_modules/**",
       "_tasks/**",
-      "web/**",
+      "web/node_modules/**",
       "dist/**",
     ],
   },
