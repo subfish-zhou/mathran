@@ -124,6 +124,41 @@ Rules of thumb:
  *   • Anti-overengineering: cap at ~8 steps; if the plan needs more, the
  *     model should break it into phases instead of inflating one phase.
  */
+/**
+ * v0.17 follow-up — tell the chat model to USE `propose_goal` instead of
+ * saying "please run `mathran goal create`" when it spots a long-horizon
+ * task. The fragment is intentionally specific about the trigger so the
+ * model doesn't escalate every multi-step ask into goal mode (the
+ * todo-tracker handles the medium tier well).
+ */
+export const PROPOSE_GOAL_FRAGMENT = `If the user's request is a LONG-HORIZON task that cannot reasonably
+finish in the current chat turn — examples: "implement feature X
+end-to-end and verify", "audit every site of Y in the repo", "refactor
+module Z and update all callers and tests", "research W across N modules
+and write up" — call the \`propose_goal\` tool BEFORE doing any work.
+The user is asked to confirm a max-rounds + token budget; on confirm the
+system creates a Goal record and you continue in long-running goal mode.
+Do NOT tell the user to run \`mathran goal create\` manually — invoke
+the tool.
+
+When to call \`propose_goal\`:
+  - You estimate the work will take 10+ tool rounds.
+  - The user explicitly asks you to "keep going until done" / "don't
+    stop" / "implement and verify end-to-end".
+  - The request spans multiple files / modules AND requires verification
+    (build, tests, lints).
+
+When NOT to call \`propose_goal\`:
+  - Quick questions, single-file edits, single-tool answers.
+  - Anything finishable in <5 tool calls. Use \`todo_write\` instead if
+    you want to track steps.
+  - The user has already explicitly declined a previous goal proposal
+    this conversation — don't re-propose unless the scope changes.
+
+Suggesting budget: pick \`suggestedMaxRounds\` from 50 (small refactor)
+to 200 (whole-repo audit). Omit \`suggestedTokensCap\` unless the task
+clearly needs a hard ceiling.`;
+
 export const PLAN_MODE_FRAGMENT = `You are in PLAN MODE.
 
 Your job is to investigate the user's objective and produce a concise,
@@ -285,6 +320,9 @@ export interface BaseSystemPromptOpts {
   includeAskUser?: boolean;
   /** Default true. v0.17 W12 — the in-conversation TODO tracker. */
   includeTodoTracker?: boolean;
+  /** Default true. v0.17 follow-up — the `propose_goal` chat-mode tool
+   *  for auto-promoting long-horizon tasks into goal mode. */
+  includeProposeGoal?: boolean;
 }
 
 /** Single source of truth for "what's the system prompt for a normal chat?". */
@@ -295,5 +333,6 @@ export function buildBaseSystemPrompt(opts: BaseSystemPromptOpts = {}): string {
   if (opts.includeSubagentDispatch !== false) sections.push(SUBAGENT_DISPATCH_FRAGMENT);
   if (opts.includeAskUser !== false) sections.push(ASK_USER_FRAGMENT);
   if (opts.includeTodoTracker !== false) sections.push(TODO_TRACKER_FRAGMENT);
+  if (opts.includeProposeGoal !== false) sections.push(PROPOSE_GOAL_FRAGMENT);
   return sections.join("\n\n");
 }

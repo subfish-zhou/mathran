@@ -741,6 +741,20 @@ export function defaultSessionFactory(workspace: string): ChatSessionFactory {
             throw new AskUserPending({ question, callId });
           },
         },
+        // v0.17 follow-up — chat-mode goal proposal. Same `AskUserPending`
+        // resolver pattern as ask_user so the SPA's existing inline
+        // confirmation UI is reused. The tool itself creates the Goal
+        // record on confirm; SSE pump (below) emits a `goal-proposed`
+        // frame on the tool-result so the SPA can render an "open goal"
+        // notification without a follow-up GET.
+        propose_goal: {
+          resolver: async (question, { callId }) => {
+            throw new AskUserPending({ question, callId });
+          },
+          workspace: scopedWorkspace,
+          scope: scope ?? { kind: "global" },
+          model: resolvedModel,
+        },
       },
     });
   };
@@ -1015,6 +1029,36 @@ function registerChatScope(
               /* best-effort — a missing file shouldn't break the stream */
             }
           }
+          // v0.17 follow-up: after a successful `propose_goal` tool result,
+          // the chat tool already wrote the Goal record (createGoal) and
+          // returned `{ ok, goalId, objective, maxRounds, tokensCap }`
+          // serialized as JSON in `content`. Surface that to the SPA as a
+          // `goal-proposed` event so the panel can show an "open goal"
+          // notification without a follow-up GET.
+          if (
+            ev.type === "tool-result" &&
+            ev.name === "propose_goal" &&
+            ev.ok
+          ) {
+            try {
+              const payload = JSON.parse((ev as { content?: string }).content ?? "{}");
+              if (payload && payload.ok && payload.goalId) {
+                await stream.writeSSE({
+                  event: "goal-proposed",
+                  data: JSON.stringify({
+                    type: "goal-proposed",
+                    goalId: payload.goalId,
+                    objective: payload.objective,
+                    maxRounds: payload.maxRounds,
+                    tokensCap: payload.tokensCap,
+                    scope: payload.scope ?? scope,
+                  }),
+                });
+              }
+            } catch {
+              /* best-effort — a malformed payload shouldn't break the stream */
+            }
+          }
         }
         // Flush the freshly-augmented history to disk before closing the stream.
         await store.flush(scope, conversationId);
@@ -1272,6 +1316,31 @@ function registerChatScope(
                 event: "todos",
                 data: JSON.stringify({ type: "todos", list }),
               });
+            } catch {
+              /* best-effort */
+            }
+          }
+          // v0.17 follow-up: propose_goal mirror in rerun path.
+          if (
+            ev.type === "tool-result" &&
+            ev.name === "propose_goal" &&
+            ev.ok
+          ) {
+            try {
+              const payload = JSON.parse((ev as { content?: string }).content ?? "{}");
+              if (payload && payload.ok && payload.goalId) {
+                await stream.writeSSE({
+                  event: "goal-proposed",
+                  data: JSON.stringify({
+                    type: "goal-proposed",
+                    goalId: payload.goalId,
+                    objective: payload.objective,
+                    maxRounds: payload.maxRounds,
+                    tokensCap: payload.tokensCap,
+                    scope: payload.scope ?? scope,
+                  }),
+                });
+              }
             } catch {
               /* best-effort */
             }
@@ -1591,6 +1660,31 @@ function registerChatScope(
                 event: "todos",
                 data: JSON.stringify({ type: "todos", list }),
               });
+            } catch {
+              /* best-effort */
+            }
+          }
+          // v0.17 follow-up: propose_goal mirror in resume-from-ask path.
+          if (
+            ev.type === "tool-result" &&
+            ev.name === "propose_goal" &&
+            ev.ok
+          ) {
+            try {
+              const payload = JSON.parse((ev as { content?: string }).content ?? "{}");
+              if (payload && payload.ok && payload.goalId) {
+                await stream.writeSSE({
+                  event: "goal-proposed",
+                  data: JSON.stringify({
+                    type: "goal-proposed",
+                    goalId: payload.goalId,
+                    objective: payload.objective,
+                    maxRounds: payload.maxRounds,
+                    tokensCap: payload.tokensCap,
+                    scope: payload.scope ?? scope,
+                  }),
+                });
+              }
             } catch {
               /* best-effort */
             }

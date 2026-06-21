@@ -51,6 +51,7 @@ import {
   isAskUserPending,
   type AskUserResolver,
 } from "./tools/ask-user.js";
+import { createProposeGoalTool } from "./tools/propose-goal.js";
 import * as path from "node:path";
 
 /**
@@ -239,6 +240,21 @@ export interface ChatSessionOptions {
      * this is an object because the resolver differs per host.
      */
     ask_user?: { resolver: AskUserResolver };
+    /**
+     * v0.17 follow-up — chat-mode goal proposal. Same resolver shape as
+     * `ask_user` (the tool piggybacks ask_user's serve UI). When provided,
+     * the LLM gets a `propose_goal` tool that, upon model invocation, asks
+     * the user to confirm max-rounds + token budget and then creates a
+     * Goal record on disk. Workspace + scope + model are needed so the
+     * goal is seeded in the right project bucket with the same model the
+     * chat is currently using.
+     */
+    propose_goal?: {
+      resolver: AskUserResolver;
+      workspace: string;
+      scope: { kind: "global" | "project" | "effort"; projectSlug?: string; effortSlug?: string };
+      model: string;
+    };
   };
   /**
    * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
@@ -595,6 +611,20 @@ export class ChatSession {
     // the model sees the same affordance everywhere.
     if (cfg.ask_user && cfg.ask_user.resolver) {
       out.push(createAskUserTool({ resolver: cfg.ask_user.resolver }));
+    }
+    // v0.17 follow-up: propose_goal. Same resolver pattern as ask_user so
+    // the SPA's existing confirmation UI is reused. The tool itself does
+    // the createGoal write on confirm; serve.ts watches for tool-result
+    // name=propose_goal and emits a `goal-proposed` SSE frame.
+    if (cfg.propose_goal && cfg.propose_goal.resolver) {
+      out.push(
+        createProposeGoalTool({
+          resolver: cfg.propose_goal.resolver,
+          workspace: cfg.propose_goal.workspace,
+          scope: cfg.propose_goal.scope,
+          model: cfg.propose_goal.model,
+        }),
+      );
     }
     return out;
   }

@@ -2181,8 +2181,16 @@ describe("persistent context injection (v0.15 §1)", () => {
     await fs.writeFile(path.join(tmp, "MEMORY.md"), big);
     const out = buildScopedSystemPrompt(undefined, tmp);
     expect(out).toContain("... [truncated at");
-    // The marker count: prompt size must be << len(big) + prompt overhead
-    expect(out.length).toBeLessThan(big.length);
+    // Pull out the LONGEST contiguous run of 'x' chars (the embedded
+    // file body) and assert that was capped at 64 KiB — robust against
+    // any future system-prompt fragment additions that change
+    // `out.length`. We use a global regex + reduce so a stray single
+    // 'x' character anywhere else in the prompt doesn't shadow the
+    // real run we care about.
+    const xRuns = out.match(/x+/g) ?? [];
+    expect(xRuns.length).toBeGreaterThan(0);
+    const longest = xRuns.reduce((a, b) => (a.length >= b.length ? a : b));
+    expect(longest.length).toBe(64 * 1024);
   });
 
   it("ignores zero-byte files", async () => {
