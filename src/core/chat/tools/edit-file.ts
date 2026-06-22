@@ -17,6 +17,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ToolSpec, ToolExecuteContext } from "../session.js";
+import { formatHookBlock } from "../../hooks/executor.js";
 
 export interface EditFileToolOptions {
   /**
@@ -201,6 +202,14 @@ export function createEditFileTool(opts: EditFileToolOptions = {}): ToolSpec {
         ? replaceAll(text, oldString, newString)
         : text.replace(oldString, newString);
 
+      // pre-edit hooks — a blocking failure aborts the edit.
+      if (ctx?.hooks) {
+        const pre = await ctx.hooks.run("pre-edit", { filePath: resolved });
+        if (pre.blocked) {
+          return { ok: false, content: formatHookBlock("edit_file", pre) };
+        }
+      }
+
       try {
         await fs.writeFile(resolved, updated, "utf-8");
       } catch (err: any) {
@@ -212,9 +221,17 @@ export function createEditFileTool(opts: EditFileToolOptions = {}): ToolSpec {
 
       const n = replaceAllFlag ? matches : 1;
       ctx?.recordRead?.(resolved);
+      let result = `edited ${rawPath}: ${n} replacement${n === 1 ? "" : "s"}`;
+
+      // post-edit hooks — never block; surface output to the model.
+      if (ctx?.hooks) {
+        const post = await ctx.hooks.run("post-edit", { filePath: resolved });
+        if (post.summary) result += `\n\n${post.summary}`;
+      }
+
       return {
         ok: true,
-        content: `edited ${rawPath}: ${n} replacement${n === 1 ? "" : "s"}`,
+        content: result,
       };
     },
   };

@@ -16,6 +16,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ToolSpec, ToolExecuteContext } from "../session.js";
+import { formatHookBlock } from "../../hooks/executor.js";
 
 export interface WriteFileToolOptions {
   /**
@@ -99,6 +100,18 @@ export function createWriteFileTool(
             content: `must read this file first (use read_file) before overwriting; or the file may not exist yet — checked path: ${rawPath}`,
           };
         }
+
+        // pre-edit hooks — a blocking failure aborts the write.
+        if (ctx?.hooks) {
+          const pre = await ctx.hooks.run("pre-edit", { filePath: resolved });
+          if (pre.blocked) {
+            return {
+              ok: false,
+              content: formatHookBlock("write_file", pre),
+            };
+          }
+        }
+
         await fs.mkdir(path.dirname(resolved), { recursive: true });
         await fs.writeFile(resolved, content, "utf-8");
       } catch (err: any) {
@@ -111,9 +124,17 @@ export function createWriteFileTool(
       ctx?.recordRead?.(resolved);
 
       const bytes = Buffer.byteLength(content, "utf-8");
+      let result = `wrote ${bytes} bytes to ${rawPath}`;
+
+      // post-edit hooks — never block; surface their output to the model.
+      if (ctx?.hooks) {
+        const post = await ctx.hooks.run("post-edit", { filePath: resolved });
+        if (post.summary) result += `\n\n${post.summary}`;
+      }
+
       return {
         ok: true,
-        content: `wrote ${bytes} bytes to ${rawPath}`,
+        content: result,
       };
     },
   };

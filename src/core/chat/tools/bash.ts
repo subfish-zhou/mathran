@@ -19,6 +19,7 @@
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 import type { ToolSpec, ToolExecuteContext } from "../session.js";
+import { formatHookBlock } from "../../hooks/executor.js";
 
 export interface BashToolOptions {
   /** Hard timeout cap in ms (default 120_000, max 600_000). */
@@ -90,6 +91,16 @@ function resolveCwd(
   return absolute;
 }
 
+/**
+ * Detect whether a shell command contains a `git commit`. Deliberately a
+ * simple match (PLAN 不在范围: no full git-arg parsing) so `git commit -am ...`,
+ * `git -C foo commit`, and `cd x && git commit` all trigger the `pre-commit`
+ * hook. Word boundaries keep `git committed-files.sh` from matching.
+ */
+export function isGitCommit(command: string): boolean {
+  return /\bgit\b[\s\S]*\bcommit\b/.test(command);
+}
+
 export function createBashTool(opts: BashToolOptions = {}): ToolSpec {
   const defaultTimeoutMs = opts.defaultTimeoutMs ?? DEFAULT_DEFAULT_TIMEOUT;
   const maxTimeoutMs = Math.min(
@@ -150,6 +161,23 @@ export function createBashTool(opts: BashToolOptions = {}): ToolSpec {
           ok: false,
           content: `error: cwd '${cwdArg}' escapes workspace`,
         };
+      }
+
+      // pre-bash + pre-commit hooks — a blocking failure aborts the command.
+      // pre-commit is the `git commit` specialisation of pre-bash; both run.
+      if (ctx?.hooks) {
+        const preBash = await ctx.hooks.run("pre-bash", { bashCommand: command });
+        if (preBash.blocked) {
+          return { ok: false, content: formatHookBlock("bash", preBash) };
+        }
+        if (isGitCommit(command)) {
+          const preCommit = await ctx.hooks.run("pre-commit", {
+            bashCommand: command,
+          });
+          if (preCommit.blocked) {
+            return { ok: false, content: formatHookBlock("git commit", preCommit) };
+          }
+        }
       }
 
       const stdout = new CappedBuffer(maxOutputBytes);

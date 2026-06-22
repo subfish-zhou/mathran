@@ -121,7 +121,16 @@ export const MathranSettingsSchema = z
       .optional(),
     hooks: z
       .object({
+        /** Whitelist of hook names/types — when present, only these run. */
         allowed: z.array(z.string()).optional(),
+        /** Master switch for the whole hooks subsystem (default true). */
+        enabled: z.boolean().optional(),
+        /** Per-hook timeout in ms (default 30000). */
+        timeoutMs: z.number().int().positive().optional(),
+        /** Run post-* / on-* hooks fire-and-forget (default false). */
+        async: z.boolean().optional(),
+        /** Operations whose filePath/command start with these skip hooks. */
+        bypassPrefix: z.array(z.string()).optional(),
       })
       .passthrough()
       .optional(),

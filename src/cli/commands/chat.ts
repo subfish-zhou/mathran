@@ -47,6 +47,8 @@ import {
 import { loadLayeredSkills } from "../../core/skills/loader.js";
 import type { LoadedSkill } from "../../core/skills/loader.js";
 import { loadLayeredSettings } from "../../core/config/layered-settings.js";
+import { loadLayeredHooks } from "../../core/hooks/loader.js";
+import { HookInvoker } from "../../core/hooks/executor.js";
 import { ApprovalBroker } from "../../core/chat/approval-broker.js";
 import {
   resolveApprovalConfig,
@@ -61,6 +63,9 @@ import {
   formatSkillDetail,
   toggleSkillDisabled,
   formatAgentsList,
+  formatHooksList,
+  formatHooksLog,
+  parseHooksSubcommand,
   REVIEW_STUB_PROMPT,
 } from "../../core/chat/slash-builtin.js";
 import { createOpenAITokenCounter, createFallbackTokenCounter } from "../../core/chat/token-counter.js";
@@ -294,6 +299,7 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
   session: ChatSession;
   model: string;
   providerKey: string;
+  hookInvoker: HookInvoker;
 } {
   const config = loadConfig(opts.configPath);
   const model = opts.model ?? config.defaultModel ?? DEFAULT_MODEL;
@@ -343,6 +349,32 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
       ? { proposalResolver: opts.ruleProposalResolver }
       : {}),
   });
+
+  // Hooks (PreEdit/PostEdit/PreCommit/PreBash/PostTool/OnGoalComplete). Load
+  // the layered settings for the hooks block + the layered hook scripts, then
+  // build the per-session invoker (sharing the approval broker + denylist so
+  // each hook is gated like any other exec call). Best-effort: a workspace
+  // with no `.mathran/hooks/` yields an empty (inert) invoker.
+  const { settings: layeredSettings } = loadLayeredSettings({ workspace });
+  const hookSettings = (layeredSettings.hooks ?? {}) as {
+    allowed?: string[];
+    enabled?: boolean;
+    timeoutMs?: number;
+    async?: boolean;
+    bypassPrefix?: string[];
+  };
+  const { hooks: loadedHooks } = loadLayeredHooks({
+    workspace,
+    ...(hookSettings.allowed ? { allowed: hookSettings.allowed } : {}),
+  });
+  const hookInvoker = new HookInvoker({
+    hooks: loadedHooks,
+    workspace,
+    settings: hookSettings,
+    approvalBroker,
+    denylist: approvalCfg.denylist,
+  });
+
   const session = new ChatSession({
     llm: router,
     model,
@@ -352,6 +384,7 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     subagentScheduler: scheduler,
     scheduler,
     approvalBroker,
+    hooks: hookInvoker,
     // v0.4 §1: enable the full builtin toolkit for `mathran chat`. Users
     // run chat at a workspace root with full access; treat it like a local
     // shell session.
@@ -379,7 +412,7 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     ...(layeredSkills.length > 0 ? { layeredSkills } : {}),
   });
 
-  return { session, model, providerKey };
+  return { session, model, providerKey, hookInvoker };
 }
 
 /** Read all of stdin (used for piped one-shot prompts). */
@@ -439,6 +472,38 @@ export interface OneShotOptions {
   configPath?: string;
 }
 
+/**
+ * `/hooks disable <name>` persistence: rewrite `<workspace>/.mathran/
+ * settings.json` so `hooks.allowed` whitelists every currently-loaded hook
+ * EXCEPT `name` (a whitelist that omits the target effectively disables it).
+ * Returns the resulting allow-list. Best-effort JSON merge.
+ */
+export function disableHookInSettings(
+  workspace: string,
+  invoker: HookInvoker,
+  name: string,
+): string[] {
+  const allNames = invoker.allHooks.map((h) => h.name);
+  const remaining = [...new Set(allNames.filter((n) => n !== name))];
+  const dir = path.join(workspace, ".mathran");
+  const file = path.join(dir, "settings.json");
+  let current: Record<string, unknown> = {};
+  try {
+    current = JSON.parse(fsSync.readFileSync(file, "utf-8"));
+  } catch {
+    current = {};
+  }
+  const hooks =
+    current.hooks && typeof current.hooks === "object" && !Array.isArray(current.hooks)
+      ? { ...(current.hooks as Record<string, unknown>) }
+      : {};
+  hooks.allowed = remaining;
+  const next = { ...current, hooks };
+  fsSync.mkdirSync(dir, { recursive: true });
+  fsSync.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`);
+  return remaining;
+}
+
 /** Run a single prompt and exit. Returns a process exit code. */
 export async function runOneShot(opts: OneShotOptions): Promise<number> {
   const workspace = process.env.MATHRAN_WORKSPACE ?? process.cwd();
@@ -446,7 +511,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   // C 方案: default to the three-layer layered memory + skills (buildChatSession
   // honours MATHRAN_WORKSPACE / cwd). We no longer opt into the old two-layer
   // `memoryWorkspace` path here — the layered loader subsumes it.
-  const { session } = buildChatSession({
+  const { session, hookInvoker } = buildChatSession({
     model: opts.model,
     configPath: opts.configPath,
   });
@@ -456,6 +521,15 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     process.stderr.write(
       `Loaded memory: global=${memInfo.globalSize}B project=${memInfo.projectSize}B\n`,
     );
+  }
+  // pre-chat hooks — a blocking failure aborts the one-shot run.
+  {
+    const pre = await hookInvoker.run("pre-chat", {});
+    if (pre.summary) process.stderr.write(`${pre.summary}\n`);
+    if (pre.blocked) {
+      process.stderr.write(`mathran: pre-chat hook blocked the run: ${pre.blockedReason}\n`);
+      return 1;
+    }
   }
   try {
     await renderTurn(session.send(opts.prompt));
@@ -486,6 +560,8 @@ export interface SlashContext {
   model: string;
   providerKey: string;
   configPath?: string;
+  /** Hooks runner for the `/hooks` slash command (list/log/bypass/disable). */
+  hookInvoker?: HookInvoker;
   /**
    * Workspace root used by the `/memory` slash command to resolve project
    * MATHRAN.md. Defaults to {@link process.cwd} when unset. The CLI auto-fills
@@ -522,6 +598,7 @@ const HELP_TEXT = `commands:
   /skills <name>           show one skill's full SKILL.md (trigger + tools + body)
   /skills disable <name>   add <name> to settings.json#skills.disabled
   /skills enable <name>    remove <name> from settings.json#skills.disabled
+  /hooks                   list layered hooks (use /hooks log|bypass|disable <name>)
   /agents                  list available sub-agent kinds (+ active)
   /review                  print the preset review prompt (MVP stub)
   /memory                  show MATHRAN.md memory (use /memory help for sub-commands)
@@ -700,6 +777,45 @@ export async function handleSlashCommand(
       } catch (err: any) {
         return { kind: "continue", output: `mathran: /skills failed: ${err?.message ?? err}` };
       }
+    }
+
+    case "/hooks": {
+      const invoker = ctx.hookInvoker;
+      if (!invoker) {
+        return { kind: "continue", output: "mathran: hooks are not available in this session" };
+      }
+      const sub = parseHooksSubcommand(arg);
+      switch (sub.kind) {
+        case "list":
+          return { kind: "continue", output: formatHooksList(invoker) };
+        case "log":
+          return { kind: "continue", output: formatHooksLog(invoker, sub.name) };
+        case "bypass": {
+          invoker.bypassNext(sub.name);
+          return {
+            kind: "continue",
+            output: `will skip hook '${sub.name}' on its next trigger (session-only)`,
+          };
+        }
+        case "disable": {
+          const workspace = ctx.memoryWorkspace ?? process.cwd();
+          try {
+            const remaining = disableHookInSettings(workspace, invoker, sub.name);
+            return {
+              kind: "continue",
+              output:
+                `disabled hook '${sub.name}'. settings.json#hooks.allowed now whitelists: ` +
+                `${remaining.length > 0 ? remaining.join(", ") : "(none)"}. ` +
+                `Restart chat (or /model) to reload hooks.`,
+            };
+          } catch (err: any) {
+            return { kind: "continue", output: `mathran: /hooks disable failed: ${err?.message ?? err}` };
+          }
+        }
+        case "error":
+          return { kind: "continue", output: sub.message };
+      }
+      return { kind: "continue", output: formatHooksList(invoker) };
     }
 
     case "/agents": {
@@ -942,7 +1058,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
   const approvalResolver = createReadlineApprovalResolver(rl);
   const ruleProposalResolver = createReadlineRuleProposalResolver(rl);
 
-  let { session, model, providerKey } = buildChatSession({
+  let { session, model, providerKey, hookInvoker } = buildChatSession({
     model: opts.model,
     configPath: opts.configPath,
     askUserResolver,
@@ -957,6 +1073,16 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
     );
   }
   console.log(`Type your message. /help for commands, /exit to quit.\n`);
+
+  // pre-chat hooks — run once at startup. A blocking failure is surfaced as a
+  // warning (the REPL stays usable rather than locking the user out).
+  {
+    const pre = await hookInvoker.run("pre-chat", {});
+    if (pre.summary) console.log(pre.summary);
+    if (pre.blocked) {
+      console.log(`\x1b[33m[mathran] pre-chat hook reported a failure: ${pre.blockedReason}\x1b[0m`);
+    }
+  }
 
   // Reload-prompt helper: pauses the readline, asks the user, resumes.
   const promptReload = async (): Promise<boolean> => {
@@ -984,6 +1110,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           providerKey,
           configPath: opts.configPath,
           memoryWorkspace: workspace,
+          hookInvoker,
           promptReload,
         });
         if (result.output) console.log(result.output);
@@ -998,6 +1125,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           session = built.session;
           model = built.model;
           providerKey = built.providerKey;
+          hookInvoker = built.hookInvoker;
         }
       } catch (err: any) {
         console.error(`mathran: ${err?.message ?? err}`);

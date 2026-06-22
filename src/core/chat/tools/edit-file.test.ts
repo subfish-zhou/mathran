@@ -202,3 +202,54 @@ describe("createEditFileTool", () => {
     expect(read.has(p)).toBe(true);
   });
 });
+
+import * as fssync from "node:fs";
+import { HookInvoker } from "../../hooks/executor.js";
+import type { LoadedHook } from "../../hooks/loader.js";
+
+function editHookInvoker(
+  ws: string,
+  type: "pre-edit" | "post-edit",
+  body: string,
+): HookInvoker {
+  const dir = path.join(ws, ".mathran", "hooks");
+  fssync.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, `${type}.sh`);
+  fssync.writeFileSync(p, body);
+  const hooks: LoadedHook[] = [
+    { name: type, type, layer: "workspace", path: p, allowed: false },
+  ];
+  return new HookInvoker({ hooks, workspace: ws });
+}
+
+describe("createEditFileTool — hooks", () => {
+  it("runs post-edit and appends its summary", async () => {
+    const p = path.join(workspace, "a.txt");
+    await fs.writeFile(p, "hello world\n");
+    const read = new Set<string>([p]);
+    const tool = createEditFileTool({ workspace });
+    const hooks = editHookInvoker(workspace, "post-edit", "#!/bin/bash\necho done\n");
+    const res = await tool.execute(
+      { path: "a.txt", old_string: "hello", new_string: "bye" },
+      { workspace, hooks, hasRead: (x: string) => read.has(x), recordRead: () => {} },
+    );
+    expect(res.ok).toBe(true);
+    expect(res.content).toContain("done");
+  });
+
+  it("blocks the edit when a pre-edit hook fails", async () => {
+    const p = path.join(workspace, "a.txt");
+    await fs.writeFile(p, "hello world\n");
+    const read = new Set<string>([p]);
+    const tool = createEditFileTool({ workspace });
+    const hooks = editHookInvoker(workspace, "pre-edit", "#!/bin/bash\nexit 3\n");
+    const res = await tool.execute(
+      { path: "a.txt", old_string: "hello", new_string: "bye" },
+      { workspace, hooks, hasRead: (x: string) => read.has(x), recordRead: () => {} },
+    );
+    expect(res.ok).toBe(false);
+    expect(res.content).toContain("blocked by hook");
+    // file must be unchanged
+    expect(await fs.readFile(p, "utf-8")).toBe("hello world\n");
+  });
+});
