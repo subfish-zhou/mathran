@@ -130,6 +130,12 @@ Rules of thumb:
  * task. The fragment is intentionally specific about the trigger so the
  * model doesn't escalate every multi-step ask into goal mode (the
  * todo-tracker handles the medium tier well).
+ *
+ * Skills/Plugins 二层: this guidance also ships as the builtin skill
+ * `src/core/chat/builtin-skills/propose-goal/SKILL.md`. The CLI injects the
+ * skill body instead of this fragment (and disables it via
+ * `includeProposeGoal: false`); keep the two in sync. Serve still uses this
+ * fragment because it does not wire layered skills.
  */
 export const PROPOSE_GOAL_FRAGMENT = `If the user's request is a LONG-HORIZON task that cannot reasonably
 finish in the current chat turn — examples: "implement feature X
@@ -171,6 +177,10 @@ clearly needs a hard ceiling.`;
  *
  * The fragment teaches the model to recognise the trigger, call
  * \`propose_plan\`, and NOT confuse it with goal-mode work-execution.
+ *
+ * Skills/Plugins 二层: mirrored as the builtin skill
+ * `src/core/chat/builtin-skills/propose-plan/SKILL.md`, which the CLI injects
+ * in place of this fragment (`includeProposePlan: false`). Keep both in sync.
  */
 export const PROPOSE_PLAN_FRAGMENT = `If the user asks for a PLAN, sketch, or approach BEFORE the work itself
 — examples: "what's the plan for refactoring X", "sketch the steps to

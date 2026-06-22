@@ -71,7 +71,16 @@ const DEFAULT_MODEL = "copilot/gpt-5.5";
 
 import { buildBaseSystemPrompt } from "../../core/prompts/index.js";
 
-const SYSTEM_PROMPT = buildBaseSystemPrompt();
+// Skills/Plugins 二层: the propose-plan / propose-goal guidance now ships as
+// builtin skills (src/core/chat/builtin-skills/), which `buildChatSession`
+// injects via `layeredSkills`. Drop the hardcoded PROPOSE_* fragments from the
+// CLI base prompt so the skill bodies are the single source of truth (and a
+// user can override them with a same-named SKILL.md). Serve still uses the
+// fragments (it does not wire layered skills).
+const SYSTEM_PROMPT = buildBaseSystemPrompt({
+  includeProposeGoal: false,
+  includeProposePlan: false,
+});
 
 export interface BuildSessionOptions {
   model?: string;
