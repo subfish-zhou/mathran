@@ -50,6 +50,23 @@ describe("MathranSettingsSchema", () => {
     expect(MathranSettingsSchema.parse(s)).toMatchObject(s);
   });
 
+  it("accepts the extended hooks shape", () => {
+    const s = {
+      hooks: {
+        allowed: ["post-edit.sh"],
+        enabled: false,
+        timeoutMs: 15000,
+        async: true,
+        bypassPrefix: ["git status"],
+      },
+    };
+    expect(MathranSettingsSchema.parse(s)).toMatchObject(s);
+  });
+
+  it("rejects a non-positive hooks timeout", () => {
+    expect(() => MathranSettingsSchema.parse({ hooks: { timeoutMs: 0 } })).toThrow();
+  });
+
   it("rejects a bad theme enum", () => {
     expect(() => MathranSettingsSchema.parse({ ui: { theme: "neon" } })).toThrow();
   });
