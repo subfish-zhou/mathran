@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { SubagentRegistry } from "../registry.js";
+import { SubagentRegistry, recommendedModelFor, RECOMMENDED_MODELS } from "../registry.js";
 import type { SubagentRunner } from "../types.js";
 
 function mkRunner(type: SubagentRunner["type"]): SubagentRunner {
@@ -36,5 +36,21 @@ describe("SubagentRegistry", () => {
     const reg = new SubagentRegistry();
     reg.register(mkRunner("search"));
     expect(() => reg.register(mkRunner("search"))).toThrow();
+  });
+
+  it("listWithMeta attaches recommendedModel only where defined", () => {
+    const reg = new SubagentRegistry();
+    reg.register(mkRunner("search"));
+    reg.register(mkRunner("lean_explore"));
+    const meta = reg.listWithMeta();
+    const byType = Object.fromEntries(meta.map((m) => [m.type, m]));
+    expect(byType.lean_explore.recommendedModel).toBe("copilot/claude-opus-4.8");
+    // search never calls an LLM → no recommendedModel key.
+    expect("recommendedModel" in byType.search).toBe(false);
+  });
+
+  it("recommendedModelFor / RECOMMENDED_MODELS agree", () => {
+    expect(recommendedModelFor("research")).toBe(RECOMMENDED_MODELS.research);
+    expect(recommendedModelFor("search")).toBeUndefined();
   });
 });
