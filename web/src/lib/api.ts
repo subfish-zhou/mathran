@@ -1,5 +1,11 @@
 // Tiny typed client for the mathran local backend (src/server/serve.ts).
 
+import type {
+  EffectiveSettingsResponse,
+  LayerSettingsResponse,
+  SettingsLayerName,
+} from "./settings-client.ts";
+
 export interface ProjectSummary {
   slug: string;
   name?: string;
@@ -353,6 +359,33 @@ export const api = {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
+      }),
+    );
+  },
+
+  // ─── Layered settings (.mathran/settings.json) ───────────────────────────
+  async getEffectiveSettings(projectSlug?: string): Promise<EffectiveSettingsResponse> {
+    const qs = projectSlug ? `?projectSlug=${enc(projectSlug)}` : "";
+    return jsonOrThrow(await fetch(`/api/settings/effective${qs}`));
+  },
+  async getSettings(
+    layer: SettingsLayerName,
+    projectSlug?: string,
+  ): Promise<LayerSettingsResponse> {
+    const qs = projectSlug ? `?projectSlug=${enc(projectSlug)}` : "";
+    return jsonOrThrow(await fetch(`/api/settings/${enc(layer)}${qs}`));
+  },
+  async putSettings(
+    layer: SettingsLayerName,
+    patch: Record<string, unknown>,
+    projectSlug?: string,
+  ): Promise<LayerSettingsResponse> {
+    const qs = projectSlug ? `?projectSlug=${enc(projectSlug)}` : "";
+    return jsonOrThrow(
+      await fetch(`/api/settings/${enc(layer)}${qs}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(patch),
       }),
     );
   },

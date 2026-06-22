@@ -29,6 +29,7 @@ import ProjectsPanel from "./components/ProjectsPanel.tsx";
 import WikiPanel from "./components/WikiPanel.tsx";
 import ChatPanel from "./components/ChatPanel.tsx";
 import ProvidersPanel from "./components/ProvidersPanel.tsx";
+import SettingsPanel from "./components/SettingsPanel.tsx";
 import EffortsPanel from "./components/EffortsPanel.tsx";
 import EffortDocumentPanel from "./components/EffortDocumentPanel.tsx";
 
@@ -43,7 +44,8 @@ export default function App() {
             path="/global-chat"
             element={<ChatPanel scope={{ kind: "global" }} scopeLabel="global" />}
           />
-          <Route path="/settings" element={<ProvidersPanel />} />
+          <Route path="/settings" element={<SettingsPanel />} />
+          <Route path="/settings/providers" element={<ProvidersPanel />} />
 
           <Route path="/projects/:slug" element={<ProjectLayout />}>
             <Route index element={<ProjectHome />} />

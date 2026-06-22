@@ -17,6 +17,7 @@
  * password placeholder; saving a blank value keeps the existing secret.
  */
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { api, type ProvidersResponse } from "../lib/api.ts";
 
 interface DraftRow {
@@ -146,6 +147,12 @@ export default function ProvidersPanel() {
   return (
     <div className="h-full overflow-y-auto p-6">
       <div className="mx-auto max-w-3xl">
+        <Link
+          to="/settings"
+          className="mb-3 inline-block text-xs text-slate-500 underline hover:text-slate-700"
+        >
+          ← Settings
+        </Link>
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
             Providers
