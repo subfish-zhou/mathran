@@ -141,7 +141,7 @@ export function skillsToSummaries(skills: readonly LoadedSkill[]): SkillSummary[
 /** Human-readable skills listing for the CLI `/skills` command. */
 export function formatSkillsList(skills: readonly LoadedSkill[]): string {
   if (skills.length === 0) return "(no skills found in any layer)";
-  const order: Record<LayerName, number> = { project: 0, workspace: 1, user: 2 };
+  const order: Record<LayerName, number> = { project: 0, workspace: 1, user: 2, builtin: 3 };
   const sorted = [...skills].sort(
     (a, b) => order[a.layer] - order[b.layer] || a.name.localeCompare(b.name),
   );
