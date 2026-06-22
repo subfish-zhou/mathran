@@ -55,6 +55,45 @@ export const ModelPreferenceSchema = z
 
 export type ModelPreference = z.infer<typeof ModelPreferenceSchema>;
 
+// ──────────────────────────────────────────────────────────────────────
+// approval (Approval Policy 矩阵)
+// ──────────────────────────────────────────────────────────────────────
+
+/** An inline approval rule inside `settings.json` (lowest precedence). */
+export const ApprovalRuleSchema = z
+  .object({
+    tool: z.string().min(1),
+    prefix: z.string().optional(),
+    pathGlob: z.string().optional(),
+    action: z.enum(["allow", "deny"]),
+    scope: z.enum(["session", "persistent"]).optional(),
+  })
+  .passthrough();
+
+export type ApprovalRuleConfig = z.infer<typeof ApprovalRuleSchema>;
+
+/**
+ * `settings.json#approval` — the approval-policy config block. All fields are
+ * optional; a missing block (or a missing `policy`) falls back to the default
+ * `on-request` policy at load time (see {@link DEFAULT_APPROVAL_POLICY}).
+ */
+export const ApprovalSettingsSchema = z
+  .object({
+    /** never | on-request | untrusted | on-failure. Default on-request. */
+    policy: z.enum(["never", "on-request", "untrusted", "on-failure"]).optional(),
+    /** Learning mode on/off. Default true. */
+    learning: z.boolean().optional(),
+    /** Consecutive-decision threshold before proposing a rule. Default 5. */
+    proposeAfter: z.number().int().positive().optional(),
+    /** Inline rules (lower precedence than approval-rules.json files). */
+    rules: z.array(ApprovalRuleSchema).optional(),
+    /** Denylist entries `"<tool>:<pattern>"` — highest-priority veto. */
+    denylist: z.array(z.string()).optional(),
+  })
+  .passthrough();
+
+export type ApprovalSettings = z.infer<typeof ApprovalSettingsSchema>;
+
 /**
  * `settings.json` — workspace + project (+ user) shared shape.
  *
@@ -93,6 +132,8 @@ export const MathranSettingsSchema = z
       })
       .passthrough()
       .optional(),
+    /** Approval Policy 矩阵 — see {@link ApprovalSettingsSchema}. */
+    approval: ApprovalSettingsSchema.optional(),
   })
   .passthrough();
 

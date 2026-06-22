@@ -155,6 +155,7 @@ export function createDispatchSubagentTool(
 ): ToolSpec {
   return {
     name: "dispatch_subagent",
+    riskClass: "exec",
     description:
       "Dispatch a bounded subagent runner (search / read_summarize / compact / " +
       "research / lean_explore). Use this when you need to offload work that " +

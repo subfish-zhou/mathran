@@ -142,6 +142,7 @@ export function createProposePlanTool(opts: ProposePlanToolOptions): ToolSpec {
   const { resolver, workspace, model, autoRunner } = opts;
   return {
     name: "propose_plan",
+    riskClass: "read",
     description: DESCRIPTION,
     parameters: {
       type: "object",

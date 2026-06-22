@@ -59,6 +59,8 @@ import {
 } from "./tools/ask-user.js";
 import { createProposeGoalTool } from "./tools/propose-goal.js";
 import { createProposePlanTool } from "./tools/propose-plan.js";
+import { ApprovalBroker } from "./approval-broker.js";
+import type { RiskClass, ApprovalRequest, ApprovalDecision, ApprovalResolver } from "../approval/types.js";
 import * as path from "node:path";
 
 /**
@@ -98,6 +100,13 @@ export interface ToolSpec {
   description?: string;
   parameters: Record<string, unknown>;
   /**
+   * Coarse risk bucket driving the approval policy (Approval Policy 矩阵).
+   * Optional for backward-compat: a tool without a `riskClass` is treated as
+   * `read` by the approval broker (the most permissive bucket) so legacy /
+   * third-party tools never accidentally gate. Builtin tools all set it.
+   */
+  riskClass?: RiskClass;
+  /**
    * Execute the tool. `args` is the parsed JSON arguments object (or `{}` if
    * the model emitted no/invalid JSON). `ctx` carries optional workspace/scope
    * hints — tools should treat it as advisory and fall back to safe defaults
@@ -115,6 +124,22 @@ export type ChatEvent =
   | { type: "text"; delta: string }
   | { type: "tool-call"; id: string; name: string; args: string }
   | { type: "tool-result"; id: string; name: string; ok: boolean; content: string }
+  | {
+      /** Approval Policy 矩阵 — emitted just before the host prompts the user
+       *  to approve a high-risk tool call. Lets the SPA render its
+       *  `ApprovalDialog` (serve) / observers log the request. CLI hosts use
+       *  their readline resolver and may ignore this event. */
+      type: "approval_request";
+      request: ApprovalRequest;
+    }
+  | {
+      /** Approval Policy 矩阵 — emitted after a tool call's approval is
+       *  resolved (allowed / denied / deferred), carrying the decision so the
+       *  SPA can dismiss its modal and observers can audit the outcome. */
+      type: "approval_resolved";
+      id: string;
+      decision: ApprovalDecision;
+    }
   | {
       /** v0.16 §11 — the model called `ask_user`; the host (serve) will
        *  persist a pending annotation and end the stream so the user can
@@ -288,6 +313,24 @@ export interface ChatSessionOptions {
    * SAME scheduler to both fields when both compact and dispatch are wanted.
    */
   scheduler?: SubagentScheduler;
+  /**
+   * Approval broker (Approval Policy 矩阵). When set, every high-risk tool
+   * call (per its `riskClass`) is routed through the broker before execution:
+   * it may run silently, run after host-prompted approval, be denied, or be
+   * deferred (run then ask on failure). When unset, tools execute with the
+   * legacy zero-approval behaviour (backward-compatible).
+   */
+  approvalBroker?: ApprovalBroker;
+  /**
+   * Session-level approval resolver (Approval Policy 矩阵). When set together
+   * with {@link approvalBroker}, approval prompts are driven by the session
+   * itself: it yields an `approval_request` event, awaits this resolver for the
+   * decision, yields `approval_resolved`, then continues executing the tool
+   * in-place. This keeps long-lived transports (serve's SSE stream) open across
+   * the user interaction. When unset, the broker's own resolver (if any) drives
+   * the prompt; with neither, prompts fail safe to deny.
+   */
+  approvalResolver?: ApprovalResolver;
   /**
    * MATHRAN.md memory injection (v0.3 §14). When `enabled: true`, the
    * constructor synchronously reads `~/.mathran/MATHRAN.md` (global) and
@@ -474,6 +517,10 @@ export class ChatSession {
   /** v0.5 §7 — absolute paths read this session (read-before-write gate). */
   private readonly readPaths = new Set<string>();
   private readonly builtinToolsCfg?: ChatSessionOptions["builtinTools"];
+  /** Approval broker (Approval Policy 矩阵). Optional; gates high-risk tools. */
+  private readonly approvalBroker?: ApprovalBroker;
+  /** Session-level approval resolver (yield-based prompt driver). */
+  private readonly approvalResolver?: ApprovalResolver;
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
   private messages: LLMMessage[] = [];
@@ -507,6 +554,8 @@ export class ChatSession {
     // pass the latter (for compact) automatically get dispatch too.
     this.dispatchScheduler = opts.scheduler ?? opts.subagentScheduler;
     this.builtinToolsCfg = opts.builtinTools;
+    this.approvalBroker = opts.approvalBroker;
+    this.approvalResolver = opts.approvalResolver;
     // Mix in built-in tools (v0.2 §9+). Order: built-ins first, then caller's
     // tools (so a caller-supplied tool with the same name wins via the
     // `toolByName` map's last-write).
@@ -721,14 +770,132 @@ export class ChatSession {
   }
 
   /**
-   * Construct the `search` ToolSpec (v0.2 §8). Closure captures `this` so
-   * the tool lazily resolves `getOrBuildScheduler()` at call time — matches
-   * the compact / read_file_summary lazy-init pattern.
+   * Run a tool through the approval broker (Approval Policy 矩阵), then execute
+   * it (or not) per the verdict. An async generator: it yields `approval_request`
+   * / `approval_resolved` events around any user prompt and **returns** the tool
+   * result the loop feeds back to the model (consume via `yield*`). When no
+   * broker is wired, or the tool carries no `riskClass`, this is a thin
+   * pass-through to `tool.execute` (legacy zero-approval behaviour).
+   *
+   * Prompts are driven by the session-level {@link approvalResolver} when set
+   * (yield-based, keeps serve's SSE stream open); otherwise the broker's own
+   * resolver drives them (CLI/tests). With neither, prompts fail safe to deny.
    */
+  private async *executeWithApproval(
+    tool: ToolSpec,
+    call: { id: string; name: string },
+    parsed: Record<string, unknown>,
+    callCtx: ToolExecuteContext,
+  ): AsyncGenerator<ChatEvent, { ok: boolean; content: string }, void> {
+    const broker = this.approvalBroker;
+    if (!broker || !tool.riskClass) {
+      return await tool.execute(parsed, callCtx);
+    }
+    const authCall = {
+      tool: call.name,
+      riskClass: tool.riskClass,
+      args: parsed,
+      id: call.id,
+    };
+
+    // When no session-level resolver is wired, defer entirely to the broker's
+    // own resolver (CLI/tests) — no event yielding needed.
+    if (!this.approvalResolver) {
+      const auth = await broker.authorize(authCall);
+      if (auth.kind === "deny") {
+        return {
+          ok: false,
+          content: `⛔ tool call denied by approval policy: ${auth.reason}`,
+        };
+      }
+      if (auth.kind === "allow") {
+        return await tool.execute(parsed, callCtx);
+      }
+      return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, null);
+    }
+
+    // Session-driven (yield-based) prompt flow.
+    const resolver = this.approvalResolver;
+    const pre = await broker.preCheck(authCall);
+    if (pre.kind === "deny") {
+      return {
+        ok: false,
+        content: `⛔ tool call denied by approval policy: ${pre.reason}`,
+      };
+    }
+    if (pre.kind === "allow") {
+      return await tool.execute(parsed, callCtx);
+    }
+    if (pre.kind === "defer-on-failure") {
+      return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, resolver);
+    }
+    // pre.kind === "ask": surface the request, await the decision, continue.
+    yield { type: "approval_request", request: pre.request };
+    const decision = await resolver(pre.request);
+    yield { type: "approval_resolved", id: pre.request.id, decision };
+    const verdict = await broker.resolveDecision(authCall, decision);
+    if (verdict.kind === "deny") {
+      return {
+        ok: false,
+        content: `⛔ tool call denied by approval policy: ${verdict.reason}`,
+      };
+    }
+    if (verdict.kind === "defer-on-failure") {
+      return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, resolver);
+    }
+    return await tool.execute(parsed, callCtx);
+  }
+
+  /**
+   * `on-failure` policy: run the tool, then on failure ask retry/abandon. When
+   * `resolver` is set, prompts are yield-based (serve); otherwise the broker's
+   * own resolver drives them (CLI/tests).
+   */
+  private async *runDeferOnFailure(
+    tool: ToolSpec,
+    authCall: {
+      tool: string;
+      riskClass: RiskClass;
+      args: Record<string, unknown>;
+      id: string;
+    },
+    parsed: Record<string, unknown>,
+    callCtx: ToolExecuteContext,
+    resolver: ApprovalResolver | null,
+  ): AsyncGenerator<ChatEvent, { ok: boolean; content: string }, void> {
+    const broker = this.approvalBroker!;
+    let result = await tool.execute(parsed, callCtx);
+    let guard = 0;
+    const MAX_RETRIES = 5;
+    while (!result.ok && guard < MAX_RETRIES) {
+      let failure;
+      if (resolver) {
+        const request = broker.buildFailureRequest(authCall, result.content);
+        yield { type: "approval_request", request };
+        const decision = await resolver(request);
+        yield { type: "approval_resolved", id: request.id, decision };
+        failure = broker.applyFailureDecision(decision);
+      } else {
+        failure = await broker.onFailure(authCall, result.content);
+      }
+      if (failure.kind === "retry") {
+        result = await tool.execute(parsed, callCtx);
+        guard++;
+        continue;
+      }
+      return {
+        ok: false,
+        content: `⛔ tool failed and the user abandoned it: ${failure.reason}\n\n--- original failure ---\n${result.content}`,
+      };
+    }
+    return result;
+  }
+
   private makeSearchTool(): ToolSpec {
     const self = this;
     return {
       name: "search",
+      riskClass: "read",
       description:
         "Search the workspace for a pattern. Use this when looking for code, text, or files. Returns top files and counts; full results are stored in an artifact.",
       parameters: {
@@ -789,6 +956,7 @@ export class ChatSession {
     const self = this;
     return {
       name: "read_file_summary",
+      riskClass: "read",
       description:
         "Read a file and get a focused summary answering your question. " +
         "Use this for long files where you only need specific information. " +
@@ -1223,7 +1391,12 @@ export class ChatSession {
                       : path.resolve(this.workspace ?? "", p),
                   ),
               };
-              result = await tool.execute(parsed, callCtx);
+              result = yield* this.executeWithApproval(
+                tool,
+                call,
+                parsed,
+                callCtx,
+              );
             } catch (err: any) {
               if (isAskUserPending(err)) {
                 // v0.16 §11: bail out of the LLM loop so the serve route can

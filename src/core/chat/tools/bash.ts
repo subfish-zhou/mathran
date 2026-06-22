@@ -101,6 +101,7 @@ export function createBashTool(opts: BashToolOptions = {}): ToolSpec {
 
   return {
     name: "bash",
+    riskClass: "exec",
     description:
       "Run a shell command via `bash -lc`. Each call is a fresh shell (no persistent state). " +
       "Use it for git, build, test runs, package management, and anything that genuinely needs a shell. " +
