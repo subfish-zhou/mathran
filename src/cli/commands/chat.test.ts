@@ -15,9 +15,11 @@ import {
   createReadlineAskUserResolver,
   buildChatSession,
   loadLayeredContext,
+  disableHookInSettings,
   type SlashContext,
 } from "./chat.js";
 import { ChatSession } from "../../core/chat/index.js";
+import { HookInvoker } from "../../core/hooks/executor.js";
 import type { LLMProvider, LLMRequest, LLMResponse } from "../../core/providers/llm.js";
 
 const scriptedLlm: LLMProvider = {
@@ -509,5 +511,96 @@ describe("buildChatSession: layered .mathran wire-up", () => {
       .map((m) => m.content)
       .join("\n");
     expect(systemText).not.toContain("Available skills");
+  });
+});
+
+describe("handleSlashCommand: /hooks", () => {
+  function makeInvoker(extra: any = {}) {
+    return new HookInvoker({
+      hooks: [
+        {
+          name: "post-edit",
+          type: "post-edit",
+          layer: "workspace",
+          path: "/ws/.mathran/hooks/post-edit.sh",
+          allowed: true,
+        },
+        {
+          name: "pre-bash",
+          type: "pre-bash",
+          layer: "project",
+          path: "/ws/.mathran/hooks/pre-bash.sh",
+          allowed: true,
+        },
+      ],
+      workspace: "/ws",
+      settings: { timeoutMs: 30000 },
+      ...extra,
+    });
+  }
+
+  it("lists hooks by default", async () => {
+    const res = await handleSlashCommand("/hooks", { ...ctx, hookInvoker: makeInvoker() });
+    expect(res.kind).toBe("continue");
+    expect(res.output).toContain("WORKSPACE (1)");
+    expect(res.output).toContain("post-edit.sh");
+    expect(res.output).toContain("pre-bash.sh");
+  });
+
+  it("reports unavailable when no invoker", async () => {
+    const res = await handleSlashCommand("/hooks", ctx);
+    expect(res.output).toContain("not available");
+  });
+
+  it("bypass marks a hook for skip", async () => {
+    const invoker = makeInvoker();
+    const res = await handleSlashCommand("/hooks bypass pre-bash", { ...ctx, hookInvoker: invoker });
+    expect(res.output).toContain("skip hook 'pre-bash'");
+  });
+
+  it("log reports no executions for a fresh hook", async () => {
+    const res = await handleSlashCommand("/hooks log post-edit", { ...ctx, hookInvoker: makeInvoker() });
+    expect(res.output).toContain("no recorded executions");
+  });
+
+  it("disable writes settings.json#hooks.allowed", async () => {
+    const invoker = makeInvoker();
+    const res = await handleSlashCommand("/hooks disable pre-bash", {
+      ...ctx,
+      hookInvoker: invoker,
+      memoryWorkspace: tmpDir,
+    });
+    expect(res.output).toContain("disabled hook 'pre-bash'");
+    const written = JSON.parse(
+      await fs.readFile(path.join(tmpDir, ".mathran", "settings.json"), "utf-8"),
+    );
+    expect(written.hooks.allowed).toContain("post-edit");
+    expect(written.hooks.allowed).not.toContain("pre-bash");
+  });
+});
+
+describe("disableHookInSettings", () => {
+  it("merges into existing settings.json without clobbering other keys", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-hooks-disable-"));
+    await fs.mkdir(path.join(dir, ".mathran"), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, ".mathran", "settings.json"),
+      JSON.stringify({ model: "x", hooks: { timeoutMs: 5000 } }),
+    );
+    const invoker = new HookInvoker({
+      hooks: [
+        { name: "a", type: "pre-bash", layer: "workspace", path: "/ws/a.sh", allowed: true },
+        { name: "b", type: "post-edit", layer: "workspace", path: "/ws/b.sh", allowed: true },
+      ],
+      workspace: dir,
+    });
+    const remaining = disableHookInSettings(dir, invoker, "a");
+    expect(remaining).toEqual(["b"]);
+    const written = JSON.parse(
+      await fs.readFile(path.join(dir, ".mathran", "settings.json"), "utf-8"),
+    );
+    expect(written.model).toBe("x");
+    expect(written.hooks.timeoutMs).toBe(5000);
+    expect(written.hooks.allowed).toEqual(["b"]);
   });
 });

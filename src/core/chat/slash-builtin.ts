@@ -17,6 +17,10 @@
 
 import type { LoadedSkill, LayerName } from "../skills/loader.js";
 import type { ChatSession } from "./session.js";
+import type { HookInvoker } from "../hooks/executor.js";
+import { outcomeTag, relativeAge } from "../hooks/executor.js";
+import { isBlockingHookType, type LoadedHook } from "../hooks/loader.js";
+import * as nodePath from "node:path";
 
 /** Canonical effort levels accepted by `/effort`. */
 export type ReasoningEffortLevel = "low" | "med" | "high";
@@ -54,6 +58,7 @@ export const NEW_BUILTIN_SLASH_COMMANDS: readonly BuiltinSlashCommandSpec[] = [
   { name: "diff", description: "Open the diff view for the current effort (coming soon)" },
   { name: "agents", description: "List available and active sub-agents" },
   { name: "skills", description: "List layered skills (project / workspace / user)" },
+  { name: "hooks", description: "List/log/bypass layered hooks (post-edit / pre-commit / …)" },
 ];
 
 /** Full builtin list (existing + new), de-duplicated by name, sorted by name. */
@@ -185,3 +190,98 @@ export function formatAgentsList(summary: AgentsSummary): string {
     .join("\n");
   return `${kindLine}\nactive sub-agents (${summary.active.length}):\n${active}`;
 }
+
+// ── /hooks ───────────────────────────────────────────────────────────────
+
+const HOOKS_RULE = "═".repeat(43);
+const LAYER_ORDER: LayerName[] = ["user", "workspace", "project"];
+
+function hookFileName(h: LoadedHook): string {
+  return nodePath.basename(h.path);
+}
+
+/** Render the `/hooks list` view (default `/hooks` behaviour). */
+export function formatHooksList(invoker: HookInvoker, now: number = Date.now()): string {
+  const hooks = [...invoker.allHooks];
+  const lines: string[] = [HOOKS_RULE];
+  for (const layer of LAYER_ORDER) {
+    const inLayer = hooks.filter((h) => h.layer === layer);
+    lines.push(`${layer.toUpperCase()} (${inLayer.length})`);
+    for (const h of inLayer) {
+      const count = invoker.history.countToday(h.name);
+      const last = invoker.history.last(h.name);
+      const lastStr = last
+        ? `last: ${outcomeTag(last)} ${relativeAge(last.at, now)}`
+        : "never run";
+      const file = hookFileName(h).padEnd(20);
+      lines.push(`  ${file}triggered: ${count} times today (${lastStr})`);
+    }
+  }
+  const s = invoker.settingsSnapshot;
+  lines.push("");
+  lines.push(
+    `settings: enabled=${s.enabled}, timeoutMs=${s.timeoutMs}, async=${s.async}`,
+  );
+  lines.push(HOOKS_RULE);
+  return lines.join("\n");
+}
+
+/** Render the `/hooks log <name>` view (last `limit` executions). */
+export function formatHooksLog(
+  invoker: HookInvoker,
+  name: string,
+  now: number = Date.now(),
+  limit = 5,
+): string {
+  const recent = invoker.history.recent(name, limit);
+  if (recent.length === 0) {
+    return `no recorded executions for hook '${name}'`;
+  }
+  const lines = [`last ${recent.length} execution(s) of '${name}':`];
+  for (const r of recent) {
+    const tag = outcomeTag(r);
+    const dur = (r.durationMs / 1000).toFixed(1);
+    lines.push(
+      `  [${relativeAge(r.at, now)}] ${tag} exit=${r.exitCode} in ${dur}s` +
+        (r.timedOut ? " (timed out)" : ""),
+    );
+    const out = (r.stdoutPreview ?? "").trim();
+    if (out) {
+      for (const l of out.split("\n").slice(0, 3)) lines.push(`      ${l}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export type HooksSubcommand =
+  | { kind: "list" }
+  | { kind: "log"; name: string }
+  | { kind: "bypass"; name: string }
+  | { kind: "disable"; name: string }
+  | { kind: "error"; message: string };
+
+/** Parse a `/hooks` argument string into a subcommand. */
+export function parseHooksSubcommand(arg: string): HooksSubcommand {
+  const trimmed = arg.trim();
+  if (!trimmed || trimmed === "list") return { kind: "list" };
+  const [sub, ...rest] = trimmed.split(/\s+/);
+  const name = rest.join(" ").trim();
+  switch (sub) {
+    case "log":
+      if (!name) return { kind: "error", message: "usage: /hooks log <name>" };
+      return { kind: "log", name };
+    case "bypass":
+      if (!name) return { kind: "error", message: "usage: /hooks bypass <name>" };
+      return { kind: "bypass", name };
+    case "disable":
+      if (!name) return { kind: "error", message: "usage: /hooks disable <name>" };
+      return { kind: "disable", name };
+    default:
+      return {
+        kind: "error",
+        message: `unknown /hooks subcommand '${sub}' (try: list, log, bypass, disable)`,
+      };
+  }
+}
+
+export { isBlockingHookType };

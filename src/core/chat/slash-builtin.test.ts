@@ -12,16 +12,22 @@ import {
   skillsToSummaries,
   formatSkillsList,
   formatAgentsList,
+  formatHooksList,
+  formatHooksLog,
+  parseHooksSubcommand,
   REVIEW_STUB_PROMPT,
 } from "./slash-builtin.js";
 import type { ChatSession } from "./session.js";
 import type { LoadedSkill } from "../skills/loader.js";
+import { HookInvoker } from "../hooks/executor.js";
+import { HookHistory } from "../hooks/history.js";
+import type { LoadedHook } from "../hooks/loader.js";
 
 describe("builtin command metadata", () => {
-  it("includes all nine new commands", () => {
+  it("includes all ten new commands", () => {
     const names = NEW_BUILTIN_SLASH_COMMANDS.map((c) => c.name).sort();
     expect(names).toEqual(
-      ["agents", "cd", "compact", "context", "diff", "effort", "plan", "review", "skills"].sort(),
+      ["agents", "cd", "compact", "context", "diff", "effort", "hooks", "plan", "review", "skills"].sort(),
     );
   });
 
@@ -131,5 +137,100 @@ describe("agents formatting", () => {
     expect(out).toContain("lean_explore (recommended: copilot/claude-opus-4.8)");
     // search has no recommendation → no parenthetical.
     expect(out).not.toContain("search (recommended");
+  });
+});
+
+describe("/hooks formatters", () => {
+  function makeHook(
+    name: string,
+    type: string,
+    layer: string,
+  ): LoadedHook {
+    return {
+      name,
+      type: type as any,
+      layer: layer as any,
+      path: `/ws/.mathran/hooks/${name}.sh`,
+      allowed: true,
+    };
+  }
+
+  function makeInvoker(hooks: LoadedHook[], history?: HookHistory): HookInvoker {
+    return new HookInvoker({
+      hooks,
+      workspace: "/ws",
+      settings: { timeoutMs: 30000 },
+      history: history ?? new HookHistory(),
+    });
+  }
+
+  it("parseHooksSubcommand handles list/log/bypass/disable + errors", () => {
+    expect(parseHooksSubcommand("")).toEqual({ kind: "list" });
+    expect(parseHooksSubcommand("list")).toEqual({ kind: "list" });
+    expect(parseHooksSubcommand("log post-edit")).toEqual({ kind: "log", name: "post-edit" });
+    expect(parseHooksSubcommand("bypass pre-bash")).toEqual({ kind: "bypass", name: "pre-bash" });
+    expect(parseHooksSubcommand("disable x")).toEqual({ kind: "disable", name: "x" });
+    expect(parseHooksSubcommand("log").kind).toBe("error");
+    expect(parseHooksSubcommand("frobnicate").kind).toBe("error");
+  });
+
+  it("formatHooksList groups by layer and shows settings", () => {
+    const invoker = makeInvoker([
+      makeHook("post-edit", "post-edit", "workspace"),
+      makeHook("pre-bash", "pre-bash", "project"),
+    ]);
+    const out = formatHooksList(invoker);
+    expect(out).toContain("USER (0)");
+    expect(out).toContain("WORKSPACE (1)");
+    expect(out).toContain("PROJECT (1)");
+    expect(out).toContain("post-edit.sh");
+    expect(out).toContain("never run");
+    expect(out).toContain("enabled=true");
+    expect(out).toContain("timeoutMs=30000");
+    expect(out).toContain("async=false");
+  });
+
+  it("formatHooksList reflects recorded executions", () => {
+    const history = new HookHistory();
+    history.record({
+      name: "post-edit",
+      type: "post-edit",
+      layer: "workspace",
+      exitCode: 0,
+      stdout: "ok",
+      stderr: "",
+      timedOut: false,
+      durationMs: 1200,
+      blocked: false,
+      truncated: false,
+      at: Date.now(),
+    });
+    const invoker = makeInvoker([makeHook("post-edit", "post-edit", "workspace")], history);
+    const out = formatHooksList(invoker);
+    expect(out).toContain("triggered: 1 times today");
+    expect(out).toContain("last: ok");
+  });
+
+  it("formatHooksLog shows recent runs or a no-runs message", () => {
+    const history = new HookHistory();
+    const invoker = makeInvoker([makeHook("pre-commit", "pre-commit", "workspace")], history);
+    expect(formatHooksLog(invoker, "pre-commit")).toContain("no recorded executions");
+    history.record({
+      name: "pre-commit",
+      type: "pre-commit",
+      layer: "workspace",
+      exitCode: 1,
+      stdout: "lint failed",
+      stderr: "",
+      timedOut: false,
+      durationMs: 800,
+      blocked: true,
+      truncated: false,
+      at: Date.now(),
+    });
+    const out = formatHooksLog(invoker, "pre-commit");
+    expect(out).toContain("blocked");
+    expect(out).toContain("exit=1");
+    expect(out).toContain("lint failed");
   });
 });
