@@ -147,6 +147,22 @@ export class ApprovalBroker {
     return [...this.sessionRules];
   }
 
+  /**
+   * Register a temporary, session-scoped rule (Skills/Plugins 二层 §B.3).
+   *
+   * Used when an activated skill declares `allowedTools`: each tool becomes a
+   * session-scoped `allow` rule so the skill's tools run without a prompt for
+   * the rest of the session. These rules live only in memory (never persisted
+   * to `approval-rules.json`) and are deduped against existing session rules.
+   *
+   * The denylist still wins — {@link preCheck} checks the denylist BEFORE
+   * standing rules, so a temporary allow can never override a denylist veto.
+   * The `scope` is forced to `session` regardless of the input.
+   */
+  registerTemporaryRule(rule: Rule): void {
+    this.addSessionRule({ ...rule, scope: "session" });
+  }
+
   /** Merge all rule sources, highest precedence first. */
   private async allRules(): Promise<Rule[]> {
     const fileRules: Rule[] = [];
