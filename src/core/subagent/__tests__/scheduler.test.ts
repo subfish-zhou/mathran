@@ -32,8 +32,7 @@ describe("SubagentScheduler", () => {
     registry = new SubagentRegistry();
   });
 
-  it("dispatch with ok runner → status ok, runId formatted, stats populated", async () => {
-    registry.register(okRunner("search", "hi"));
+  it("dispatch with ok runner → status ok, runId formatted, stats populated", async () => {    registry.register(okRunner("search", "hi"));
     const sched = new SubagentScheduler({ workspace, registry });
     const res = await sched.dispatch({ type: "search", input: {} });
 
@@ -391,5 +390,65 @@ describe("SubagentScheduler", () => {
     expect(res.status).toBe("cap_exceeded");
     expect(Buffer.byteLength(res.summary, "utf8")).toBeLessThanOrEqual(100);
     expect(res.stats.durationMs).toBe(123);
+  });
+
+  describe("model → modelHint propagation", () => {
+    /** Runner that records the input it was handed. */
+    function capturingRunner(type: SubagentTaskType, sink: Array<Record<string, unknown>>): SubagentRunner {
+      return {
+        type,
+        async run(task) {
+          sink.push(task.input);
+          return { status: "ok" as const, summary: "ok", artifactPath: null };
+        },
+      };
+    }
+
+    it("injects task.model as input.modelHint (inline)", async () => {
+      const seen: Array<Record<string, unknown>> = [];
+      registry.register(capturingRunner("research", seen));
+      const sched = new SubagentScheduler({ workspace, registry });
+      await sched.dispatch({
+        type: "research",
+        input: { objective: "x" },
+        model: "copilot/claude-opus-4.8",
+      });
+      expect(seen).toHaveLength(1);
+      expect(seen[0].modelHint).toBe("copilot/claude-opus-4.8");
+      expect(seen[0].objective).toBe("x");
+    });
+
+    it("does not set modelHint when no model override is given", async () => {
+      const seen: Array<Record<string, unknown>> = [];
+      registry.register(capturingRunner("research", seen));
+      const sched = new SubagentScheduler({ workspace, registry });
+      await sched.dispatch({ type: "research", input: { objective: "x" } });
+      expect(seen[0].modelHint).toBeUndefined();
+    });
+
+    it("leaves an explicit input.modelHint untouched (caller intent wins)", async () => {
+      const seen: Array<Record<string, unknown>> = [];
+      registry.register(capturingRunner("research", seen));
+      const sched = new SubagentScheduler({ workspace, registry });
+      await sched.dispatch({
+        type: "research",
+        input: { objective: "x", modelHint: "copilot/gpt-5.5" },
+        model: "copilot/claude-opus-4.8",
+      });
+      expect(seen[0].modelHint).toBe("copilot/gpt-5.5");
+    });
+
+    it("does not mutate the caller's original task object", async () => {
+      const seen: Array<Record<string, unknown>> = [];
+      registry.register(capturingRunner("research", seen));
+      const sched = new SubagentScheduler({ workspace, registry });
+      const task = {
+        type: "research" as const,
+        input: { objective: "x" } as Record<string, unknown>,
+        model: "copilot/claude-opus-4.8",
+      };
+      await sched.dispatch(task);
+      expect(task.input.modelHint).toBeUndefined();
+    });
   });
 });
