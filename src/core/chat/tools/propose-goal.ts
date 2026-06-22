@@ -184,6 +184,7 @@ export function createProposeGoalTool(opts: ProposeGoalToolOptions): ToolSpec {
   const { resolver, workspace, scope, model, autoRunner } = opts;
   return {
     name: "propose_goal",
+    riskClass: "read",
     description: DESCRIPTION,
     parameters: {
       type: "object",

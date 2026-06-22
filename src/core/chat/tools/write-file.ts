@@ -43,6 +43,7 @@ export function createWriteFileTool(
 
   return {
     name: "write_file",
+    riskClass: "write",
     description:
       "Create or overwrite a file in the workspace. Creates parent directories automatically. " +
       "Use `edit_file` instead when you only need to change a small region — `write_file` " +

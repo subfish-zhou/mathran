@@ -304,6 +304,7 @@ export function createTodoWriteTool(opts: CreateTodoWriteToolOptions): ToolSpec 
   const { workspace, scope, conversationId } = opts;
   return {
     name: "todo_write",
+    riskClass: "write",
     description: DEFAULT_DESCRIPTION,
     parameters: {
       type: "object",

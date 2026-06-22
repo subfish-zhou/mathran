@@ -59,6 +59,8 @@ import {
 } from "./tools/ask-user.js";
 import { createProposeGoalTool } from "./tools/propose-goal.js";
 import { createProposePlanTool } from "./tools/propose-plan.js";
+import { ApprovalBroker } from "./approval-broker.js";
+import type { RiskClass } from "../approval/types.js";
 import * as path from "node:path";
 
 /**
@@ -97,6 +99,13 @@ export interface ToolSpec {
   name: string;
   description?: string;
   parameters: Record<string, unknown>;
+  /**
+   * Coarse risk bucket driving the approval policy (Approval Policy 矩阵).
+   * Optional for backward-compat: a tool without a `riskClass` is treated as
+   * `read` by the approval broker (the most permissive bucket) so legacy /
+   * third-party tools never accidentally gate. Builtin tools all set it.
+   */
+  riskClass?: RiskClass;
   /**
    * Execute the tool. `args` is the parsed JSON arguments object (or `{}` if
    * the model emitted no/invalid JSON). `ctx` carries optional workspace/scope
@@ -729,6 +738,7 @@ export class ChatSession {
     const self = this;
     return {
       name: "search",
+      riskClass: "read",
       description:
         "Search the workspace for a pattern. Use this when looking for code, text, or files. Returns top files and counts; full results are stored in an artifact.",
       parameters: {
@@ -789,6 +799,7 @@ export class ChatSession {
     const self = this;
     return {
       name: "read_file_summary",
+      riskClass: "read",
       description:
         "Read a file and get a focused summary answering your question. " +
         "Use this for long files where you only need specific information. " +
