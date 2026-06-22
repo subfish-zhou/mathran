@@ -12,6 +12,7 @@ import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import { stringify as tomlStringify } from "smol-toml";
 import { slugify } from "../../lib/slug.js";
+import { SETTINGS_SCHEMA_VERSION } from "../../core/config/schemas.js";
 
 export interface ProjectInitOptions {
   /** Explicit workspace root (highest precedence). */
@@ -115,6 +116,21 @@ export async function initProject(name: string, opts: ProjectInitOptions = {}): 
 
   await fs.writeFile(path.join(projectDir, "project.toml"), buildProjectToml(trimmed, slug, createdAt, version), "utf-8");
   await fs.writeFile(path.join(projectDir, "wiki", "index.md"), buildWikiIndex(trimmed, createdAt), "utf-8");
+
+  // Project-level layered-config skeleton (C 方案 — PROJECT layer ⭐).
+  // Team config goes here and is meant to be committed to git. Runtime state
+  // lives elsewhere (workspace `.mathran/`); this is config-only.
+  const projectMathran = path.join(projectDir, ".mathran");
+  await fs.mkdir(projectMathran, { recursive: true });
+  for (const sub of ["skills", "commands", "hooks"]) {
+    await fs.mkdir(path.join(projectMathran, sub), { recursive: true });
+    await fs.writeFile(path.join(projectMathran, sub, ".gitkeep"), "", "utf-8");
+  }
+  await fs.writeFile(
+    path.join(projectMathran, "settings.json"),
+    JSON.stringify({ schemaVersion: SETTINGS_SCHEMA_VERSION }, null, 2) + "\n",
+    "utf-8",
+  );
 
   return { slug, projectDir, workspaceRoot };
 }

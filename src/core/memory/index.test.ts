@@ -198,3 +198,30 @@ describe("formatMathranMemory", () => {
     expect(out).toBe("");
   });
 });
+
+describe("loadLayeredMathranMemorySync (three-layer)", () => {
+  it("loads USER < WORKSPACE < PROJECT and formats them in order", async () => {
+    const { loadLayeredMathranMemorySync, formatLayeredMathranMemory } = await import("./index.js");
+    await fs.mkdir(path.join(home, ".mathran"), { recursive: true });
+    await fs.writeFile(path.join(home, ".mathran", "MATHRAN.md"), "USER MEM", "utf8");
+    await fs.writeFile(path.join(workspace, "MATHRAN.md"), "WS MEM", "utf8");
+    const projDir = path.join(workspace, "projects", "p1");
+    await fs.mkdir(projDir, { recursive: true });
+    await fs.writeFile(path.join(projDir, "MATHRAN.md"), "PROJ MEM", "utf8");
+
+    const m = loadLayeredMathranMemorySync({ workspace, home, projectSlug: "p1" });
+    expect(m.user.body).toBe("USER MEM");
+    expect(m.workspace.body).toBe("WS MEM");
+    expect(m.project.body).toBe("PROJ MEM");
+
+    const out = formatLayeredMathranMemory(m);
+    expect(out.indexOf("## User")).toBeLessThan(out.indexOf("## Workspace"));
+    expect(out.indexOf("## Workspace")).toBeLessThan(out.indexOf("## Project"));
+  });
+
+  it("returns empty fragment when nothing exists", async () => {
+    const { loadLayeredMathranMemorySync, formatLayeredMathranMemory } = await import("./index.js");
+    const m = loadLayeredMathranMemorySync({ workspace, home, skipUser: true });
+    expect(formatLayeredMathranMemory(m)).toBe("");
+  });
+});

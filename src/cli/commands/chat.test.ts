@@ -5,12 +5,18 @@
  * provider gets contacted), call `handleSlashCommand`, and assert the
  * `SlashResult` shape + any disk side effects.
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import { handleSlashCommand, createReadlineAskUserResolver, type SlashContext } from "./chat.js";
+import {
+  handleSlashCommand,
+  createReadlineAskUserResolver,
+  buildChatSession,
+  loadLayeredContext,
+  type SlashContext,
+} from "./chat.js";
 import { ChatSession } from "../../core/chat/index.js";
 import type { LLMProvider, LLMRequest, LLMResponse } from "../../core/providers/llm.js";
 
@@ -361,5 +367,94 @@ describe("createReadlineAskUserResolver (v0.16 §11)", () => {
     const resolver = createReadlineAskUserResolver(rl);
     const reply = await resolver("?", { callId: "" });
     expect(reply).toBe("");
+  });
+});
+
+// ─── C 方案 wire-up: layered `.mathran/` skills + memory in `mathran chat` ──
+//
+// e2e smoke for the default-chat wiring: a workspace carrying a
+// `.mathran/skills/<name>/SKILL.md` must surface that skill in the built
+// session's system prompt, and a `.mathran`-less workspace must stay clean.
+describe("buildChatSession: layered .mathran wire-up", () => {
+  let wsDir: string;
+  let prevWorkspace: string | undefined;
+
+  beforeEach(async () => {
+    wsDir = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-wire-test-"));
+    prevWorkspace = process.env.MATHRAN_WORKSPACE;
+  });
+
+  afterEach(() => {
+    if (prevWorkspace === undefined) delete process.env.MATHRAN_WORKSPACE;
+    else process.env.MATHRAN_WORKSPACE = prevWorkspace;
+  });
+
+  async function writeSkill(name: string, description: string): Promise<void> {
+    const dir = path.join(wsDir, ".mathran", "skills", name);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "SKILL.md"),
+      `---\ndescription: ${description}\n---\n${name} body\n`,
+      "utf8",
+    );
+  }
+
+  it("loadLayeredContext discovers a workspace-layer skill", async () => {
+    await writeSkill("test-skill", "A test skill");
+    const { skills } = loadLayeredContext(wsDir);
+    expect(skills.map((s) => s.name)).toContain("test-skill");
+  });
+
+  it("injects the workspace skill into the built session's system prompt", async () => {
+    await writeSkill("test-skill", "A test skill");
+    process.env.MATHRAN_WORKSPACE = wsDir;
+    const { session } = buildChatSession({});
+    const systemText = session
+      .history()
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n");
+    expect(systemText).toContain("test-skill");
+    expect(systemText).toContain("Available skills");
+  });
+
+  it("filters skills listed in settings.skills.disabled", async () => {
+    await writeSkill("keep-skill", "kept");
+    await writeSkill("drop-skill", "dropped");
+    await fs.writeFile(
+      path.join(wsDir, ".mathran", "settings.json"),
+      JSON.stringify({ skills: { disabled: ["drop-skill"] } }),
+      "utf8",
+    );
+    const names = loadLayeredContext(wsDir).skills.map((s) => s.name);
+    expect(names).toContain("keep-skill");
+    expect(names).not.toContain("drop-skill");
+  });
+
+  it("injects three-layer MATHRAN.md memory by default", async () => {
+    await fs.writeFile(
+      path.join(wsDir, "MATHRAN.md"),
+      "WORKSPACE_MEMORY_MARKER",
+      "utf8",
+    );
+    process.env.MATHRAN_WORKSPACE = wsDir;
+    const { session } = buildChatSession({});
+    const systemText = session
+      .history()
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n");
+    expect(systemText).toContain("WORKSPACE_MEMORY_MARKER");
+  });
+
+  it("a workspace without .mathran injects no skills block", async () => {
+    process.env.MATHRAN_WORKSPACE = wsDir;
+    const { session } = buildChatSession({});
+    const systemText = session
+      .history()
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n");
+    expect(systemText).not.toContain("Available skills");
   });
 });

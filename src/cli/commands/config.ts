@@ -33,6 +33,7 @@ import * as path from "node:path";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 
 import { DEFAULT_CONFIG_PATH } from "../../core/config.js";
+import { loadLayeredSettings } from "../../core/config/layered-settings.js";
 
 const VALID_KINDS = new Set(["openai", "anthropic", "azure", "copilot", "ollama"]);
 const PROVIDER_FIELDS = new Set([
@@ -247,5 +248,32 @@ export async function runConfigUnset(key: string, opts: ConfigCliOptions): Promi
   }
   await writeConfigDoc(cfgPath, doc);
   process.stdout.write(`unset ${key}\n`);
+  return 0;
+}
+
+/**
+ * `mathran config settings` — print the merged layered `.mathran/settings.json`
+ * (PROJECT > WORKSPACE > USER). This is the new layered model; the TOML-based
+ * `config get/set/...` commands above stay for provider/defaultModel config.
+ */
+export async function runConfigSettings(
+  opts: ConfigCliOptions & { project?: string; json?: boolean },
+): Promise<number> {
+  const workspace = opts.workspace ?? process.env.MATHRAN_WORKSPACE;
+  const ws = workspace ? path.resolve(workspace) : path.dirname(DEFAULT_CONFIG_PATH);
+  const result = loadLayeredSettings({
+    workspace: ws,
+    ...(opts.project ? { projectSlug: opts.project } : {}),
+  });
+  if (opts.json) {
+    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    return 0;
+  }
+  process.stdout.write(`layered settings (PROJECT > WORKSPACE > USER), workspace: ${ws}\n`);
+  for (const layer of result.layers) {
+    process.stdout.write(`  [${layer.layer}] ${layer.path ?? "(absent)"}\n`);
+  }
+  process.stdout.write("\n" + JSON.stringify(result.settings, null, 2) + "\n");
+  for (const w of result.warnings) process.stderr.write(`warning: ${w}\n`);
   return 0;
 }

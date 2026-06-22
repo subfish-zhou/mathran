@@ -1414,3 +1414,38 @@ describe("ChatSession read-before-write tracking (v0.5 §7)", () => {
     }
   });
 });
+
+describe("ChatSession layeredSkills injection", () => {
+  it("injects a skills system message before the persona prompt", () => {
+    const llm = new ScriptedLLM([]);
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      systemPrompt: "PERSONA",
+      layeredSkills: [
+        {
+          name: "lean-helper",
+          layer: "workspace",
+          path: "/x/SKILL.md",
+          manifest: { name: "lean-helper", description: "Helps with Lean" },
+          body: "body",
+        },
+      ],
+    });
+    const sys = session.history().filter((m) => m.role === "system");
+    const joined = sys.map((m) => m.content).join("\n");
+    expect(joined).toContain("Available skills");
+    expect(joined).toContain("lean-helper");
+    // persona prompt must come after the skills fragment
+    const idxSkills = sys.findIndex((m) => String(m.content).includes("lean-helper"));
+    const idxPersona = sys.findIndex((m) => m.content === "PERSONA");
+    expect(idxSkills).toBeLessThan(idxPersona);
+  });
+
+  it("injects nothing when layeredSkills is empty", () => {
+    const llm = new ScriptedLLM([]);
+    const session = new ChatSession({ llm, model: "m", layeredSkills: [] });
+    const sys = session.history().filter((m) => m.role === "system");
+    expect(sys.every((m) => !String(m.content).includes("Available skills"))).toBe(true);
+  });
+});

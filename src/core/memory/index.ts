@@ -386,3 +386,76 @@ export function formatScopedMathranMemoryForPrompt(
   const truncated = buf.subarray(0, truncBudget).toString("utf8");
   return `${headerPrefix}${truncated}${noticeWithSep}`;
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// C 方案 — three-layer MATHRAN.md cascade (USER < WORKSPACE < PROJECT).
+//
+// The original chat loader (`loadMathranMemory`) is two-layer
+// (global + workspace). The layered `.mathran/` config model adds an
+// explicit PROJECT layer (`<workspace>/projects/<slug>/MATHRAN.md`) so a
+// project's team memory cascades above the shared workspace memory and the
+// user-global one. This is additive: the two-layer loader is untouched.
+//
+// Precedence (highest first): PROJECT > WORKSPACE > USER.
+// ──────────────────────────────────────────────────────────────────────
+
+export interface LoadLayeredMathranMemoryOpts {
+  /** Workspace root (holds the WORKSPACE-layer MATHRAN.md). */
+  workspace: string;
+  /** Project slug → adds the PROJECT-layer MATHRAN.md. */
+  projectSlug?: string;
+  /** Override $HOME for the USER layer (tests). */
+  home?: string;
+  /** Skip the USER layer (~/.mathran/MATHRAN.md) — tests. */
+  skipUser?: boolean;
+  /** Per-file cap; default {@link DEFAULT_MEMORY_MAX_BYTES}. */
+  maxBytes?: number;
+}
+
+export interface LayeredMathranMemory {
+  user: MathranMemory;
+  workspace: MathranMemory;
+  project: MathranMemory;
+}
+
+/**
+ * Synchronously load the three MATHRAN.md layers. Never throws; a missing /
+ * unreadable file yields `body: null`.
+ */
+export function loadLayeredMathranMemorySync(
+  opts: LoadLayeredMathranMemoryOpts,
+): LayeredMathranMemory {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MEMORY_MAX_BYTES;
+
+  const user = opts.skipUser
+    ? { path: null, body: null, truncated: false }
+    : readMemoryFileSync(resolveGlobalMemoryPath(opts.home), maxBytes);
+
+  const workspace = readMemoryFileSync(
+    path.join(opts.workspace, "MATHRAN.md"),
+    maxBytes,
+  );
+
+  const project = opts.projectSlug
+    ? readMemoryFileSync(
+        path.join(opts.workspace, "projects", opts.projectSlug, "MATHRAN.md"),
+        maxBytes,
+      )
+    : { path: null, body: null, truncated: false };
+
+  return { user, workspace, project };
+}
+
+/**
+ * Render the three-layer memory into a single system-prompt fragment, highest
+ * precedence last (so later text wins the model's attention). Empty layers are
+ * omitted; returns "" when all three are empty.
+ */
+export function formatLayeredMathranMemory(m: LayeredMathranMemory): string {
+  const sections: string[] = [];
+  if (m.user.body !== null) sections.push(formatSection("User", m.user));
+  if (m.workspace.body !== null) sections.push(formatSection("Workspace", m.workspace));
+  if (m.project.body !== null) sections.push(formatSection("Project", m.project));
+  if (sections.length === 0) return "";
+  return `${MEMORY_BLOCK_HEADER}\n\n${sections.join("\n\n")}`;
+}
