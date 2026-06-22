@@ -475,6 +475,79 @@ configCmd
     process.exit(await runConfigUnset(key, { workspace: opts.workspace }));
   });
 
+configCmd
+  .command("settings")
+  .description("Print the merged layered .mathran/settings.json (PROJECT > WORKSPACE > USER)")
+  .option("--workspace <dir>", "Workspace root")
+  .option("--project <slug>", "Include a project-level .mathran layer")
+  .option("--json", "Emit JSON", false)
+  .action(async (opts: { workspace?: string; project?: string; json?: boolean }) => {
+    const { runConfigSettings } = await import("./commands/config.js");
+    process.exit(
+      await runConfigSettings({
+        workspace: opts.workspace,
+        ...(opts.project !== undefined ? { project: opts.project } : {}),
+        ...(opts.json !== undefined ? { json: opts.json } : {}),
+      }),
+    );
+  });
+
+const rootCmd = program
+  .command("root")
+  .description("Manage the layered .mathran/ config root (init / show / validate / migrate)");
+
+rootCmd
+  .command("init")
+  .description("Create (or adopt) a .mathran/ root with idiot-proof safety checks")
+  .argument("<path>", "Project dir (auto-appends /.mathran) or an explicit .mathran path")
+  .option("--json", "Emit JSON", false)
+  .action(async (target: string, opts: { json?: boolean }) => {
+    const { runRootInit } = await import("./commands/init-root.js");
+    process.exit(runRootInit(target, { json: opts.json }));
+  });
+
+rootCmd
+  .command("show")
+  .description("Print the merged layered settings (PROJECT > WORKSPACE > USER)")
+  .option("--workspace <dir>", "Workspace root")
+  .option("--project <slug>", "Include a project-level .mathran layer")
+  .option("--json", "Emit JSON", false)
+  .action(async (opts: { workspace?: string; project?: string; json?: boolean }) => {
+    const { runRootShow } = await import("./commands/init-root.js");
+    process.exit(
+      runRootShow({
+        ...(opts.workspace !== undefined ? { workspace: opts.workspace } : {}),
+        ...(opts.project !== undefined ? { projectSlug: opts.project } : {}),
+        ...(opts.json !== undefined ? { json: opts.json } : {}),
+      }),
+    );
+  });
+
+rootCmd
+  .command("validate")
+  .description("Re-read and verify an existing root's .signature")
+  .argument("<path>", "Project dir or .mathran path")
+  .option("--json", "Emit JSON", false)
+  .action(async (target: string, opts: { json?: boolean }) => {
+    const { runRootValidate } = await import("./commands/init-root.js");
+    process.exit(runRootValidate(target, { json: opts.json }));
+  });
+
+rootCmd
+  .command("migrate")
+  .description("Opt-in: copy config.toml's defaultModel into .mathran/settings.json")
+  .option("--workspace <dir>", "Workspace root")
+  .option("--dry-run", "Show what would change without writing", false)
+  .action(async (opts: { workspace?: string; dryRun?: boolean }) => {
+    const { runRootMigrate } = await import("./commands/init-root.js");
+    process.exit(
+      await runRootMigrate({
+        ...(opts.workspace !== undefined ? { workspace: opts.workspace } : {}),
+        ...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
+      }),
+    );
+  });
+
 program
   .command("subagent")
   .description(
