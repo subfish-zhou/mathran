@@ -47,6 +47,12 @@ import {
 import { loadLayeredSkills } from "../../core/skills/loader.js";
 import type { LoadedSkill } from "../../core/skills/loader.js";
 import { loadLayeredSettings } from "../../core/config/layered-settings.js";
+import { ApprovalBroker } from "../../core/chat/approval-broker.js";
+import {
+  resolveApprovalConfig,
+  historyFor,
+  derivePrefix,
+} from "../../core/approval/index.js";
 import {
   parseReasoningEffort,
   setSessionReasoningEffort,
@@ -84,6 +90,14 @@ export interface BuildSessionOptions {
    * to answer.
    */
   askUserResolver?: import("../../core/chat/index.js").AskUserResolver;
+  /**
+   * Approval Policy 矩阵 — interactive approval resolver (readline). The REPL
+   * passes one so high-risk tool calls prompt for sign-off; one-shot `-p`
+   * omits it so the broker auto-denies (fail-safe).
+   */
+  approvalResolver?: import("../../core/approval/index.js").ApprovalResolver;
+  /** Learning-mode rule-proposal resolver (readline). REPL-only. */
+  ruleProposalResolver?: import("../../core/approval/index.js").RuleProposalResolver;
 }
 
 /**
@@ -112,6 +126,73 @@ export function createReadlineAskUserResolver(
       rl.question("› ", (a) => resolve(a));
     });
     return answer;
+  };
+}
+
+/**
+ * Build a readline-backed approval resolver (Approval Policy 矩阵).
+ *
+ * Renders the Codex-style inline prompt and maps a single keystroke to an
+ * {@link ApprovalDecision}. For the normal (pre-execution) prompt the choices
+ * are allow-once / session / prefix / deny; for the `on-failure` retry prompt
+ * they are retry / abandon. An empty / unrecognised reply fails safe to deny
+ * (or abandon for on-failure).
+ *
+ * Used by the interactive REPL only; one-shot `mathran -p` passes no resolver,
+ * so the broker auto-denies high-risk calls (decision #4: fail-safe).
+ */
+export function createReadlineApprovalResolver(
+  rl: readline.Interface,
+): import("../../core/approval/index.js").ApprovalResolver {
+  return async (req) => {
+    const { tool, riskClass, trigger, preview } = req;
+    const suggestedPrefix = derivePrefix(tool, req.args);
+    const ask = (prompt: string): Promise<string> =>
+      new Promise((resolve) => rl.question(prompt, (a) => resolve(a.trim())));
+
+    if (trigger === "on-failure") {
+      process.stdout.write(
+        `\n\x1b[33m🔐 [${tool}] FAILED — approval to retry (risk: ${riskClass})\x1b[0m\n` +
+          `Preview:\n  ${preview.replace(/\n/g, "\n  ")}\n`,
+      );
+      const a = (await ask(`[r]etry  [d]eny/abandon  > `)).toLowerCase();
+      return a.startsWith("r")
+        ? { outcome: "retry" }
+        : { outcome: "abandon", reason: "user abandoned after failure" };
+    }
+
+    const riskHint = trigger === "untrusted" ? `${riskClass}, untrusted` : riskClass;
+    process.stdout.write(
+      `\n\x1b[33m🔐 [${tool}] APPROVAL NEEDED (risk: ${riskHint})\x1b[0m\n` +
+        `Preview:\n  ${preview.replace(/\n/g, "\n  ")}\n`,
+    );
+    const a = (
+      await ask(
+        `[a]llow once  [s]ession  [p]refix:"${suggestedPrefix}"  [d]eny  > `,
+      )
+    ).toLowerCase();
+    if (a.startsWith("a")) return { outcome: "allow_once" };
+    if (a.startsWith("s")) return { outcome: "allow_session" };
+    if (a.startsWith("p")) return { outcome: "allow_prefix", prefix: suggestedPrefix };
+    return { outcome: "deny", reason: "user denied" };
+  };
+}
+
+/**
+ * Build a readline-backed rule-proposal resolver for learning mode. Returns
+ * whether the user accepted promoting the repeated decision to a rule.
+ */
+export function createReadlineRuleProposalResolver(
+  rl: readline.Interface,
+): import("../../core/approval/index.js").RuleProposalResolver {
+  return async ({ tool, prefix, count }) => {
+    process.stdout.write(
+      `\n\x1b[36m🎓 You've allowed \`${tool}: ${prefix} *\` ${count} times in a row.\x1b[0m\n`,
+    );
+    const a = await new Promise<string>((resolve) =>
+      rl.question("Promote to a standing rule? [y/N] ", (x) => resolve(x.trim())),
+    );
+    return /^y(es)?$/i.test(a);
   };
 }
 
@@ -185,6 +266,29 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     workspace,
     registry: defaultSubagentRegistry(),
   });
+  // Approval Policy 矩阵 — resolve the layered approval config (running the
+  // legacy-settings migration), build the broker, and wire the interactive
+  // readline resolver when one was provided (REPL). One-shot `-p` passes no
+  // resolver → high-risk calls auto-deny (fail-safe, decision #4).
+  const approvalCfg = resolveApprovalConfig({ workspace });
+  for (const w of approvalCfg.warnings) {
+    process.stderr.write(`\x1b[33m[mathran] ${w}\x1b[0m\n`);
+  }
+  const approvalBroker = new ApprovalBroker({
+    policy: approvalCfg.policy,
+    workspace,
+    learning: approvalCfg.learning,
+    proposeAfter: approvalCfg.proposeAfter,
+    inlineRules: approvalCfg.inlineRules,
+    denylist: approvalCfg.denylist,
+    rulesFiles: approvalCfg.rulesFiles,
+    persistentRuleFile: approvalCfg.persistentRuleFile,
+    history: historyFor(approvalCfg),
+    ...(opts.approvalResolver ? { resolver: opts.approvalResolver } : {}),
+    ...(opts.ruleProposalResolver
+      ? { proposalResolver: opts.ruleProposalResolver }
+      : {}),
+  });
   const session = new ChatSession({
     llm: router,
     model,
@@ -193,6 +297,7 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     workspace,
     subagentScheduler: scheduler,
     scheduler,
+    approvalBroker,
     // v0.4 §1: enable the full builtin toolkit for `mathran chat`. Users
     // run chat at a workspace root with full access; treat it like a local
     // shell session.
@@ -262,6 +367,11 @@ async function renderTurn(events: AsyncIterable<ChatEvent>): Promise<void> {
       // render anything extra; the event is here so non-CLI hosts can
       // observe the ask. Suppress the typical tool-call/tool-result pair
       // for ask_user so the transcript stays clean.
+      sawText = false;
+    } else if (ev.type === "approval_request" || ev.type === "approval_resolved") {
+      // Approval Policy 矩阵 — the readline approval resolver renders its own
+      // prompt inline; these events exist for SPA / observers. Nothing extra
+      // to print in the CLI transcript.
       sawText = false;
     } else if (ev.type === "done") {
       if (sawText) process.stdout.write("\n");
@@ -744,11 +854,15 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
   });
 
   const askUserResolver = createReadlineAskUserResolver(rl);
+  const approvalResolver = createReadlineApprovalResolver(rl);
+  const ruleProposalResolver = createReadlineRuleProposalResolver(rl);
 
   let { session, model, providerKey } = buildChatSession({
     model: opts.model,
     configPath: opts.configPath,
     askUserResolver,
+    approvalResolver,
+    ruleProposalResolver,
   });
 
   console.log(`mathran chat — model: ${model}  (provider: ${providerKey})`);
@@ -793,6 +907,8 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           const built = buildChatSession({
             ...result.nextBuild,
             askUserResolver,
+            approvalResolver,
+            ruleProposalResolver,
           });
           session = built.session;
           model = built.model;

@@ -7,6 +7,13 @@
  */
 
 export { ChatSession } from "./session.js";
+export {
+  ApprovalBroker,
+  type ApprovalBrokerOptions,
+  type ApprovalCall,
+  type AuthorizeResult,
+  type FailureResult,
+} from "./approval-broker.js";
 export type {
   ChatEvent,
   ChatSessionOptions,
