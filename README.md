@@ -44,7 +44,15 @@ defaultModel = "copilot/gpt-5.5"
 [providers.copilot]
 kind = "copilot"
 defaultModel = "gpt-5.5"
+# Optional whitelist: when set, only these bare model names are accepted
+# (typo-guard). Omit it to allow any model the provider supports.
+allowedModels = ["gpt-5.5", "claude-opus-4.8"]
 EOF
+
+# Pick a model per run with `provider/model` syntax:
+#   mathran chat --model copilot/claude-opus-4.8
+# Sub-agents can also be dispatched with a per-run model override; the main
+# agent decides (e.g. Opus for Lean/math, GPT for research). See /agents.
 
 # 5. Create a project + ask the agent something
 mathran project init my-proof

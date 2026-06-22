@@ -39,6 +39,12 @@ function coerceProvider(key: string, raw: any): ProviderConfig {
   if (raw.deployment !== undefined) cfg.deployment = String(raw.deployment);
   if (raw.apiVersion !== undefined) cfg.apiVersion = String(raw.apiVersion);
   if (raw.defaultModel !== undefined) cfg.defaultModel = String(raw.defaultModel);
+  if (raw.allowedModels !== undefined) {
+    if (!Array.isArray(raw.allowedModels)) {
+      throw new Error(`config: provider "${key}" allowedModels must be an array of strings`);
+    }
+    cfg.allowedModels = raw.allowedModels.map((m: unknown) => String(m));
+  }
   return cfg;
 }
 

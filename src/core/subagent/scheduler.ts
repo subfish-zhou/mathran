@@ -143,13 +143,30 @@ export class SubagentScheduler {
   }
 
   async dispatch(task: SubagentTask): Promise<SubagentResult> {
+    // Propagate an optional per-dispatch model override down to the runner as
+    // `input.modelHint` (runners read the hint from their input). We do this
+    // once, here, so both the inline and subprocess paths agree. An explicit
+    // `input.modelHint` already present is left untouched (caller intent wins).
+    const effective = this.withModelHint(task);
     // Read the optional `runtime` override (see `SubagentTaskWithRuntime`).
     // types.ts is read-only for v0.3 §16, so the field is carried via cast.
-    const runtime = (task as SubagentTaskWithRuntime).runtime ?? "inline";
+    const runtime = (effective as SubagentTaskWithRuntime).runtime ?? "inline";
     if (runtime === "subprocess") {
-      return this.dispatchSubprocess(task);
+      return this.dispatchSubprocess(effective);
     }
-    return this.dispatchInline(task);
+    return this.dispatchInline(effective);
+  }
+
+  /**
+   * Return a task whose `input.modelHint` reflects `task.model` (when set and
+   * not already specified on the input). Non-mutating: returns a shallow clone
+   * so the caller's original task object is untouched.
+   */
+  private withModelHint(task: SubagentTask): SubagentTask {
+    if (!task.model) return task;
+    const input = (task.input ?? {}) as Record<string, unknown>;
+    if (input.modelHint !== undefined) return task;
+    return { ...task, input: { ...input, modelHint: task.model } };
   }
 
   /** Inline (in-process) dispatch path — unchanged from v0.2. */

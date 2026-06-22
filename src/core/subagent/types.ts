@@ -21,6 +21,14 @@ export interface SubagentTask {
   parentRunId?: string; // optional: parent goal id or session id for audit chain
   hardCapBytes?: number; // summary byte cap; default 2048
   timeoutMs?: number; // default 60000
+  /**
+   * Optional model override for this dispatch, in `provider/model` form
+   * (e.g. "copilot/claude-opus-4.8"). The scheduler propagates it to the
+   * runner as `input.modelHint`; runners that drive an LLM forward it to their
+   * LLMRequest.model. When omitted the runner inherits the parent session's
+   * model. Validated at the dispatch tool layer, not here.
+   */
+  model?: string;
 }
 
 export interface SubagentResult {

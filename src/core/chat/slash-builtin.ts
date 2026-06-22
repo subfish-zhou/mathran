@@ -159,13 +159,23 @@ export interface AgentsSummary {
   kinds: string[];
   /** Currently-running subagents (best-effort; may be empty). */
   active: Array<{ id: string; type: string; status?: string }>;
+  /**
+   * Optional per-kind recommended model hint (in `provider/model` form). When
+   * present and non-empty for a kind, it is appended after the kind name.
+   */
+  recommended?: Record<string, string | undefined>;
 }
 
 /** Human-readable agents listing for the CLI `/agents` command. */
 export function formatAgentsList(summary: AgentsSummary): string {
+  const rec = summary.recommended;
+  const renderKind = (k: string): string => {
+    const model = rec?.[k];
+    return model ? `${k} (recommended: ${model})` : k;
+  };
   const kindLine =
     summary.kinds.length > 0
-      ? `available kinds: ${summary.kinds.join(", ")}`
+      ? `available kinds: ${summary.kinds.map(renderKind).join(", ")}`
       : "available kinds: (none)";
   if (summary.active.length === 0) {
     return `${kindLine}\nactive sub-agents: (none)`;

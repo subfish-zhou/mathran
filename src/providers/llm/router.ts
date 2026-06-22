@@ -33,6 +33,14 @@ export interface ProviderConfig {
   apiVersion?: string;
   /** Optional default model for this provider when none is supplied. */
   defaultModel?: string;
+  /**
+   * Optional whitelist of bare model names this provider will accept. When set,
+   * a request whose resolved model is not in the list is rejected with a clear
+   * error listing the allowed models. When omitted (or empty), no whitelist
+   * check is performed — any model string is forwarded to the adapter
+   * (fail-open, for backward compatibility).
+   */
+  allowedModels?: string[];
 }
 
 export interface MathranConfig {
@@ -88,8 +96,27 @@ export class ModelRouter implements LLMProvider {
 
   async chat(req: LLMRequest): Promise<LLMResponse> {
     const { providerKey, model } = this.resolve(req.model);
+    this.assertModelAllowed(providerKey, model);
     const adapter = this.getAdapter(providerKey);
     return adapter.chat({ ...req, model });
+  }
+
+  /**
+   * Enforce a provider's `allowedModels` whitelist (when configured). Throws a
+   * clear error listing the allowed models if `model` is not permitted. A
+   * provider without `allowedModels` (or with an empty list) imposes no
+   * restriction.
+   */
+  assertModelAllowed(providerKey: string, model: string): void {
+    const cfg = this.cfg.providers[providerKey];
+    const allowed = cfg?.allowedModels;
+    if (!allowed || allowed.length === 0) return;
+    if (!allowed.includes(model)) {
+      throw new Error(
+        `ModelRouter: model "${model}" is not allowed for provider "${providerKey}". ` +
+          `Allowed models: ${allowed.join(", ")}`,
+      );
+    }
   }
 
   /**

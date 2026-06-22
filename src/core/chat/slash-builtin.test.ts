@@ -122,4 +122,14 @@ describe("agents formatting", () => {
     expect(out).toContain("a1 (search)");
     expect(out).toContain("running");
   });
+  it("appends recommended model per kind when provided", () => {
+    const out = formatAgentsList({
+      kinds: ["search", "lean_explore"],
+      active: [],
+      recommended: { lean_explore: "copilot/claude-opus-4.8", search: undefined },
+    });
+    expect(out).toContain("lean_explore (recommended: copilot/claude-opus-4.8)");
+    // search has no recommendation → no parenthetical.
+    expect(out).not.toContain("search (recommended");
+  });
 });

@@ -77,4 +77,49 @@ kind = "not-a-real-kind"
     expect(cfg.defaultModel).toBe("openai/gpt-4o");
     expect(cfg.providers).toEqual({});
   });
+
+  it("parses a copilot provider with an allowedModels whitelist", () => {
+    const p = write(
+      "copilot.toml",
+      `
+defaultModel = "copilot/gpt-5.5"
+
+[providers.copilot]
+kind = "copilot"
+defaultModel = "gpt-5.5"
+allowedModels = ["gpt-5.5", "claude-opus-4.8"]
+`,
+    );
+    const cfg = loadConfig(p);
+    expect(cfg.providers.copilot).toEqual({
+      kind: "copilot",
+      defaultModel: "gpt-5.5",
+      allowedModels: ["gpt-5.5", "claude-opus-4.8"],
+    });
+  });
+
+  it("leaves allowedModels undefined when omitted (fail-open)", () => {
+    const p = write(
+      "copilot-nolist.toml",
+      `
+[providers.copilot]
+kind = "copilot"
+defaultModel = "gpt-5.5"
+`,
+    );
+    const cfg = loadConfig(p);
+    expect(cfg.providers.copilot.allowedModels).toBeUndefined();
+  });
+
+  it("rejects allowedModels that is not an array", () => {
+    const p = write(
+      "copilot-bad.toml",
+      `
+[providers.copilot]
+kind = "copilot"
+allowedModels = "gpt-5.5"
+`,
+    );
+    expect(() => loadConfig(p)).toThrow(/allowedModels must be an array/);
+  });
 });

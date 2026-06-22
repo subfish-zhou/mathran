@@ -48,6 +48,13 @@ export interface SearchRunnerInput {
   maxFiles?: number;
   contextLines?: number;
   caseInsensitive?: boolean;
+  /**
+   * Optional model hint, propagated by the scheduler from a dispatch `model`
+   * override. The search runner is purely grep/glob and never calls an LLM, so
+   * this is currently a no-op accepted only for a uniform runner-input schema.
+   * TODO: wire into an LLM-assisted ranking pass if/when search grows one.
+   */
+  modelHint?: string;
   /** Test-only escape hatch: force the Node fallback path even when rg is on PATH. */
   _forceNodeFallback?: boolean;
 }
