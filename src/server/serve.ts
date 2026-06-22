@@ -81,8 +81,18 @@ import {
   ASK_USER_PENDING_PLACEHOLDER,
   createTodoWriteTool,
   loadTodos,
+  ApprovalBroker,
   type ChatEvent,
 } from "../core/chat/index.js";
+import {
+  resolveApprovalConfig,
+  historyFor,
+} from "../core/approval/index.js";
+import {
+  ApprovalRegistry,
+  sharedApprovalRegistry,
+  registerApprovalRoute,
+} from "./approval-routes.js";
 import {
   SubagentScheduler,
   defaultSubagentRegistry,
@@ -683,7 +693,10 @@ async function writeProviders(workspace: string, payload: any): Promise<Record<s
 
 // ─── Chat (SSE) ──────────────────────────────────────────────────────────────
 
-export function defaultSessionFactory(workspace: string): ChatSessionFactory {
+export function defaultSessionFactory(
+  workspace: string,
+  approvalRegistry: ApprovalRegistry = sharedApprovalRegistry,
+): ChatSessionFactory {
   return ({ model, scope, conversationId, autoRunGoal, autoRunPlan }) => {
     const config = loadConfig(configPathFor(workspace));
     const resolvedModel = model ?? config.defaultModel ?? DEFAULT_MODEL;
@@ -712,9 +725,37 @@ export function defaultSessionFactory(workspace: string): ChatSessionFactory {
       workspace: scopedWorkspace,
       registry: defaultSubagentRegistry(),
     });
+    // Approval Policy 矩阵 — build the broker from the layered config and wire a
+    // session-level resolver that parks each prompt in the shared registry. The
+    // SSE pump forwards the `approval_request` event to the SPA; the parked
+    // Promise resolves when the SPA `POST`s the decision (see approval-routes).
+    // No broker-internal resolver in serve mode (the session drives prompts);
+    // no rule-proposal resolver either (no second modal — a follow-up).
+    const approvalCfg = resolveApprovalConfig({ workspace: scopedWorkspace });
+    for (const w of approvalCfg.warnings) {
+      // eslint-disable-next-line no-console
+      console.warn(`[mathran] ${w}`);
+    }
+    const approvalBroker = new ApprovalBroker({
+      policy: approvalCfg.policy,
+      workspace: scopedWorkspace,
+      learning: approvalCfg.learning,
+      proposeAfter: approvalCfg.proposeAfter,
+      inlineRules: approvalCfg.inlineRules,
+      denylist: approvalCfg.denylist,
+      rulesFiles: approvalCfg.rulesFiles,
+      persistentRuleFile: approvalCfg.persistentRuleFile,
+      history: historyFor(approvalCfg),
+    });
+    const approvalResolver = conversationId
+      ? (request: Parameters<typeof approvalRegistry.register>[1]) =>
+          approvalRegistry.register(conversationId, request)
+      : undefined;
     return new ChatSession({
       llm: router,
       model: resolvedModel,
+      approvalBroker,
+      ...(approvalResolver ? { approvalResolver } : {}),
       // T1-D: thread workspace + scope into tools so lean_check (and future
       // wiki/effort tools) can resolve project-relative paths. BUG #7 fix.
       // v0.5 §2: workspace is now scope-narrowed so fs tools land inside the
@@ -955,7 +996,11 @@ function registerChatScope(
   store: ScopedChatSessionStore,
   basePath: string,
   getScope: (c: any) => { scope?: ChatScope; error?: string; status?: 400 | 404 },
+  approvalRegistry: ApprovalRegistry = sharedApprovalRegistry,
 ): void {
+  // Approval Policy 矩阵 — POST <base>/:cid/approval/:id resolves a parked
+  // prompt; GET lists pending prompts for recovery after a page reload.
+  registerApprovalRoute(app, basePath, approvalRegistry);
   // POST <base>  — send a message (SSE)
   app.post(basePath, async (c) => {
     const resolved = getScope(c);
@@ -1162,6 +1207,10 @@ function registerChatScope(
         // gone). Also clears any unread steer on the way out so a fresh
         // stream on the same conversationId doesn't pick up a stale one.
         releaseSteerSlot();
+        // Approval Policy 矩阵 — fail-safe: settle any prompt still awaiting a
+        // decision (browser closed mid-approval) as a deny so the session never
+        // hangs on a dead Promise.
+        approvalRegistry.rejectPending(conversationId);
       }
     });
   });
@@ -1456,6 +1505,7 @@ function registerChatScope(
         });
       } finally {
         releaseSteerSlot();
+        approvalRegistry.rejectPending(id);
       }
     });
   });
@@ -1823,6 +1873,9 @@ function registerChatScope(
         });
       } finally {
         releaseSteerSlot();
+        // Approval Policy 矩阵 — fail-safe: a resumed round can raise a fresh
+        // approval prompt too; settle any still pending if the stream dies.
+        approvalRegistry.rejectPending(id);
       }
     });
   });
