@@ -254,3 +254,12 @@ export function parseCdTarget(arg: string): { slug: string } | { error: string }
 export function projectScopeBase(slug: string): string {
   return chatScopeBase({ kind: "project", projectSlug: slug } as ChatScopeSpec);
 }
+
+/**
+ * Substitute `$ARGUMENTS` in a custom command's body with the given args.
+ * Mirrors the server-side `buildCustomPrompt` so the injected prompt is
+ * identical whether resolved on the client or the server.
+ */
+export function buildCustomPromptFromItem(item: SuggesterItem, args: string): string {
+  return (item.body ?? "").split("$ARGUMENTS").join(args.trim());
+}
