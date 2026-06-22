@@ -220,6 +220,59 @@ describe("handleSlashCommand: /compact", () => {
   });
 });
 
+describe("handleSlashCommand: new builtins (SPA Slash Commands)", () => {
+  it("/effort with no arg shows usage", async () => {
+    const res = await handleSlashCommand("/effort", ctx);
+    expect(res.kind).toBe("continue");
+    expect(res.output).toMatch(/usage: \/effort/);
+  });
+
+  it("/effort high sets the level and reads back via /effort", async () => {
+    const set = await handleSlashCommand("/effort high", ctx);
+    expect(set.output).toMatch(/reasoning effort set to "high"/);
+    const read = await handleSlashCommand("/effort", ctx);
+    expect(read.output).toMatch(/reasoning effort: high/);
+  });
+
+  it("/effort rejects an invalid level", async () => {
+    const res = await handleSlashCommand("/effort turbo", ctx);
+    expect(res.output).toMatch(/usage: \/effort/);
+  });
+
+  it("/agents lists available kinds", async () => {
+    const res = await handleSlashCommand("/agents", ctx);
+    expect(res.kind).toBe("continue");
+    expect(res.output).toMatch(/available kinds/);
+    expect(res.output).toContain("search");
+  });
+
+  it("/skills reports no skills for an empty workspace", async () => {
+    const res = await handleSlashCommand("/skills", { ...ctx, memoryWorkspace: tmpDir });
+    expect(res.kind).toBe("continue");
+    expect(res.output).toMatch(/no skills|skills \(/);
+  });
+
+  it("/context reports message + token counts", async () => {
+    const res = await handleSlashCommand("/context", ctx);
+    expect(res.kind).toBe("continue");
+    expect(res.output).toMatch(/context: \d+ message\(s\), ~\d+ token/);
+  });
+
+  it("/review prints the preset stub prompt", async () => {
+    const res = await handleSlashCommand("/review", ctx);
+    expect(res.kind).toBe("continue");
+    expect(res.output).toMatch(/review/i);
+  });
+
+  it("/help lists the new commands", async () => {
+    const res = await handleSlashCommand("/help", ctx);
+    expect(res.output).toContain("/skills");
+    expect(res.output).toContain("/agents");
+    expect(res.output).toContain("/effort");
+    expect(res.output).toContain("/context");
+  });
+});
+
 describe("handleSlashCommand: /memory (v0.3 §14)", () => {
   it("prints both files with byte counts (or 'not present')", async () => {
     // No files in tmpDir—both should report not present (project at least).

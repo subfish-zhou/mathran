@@ -47,6 +47,15 @@ import {
 import { loadLayeredSkills } from "../../core/skills/loader.js";
 import type { LoadedSkill } from "../../core/skills/loader.js";
 import { loadLayeredSettings } from "../../core/config/layered-settings.js";
+import {
+  parseReasoningEffort,
+  setSessionReasoningEffort,
+  getSessionReasoningEffort,
+  formatSkillsList,
+  formatAgentsList,
+  REVIEW_STUB_PROMPT,
+} from "../../core/chat/slash-builtin.js";
+import { createOpenAITokenCounter, createFallbackTokenCounter } from "../../core/chat/token-counter.js";
 
 const DEFAULT_MODEL = "copilot/gpt-5.5";
 
@@ -343,6 +352,11 @@ const HELP_TEXT = `commands:
   /reset                   clear conversation history (keep system prompt)
   /history                 print a summary of the current history
   /compact [k]             compact history via subagent (keep last k user rounds, default 5)
+  /context                 show message count + approximate token usage
+  /effort [low|med|high]   show or set the reasoning-effort level (MVP: stored only)
+  /skills                  list layered skills (project / workspace / user)
+  /agents                  list available sub-agent kinds (+ active)
+  /review                  print the preset review prompt (MVP stub)
   /memory                  show MATHRAN.md memory (use /memory help for sub-commands)
   /system [text]           show or replace the system prompt (resets history)
   /model [model]           show or switch the active model (resets history)
@@ -487,6 +501,72 @@ export async function handleSlashCommand(
       return {
         kind: "continue",
         output: `loaded ${messages.length} message(s) from ${arg}`,
+      };
+    }
+
+    case "/skills": {
+      const workspace = ctx.memoryWorkspace ?? process.cwd();
+      try {
+        const { skills } = loadLayeredSkills({ workspace });
+        return { kind: "continue", output: formatSkillsList(skills) };
+      } catch (err: any) {
+        return { kind: "continue", output: `mathran: /skills failed: ${err?.message ?? err}` };
+      }
+    }
+
+    case "/agents": {
+      const kinds = defaultSubagentRegistry().list();
+      return {
+        kind: "continue",
+        output: formatAgentsList({ kinds, active: [] }),
+      };
+    }
+
+    case "/effort": {
+      if (!arg) {
+        const current = getSessionReasoningEffort(ctx.session);
+        return {
+          kind: "continue",
+          output: current
+            ? `reasoning effort: ${current}`
+            : "usage: /effort <low|med|high>",
+        };
+      }
+      const level = parseReasoningEffort(arg);
+      if (!level) {
+        return { kind: "continue", output: "usage: /effort <low|med|high>" };
+      }
+      setSessionReasoningEffort(ctx.session, level);
+      return {
+        kind: "continue",
+        output: `reasoning effort set to "${level}" (MVP: stored only; model router unchanged).`,
+      };
+    }
+
+    case "/context": {
+      const history = ctx.session.history();
+      const counter = ctx.model.includes("claude") || ctx.model.includes("anthropic")
+        ? createFallbackTokenCounter()
+        : (() => {
+            try {
+              return createOpenAITokenCounter(ctx.model.split("/").pop());
+            } catch {
+              return createFallbackTokenCounter();
+            }
+          })();
+      const tokens = counter.countMessages(history);
+      return {
+        kind: "continue",
+        output: `context: ${history.length} message(s), ~${tokens} token(s) (model: ${ctx.model}).`,
+      };
+    }
+
+    case "/review": {
+      // MVP stub (PLAN decision #2): no reviewer agent yet. Surface the
+      // preset prompt so the user can copy/paste or re-send it.
+      return {
+        kind: "continue",
+        output: `/review (MVP stub) — send this prompt to request a review:\n${REVIEW_STUB_PROMPT}`,
       };
     }
 
