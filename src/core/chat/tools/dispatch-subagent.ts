@@ -21,6 +21,7 @@
 import type { ToolSpec } from "../session.js";
 import type { SubagentScheduler, SubagentTaskWithRuntime } from "../../subagent/scheduler.js";
 import type { SubagentTaskType } from "../../subagent/types.js";
+import { RECOMMENDED_MODELS } from "../../subagent/registry.js";
 
 const KNOWN_TYPES: readonly SubagentTaskType[] = [
   "compact",
@@ -37,6 +38,52 @@ const SUMMARY_DISPLAY_CAP = 4096; // truncate summaries longer than this for the
 export interface DispatchSubagentToolOptions {
   /** Required — the scheduler the tool dispatches into. */
   scheduler: SubagentScheduler;
+  /**
+   * Optional list of configured provider keys (e.g. ["copilot", "openai"]).
+   * When provided, a `model` override whose provider is not in this list is
+   * rejected at dispatch time. When omitted, only the `provider/model` *format*
+   * is validated (fail-open on provider existence).
+   */
+  knownProviders?: readonly string[];
+}
+
+/** Render the recommended-model mapping for the tool description. */
+function recommendedModelsHint(): string {
+  const entries = Object.entries(RECOMMENDED_MODELS).map(
+    ([type, model]) => `${type} → ${model}`,
+  );
+  return entries.length > 0 ? entries.join(", ") : "(none)";
+}
+
+/**
+ * Validate an optional `model` override. Returns an error string if invalid, or
+ * the trimmed model string (or undefined when absent) when valid.
+ */
+export function validateModelOverride(
+  raw: unknown,
+  knownProviders?: readonly string[],
+): { ok: true; model?: string } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true };
+  if (typeof raw !== "string") {
+    return { ok: false, error: 'dispatch_subagent: "model" must be a string' };
+  }
+  const model = raw.trim();
+  if (model.length === 0) return { ok: true };
+  const slash = model.indexOf("/");
+  if (slash <= 0 || slash >= model.length - 1) {
+    return {
+      ok: false,
+      error: `dispatch_subagent: invalid model "${raw}" (expected "provider/model" form, e.g. "copilot/claude-opus-4.8")`,
+    };
+  }
+  const provider = model.slice(0, slash);
+  if (knownProviders && knownProviders.length > 0 && !knownProviders.includes(provider)) {
+    return {
+      ok: false,
+      error: `dispatch_subagent: unknown provider "${provider}" in model "${raw}" (known: ${knownProviders.join(", ")})`,
+    };
+  }
+  return { ok: true, model };
 }
 
 const PARAMETERS = {
@@ -64,6 +111,17 @@ const PARAMETERS = {
       description:
         "Optional. Default 'inline'. 'subprocess' isolates the runner in a " +
         "forked Node process (slower startup, safer for crashy LLM calls).",
+    },
+    model: {
+      type: "string",
+      description:
+        "Optional model override for this subagent run, in 'provider/model' " +
+        "form (e.g. 'copilot/claude-opus-4.8'). Defaults to the parent " +
+        "session's model. Pick a stronger model (Opus) for code/Lean/math " +
+        "reasoning, a faster one (GPT) for research/summarization. " +
+        "Recommended per type: " +
+        recommendedModelsHint() +
+        " (these are hints — you decide).",
     },
     timeoutMs: {
       type: "number",
@@ -153,12 +211,21 @@ export function createDispatchSubagentTool(
           ? args.hardCapBytes
           : undefined;
 
+      // Validate the optional model override *before* dispatching so a bad
+      // string fails fast instead of letting a subagent spin up and crash.
+      const modelCheck = validateModelOverride(args.model, opts.knownProviders);
+      if (!modelCheck.ok) {
+        return { ok: false, content: modelCheck.error };
+      }
+      const model = modelCheck.model;
+
       const task: SubagentTaskWithRuntime = {
         type,
         input,
         ...(runtime !== undefined ? { runtime } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(hardCapBytes !== undefined ? { hardCapBytes } : {}),
+        ...(model !== undefined ? { model } : {}),
       };
 
       let result: Awaited<ReturnType<typeof opts.scheduler.dispatch>>;
