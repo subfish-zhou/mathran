@@ -18,7 +18,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && tsx scripts/copy-builtin-skills.ts",
     "build:web": "cd web && npm ci && npm run build",
     "build:embedded-assets": "tsx scripts/build-static-assets.ts",
     "build:all": "npm run build:web && npm run build:embedded-assets && npm run build",

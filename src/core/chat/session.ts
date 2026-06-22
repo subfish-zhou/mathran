@@ -45,6 +45,12 @@ import {
   formatSkillsForPrompt,
   type LoadedSkill,
 } from "../skills/loader.js";
+import {
+  matchSkillTriggers,
+  renderSkillPrompt,
+  isAlwaysSkill,
+} from "../skills/trigger.js";
+import { registerSkillToolRules } from "../skills/temp-approval.js";
 import { createBashTool } from "./tools/bash.js";
 import { createReadFileTool } from "./tools/read-file.js";
 import { createWriteFileTool } from "./tools/write-file.js";
@@ -524,6 +530,13 @@ export class ChatSession {
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
   private messages: LLMMessage[] = [];
+  /**
+   * Skills/Plugins 二层: skills carrying a `trigger` (keyword / regex). These
+   * are matched against each user message and injected per-turn (transiently),
+   * unlike "always" skills which inject at construction. Empty when no layered
+   * skills were provided.
+   */
+  private readonly triggerSkills: LoadedSkill[] = [];
 
   constructor(opts: ChatSessionOptions) {
     this.llm = opts.llm;
@@ -605,11 +618,32 @@ export class ChatSession {
     // v0.16 §C 方案: advertise layered skills (PROJECT > WORKSPACE > USER) as
     // a system fragment, after memory and before the persona prompt. Never
     // throws; an empty list injects nothing.
+    //
+    // Skills/Plugins 二层 §B: split the loaded skills into "always" (no
+    // trigger → injected here, permanently) and "trigger" (keyword/regex →
+    // matched + injected per-turn in send()). Always-skills also register
+    // their `allowedTools` as temporary approval rules up front.
     if (opts.layeredSkills && opts.layeredSkills.length > 0) {
       try {
         const skillsFragment = formatSkillsForPrompt(opts.layeredSkills);
         if (skillsFragment.length > 0) {
           this.messages.push({ role: "system", content: skillsFragment });
+        }
+        const alwaysFragments: string[] = [];
+        for (const skill of opts.layeredSkills) {
+          if (isAlwaysSkill(skill)) {
+            const rendered = renderSkillPrompt(skill, "");
+            if (rendered.trim().length > 0) alwaysFragments.push(rendered.trim());
+            registerSkillToolRules(this.approvalBroker, skill);
+          } else {
+            this.triggerSkills.push(skill);
+          }
+        }
+        if (alwaysFragments.length > 0) {
+          this.messages.push({
+            role: "system",
+            content: alwaysFragments.join("\n\n"),
+          });
         }
       } catch {
         // constructors must NEVER throw.
@@ -1162,13 +1196,63 @@ export class ChatSession {
     // message, so we don't immediately discard it. Silent on failure.
     await this.maybeAutoCompact();
 
+    // Skills/Plugins 二层 §B.2: match trigger-bearing skills against this
+    // message and inject their rendered prompt as a TRANSIENT system message
+    // (removed after the turn so a long chat doesn't accumulate stale skill
+    // fragments). Matched skills also register their `allowedTools` as
+    // temporary approval rules for the rest of the session.
+    const skillMessage = this.activateTriggeredSkills(userText);
+
     this.messages.push(
       opts.attachments && opts.attachments.length > 0
         ? { role: "user", content: userText, attachments: opts.attachments }
         : { role: "user", content: userText },
     );
 
-    yield* this.runRounds(opts);
+    try {
+      yield* this.runRounds(opts);
+    } finally {
+      // Drop the transient skill fragment from history (keep the user turn).
+      if (skillMessage) {
+        const idx = this.messages.indexOf(skillMessage);
+        if (idx >= 0) this.messages.splice(idx, 1);
+      }
+    }
+  }
+
+  /**
+   * Match the session's trigger-bearing skills against `userText`. For each
+   * match: register its `allowedTools` as temporary approval rules and collect
+   * its rendered prompt. When any skill matched, push a single combined
+   * system message and RETURN it so the caller can remove it after the turn
+   * (per-turn injection — decision F.2). Returns `null` when nothing matched.
+   *
+   * Never throws: skill activation must not break a user turn.
+   */
+  private activateTriggeredSkills(userText: string): LLMMessage | null {
+    if (this.triggerSkills.length === 0) return null;
+    try {
+      const matches = matchSkillTriggers({
+        skills: this.triggerSkills,
+        userMessage: userText,
+      });
+      if (matches.length === 0) return null;
+      const fragments: string[] = [];
+      for (const m of matches) {
+        registerSkillToolRules(this.approvalBroker, m.skill);
+        const rendered = renderSkillPrompt(m.skill, userText);
+        if (rendered.trim().length > 0) fragments.push(rendered.trim());
+      }
+      if (fragments.length === 0) return null;
+      const message: LLMMessage = {
+        role: "system",
+        content: fragments.join("\n\n"),
+      };
+      this.messages.push(message);
+      return message;
+    } catch {
+      return null;
+    }
   }
 
   /**

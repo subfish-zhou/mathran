@@ -23,11 +23,17 @@ import * as path from "node:path";
 import { SkillManifestSchema, type SkillManifest } from "../config/schemas.js";
 import { MATHRAN_DIR } from "../config/mathran-root.js";
 import { parseFrontmatter } from "../config/frontmatter.js";
+import { loadBuiltinSkills } from "../chat/builtin-skills/loader.js";
 
-export type LayerName = "user" | "workspace" | "project";
+export type LayerName = "builtin" | "user" | "workspace" | "project";
 
 /** Precedence order, lowest → highest. */
-export const LAYER_PRECEDENCE: ReadonlyArray<LayerName> = ["user", "workspace", "project"];
+export const LAYER_PRECEDENCE: ReadonlyArray<LayerName> = [
+  "builtin",
+  "user",
+  "workspace",
+  "project",
+];
 
 export interface LoadedSkill {
   name: string;
@@ -46,6 +52,11 @@ export interface LoadLayeredSkillsOpts {
   skipUser?: boolean;
   /** Names to exclude (e.g. from settings.skills.disabled). */
   disabled?: ReadonlyArray<string>;
+  /**
+   * Include the shipped builtin skills as a hidden layer below USER (default
+   * true). User/workspace/project skills with the same `name` override them.
+   */
+  includeBuiltins?: boolean;
 }
 
 export interface LayeredSkillsResult {
@@ -64,7 +75,7 @@ function projectSkillsDir(workspace: string, slug: string): string {
   return path.join(workspace, "projects", slug, MATHRAN_DIR, "skills");
 }
 
-function readSkillsFromDir(
+export function readSkillsFromDir(
   dir: string,
   layer: LayerName,
   warnings: string[],
@@ -120,6 +131,17 @@ function readSkillsFromDir(
 export function loadLayeredSkills(opts: LoadLayeredSkillsOpts): LayeredSkillsResult {
   const warnings: string[] = [];
   const byName = new Map<string, LoadedSkill>();
+
+  // Builtin layer first (lowest precedence) so any same-named user / workspace
+  // / project skill overrides it. Lazy require avoids an import cycle with the
+  // builtin loader (which imports readSkillsFromDir from this module).
+  if (opts.includeBuiltins !== false) {
+    const builtin = loadBuiltinSkills();
+    warnings.push(...builtin.warnings);
+    for (const s of builtin.skills) {
+      byName.set(s.name, s);
+    }
+  }
 
   // Apply lowest → highest so later layers overwrite same-named entries.
   if (!opts.skipUser) {

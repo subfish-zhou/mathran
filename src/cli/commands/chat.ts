@@ -58,16 +58,29 @@ import {
   setSessionReasoningEffort,
   getSessionReasoningEffort,
   formatSkillsList,
+  formatSkillDetail,
+  toggleSkillDisabled,
   formatAgentsList,
   REVIEW_STUB_PROMPT,
 } from "../../core/chat/slash-builtin.js";
 import { createOpenAITokenCounter, createFallbackTokenCounter } from "../../core/chat/token-counter.js";
+import { MATHRAN_DIR, SETTINGS_FILE } from "../../core/config/mathran-root.js";
+import { atomicWriteFile } from "../../core/chat/atomic-write.js";
 
 const DEFAULT_MODEL = "copilot/gpt-5.5";
 
 import { buildBaseSystemPrompt } from "../../core/prompts/index.js";
 
-const SYSTEM_PROMPT = buildBaseSystemPrompt();
+// Skills/Plugins 二层: the propose-plan / propose-goal guidance now ships as
+// builtin skills (src/core/chat/builtin-skills/), which `buildChatSession`
+// injects via `layeredSkills`. Drop the hardcoded PROPOSE_* fragments from the
+// CLI base prompt so the skill bodies are the single source of truth (and a
+// user can override them with a same-named SKILL.md). Serve still uses the
+// fragments (it does not wire layered skills).
+const SYSTEM_PROMPT = buildBaseSystemPrompt({
+  includeProposeGoal: false,
+  includeProposePlan: false,
+});
 
 export interface BuildSessionOptions {
   model?: string;
@@ -233,6 +246,47 @@ export function loadLayeredContext(
   } catch {
     return { skills: [], warnings };
   }
+}
+
+/**
+ * Persist a `/skills enable|disable <name>` toggle to the WORKSPACE
+ * `settings.json` (`<workspace>/.mathran/settings.json`). Reads the current
+ * file (best-effort), applies {@link toggleSkillDisabled} to
+ * `skills.disabled`, and atomically writes it back. Returns a human-readable
+ * status line for the REPL.
+ */
+export async function toggleWorkspaceSkillDisabled(
+  workspace: string,
+  name: string,
+  action: "enable" | "disable",
+): Promise<string> {
+  const file = path.join(workspace, MATHRAN_DIR, SETTINGS_FILE);
+  let settings: Record<string, unknown> = {};
+  try {
+    const raw = await fs.readFile(file, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      settings = parsed as Record<string, unknown>;
+    }
+  } catch {
+    /* missing / malformed → start from an empty object */
+  }
+  const skillsBlock =
+    settings.skills && typeof settings.skills === "object"
+      ? (settings.skills as Record<string, unknown>)
+      : {};
+  const current = Array.isArray(skillsBlock.disabled)
+    ? (skillsBlock.disabled as unknown[]).filter((x): x is string => typeof x === "string")
+    : [];
+  const next = toggleSkillDisabled(current, name, action);
+  settings.skills = { ...skillsBlock, disabled: next };
+
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await atomicWriteFile(file, JSON.stringify(settings, null, 2) + "\n");
+
+  return action === "disable"
+    ? `disabled skill "${name}" (written to ${file}). It won't load on the next chat.`
+    : `enabled skill "${name}" (written to ${file}). It will load on the next chat.`;
 }
 
 /** Build a ChatSession wired to the configured ModelRouter + lean_check tool. */
@@ -464,7 +518,10 @@ const HELP_TEXT = `commands:
   /compact [k]             compact history via subagent (keep last k user rounds, default 5)
   /context                 show message count + approximate token usage
   /effort [low|med|high]   show or set the reasoning-effort level (MVP: stored only)
-  /skills                  list layered skills (project / workspace / user)
+  /skills                  list layered skills (builtin / user / workspace / project)
+  /skills <name>           show one skill's full SKILL.md (trigger + tools + body)
+  /skills disable <name>   add <name> to settings.json#skills.disabled
+  /skills enable <name>    remove <name> from settings.json#skills.disabled
   /agents                  list available sub-agent kinds (+ active)
   /review                  print the preset review prompt (MVP stub)
   /memory                  show MATHRAN.md memory (use /memory help for sub-commands)
@@ -620,8 +677,25 @@ export async function handleSlashCommand(
 
     case "/skills": {
       const workspace = ctx.memoryWorkspace ?? process.cwd();
+      const [sub, ...subRest] = rest;
+      const subArg = subRest.join(" ").trim();
       try {
+        // Sub-commands: enable / disable persist to the workspace settings.json;
+        // a bare name prints that skill's full SKILL.md.
+        if (sub === "disable" || sub === "enable") {
+          if (!subArg) {
+            return {
+              kind: "continue",
+              output: `usage: /skills ${sub} <name>`,
+            };
+          }
+          const out = await toggleWorkspaceSkillDisabled(workspace, subArg, sub);
+          return { kind: "continue", output: out };
+        }
         const { skills } = loadLayeredSkills({ workspace });
+        if (sub) {
+          return { kind: "continue", output: formatSkillDetail(skills, sub) };
+        }
         return { kind: "continue", output: formatSkillsList(skills) };
       } catch (err: any) {
         return { kind: "continue", output: `mathran: /skills failed: ${err?.message ?? err}` };

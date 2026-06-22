@@ -34,7 +34,7 @@ afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 describe("loadLayeredSkills", () => {
   it("returns empty when no skills exist", () => {
-    const r = loadLayeredSkills({ workspace, home });
+    const r = loadLayeredSkills({ workspace, home, includeBuiltins: false });
     expect(r.skills).toEqual([]);
   });
 
@@ -42,7 +42,7 @@ describe("loadLayeredSkills", () => {
     writeSkill(home, "user-skill", "name: user-skill\ndescription: U");
     writeSkill(workspace, "ws-skill", "name: ws-skill\ndescription: W");
     writeSkill(projectDir(), "proj-skill", "name: proj-skill\ndescription: P");
-    const r = loadLayeredSkills({ workspace, home, projectSlug: "p1" });
+    const r = loadLayeredSkills({ workspace, home, projectSlug: "p1", includeBuiltins: false });
     const names = r.skills.map((s) => s.name).sort();
     expect(names).toEqual(["proj-skill", "user-skill", "ws-skill"]);
   });
@@ -51,7 +51,7 @@ describe("loadLayeredSkills", () => {
     writeSkill(home, "dup", "name: dup\ndescription: from-user");
     writeSkill(workspace, "dup", "name: dup\ndescription: from-ws");
     writeSkill(projectDir(), "dup", "name: dup\ndescription: from-proj");
-    const r = loadLayeredSkills({ workspace, home, projectSlug: "p1" });
+    const r = loadLayeredSkills({ workspace, home, projectSlug: "p1", includeBuiltins: false });
     expect(r.skills).toHaveLength(1);
     expect(r.skills[0].layer).toBe("project");
     expect(r.skills[0].manifest.description).toBe("from-proj");
@@ -60,20 +60,20 @@ describe("loadLayeredSkills", () => {
   it("workspace beats user when no project layer", () => {
     writeSkill(home, "dup", "name: dup\ndescription: from-user");
     writeSkill(workspace, "dup", "name: dup\ndescription: from-ws");
-    const r = loadLayeredSkills({ workspace, home });
+    const r = loadLayeredSkills({ workspace, home, includeBuiltins: false });
     expect(r.skills[0].layer).toBe("workspace");
   });
 
   it("defaults name to the directory when frontmatter omits it", () => {
     writeSkill(workspace, "implicit", "description: no-name-field");
-    const r = loadLayeredSkills({ workspace, home });
+    const r = loadLayeredSkills({ workspace, home, includeBuiltins: false });
     expect(r.skills[0].name).toBe("implicit");
   });
 
   it("filters disabled names", () => {
     writeSkill(workspace, "keep", "name: keep");
     writeSkill(workspace, "drop", "name: drop");
-    const r = loadLayeredSkills({ workspace, home, disabled: ["drop"] });
+    const r = loadLayeredSkills({ workspace, home, disabled: ["drop"], includeBuiltins: false });
     expect(r.skills.map((s) => s.name)).toEqual(["keep"]);
   });
 
@@ -81,14 +81,14 @@ describe("loadLayeredSkills", () => {
     const dir = path.join(workspace, MATHRAN_DIR, "skills", "bad");
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, "SKILL.md"), "---\n: : bad: :\n---\nbody");
-    const r = loadLayeredSkills({ workspace, home });
+    const r = loadLayeredSkills({ workspace, home, includeBuiltins: false });
     expect(r.skills).toEqual([]);
     expect(r.warnings.length).toBeGreaterThan(0);
   });
 
   it("captures the body sans frontmatter", () => {
     writeSkill(workspace, "withbody", "name: withbody", "## Heading\ncontent");
-    const r = loadLayeredSkills({ workspace, home });
+    const r = loadLayeredSkills({ workspace, home, includeBuiltins: false });
     expect(r.skills[0].body.trim()).toBe("## Heading\ncontent");
   });
 });

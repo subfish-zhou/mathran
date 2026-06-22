@@ -138,18 +138,95 @@ export function skillsToSummaries(skills: readonly LoadedSkill[]): SkillSummary[
   }));
 }
 
+/**
+ * Human-readable one-line description of a skill's trigger:
+ *   - absent           → "always"
+ *   - string           → `keyword: "foo"`
+ *   - { keywords }     → `keyword: "a", "b"`
+ *   - { regex }        → `regex: /.../`
+ *   - { keywords,regex}→ both, comma-joined
+ */
+export function formatSkillTrigger(skill: LoadedSkill): string {
+  const t = skill.manifest.trigger;
+  if (t === undefined) return "always";
+  if (typeof t === "string") return `keyword: "${t}"`;
+  const parts: string[] = [];
+  const keywords = Array.isArray(t.keywords) ? t.keywords : [];
+  if (keywords.length > 0) {
+    parts.push(`keyword: ${keywords.map((k) => `"${k}"`).join(", ")}`);
+  }
+  if (typeof t.regex === "string" && t.regex.length > 0) {
+    parts.push(`regex: /${t.regex}/`);
+  }
+  return parts.length > 0 ? parts.join("; ") : "always";
+}
+
 /** Human-readable skills listing for the CLI `/skills` command. */
 export function formatSkillsList(skills: readonly LoadedSkill[]): string {
   if (skills.length === 0) return "(no skills found in any layer)";
-  const order: Record<LayerName, number> = { project: 0, workspace: 1, user: 2 };
+  const order: Record<LayerName, number> = { project: 0, workspace: 1, user: 2, builtin: 3 };
   const sorted = [...skills].sort(
     (a, b) => order[a.layer] - order[b.layer] || a.name.localeCompare(b.name),
   );
-  const lines = sorted.map((s) => {
+  const lines: string[] = [];
+  for (const s of sorted) {
     const desc = s.manifest.description ? ` — ${String(s.manifest.description)}` : "";
-    return `  [${s.layer}] ${s.name}${desc}`;
-  });
+    lines.push(`  [${s.layer}] ${s.name}${desc}`);
+    lines.push(`      trigger: ${formatSkillTrigger(s)}`);
+    const tools = s.manifest.allowedTools;
+    if (Array.isArray(tools) && tools.length > 0) {
+      lines.push(`      tools: ${tools.join(", ")}`);
+    }
+  }
   return `skills (${skills.length}):\n${lines.join("\n")}`;
+}
+
+/**
+ * Full detail for `/skills <name>`: metadata header + the raw SKILL.md body.
+ * Returns a "not found" line when no skill matches.
+ */
+export function formatSkillDetail(
+  skills: readonly LoadedSkill[],
+  name: string,
+): string {
+  const skill = skills.find((s) => s.name === name);
+  if (!skill) {
+    return `(no skill named "${name}" — try /skills for the list)`;
+  }
+  const m = skill.manifest;
+  const lines: string[] = [];
+  lines.push(`skill: ${skill.name} [${skill.layer}]`);
+  if (m.description) lines.push(`description: ${String(m.description)}`);
+  lines.push(`trigger: ${formatSkillTrigger(skill)}`);
+  if (Array.isArray(m.allowedTools) && m.allowedTools.length > 0) {
+    lines.push(`tools: ${m.allowedTools.join(", ")}`);
+  }
+  if (m.version) lines.push(`version: ${String(m.version)}`);
+  if (m.author) lines.push(`author: ${String(m.author)}`);
+  if (Array.isArray(m.tags) && m.tags.length > 0) {
+    lines.push(`tags: ${m.tags.join(", ")}`);
+  }
+  lines.push(`path: ${skill.path}`);
+  if (skill.body.trim().length > 0) {
+    lines.push("", "─── SKILL.md body ───", skill.body.trim());
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Pure helper for `/skills enable|disable <name>`: returns the next
+ * `skills.disabled` list. `disable` adds the name (deduped); `enable` removes
+ * every occurrence. Order is otherwise preserved.
+ */
+export function toggleSkillDisabled(
+  current: readonly string[],
+  name: string,
+  action: "enable" | "disable",
+): string[] {
+  if (action === "disable") {
+    return current.includes(name) ? [...current] : [...current, name];
+  }
+  return current.filter((n) => n !== name);
 }
 
 // ── /agents ────────────────────────────────────────────────────────────────

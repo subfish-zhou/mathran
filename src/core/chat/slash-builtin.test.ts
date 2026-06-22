@@ -11,6 +11,9 @@ import {
   getSessionReasoningEffort,
   skillsToSummaries,
   formatSkillsList,
+  formatSkillTrigger,
+  formatSkillDetail,
+  toggleSkillDisabled,
   formatAgentsList,
   REVIEW_STUB_PROMPT,
 } from "./slash-builtin.js";
@@ -105,6 +108,92 @@ describe("skills formatting", () => {
     const uIdx = out.indexOf("[user]");
     expect(pIdx).toBeLessThan(wIdx);
     expect(wIdx).toBeLessThan(uIdx);
+  });
+});
+
+function richSkill(
+  name: string,
+  layer: LoadedSkill["layer"],
+  manifest: Record<string, unknown>,
+  body = "",
+): LoadedSkill {
+  return {
+    name,
+    layer,
+    path: `/x/${name}/SKILL.md`,
+    manifest: { name, ...manifest } as LoadedSkill["manifest"],
+    body,
+  };
+}
+
+describe("formatSkillTrigger", () => {
+  it("renders always for no trigger", () => {
+    expect(formatSkillTrigger(richSkill("s", "user", {}))).toBe("always");
+  });
+  it("renders a string keyword", () => {
+    expect(formatSkillTrigger(richSkill("s", "user", { trigger: "lean" }))).toBe(
+      'keyword: "lean"',
+    );
+  });
+  it("renders keywords + regex", () => {
+    const out = formatSkillTrigger(
+      richSkill("s", "user", { trigger: { keywords: ["a", "b"], regex: "x.*" } }),
+    );
+    expect(out).toContain('keyword: "a", "b"');
+    expect(out).toContain("regex: /x.*/");
+  });
+});
+
+describe("formatSkillsList detail annotations", () => {
+  it("shows trigger + tools lines", () => {
+    const out = formatSkillsList([
+      richSkill("s", "user", {
+        trigger: { keywords: ["lean"] },
+        allowedTools: ["bash:lake", "read_file"],
+      }),
+    ]);
+    expect(out).toContain("trigger: keyword: \"lean\"");
+    expect(out).toContain("tools: bash:lake, read_file");
+  });
+});
+
+describe("formatSkillDetail", () => {
+  const skills = [
+    richSkill(
+      "lean-debug",
+      "user",
+      {
+        description: "debug lean",
+        trigger: { keywords: ["lean"] },
+        allowedTools: ["bash:lake"],
+        version: "1.0.0",
+        tags: ["lean"],
+      },
+      "Body goes here.",
+    ),
+  ];
+  it("prints metadata + body for a known skill", () => {
+    const out = formatSkillDetail(skills, "lean-debug");
+    expect(out).toContain("skill: lean-debug [user]");
+    expect(out).toContain("description: debug lean");
+    expect(out).toContain("tools: bash:lake");
+    expect(out).toContain("version: 1.0.0");
+    expect(out).toContain("Body goes here.");
+  });
+  it("reports not found for an unknown skill", () => {
+    expect(formatSkillDetail(skills, "nope")).toMatch(/no skill named/);
+  });
+});
+
+describe("toggleSkillDisabled", () => {
+  it("adds a name on disable (deduped)", () => {
+    expect(toggleSkillDisabled([], "a", "disable")).toEqual(["a"]);
+    expect(toggleSkillDisabled(["a"], "a", "disable")).toEqual(["a"]);
+    expect(toggleSkillDisabled(["a"], "b", "disable")).toEqual(["a", "b"]);
+  });
+  it("removes a name on enable", () => {
+    expect(toggleSkillDisabled(["a", "b"], "a", "enable")).toEqual(["b"]);
+    expect(toggleSkillDisabled(["a"], "missing", "enable")).toEqual(["a"]);
   });
 });
 

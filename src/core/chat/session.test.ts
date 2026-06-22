@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ChatSession, type ChatEvent, type ToolSpec } from "./session.js";
 import { createLeanCheckTool } from "./tools/lean-check.js";
+import { ApprovalBroker } from "./approval-broker.js";
 import type {
   LLMProvider,
   LLMRequest,
@@ -1447,5 +1448,134 @@ describe("ChatSession layeredSkills injection", () => {
     const session = new ChatSession({ llm, model: "m", layeredSkills: [] });
     const sys = session.history().filter((m) => m.role === "system");
     expect(sys.every((m) => !String(m.content).includes("Available skills"))).toBe(true);
+  });
+});
+
+describe("ChatSession skill triggers (Skills/Plugins 二层)", () => {
+  function skill(
+    name: string,
+    manifest: Record<string, unknown>,
+    body = "",
+  ) {
+    return {
+      name,
+      layer: "user" as const,
+      path: `/x/${name}/SKILL.md`,
+      manifest: { name, ...manifest } as any,
+      body,
+    };
+  }
+
+  it("injects an always-skill body at construction (permanent)", () => {
+    const llm = new ScriptedLLM([]);
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      layeredSkills: [skill("always-one", {}, "ALWAYS BODY TEXT")],
+    });
+    const joined = session
+      .history()
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n");
+    expect(joined).toContain("ALWAYS BODY TEXT");
+  });
+
+  it("does NOT inject a trigger-skill body at construction", () => {
+    const llm = new ScriptedLLM([]);
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      layeredSkills: [
+        skill("kw", { trigger: "lean" }, "TRIGGER BODY TEXT"),
+      ],
+    });
+    const joined = session
+      .history()
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n");
+    expect(joined).not.toContain("TRIGGER BODY TEXT");
+  });
+
+  it("injects a matched trigger skill into the turn's LLM request, then removes it", async () => {
+    const llm = new ScriptedLLM([
+      [{ type: "text", delta: "ok" }, { type: "done", finishReason: "stop" }],
+    ]);
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      layeredSkills: [
+        skill("kw", { trigger: "lean", promptTemplate: "SKILL FOR: {{userMessage}}" }),
+      ],
+    });
+    await collect(session.send("my lean proof"));
+    // The request the model saw must include the rendered skill fragment.
+    const reqSystem = llm.requests[0].messages
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n");
+    expect(reqSystem).toContain("SKILL FOR: my lean proof");
+    // But it is transient: gone from persisted history after the turn.
+    const histSystem = session
+      .history()
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n");
+    expect(histSystem).not.toContain("SKILL FOR:");
+  });
+
+  it("does not inject when the trigger does not match", async () => {
+    const llm = new ScriptedLLM([
+      [{ type: "text", delta: "ok" }, { type: "done", finishReason: "stop" }],
+    ]);
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      layeredSkills: [skill("kw", { trigger: "lean" }, "SHOULD NOT APPEAR")],
+    });
+    await collect(session.send("hello world"));
+    const reqSystem = llm.requests[0].messages
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n");
+    expect(reqSystem).not.toContain("SHOULD NOT APPEAR");
+  });
+
+  it("registers an always-skill's allowedTools as session rules at construction", () => {
+    const llm = new ScriptedLLM([]);
+    const broker = new ApprovalBroker({ policy: "on-request" });
+    new ChatSession({
+      llm,
+      model: "m",
+      approvalBroker: broker,
+      layeredSkills: [skill("a", { allowedTools: ["bash:lake"] }, "body")],
+    });
+    expect(broker.sessionRulesSnapshot).toEqual([
+      { tool: "bash", prefix: "lake", action: "allow", scope: "session" },
+    ]);
+  });
+
+  it("registers a trigger-skill's allowedTools only when it matches", async () => {
+    const llm = new ScriptedLLM([
+      [{ type: "text", delta: "ok" }, { type: "done", finishReason: "stop" }],
+      [{ type: "text", delta: "ok" }, { type: "done", finishReason: "stop" }],
+    ]);
+    const broker = new ApprovalBroker({ policy: "on-request" });
+    const session = new ChatSession({
+      llm,
+      model: "m",
+      approvalBroker: broker,
+      layeredSkills: [skill("kw", { trigger: "lean", allowedTools: ["bash"] })],
+    });
+    // No match yet.
+    expect(broker.sessionRulesSnapshot).toEqual([]);
+    await collect(session.send("no relevant words"));
+    expect(broker.sessionRulesSnapshot).toEqual([]);
+    // Now it matches → rule registered.
+    await collect(session.send("my lean goal"));
+    expect(broker.sessionRulesSnapshot).toEqual([
+      { tool: "bash", action: "allow", scope: "session" },
+    ]);
   });
 });
