@@ -39,6 +39,42 @@ describe("hookTypeFor", () => {
     expect(hookTypeFor("post-tool.audit")).toBe("post-tool");
     expect(hookTypeFor("random")).toBe("unknown");
   });
+
+  it("classifies the five new hook types", () => {
+    expect(hookTypeFor("pre-edit")).toBe("pre-edit");
+    expect(hookTypeFor("pre-edit-format")).toBe("pre-edit");
+    expect(hookTypeFor("post-edit")).toBe("post-edit");
+    expect(hookTypeFor("post-edit_prettier")).toBe("post-edit");
+    expect(hookTypeFor("pre-commit")).toBe("pre-commit");
+    expect(hookTypeFor("pre-commit-test")).toBe("pre-commit");
+    expect(hookTypeFor("pre-bash")).toBe("pre-bash");
+    expect(hookTypeFor("pre-bash.audit")).toBe("pre-bash");
+    expect(hookTypeFor("on-goal-complete")).toBe("on-goal-complete");
+    expect(hookTypeFor("on-goal-complete-notify")).toBe("on-goal-complete");
+  });
+
+  it("does not confuse similar prefixes", () => {
+    expect(hookTypeFor("pre-commitment")).toBe("unknown");
+    expect(hookTypeFor("pre-editor")).toBe("unknown");
+    expect(hookTypeFor("preedit")).toBe("unknown");
+  });
+});
+
+import { isBlockingHookType } from "./loader.js";
+
+describe("isBlockingHookType", () => {
+  it("blocks pre-* hooks only", () => {
+    expect(isBlockingHookType("pre-chat")).toBe(true);
+    expect(isBlockingHookType("pre-edit")).toBe(true);
+    expect(isBlockingHookType("pre-commit")).toBe(true);
+    expect(isBlockingHookType("pre-bash")).toBe(true);
+  });
+  it("does not block post-*/on-* hooks", () => {
+    expect(isBlockingHookType("post-tool")).toBe(false);
+    expect(isBlockingHookType("post-edit")).toBe(false);
+    expect(isBlockingHookType("on-goal-complete")).toBe(false);
+    expect(isBlockingHookType("unknown")).toBe(false);
+  });
 });
 
 describe("loadLayeredHooks", () => {
@@ -55,9 +91,32 @@ describe("loadLayeredHooks", () => {
     expect(r.hooks.map((h) => h.layer)).toEqual(["user", "workspace", "project"]);
   });
 
-  it("ignores non-.sh files", () => {
+  it("ignores non-hook files (unrecognised extension)", () => {
     writeHook(workspace, "notes.txt");
+    writeHook(workspace, "README.md");
     expect(loadLayeredHooks({ workspace, home }).hooks).toEqual([]);
+  });
+
+  it("loads .sh/.bash/.js/.py and extensionless hooks", () => {
+    writeHook(workspace, "pre-edit.sh");
+    writeHook(workspace, "post-edit.bash");
+    writeHook(workspace, "pre-bash.js");
+    writeHook(workspace, "pre-commit.py");
+    writeHook(workspace, "post-tool");
+    const r = loadLayeredHooks({ workspace, home });
+    const byName = Object.fromEntries(r.hooks.map((h) => [h.name, h.type]));
+    expect(byName["pre-edit"]).toBe("pre-edit");
+    expect(byName["post-edit"]).toBe("post-edit");
+    expect(byName["pre-bash"]).toBe("pre-bash");
+    expect(byName["pre-commit"]).toBe("pre-commit");
+    expect(byName["post-tool"]).toBe("post-tool");
+    expect(r.hooks).toHaveLength(5);
+  });
+
+  it("matches the whitelist against the full filename too", () => {
+    writeHook(workspace, "post-edit.sh");
+    const r = loadLayeredHooks({ workspace, home, allowed: ["post-edit.sh"] });
+    expect(r.hooks[0].allowed).toBe(true);
   });
 
   it("derives type from filename", () => {
