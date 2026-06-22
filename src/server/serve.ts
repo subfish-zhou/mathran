@@ -32,6 +32,7 @@ import {
   makeEmbeddedAssetHandler,
 } from "./static-assets.js";
 import { registerUploadRoutes } from "./upload-routes.js";
+import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerSlashRoutes } from "./slash-routes.js";
 import {
   buildUserMessageWithAttachments,
@@ -2328,6 +2329,9 @@ function buildApp(
 
   // v0.17 mathub parity: file-upload endpoint for the SPA attachments flow.
   registerUploadRoutes(app, workspace);
+
+  // Layered `.mathran/settings.json` editor surface for the SPA /settings page.
+  registerSettingsRoutes(app, workspace);
 
   app.get("/api/projects", async (c) => {
     return c.json({ projects: await listProjects(workspace) });
