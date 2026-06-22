@@ -131,3 +131,73 @@ describe("createBashTool", () => {
     expect(desc).toMatch(/not (echo|sed|awk)/);
   });
 });
+
+import * as fssync from "node:fs";
+import { createBashTool as mkBash, isGitCommit } from "./bash.js";
+import { HookInvoker } from "../../hooks/executor.js";
+import type { LoadedHook, HookType } from "../../hooks/loader.js";
+
+function bashHookInvoker(
+  ws: string,
+  type: HookType,
+  body: string,
+): HookInvoker {
+  const dir = path.join(ws, ".mathran", "hooks");
+  fssync.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, `${type}.sh`);
+  fssync.writeFileSync(p, body);
+  const hooks: LoadedHook[] = [
+    { name: type, type, layer: "workspace", path: p, allowed: false },
+  ];
+  return new HookInvoker({ hooks, workspace: ws });
+}
+
+describe("isGitCommit", () => {
+  it("matches git commit variants", () => {
+    expect(isGitCommit("git commit -m x")).toBe(true);
+    expect(isGitCommit("git commit -am 'x'")).toBe(true);
+    expect(isGitCommit("git -C foo commit")).toBe(true);
+    expect(isGitCommit("cd x && git commit")).toBe(true);
+  });
+  it("does not match unrelated commands", () => {
+    expect(isGitCommit("git status")).toBe(false);
+    expect(isGitCommit("ls")).toBe(false);
+    expect(isGitCommit("npm run commit-lint")).toBe(false);
+  });
+});
+
+describe("createBashTool — hooks", () => {
+  it("blocks the command when pre-bash fails", async () => {
+    const tool = mkBash({ workspace });
+    const hooks = bashHookInvoker(workspace, "pre-bash", "#!/bin/bash\nexit 1\n");
+    const res = await tool.execute(
+      { command: "echo should-not-run > marker.txt" },
+      { workspace, hooks },
+    );
+    expect(res.ok).toBe(false);
+    expect(res.content).toContain("blocked by hook");
+    expect(fssync.existsSync(path.join(workspace, "marker.txt"))).toBe(false);
+  });
+
+  it("runs the command when pre-bash passes", async () => {
+    const tool = mkBash({ workspace });
+    const hooks = bashHookInvoker(workspace, "pre-bash", "#!/bin/bash\nexit 0\n");
+    const res = await tool.execute({ command: "echo hi" }, { workspace, hooks });
+    expect(res.ok).toBe(true);
+    expect(res.content).toContain("hi");
+  });
+
+  it("triggers pre-commit only on git commit and blocks", async () => {
+    const tool = mkBash({ workspace });
+    const hooks = bashHookInvoker(workspace, "pre-commit", "#!/bin/bash\nexit 2\n");
+    const blocked = await tool.execute(
+      { command: "git commit -m x" },
+      { workspace, hooks },
+    );
+    expect(blocked.ok).toBe(false);
+    expect(blocked.content).toContain("git commit blocked by hook");
+    // non-commit command is unaffected
+    const ok = await tool.execute({ command: "echo hi" }, { workspace, hooks });
+    expect(ok.ok).toBe(true);
+  });
+});
