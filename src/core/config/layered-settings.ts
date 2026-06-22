@@ -29,6 +29,7 @@ export const USER_OVERRIDE_WHITELIST: ReadonlyArray<string> = [
   "ui.theme",
   "editor",
   "modelPreference",
+  "approval",
 ];
 
 export type SettingsLayerName = "user" | "workspace" | "project";
@@ -127,6 +128,13 @@ export function applyUserWhitelist(
     }
     if (key === "modelPreference") {
       if (user.modelPreference !== undefined) allowed.modelPreference = user.modelPreference;
+      continue;
+    }
+    if (key === "approval") {
+      // Approval is a personal/security preference: a user may set their own
+      // policy on their own machine.
+      if ((user as any).approval !== undefined)
+        (allowed as any).approval = (user as any).approval;
       continue;
     }
     if (key === "ui") {
