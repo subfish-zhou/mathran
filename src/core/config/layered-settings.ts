@@ -29,7 +29,6 @@ export const USER_OVERRIDE_WHITELIST: ReadonlyArray<string> = [
   "ui.theme",
   "editor",
   "modelPreference",
-  "approval",
 ];
 
 export type SettingsLayerName = "user" | "workspace" | "project";
