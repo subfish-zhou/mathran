@@ -44,6 +44,9 @@ import {
   resolveProjectMemoryPath,
   formatMathranMemory,
 } from "../../core/memory/index.js";
+import { loadLayeredSkills } from "../../core/skills/loader.js";
+import type { LoadedSkill } from "../../core/skills/loader.js";
+import { loadLayeredSettings } from "../../core/config/layered-settings.js";
 
 const DEFAULT_MODEL = "copilot/gpt-5.5";
 
@@ -103,6 +106,45 @@ export function createReadlineAskUserResolver(
   };
 }
 
+/**
+ * Best-effort discovery + load of the layered `.mathran/` config for a
+ * workspace (C 方案). Reads `settings.json` (for `skills.disabled`) and the
+ * layered skills across USER (`~/.mathran`) and WORKSPACE (`<workspace>/.mathran`)
+ * layers. The PROJECT layer is only consulted when a `projectSlug` is known
+ * (chat runs workspace-scoped, so it's usually absent).
+ *
+ * Never throws: any missing layer is simply skipped (the underlying loaders
+ * are best-effort). Warnings are returned for optional stderr surfacing.
+ */
+export function loadLayeredContext(
+  workspace: string,
+  projectSlug?: string,
+): { skills: LoadedSkill[]; warnings: string[] } {
+  const warnings: string[] = [];
+  let disabled: string[] = [];
+  try {
+    const settings = loadLayeredSettings({
+      workspace,
+      ...(projectSlug ? { projectSlug } : {}),
+    });
+    warnings.push(...settings.warnings);
+    disabled = settings.settings.skills?.disabled ? [...settings.settings.skills.disabled] : [];
+  } catch {
+    /* settings are best-effort; ignore */
+  }
+  try {
+    const result = loadLayeredSkills({
+      workspace,
+      ...(projectSlug ? { projectSlug } : {}),
+      disabled,
+    });
+    warnings.push(...result.warnings);
+    return { skills: result.skills, warnings };
+  } catch {
+    return { skills: [], warnings };
+  }
+}
+
 /** Build a ChatSession wired to the configured ModelRouter + lean_check tool. */
 export function buildChatSession(opts: BuildSessionOptions = {}): {
   session: ChatSession;
@@ -120,7 +162,12 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
   }
 
   const lean = new LocalLeanProvider();
-  const workspace = opts.memoryWorkspace ?? process.cwd();
+  const workspace =
+    opts.memoryWorkspace ?? process.env.MATHRAN_WORKSPACE ?? process.cwd();
+  // C 方案 wire-up: discover the layered `.mathran/` config (skills + the
+  // settings-driven disabled list) for this workspace. Best-effort — a
+  // workspace with no `.mathran/` yields an empty skill list.
+  const { skills: layeredSkills } = loadLayeredContext(workspace);
   // v0.5 wire-up: build a scheduler with all 5 runners pre-registered so the
   // `dispatch_subagent` builtin tool has a place to dispatch into. Same
   // scheduler is also forwarded as `subagentScheduler` so compact uses it
@@ -160,7 +207,8 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     },
     ...(opts.memoryWorkspace
       ? { memoryFiles: { enabled: true, workspace: opts.memoryWorkspace } }
-      : {}),
+      : { layeredMemory: { workspace } }),
+    ...(layeredSkills.length > 0 ? { layeredSkills } : {}),
   });
 
   return { session, model, providerKey };
@@ -220,12 +268,14 @@ export interface OneShotOptions {
 
 /** Run a single prompt and exit. Returns a process exit code. */
 export async function runOneShot(opts: OneShotOptions): Promise<number> {
-  const workspace = process.cwd();
+  const workspace = process.env.MATHRAN_WORKSPACE ?? process.cwd();
   const memInfo = detectMemoryFiles(workspace);
+  // C 方案: default to the three-layer layered memory + skills (buildChatSession
+  // honours MATHRAN_WORKSPACE / cwd). We no longer opt into the old two-layer
+  // `memoryWorkspace` path here — the layered loader subsumes it.
   const { session } = buildChatSession({
     model: opts.model,
     configPath: opts.configPath,
-    ...(memInfo.anyPresent ? { memoryWorkspace: workspace } : {}),
   });
   if (memInfo.anyPresent) {
     // Match REPL behaviour: a one-line stderr breadcrumb so users know
@@ -599,7 +649,7 @@ export interface ReplOptions {
 
 /** Run the interactive REPL. Returns a process exit code. */
 export async function runRepl(opts: ReplOptions = {}): Promise<number> {
-  const workspace = process.cwd();
+  const workspace = process.env.MATHRAN_WORKSPACE ?? process.cwd();
   const memInfo = detectMemoryFiles(workspace);
 
   // v0.16 §11: create the readline interface BEFORE the ChatSession so
@@ -619,7 +669,6 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
     model: opts.model,
     configPath: opts.configPath,
     askUserResolver,
-    ...(memInfo.anyPresent ? { memoryWorkspace: workspace } : {}),
   });
 
   console.log(`mathran chat — model: ${model}  (provider: ${providerKey})`);
@@ -664,7 +713,6 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           const built = buildChatSession({
             ...result.nextBuild,
             askUserResolver,
-            ...(memInfo.anyPresent ? { memoryWorkspace: workspace } : {}),
           });
           session = built.session;
           model = built.model;

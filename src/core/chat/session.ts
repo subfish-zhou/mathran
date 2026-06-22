@@ -38,6 +38,8 @@ import { readArtifact } from "../subagent/artifact.js";
 import {
   loadMathranMemorySync,
   formatMathranMemory,
+  loadLayeredMathranMemorySync,
+  formatLayeredMathranMemory,
 } from "../memory/index.js";
 import {
   formatSkillsForPrompt,
@@ -302,6 +304,23 @@ export interface ChatSessionOptions {
     workspace?: string;
   };
   /**
+   * Three-layer MATHRAN.md memory injection (C 方案: USER < WORKSPACE <
+   * PROJECT). When set, the constructor synchronously loads
+   * `~/.mathran/MATHRAN.md`, `<workspace>/MATHRAN.md` and (when `projectSlug`
+   * is given) `<workspace>/projects/<slug>/MATHRAN.md`, and prepends their
+   * concatenated contents BEFORE the layered skills + persona prompt.
+   *
+   * This is the layered-config replacement for {@link memoryFiles}; the two
+   * are mutually exclusive in practice (callers pick one). Reads are
+   * best-effort — missing/unreadable files are silently skipped.
+   */
+  layeredMemory?: {
+    workspace: string;
+    projectSlug?: string;
+    /** Override `$HOME` for the USER layer (tests). */
+    home?: string;
+  };
+  /**
    * Optional layered skills (loaded via `loadLayeredSkills`) to advertise in
    * the system prompt. Injected AFTER memory and BEFORE the persona prompt as
    * its own system message. Empty / undefined → nothing injected.
@@ -510,6 +529,27 @@ export class ChatSession {
       } catch {
         // Defense-in-depth: loadMathranMemorySync swallows IO errors itself
         // but constructors must NEVER throw. Belt-and-suspenders.
+      }
+    }
+
+    // v0.16 §C 方案: three-layer MATHRAN.md (USER < WORKSPACE < PROJECT) as
+    // the layered-config replacement for `memoryFiles`. Same placement
+    // (before skills + persona) and same best-effort, never-throw contract.
+    if (opts.layeredMemory) {
+      try {
+        const mem = loadLayeredMathranMemorySync({
+          workspace: opts.layeredMemory.workspace,
+          ...(opts.layeredMemory.projectSlug
+            ? { projectSlug: opts.layeredMemory.projectSlug }
+            : {}),
+          ...(opts.layeredMemory.home ? { home: opts.layeredMemory.home } : {}),
+        });
+        const fragment = formatLayeredMathranMemory(mem);
+        if (fragment.length > 0) {
+          this.messages.push({ role: "system", content: fragment });
+        }
+      } catch {
+        // constructors must NEVER throw.
       }
     }
 
