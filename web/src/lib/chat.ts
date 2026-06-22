@@ -3,6 +3,7 @@
 // frames that Hono's streamSSE emits.
 
 import { chatScopeBase, type ChatScopeSpec } from "./api.ts";
+import type { ApprovalRequest, ApprovalDecision } from "./approval-client.ts";
 
 /**
  * v0.17 mathub parity W2: attachment ref the composer forwards alongside
@@ -117,6 +118,22 @@ export type ChatEvent =
       planId: string;
       objective: string;
       autoRun: boolean;
+    }
+  | {
+      /** Approval Policy 矩阵 — a tool call needs the user's sign-off. The
+       *  serve stream emits this and then parks awaiting a decision; the SPA
+       *  renders an ApprovalDialog and POSTs the outcome via
+       *  {@link postApprovalDecision}. */
+      type: "approval_request";
+      request: ApprovalRequest;
+    }
+  | {
+      /** Approval Policy 矩阵 — emitted right after a decision lands (whether
+       *  user-driven or auto-matched by a rule), just before the tool runs or
+       *  is skipped. The SPA uses it to dismiss the dialog. */
+      type: "approval_resolved";
+      id: string;
+      decision: ApprovalDecision;
     }
   | { type: "done"; finishReason: string }
   | { type: "error"; message: string };
