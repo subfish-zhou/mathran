@@ -60,6 +60,7 @@ import {
 import { createProposeGoalTool } from "./tools/propose-goal.js";
 import { createProposePlanTool } from "./tools/propose-plan.js";
 import { ApprovalBroker } from "./approval-broker.js";
+import type { HookInvoker } from "../hooks/executor.js";
 import type { RiskClass, ApprovalRequest, ApprovalDecision, ApprovalResolver } from "../approval/types.js";
 import * as path from "node:path";
 
@@ -92,6 +93,13 @@ export interface ToolExecuteContext {
    *  history. Optional because callers outside the session loop (tests,
    *  direct `.execute()` probes) may not set it. */
   toolCallId?: string;
+  /**
+   * Hooks runner threaded in by the session so tools can fire `pre-edit` /
+   * `post-edit` / `pre-bash` / `pre-commit` hooks around their work. Absent
+   * when no hooks are configured (or in isolated test harnesses), in which
+   * case tools must behave exactly as before.
+   */
+  hooks?: HookInvoker;
 }
 
 /** A tool the model can invoke. Parameters are a JSON-schema object. */

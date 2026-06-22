@@ -148,3 +148,64 @@ describe("createWriteFileTool", () => {
     expect(read.has(path.join(workspace, "tracked.txt"))).toBe(true);
   });
 });
+
+import * as fssync from "node:fs";
+import { HookInvoker } from "../../hooks/executor.js";
+import type { LoadedHook } from "../../hooks/loader.js";
+
+function hookInvoker(
+  ws: string,
+  type: "pre-edit" | "post-edit",
+  body: string,
+): HookInvoker {
+  const dir = path.join(ws, ".mathran", "hooks");
+  fssync.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, `${type}.sh`);
+  fssync.writeFileSync(p, body);
+  const hooks: LoadedHook[] = [
+    { name: type, type, layer: "workspace", path: p, allowed: false },
+  ];
+  return new HookInvoker({ hooks, workspace: ws });
+}
+
+describe("createWriteFileTool — hooks", () => {
+  it("runs post-edit and appends its summary to the result", async () => {
+    const tool = createWriteFileTool({ workspace });
+    const hooks = hookInvoker(
+      workspace,
+      "post-edit",
+      "#!/bin/bash\necho \"modified: $MATHRAN_FILE_PATH\"\n",
+    );
+    const res = await tool.execute(
+      { path: "foo.txt", content: "hi" },
+      { workspace, hooks },
+    );
+    expect(res.ok).toBe(true);
+    expect(res.content).toContain("modified:");
+    expect(res.content).toContain("foo.txt");
+  });
+
+  it("does NOT block the write when post-edit fails", async () => {
+    const tool = createWriteFileTool({ workspace });
+    const hooks = hookInvoker(workspace, "post-edit", "#!/bin/bash\nexit 1\n");
+    const res = await tool.execute(
+      { path: "foo.txt", content: "hi" },
+      { workspace, hooks },
+    );
+    expect(res.ok).toBe(true);
+    expect(fssync.existsSync(path.join(workspace, "foo.txt"))).toBe(true);
+  });
+
+  it("blocks the write when a pre-edit hook fails", async () => {
+    const tool = createWriteFileTool({ workspace });
+    const hooks = hookInvoker(workspace, "pre-edit", "#!/bin/bash\nexit 1\n");
+    const res = await tool.execute(
+      { path: "foo.txt", content: "hi" },
+      { workspace, hooks },
+    );
+    expect(res.ok).toBe(false);
+    expect(res.content).toContain("blocked by hook");
+    expect(res.content).toContain("/hooks bypass");
+    expect(fssync.existsSync(path.join(workspace, "foo.txt"))).toBe(false);
+  });
+});

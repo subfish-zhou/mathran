@@ -508,4 +508,23 @@ export function formatHookSummary(
   return results.map(formatHookResult).join("\n");
 }
 
+/**
+ * Build the tool-error message returned when a blocking (`pre-*`) hook fails,
+ * so the model/user understand what happened and how to bypass it (C.4).
+ */
+export function formatHookBlock(operation: string, outcome: HookRunOutcome): string {
+  const names = outcome.ran
+    .filter((r) => r.blocked)
+    .map((r) => r.hook.name);
+  const bypass = names.length > 0 ? names[0] : "<name>";
+  const lines = [
+    `⛔ ${operation} blocked by hook: ${outcome.blockedReason ?? "hook failed"}.`,
+  ];
+  if (outcome.summary) lines.push(outcome.summary);
+  lines.push(
+    `Use \`/hooks bypass ${bypass}\` to skip this hook on the next call.`,
+  );
+  return lines.join("\n");
+}
+
 export { outcomeTag, relativeAge };
