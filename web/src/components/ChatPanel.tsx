@@ -42,6 +42,12 @@ import GoalRunStatusPanel from "./GoalRunStatusPanel.tsx";
 import GoalAutonomyCard from "./GoalAutonomyCard.tsx";
 import { TodoListPanel } from "./TodoListPanel.tsx";
 import PlanRunOverlay from "./PlanRunOverlay.tsx";
+import ApprovalDialog from "./ApprovalDialog.tsx";
+import {
+  postApprovalDecision,
+  type ApprovalRequest,
+  type ApprovalDecision,
+} from "../lib/approval-client.ts";
 import { AgentStatusPanel, type ChatEventPhase } from "./AgentStatusPanel.tsx";
 import { api, chatScopeBase, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
 import {
@@ -255,6 +261,15 @@ export default function ChatPanel({
   // bubble stream so a plan run never pollutes conversation history; only
   // a transient "Plan saved to <path>" toast surfaces back here.
   const [planOverlayOpen, setPlanOverlayOpen] = useState(false);
+  // Approval Policy 矩阵 — the in-flight tool approval prompt (if any), driven
+  // by `approval_request` / `approval_resolved` SSE events. `approvalSubmitting`
+  // guards the buttons while the decision POST is in flight; `approvalError`
+  // surfaces a failed POST inline so the user can retry without losing the modal.
+  const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(
+    null,
+  );
+  const [approvalSubmitting, setApprovalSubmitting] = useState(false);
+  const [approvalError, setApprovalError] = useState<string | null>(null);
   const [planSavedToast, setPlanSavedToast] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   // W4 (v0.17 mathub parity): composer is a multi-line <textarea> that
@@ -731,6 +746,19 @@ export default function ChatPanel({
         if (ev.type === "todos") {
           setTodos(ev.list);
         }
+        // Approval Policy 矩阵 — a tool call needs sign-off. Park the request so
+        // the ApprovalDialog renders; the server stream stays open awaiting our
+        // POST. `approval_resolved` (or the decision POST success) clears it.
+        if (ev.type === "approval_request") {
+          setPendingApproval(ev.request);
+          setApprovalError(null);
+          setApprovalSubmitting(false);
+        }
+        if (ev.type === "approval_resolved") {
+          setPendingApproval((cur) => (cur && cur.id === ev.id ? null : cur));
+          setApprovalSubmitting(false);
+          setApprovalError(null);
+        }
         // v0.17 P2 — propose_goal confirmation produced a real Goal.
         // Show a banner notification, and when the model + user opted
         // for autoRun, navigate the SPA to the goal page so they can
@@ -879,6 +907,11 @@ export default function ChatPanel({
         setActiveToolCalls({});
         setSubAgentActive(false);
         setRound(null);
+        // Approval Policy 矩阵 — if the stream ended while a prompt was still
+        // open (Stop pressed, or the server settled it as a fail-safe deny),
+        // drop the modal so it doesn't dangle over a dead stream.
+        setPendingApproval(null);
+        setApprovalSubmitting(false);
         // Trim a trailing empty assistant bubble that can linger when the
         // stream errors out (or is stopped) before any tokens land. Without
         // this the user sees an ellipsis-only "…" bubble that they can't
@@ -893,6 +926,26 @@ export default function ChatPanel({
       }
     },
     [refreshUsage, refreshList],
+  );
+
+  // Approval Policy 矩阵 — POST the user's decision for the open prompt. On
+  // success we keep the modal until `approval_resolved` lands (the resumed
+  // stream confirms it); on failure we surface the error inline and re-enable
+  // the buttons for a retry.
+  const handleApprovalDecide = useCallback(
+    async (decision: ApprovalDecision) => {
+      const request = pendingApproval;
+      if (!request || !conversationId) return;
+      setApprovalSubmitting(true);
+      setApprovalError(null);
+      try {
+        await postApprovalDecision(scope, conversationId, request.id, decision);
+      } catch (err) {
+        setApprovalError((err as Error).message);
+        setApprovalSubmitting(false);
+      }
+    },
+    [pendingApproval, conversationId, scope],
   );
 
   // ─── Stop the in-flight stream (v0.16 §1) ────────────────────────────────────
@@ -3246,6 +3299,17 @@ export default function ChatPanel({
         >
           📣 Steered: “{steerLastReceived.length > 80 ? steerLastReceived.slice(0, 80) + "…" : steerLastReceived}”
         </button>
+      )}
+
+      {/* Approval Policy 矩阵 — tool-call approval modal. Rendered whenever a
+          prompt is in flight; blocks nothing else but draws over the chat. */}
+      {pendingApproval && (
+        <ApprovalDialog
+          request={pendingApproval}
+          onDecide={handleApprovalDecide}
+          pending={approvalSubmitting}
+          error={approvalError}
+        />
       )}
 
       {/* ─── Image lightbox (v0.17 mathub parity) ───────────────────
