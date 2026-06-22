@@ -145,3 +145,18 @@ export function loadLayeredSkills(opts: LoadLayeredSkillsOpts): LayeredSkillsRes
   skills.sort((a, b) => a.name.localeCompare(b.name));
   return { skills, warnings };
 }
+
+/**
+ * Render loaded skills into a system-prompt fragment. Codex-style: a header
+ * plus one bullet per skill (name + optional description). Returns "" when
+ * there are no skills so callers never inject an empty header.
+ */
+export function formatSkillsForPrompt(skills: ReadonlyArray<LoadedSkill>): string {
+  if (skills.length === 0) return "";
+  const lines = ["# Available skills (.mathran/skills)"];
+  for (const s of skills) {
+    const desc = s.manifest.description ? ` — ${s.manifest.description}` : "";
+    lines.push(`- **${s.name}** (${s.layer})${desc}`);
+  }
+  return lines.join("\n");
+}

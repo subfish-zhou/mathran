@@ -39,6 +39,10 @@ import {
   loadMathranMemorySync,
   formatMathranMemory,
 } from "../memory/index.js";
+import {
+  formatSkillsForPrompt,
+  type LoadedSkill,
+} from "../skills/loader.js";
 import { createBashTool } from "./tools/bash.js";
 import { createReadFileTool } from "./tools/read-file.js";
 import { createWriteFileTool } from "./tools/write-file.js";
@@ -297,6 +301,12 @@ export interface ChatSessionOptions {
     /** Defaults to `process.cwd()`. */
     workspace?: string;
   };
+  /**
+   * Optional layered skills (loaded via `loadLayeredSkills`) to advertise in
+   * the system prompt. Injected AFTER memory and BEFORE the persona prompt as
+   * its own system message. Empty / undefined → nothing injected.
+   */
+  layeredSkills?: ReadonlyArray<LoadedSkill>;
 }
 
 interface PendingToolCall {
@@ -500,6 +510,20 @@ export class ChatSession {
       } catch {
         // Defense-in-depth: loadMathranMemorySync swallows IO errors itself
         // but constructors must NEVER throw. Belt-and-suspenders.
+      }
+    }
+
+    // v0.16 §C 方案: advertise layered skills (PROJECT > WORKSPACE > USER) as
+    // a system fragment, after memory and before the persona prompt. Never
+    // throws; an empty list injects nothing.
+    if (opts.layeredSkills && opts.layeredSkills.length > 0) {
+      try {
+        const skillsFragment = formatSkillsForPrompt(opts.layeredSkills);
+        if (skillsFragment.length > 0) {
+          this.messages.push({ role: "system", content: skillsFragment });
+        }
+      } catch {
+        // constructors must NEVER throw.
       }
     }
 
