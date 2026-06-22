@@ -252,6 +252,49 @@ describe("handleSlashCommand: new builtins (SPA Slash Commands)", () => {
     expect(res.output).toMatch(/no skills|skills \(/);
   });
 
+  it("/skills lists the builtin propose skills", async () => {
+    const res = await handleSlashCommand("/skills", { ...ctx, memoryWorkspace: tmpDir });
+    expect(res.output).toContain("propose-plan");
+    expect(res.output).toContain("[builtin]");
+    expect(res.output).toContain("trigger:");
+  });
+
+  it("/skills <name> prints a skill's detail + body", async () => {
+    const res = await handleSlashCommand("/skills propose-plan", {
+      ...ctx,
+      memoryWorkspace: tmpDir,
+    });
+    expect(res.output).toContain("skill: propose-plan [builtin]");
+    expect(res.output).toContain("SKILL.md body");
+  });
+
+  it("/skills disable then enable round-trips through settings.json", async () => {
+    const disable = await handleSlashCommand("/skills disable propose-plan", {
+      ...ctx,
+      memoryWorkspace: tmpDir,
+    });
+    expect(disable.output).toContain("disabled skill");
+    const settingsPath = path.join(tmpDir, ".mathran", "settings.json");
+    const after = JSON.parse(await fs.readFile(settingsPath, "utf-8"));
+    expect(after.skills.disabled).toContain("propose-plan");
+
+    const enable = await handleSlashCommand("/skills enable propose-plan", {
+      ...ctx,
+      memoryWorkspace: tmpDir,
+    });
+    expect(enable.output).toContain("enabled skill");
+    const after2 = JSON.parse(await fs.readFile(settingsPath, "utf-8"));
+    expect(after2.skills.disabled).not.toContain("propose-plan");
+  });
+
+  it("/skills disable without a name shows usage", async () => {
+    const res = await handleSlashCommand("/skills disable", {
+      ...ctx,
+      memoryWorkspace: tmpDir,
+    });
+    expect(res.output).toContain("usage:");
+  });
+
   it("/context reports message + token counts", async () => {
     const res = await handleSlashCommand("/context", ctx);
     expect(res.kind).toBe("continue");
@@ -500,7 +543,7 @@ describe("buildChatSession: layered .mathran wire-up", () => {
     expect(systemText).toContain("WORKSPACE_MEMORY_MARKER");
   });
 
-  it("a workspace without .mathran injects no skills block", async () => {
+  it("a workspace without .mathran injects only the builtin skills", async () => {
     process.env.MATHRAN_WORKSPACE = wsDir;
     const { session } = buildChatSession({});
     const systemText = session
@@ -508,6 +551,10 @@ describe("buildChatSession: layered .mathran wire-up", () => {
       .filter((m) => m.role === "system")
       .map((m) => m.content)
       .join("\n");
-    expect(systemText).not.toContain("Available skills");
+    // Builtin skills are always advertised (hidden layer below USER)…
+    expect(systemText).toContain("Available skills");
+    expect(systemText).toContain("propose-plan");
+    // …but no on-disk user/workspace skill is present.
+    expect(systemText).not.toContain("test-skill");
   });
 });
