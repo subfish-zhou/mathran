@@ -60,7 +60,12 @@ import {
 import { createProposeGoalTool } from "./tools/propose-goal.js";
 import { createProposePlanTool } from "./tools/propose-plan.js";
 import { ApprovalBroker } from "./approval-broker.js";
-import type { RiskClass } from "../approval/types.js";
+import type { RiskClass, ApprovalRequest, ApprovalDecision } from "../approval/types.js";
+import {
+  ApprovalPending,
+  isApprovalPending,
+  APPROVAL_PENDING_PLACEHOLDER,
+} from "../approval/pending.js";
 import * as path from "node:path";
 
 /**
@@ -124,6 +129,22 @@ export type ChatEvent =
   | { type: "text"; delta: string }
   | { type: "tool-call"; id: string; name: string; args: string }
   | { type: "tool-result"; id: string; name: string; ok: boolean; content: string }
+  | {
+      /** Approval Policy 矩阵 — emitted just before the host prompts the user
+       *  to approve a high-risk tool call. Lets the SPA render its
+       *  `ApprovalDialog` (serve) / observers log the request. CLI hosts use
+       *  their readline resolver and may ignore this event. */
+      type: "approval_request";
+      request: ApprovalRequest;
+    }
+  | {
+      /** Approval Policy 矩阵 — emitted after a tool call's approval is
+       *  resolved (allowed / denied / deferred), carrying the decision so the
+       *  SPA can dismiss its modal and observers can audit the outcome. */
+      type: "approval_resolved";
+      id: string;
+      decision: ApprovalDecision;
+    }
   | {
       /** v0.16 §11 — the model called `ask_user`; the host (serve) will
        *  persist a pending annotation and end the stream so the user can
@@ -297,6 +318,14 @@ export interface ChatSessionOptions {
    * SAME scheduler to both fields when both compact and dispatch are wanted.
    */
   scheduler?: SubagentScheduler;
+  /**
+   * Approval broker (Approval Policy 矩阵). When set, every high-risk tool
+   * call (per its `riskClass`) is routed through the broker before execution:
+   * it may run silently, run after host-prompted approval, be denied, or be
+   * deferred (run then ask on failure). When unset, tools execute with the
+   * legacy zero-approval behaviour (backward-compatible).
+   */
+  approvalBroker?: ApprovalBroker;
   /**
    * MATHRAN.md memory injection (v0.3 §14). When `enabled: true`, the
    * constructor synchronously reads `~/.mathran/MATHRAN.md` (global) and
@@ -483,6 +512,8 @@ export class ChatSession {
   /** v0.5 §7 — absolute paths read this session (read-before-write gate). */
   private readonly readPaths = new Set<string>();
   private readonly builtinToolsCfg?: ChatSessionOptions["builtinTools"];
+  /** Approval broker (Approval Policy 矩阵). Optional; gates high-risk tools. */
+  private readonly approvalBroker?: ApprovalBroker;
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
   private messages: LLMMessage[] = [];
@@ -516,6 +547,7 @@ export class ChatSession {
     // pass the latter (for compact) automatically get dispatch too.
     this.dispatchScheduler = opts.scheduler ?? opts.subagentScheduler;
     this.builtinToolsCfg = opts.builtinTools;
+    this.approvalBroker = opts.approvalBroker;
     // Mix in built-in tools (v0.2 §9+). Order: built-ins first, then caller's
     // tools (so a caller-supplied tool with the same name wins via the
     // `toolByName` map's last-write).
@@ -730,10 +762,61 @@ export class ChatSession {
   }
 
   /**
-   * Construct the `search` ToolSpec (v0.2 §8). Closure captures `this` so
-   * the tool lazily resolves `getOrBuildScheduler()` at call time — matches
-   * the compact / read_file_summary lazy-init pattern.
+   * Run a tool through the approval broker (Approval Policy 矩阵), then execute
+   * it (or not) per the verdict. Returns the tool result the loop feeds back to
+   * the model. When no broker is wired, or the tool carries no `riskClass`,
+   * this is a thin pass-through to `tool.execute` (legacy zero-approval
+   * behaviour).
+   *
+   * The broker's host resolver may throw `ApprovalPending` (serve mode) — that
+   * propagates out so the dispatch loop's catch can escape the round. CLI's
+   * readline resolver resolves synchronously and never throws.
    */
+  private async executeWithApproval(
+    tool: ToolSpec,
+    call: { id: string; name: string },
+    parsed: Record<string, unknown>,
+    callCtx: ToolExecuteContext,
+  ): Promise<{ ok: boolean; content: string }> {
+    const broker = this.approvalBroker;
+    if (!broker || !tool.riskClass) {
+      return tool.execute(parsed, callCtx);
+    }
+    const authCall = {
+      tool: call.name,
+      riskClass: tool.riskClass,
+      args: parsed,
+      id: call.id,
+    };
+    const auth = await broker.authorize(authCall);
+    if (auth.kind === "deny") {
+      return {
+        ok: false,
+        content: `⛔ tool call denied by approval policy: ${auth.reason}`,
+      };
+    }
+    if (auth.kind === "allow") {
+      return tool.execute(parsed, callCtx);
+    }
+    // auth.kind === "defer-on-failure": run, then ask retry/abandon on failure.
+    let result = await tool.execute(parsed, callCtx);
+    let guard = 0;
+    const MAX_RETRIES = 5;
+    while (!result.ok && guard < MAX_RETRIES) {
+      const failure = await broker.onFailure(authCall, result.content);
+      if (failure.kind === "retry") {
+        result = await tool.execute(parsed, callCtx);
+        guard++;
+        continue;
+      }
+      return {
+        ok: false,
+        content: `⛔ tool failed and the user abandoned it: ${failure.reason}\n\n--- original failure ---\n${result.content}`,
+      };
+    }
+    return result;
+  }
+
   private makeSearchTool(): ToolSpec {
     const self = this;
     return {
@@ -1234,8 +1317,41 @@ export class ChatSession {
                       : path.resolve(this.workspace ?? "", p),
                   ),
               };
-              result = await tool.execute(parsed, callCtx);
+              result = await this.executeWithApproval(
+                tool,
+                call,
+                parsed,
+                callCtx,
+              );
             } catch (err: any) {
+              if (isApprovalPending(err)) {
+                // Approval Policy 矩阵 — a serve-mode approval prompt bailed
+                // out of the loop. Keep history well-formed (placeholder tool
+                // messages, same as the ask_user path), surface the request to
+                // the SPA via an `approval_request` event, then re-throw so the
+                // serve route can persist the pending decision and end the
+                // stream. A `POST …/approval/:id` resumes the round.
+                this.messages.push({
+                  role: "tool",
+                  content: APPROVAL_PENDING_PLACEHOLDER,
+                  toolCallId: call.id,
+                  name: call.name,
+                });
+                for (let ri = ci + 1; ri < toolCalls.length; ri++) {
+                  const pending = toolCalls[ri];
+                  this.messages.push({
+                    role: "tool",
+                    content: "[skipped: prior approval pending]",
+                    toolCallId: pending.id,
+                    name: pending.name,
+                  });
+                }
+                yield {
+                  type: "approval_request",
+                  request: (err as ApprovalPending).request,
+                };
+                throw err;
+              }
               if (isAskUserPending(err)) {
                 // v0.16 §11: bail out of the LLM loop so the serve route can
                 // persist a `pendingAsk` annotation and end the SSE stream.

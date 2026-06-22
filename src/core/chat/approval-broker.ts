@@ -48,6 +48,12 @@ export interface ApprovalCall {
   riskClass: RiskClass;
   args: Record<string, unknown>;
   rationale?: string;
+  /**
+   * Stable id for the resulting {@link ApprovalRequest}. The session passes the
+   * provider tool-call id so a serve resume can correlate the decision. When
+   * omitted, a random uuid is generated.
+   */
+  id?: string;
 }
 
 /** The broker's verdict for the pre-execution phase. */
@@ -196,7 +202,7 @@ export class ApprovalBroker {
     trigger: ApprovalRequest["trigger"],
   ): ApprovalRequest {
     return {
-      id: randomUUID(),
+      id: call.id ?? randomUUID(),
       tool: call.tool,
       riskClass: call.riskClass,
       trigger,
