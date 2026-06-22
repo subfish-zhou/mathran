@@ -203,3 +203,90 @@ describe("ApprovalBroker — learning mode", () => {
     expect(broker.sessionRulesSnapshot).toHaveLength(0);
   });
 });
+
+describe("ApprovalBroker.preCheck / resolveDecision (yield-based host)", () => {
+  it("preCheck denies via denylist without a resolver", async () => {
+    const broker = new ApprovalBroker({
+      policy: "never",
+      denylist: ["bash:rm -rf *"],
+    });
+    const res = await broker.preCheck({
+      tool: "bash",
+      riskClass: "exec",
+      args: { command: "rm -rf /" },
+    });
+    expect(res.kind).toBe("deny");
+  });
+
+  it("preCheck allows read regardless of policy", async () => {
+    const broker = new ApprovalBroker({ policy: "on-request" });
+    const res = await broker.preCheck({
+      tool: "read_file",
+      riskClass: "read",
+      args: {},
+    });
+    expect(res).toEqual({ kind: "allow" });
+  });
+
+  it("preCheck returns ask + request for high-risk on-request", async () => {
+    const broker = new ApprovalBroker({ policy: "on-request" });
+    const res = await broker.preCheck({
+      tool: "bash",
+      riskClass: "exec",
+      args: { command: "ls" },
+      id: "call-1",
+    });
+    expect(res.kind).toBe("ask");
+    if (res.kind === "ask") {
+      expect(res.request.id).toBe("call-1");
+      expect(res.request.tool).toBe("bash");
+      expect(res.request.riskClass).toBe("exec");
+    }
+  });
+
+  it("preCheck returns defer-on-failure for on-failure policy", async () => {
+    const broker = new ApprovalBroker({ policy: "on-failure" });
+    const res = await broker.preCheck({
+      tool: "bash",
+      riskClass: "exec",
+      args: { command: "ls" },
+    });
+    expect(res).toEqual({ kind: "defer-on-failure" });
+  });
+
+  it("resolveDecision honors allow and deny + records side effects", async () => {
+    const broker = new ApprovalBroker({ policy: "on-request", learning: false });
+    const call = { tool: "bash", riskClass: "exec" as const, args: { command: "ls" } };
+    expect(await broker.resolveDecision(call, { outcome: "allow_once" })).toEqual({
+      kind: "allow",
+    });
+    expect(await broker.resolveDecision(call, { outcome: "deny", reason: "x" })).toEqual({
+      kind: "deny",
+      reason: "x",
+    });
+  });
+
+  it("resolveDecision allow_session installs a session rule", async () => {
+    const broker = new ApprovalBroker({ policy: "on-request", learning: false });
+    const call = { tool: "bash", riskClass: "exec" as const, args: { command: "ls" } };
+    await broker.resolveDecision(call, { outcome: "allow_session" });
+    expect(broker.sessionRulesSnapshot.length).toBeGreaterThan(0);
+    // Subsequent preCheck for the same prefix is auto-allowed.
+    const res = await broker.preCheck(call);
+    expect(res).toEqual({ kind: "allow" });
+  });
+
+  it("buildFailureRequest + applyFailureDecision map retry/abandon", async () => {
+    const broker = new ApprovalBroker({ policy: "on-failure" });
+    const req = broker.buildFailureRequest(
+      { tool: "bash", riskClass: "exec", args: { command: "ls" } },
+      "boom",
+    );
+    expect(req.trigger).toBe("on-failure");
+    expect(req.rationale).toBe("boom");
+    expect(broker.applyFailureDecision({ outcome: "retry" })).toEqual({ kind: "retry" });
+    expect(
+      broker.applyFailureDecision({ outcome: "abandon", reason: "stop" }),
+    ).toEqual({ kind: "abandon", reason: "stop" });
+  });
+});

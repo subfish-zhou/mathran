@@ -62,6 +62,14 @@ export type AuthorizeResult =
   | { kind: "deny"; reason: string }
   | { kind: "defer-on-failure" };
 
+/**
+ * Result of {@link ApprovalBroker.preCheck}: either a terminal verdict, or an
+ * `ask` carrying the {@link ApprovalRequest} the host must surface.
+ */
+export type PreCheckResult =
+  | AuthorizeResult
+  | { kind: "ask"; request: ApprovalRequest };
+
 /** The broker's verdict for the post-failure phase (`on-failure` policy). */
 export type FailureResult =
   | { kind: "retry" }
@@ -214,9 +222,15 @@ export class ApprovalBroker {
 
   /**
    * Pre-execution authorization. Returns whether the call may run, must be
-   * denied, or should be deferred (run then ask on failure).
+   * denied, deferred (run then ask on failure), or needs a user prompt.
+   *
+   * When the verdict is `ask`, the caller (ChatSession) is responsible for
+   * surfacing `request` to the user and feeding the decision back through
+   * {@link resolveDecision}. This split lets the session yield an
+   * `approval_request` event around the (possibly long) user interaction —
+   * which serve mode needs to keep its SSE stream alive.
    */
-  async authorize(call: ApprovalCall): Promise<AuthorizeResult> {
+  async preCheck(call: ApprovalCall): Promise<PreCheckResult> {
     const { tool, riskClass, args } = call;
 
     // 1. Denylist veto.
@@ -240,25 +254,58 @@ export class ApprovalBroker {
     if (outcome === "pass") return { kind: "allow" };
     if (outcome === "ask-on-failure") return { kind: "defer-on-failure" };
 
-    // outcome === "ask" — prompt the user.
+    // outcome === "ask" — a user prompt is required.
     const trigger: ApprovalRequest["trigger"] =
       this.policy === "untrusted" ? "untrusted" : "policy";
+    return { kind: "ask", request: this.buildRequest(call, trigger) };
+  }
+
+  /**
+   * Pre-execution authorization with the broker's own resolver driving the
+   * prompt (used by the CLI host + tests). Falls back to a fail-safe deny when
+   * a prompt is required but no resolver is wired.
+   */
+  async authorize(call: ApprovalCall): Promise<AuthorizeResult> {
+    const pre = await this.preCheck(call);
+    if (pre.kind !== "ask") return pre;
     if (!this.resolver) {
-      // Fail-safe: no human / UI available to approve → deny.
       return {
         kind: "deny",
         reason:
           "auto-denied: no approval resolver available (non-interactive host)",
       };
     }
-    const request = this.buildRequest(call, trigger);
-    const decision = await this.resolver(request);
-    return this.applyDecision(call, decision);
+    const decision = await this.resolver(pre.request);
+    return this.resolveDecision(call, decision);
   }
 
   /**
-   * The post-failure phase for `on-failure` policy: the tool already ran and
-   * failed. Ask the user to retry or abandon.
+   * Build the {@link ApprovalRequest} for the post-failure (`on-failure`)
+   * retry prompt. The host surfaces it and feeds the decision to
+   * {@link applyFailureDecision}.
+   */
+  buildFailureRequest(
+    call: ApprovalCall,
+    failureContent: string,
+  ): ApprovalRequest {
+    return this.buildRequest(
+      { ...call, rationale: failureContent },
+      "on-failure",
+    );
+  }
+
+  /** Map a post-failure user decision to retry / abandon. */
+  applyFailureDecision(decision: ApprovalDecision): FailureResult {
+    if (decision.outcome === "retry") return { kind: "retry" };
+    return {
+      kind: "abandon",
+      reason: decision.reason ?? "user abandoned after failure",
+    };
+  }
+
+  /**
+   * The post-failure phase for `on-failure` policy with the broker's own
+   * resolver driving the prompt (CLI host + tests).
    */
   async onFailure(
     call: ApprovalCall,
@@ -270,16 +317,23 @@ export class ApprovalBroker {
         reason: "tool failed and no approval resolver is available to retry",
       };
     }
-    const request = this.buildRequest(
-      { ...call, rationale: failureContent },
-      "on-failure",
+    const decision = await this.resolver(
+      this.buildFailureRequest(call, failureContent),
     );
-    const decision = await this.resolver(request);
-    if (decision.outcome === "retry") return { kind: "retry" };
-    return {
-      kind: "abandon",
-      reason: decision.reason ?? "user abandoned after failure",
-    };
+    return this.applyFailureDecision(decision);
+  }
+
+  /**
+   * Translate a user decision (from a host prompt) into an
+   * {@link AuthorizeResult} plus side effects (session rules, learning
+   * history, rule proposals). Public so the session can drive the prompt
+   * itself (serve) and feed the decision back.
+   */
+  async resolveDecision(
+    call: ApprovalCall,
+    decision: ApprovalDecision,
+  ): Promise<AuthorizeResult> {
+    return this.applyDecision(call, decision);
   }
 
   /** Translate a user decision into an {@link AuthorizeResult} + side effects. */

@@ -143,6 +143,85 @@ describe("ChatSession × approval broker", () => {
     expect(tool.ran).toBe(1);
   });
 
+  it("yields approval_request + approval_resolved with a session resolver", async () => {
+    const tool = makeRecordingTool();
+    const llm = new ScriptedLLM(callDangerThenStop());
+    const broker = new ApprovalBroker({ policy: "on-request", learning: false });
+    const session = new ChatSession({
+      llm,
+      tools: [tool],
+      approvalBroker: broker,
+      approvalResolver: async (): Promise<ApprovalDecision> => ({
+        outcome: "allow_once",
+      }),
+    });
+    const events = await collect(session.send("go"));
+    expect(tool.ran).toBe(1);
+    const req = events.find((e) => e.type === "approval_request");
+    const res = events.find((e) => e.type === "approval_resolved");
+    expect(req).toBeTruthy();
+    expect((req as any).request.tool).toBe("danger");
+    expect((req as any).request.id).toBe("c1");
+    expect(res).toBeTruthy();
+    expect((res as any).id).toBe("c1");
+    expect((res as any).decision.outcome).toBe("allow_once");
+  });
+
+  it("session resolver deny blocks the tool", async () => {
+    const tool = makeRecordingTool();
+    const llm = new ScriptedLLM(callDangerThenStop());
+    const broker = new ApprovalBroker({ policy: "on-request", learning: false });
+    const session = new ChatSession({
+      llm,
+      tools: [tool],
+      approvalBroker: broker,
+      approvalResolver: async (): Promise<ApprovalDecision> => ({
+        outcome: "deny",
+        reason: "nope",
+      }),
+    });
+    const events = await collect(session.send("go"));
+    expect(tool.ran).toBe(0);
+    const tr = events.find((e) => e.type === "tool-result");
+    expect(tr && (tr as any).content).toContain("nope");
+  });
+
+  it("session resolver with no resolver but ask policy fails safe to deny", async () => {
+    // approvalResolver set but throwing? Use broker without resolver and no
+    // session resolver → broker.authorize auto-denies.
+    const tool = makeRecordingTool();
+    const llm = new ScriptedLLM(callDangerThenStop());
+    const broker = new ApprovalBroker({ policy: "on-request", learning: false });
+    const session = new ChatSession({ llm, tools: [tool], approvalBroker: broker });
+    const events = await collect(session.send("go"));
+    expect(tool.ran).toBe(0);
+    const tr = events.find((e) => e.type === "tool-result");
+    expect(tr && (tr as any).content).toContain("auto-denied");
+  });
+
+  it("session resolver on-failure yields failure prompts", async () => {
+    const tool = makeRecordingTool({ fail: true });
+    const llm = new ScriptedLLM(callDangerThenStop());
+    const broker = new ApprovalBroker({ policy: "on-failure", learning: false });
+    let n = 0;
+    const session = new ChatSession({
+      llm,
+      tools: [tool],
+      approvalBroker: broker,
+      approvalResolver: async (): Promise<ApprovalDecision> => {
+        n++;
+        return n === 1
+          ? { outcome: "retry" }
+          : { outcome: "abandon", reason: "give up" };
+      },
+    });
+    const events = await collect(session.send("go"));
+    expect(tool.ran).toBe(2);
+    const reqs = events.filter((e) => e.type === "approval_request");
+    expect(reqs.length).toBe(2);
+    expect((reqs[0] as any).request.trigger).toBe("on-failure");
+  });
+
   it("session rule auto-approves a second call", async () => {
     const tool = makeRecordingTool();
     const llm = new ScriptedLLM([

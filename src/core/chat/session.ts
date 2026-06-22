@@ -60,12 +60,7 @@ import {
 import { createProposeGoalTool } from "./tools/propose-goal.js";
 import { createProposePlanTool } from "./tools/propose-plan.js";
 import { ApprovalBroker } from "./approval-broker.js";
-import type { RiskClass, ApprovalRequest, ApprovalDecision } from "../approval/types.js";
-import {
-  ApprovalPending,
-  isApprovalPending,
-  APPROVAL_PENDING_PLACEHOLDER,
-} from "../approval/pending.js";
+import type { RiskClass, ApprovalRequest, ApprovalDecision, ApprovalResolver } from "../approval/types.js";
 import * as path from "node:path";
 
 /**
@@ -327,6 +322,16 @@ export interface ChatSessionOptions {
    */
   approvalBroker?: ApprovalBroker;
   /**
+   * Session-level approval resolver (Approval Policy 矩阵). When set together
+   * with {@link approvalBroker}, approval prompts are driven by the session
+   * itself: it yields an `approval_request` event, awaits this resolver for the
+   * decision, yields `approval_resolved`, then continues executing the tool
+   * in-place. This keeps long-lived transports (serve's SSE stream) open across
+   * the user interaction. When unset, the broker's own resolver (if any) drives
+   * the prompt; with neither, prompts fail safe to deny.
+   */
+  approvalResolver?: ApprovalResolver;
+  /**
    * MATHRAN.md memory injection (v0.3 §14). When `enabled: true`, the
    * constructor synchronously reads `~/.mathran/MATHRAN.md` (global) and
    * `<workspace>/MATHRAN.md` (project) and prepends a single system message
@@ -514,6 +519,8 @@ export class ChatSession {
   private readonly builtinToolsCfg?: ChatSessionOptions["builtinTools"];
   /** Approval broker (Approval Policy 矩阵). Optional; gates high-risk tools. */
   private readonly approvalBroker?: ApprovalBroker;
+  /** Session-level approval resolver (yield-based prompt driver). */
+  private readonly approvalResolver?: ApprovalResolver;
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
   private messages: LLMMessage[] = [];
@@ -548,6 +555,7 @@ export class ChatSession {
     this.dispatchScheduler = opts.scheduler ?? opts.subagentScheduler;
     this.builtinToolsCfg = opts.builtinTools;
     this.approvalBroker = opts.approvalBroker;
+    this.approvalResolver = opts.approvalResolver;
     // Mix in built-in tools (v0.2 §9+). Order: built-ins first, then caller's
     // tools (so a caller-supplied tool with the same name wins via the
     // `toolByName` map's last-write).
@@ -763,24 +771,25 @@ export class ChatSession {
 
   /**
    * Run a tool through the approval broker (Approval Policy 矩阵), then execute
-   * it (or not) per the verdict. Returns the tool result the loop feeds back to
-   * the model. When no broker is wired, or the tool carries no `riskClass`,
-   * this is a thin pass-through to `tool.execute` (legacy zero-approval
-   * behaviour).
+   * it (or not) per the verdict. An async generator: it yields `approval_request`
+   * / `approval_resolved` events around any user prompt and **returns** the tool
+   * result the loop feeds back to the model (consume via `yield*`). When no
+   * broker is wired, or the tool carries no `riskClass`, this is a thin
+   * pass-through to `tool.execute` (legacy zero-approval behaviour).
    *
-   * The broker's host resolver may throw `ApprovalPending` (serve mode) — that
-   * propagates out so the dispatch loop's catch can escape the round. CLI's
-   * readline resolver resolves synchronously and never throws.
+   * Prompts are driven by the session-level {@link approvalResolver} when set
+   * (yield-based, keeps serve's SSE stream open); otherwise the broker's own
+   * resolver drives them (CLI/tests). With neither, prompts fail safe to deny.
    */
-  private async executeWithApproval(
+  private async *executeWithApproval(
     tool: ToolSpec,
     call: { id: string; name: string },
     parsed: Record<string, unknown>,
     callCtx: ToolExecuteContext,
-  ): Promise<{ ok: boolean; content: string }> {
+  ): AsyncGenerator<ChatEvent, { ok: boolean; content: string }, void> {
     const broker = this.approvalBroker;
     if (!broker || !tool.riskClass) {
-      return tool.execute(parsed, callCtx);
+      return await tool.execute(parsed, callCtx);
     }
     const authCall = {
       tool: call.name,
@@ -788,22 +797,87 @@ export class ChatSession {
       args: parsed,
       id: call.id,
     };
-    const auth = await broker.authorize(authCall);
-    if (auth.kind === "deny") {
+
+    // When no session-level resolver is wired, defer entirely to the broker's
+    // own resolver (CLI/tests) — no event yielding needed.
+    if (!this.approvalResolver) {
+      const auth = await broker.authorize(authCall);
+      if (auth.kind === "deny") {
+        return {
+          ok: false,
+          content: `⛔ tool call denied by approval policy: ${auth.reason}`,
+        };
+      }
+      if (auth.kind === "allow") {
+        return await tool.execute(parsed, callCtx);
+      }
+      return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, null);
+    }
+
+    // Session-driven (yield-based) prompt flow.
+    const resolver = this.approvalResolver;
+    const pre = await broker.preCheck(authCall);
+    if (pre.kind === "deny") {
       return {
         ok: false,
-        content: `⛔ tool call denied by approval policy: ${auth.reason}`,
+        content: `⛔ tool call denied by approval policy: ${pre.reason}`,
       };
     }
-    if (auth.kind === "allow") {
-      return tool.execute(parsed, callCtx);
+    if (pre.kind === "allow") {
+      return await tool.execute(parsed, callCtx);
     }
-    // auth.kind === "defer-on-failure": run, then ask retry/abandon on failure.
+    if (pre.kind === "defer-on-failure") {
+      return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, resolver);
+    }
+    // pre.kind === "ask": surface the request, await the decision, continue.
+    yield { type: "approval_request", request: pre.request };
+    const decision = await resolver(pre.request);
+    yield { type: "approval_resolved", id: pre.request.id, decision };
+    const verdict = await broker.resolveDecision(authCall, decision);
+    if (verdict.kind === "deny") {
+      return {
+        ok: false,
+        content: `⛔ tool call denied by approval policy: ${verdict.reason}`,
+      };
+    }
+    if (verdict.kind === "defer-on-failure") {
+      return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, resolver);
+    }
+    return await tool.execute(parsed, callCtx);
+  }
+
+  /**
+   * `on-failure` policy: run the tool, then on failure ask retry/abandon. When
+   * `resolver` is set, prompts are yield-based (serve); otherwise the broker's
+   * own resolver drives them (CLI/tests).
+   */
+  private async *runDeferOnFailure(
+    tool: ToolSpec,
+    authCall: {
+      tool: string;
+      riskClass: RiskClass;
+      args: Record<string, unknown>;
+      id: string;
+    },
+    parsed: Record<string, unknown>,
+    callCtx: ToolExecuteContext,
+    resolver: ApprovalResolver | null,
+  ): AsyncGenerator<ChatEvent, { ok: boolean; content: string }, void> {
+    const broker = this.approvalBroker!;
     let result = await tool.execute(parsed, callCtx);
     let guard = 0;
     const MAX_RETRIES = 5;
     while (!result.ok && guard < MAX_RETRIES) {
-      const failure = await broker.onFailure(authCall, result.content);
+      let failure;
+      if (resolver) {
+        const request = broker.buildFailureRequest(authCall, result.content);
+        yield { type: "approval_request", request };
+        const decision = await resolver(request);
+        yield { type: "approval_resolved", id: request.id, decision };
+        failure = broker.applyFailureDecision(decision);
+      } else {
+        failure = await broker.onFailure(authCall, result.content);
+      }
       if (failure.kind === "retry") {
         result = await tool.execute(parsed, callCtx);
         guard++;
@@ -1317,41 +1391,13 @@ export class ChatSession {
                       : path.resolve(this.workspace ?? "", p),
                   ),
               };
-              result = await this.executeWithApproval(
+              result = yield* this.executeWithApproval(
                 tool,
                 call,
                 parsed,
                 callCtx,
               );
             } catch (err: any) {
-              if (isApprovalPending(err)) {
-                // Approval Policy 矩阵 — a serve-mode approval prompt bailed
-                // out of the loop. Keep history well-formed (placeholder tool
-                // messages, same as the ask_user path), surface the request to
-                // the SPA via an `approval_request` event, then re-throw so the
-                // serve route can persist the pending decision and end the
-                // stream. A `POST …/approval/:id` resumes the round.
-                this.messages.push({
-                  role: "tool",
-                  content: APPROVAL_PENDING_PLACEHOLDER,
-                  toolCallId: call.id,
-                  name: call.name,
-                });
-                for (let ri = ci + 1; ri < toolCalls.length; ri++) {
-                  const pending = toolCalls[ri];
-                  this.messages.push({
-                    role: "tool",
-                    content: "[skipped: prior approval pending]",
-                    toolCallId: pending.id,
-                    name: pending.name,
-                  });
-                }
-                yield {
-                  type: "approval_request",
-                  request: (err as ApprovalPending).request,
-                };
-                throw err;
-              }
               if (isAskUserPending(err)) {
                 // v0.16 §11: bail out of the LLM loop so the serve route can
                 // persist a `pendingAsk` annotation and end the SSE stream.
