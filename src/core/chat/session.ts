@@ -330,6 +330,14 @@ export interface ChatSessionOptions {
    */
   approvalBroker?: ApprovalBroker;
   /**
+   * Hooks runner (PreEdit / PostEdit / PreCommit / PreBash / PostTool /
+   * OnGoalComplete). When set, the session threads it into every tool's
+   * {@link ToolExecuteContext} (so write/edit/bash fire their own pre/post
+   * hooks), runs `post-tool` after each tool call, and runs `on-goal-complete`
+   * when a user turn finishes. Unset → hooks are entirely inert.
+   */
+  hooks?: HookInvoker;
+  /**
    * Session-level approval resolver (Approval Policy 矩阵). When set together
    * with {@link approvalBroker}, approval prompts are driven by the session
    * itself: it yields an `approval_request` event, awaits this resolver for the
@@ -527,6 +535,8 @@ export class ChatSession {
   private readonly builtinToolsCfg?: ChatSessionOptions["builtinTools"];
   /** Approval broker (Approval Policy 矩阵). Optional; gates high-risk tools. */
   private readonly approvalBroker?: ApprovalBroker;
+  /** Hooks runner (PreEdit/PostEdit/PreCommit/PreBash/PostTool/OnGoalComplete). */
+  private readonly hookInvoker?: HookInvoker;
   /** Session-level approval resolver (yield-based prompt driver). */
   private readonly approvalResolver?: ApprovalResolver;
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
@@ -564,6 +574,7 @@ export class ChatSession {
     this.builtinToolsCfg = opts.builtinTools;
     this.approvalBroker = opts.approvalBroker;
     this.approvalResolver = opts.approvalResolver;
+    this.hookInvoker = opts.hooks;
     // Mix in built-in tools (v0.2 §9+). Order: built-ins first, then caller's
     // tools (so a caller-supplied tool with the same name wins via the
     // `toolByName` map's last-write).
@@ -1205,6 +1216,15 @@ export class ChatSession {
    * place means adding new entry points (resume, slash-command-driven
    * LLM call, …) doesn't drift on history bookkeeping.
    */
+  /** The text of the most recent user message (for on-goal-complete). */
+  private lastUserText(): string {
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      const m = this.messages[i];
+      if (m.role === "user" && typeof m.content === "string") return m.content;
+    }
+    return "";
+  }
+
   private async *runRounds(opts: SendOpts): AsyncIterable<ChatEvent> {
     const signal = opts.signal;
     const steerProbe = opts.steerProbe;
@@ -1314,6 +1334,17 @@ export class ChatSession {
       this.messages.push(assistantMessage);
 
       if (toolCalls.length === 0) {
+        // on-goal-complete hooks — the model finished the user's request this
+        // turn. Only fired when such hooks exist (zero-cost otherwise) so a
+        // plain chat turn doesn't spawn processes. Non-blocking.
+        if (this.hookInvoker && this.hookInvoker.hooksForType("on-goal-complete").length > 0) {
+          const done = await this.hookInvoker.run("on-goal-complete", {
+            goalText: this.lastUserText(),
+          });
+          if (done.summary) {
+            this.messages.push({ role: "system", content: done.summary });
+          }
+        }
         yield { type: "done", finishReason };
         return;
       }
@@ -1386,6 +1417,7 @@ export class ChatSession {
               const callCtx: ToolExecuteContext = {
                 ...this.toolContext,
                 toolCallId: call.id,
+                ...(this.hookInvoker ? { hooks: this.hookInvoker } : {}),
                 recordRead: (p: string) =>
                   this.readPaths.add(
                     path.isAbsolute(p)
@@ -1470,6 +1502,18 @@ export class ChatSession {
           ok: result.ok,
           content: result.content,
         };
+
+        // post-tool hooks — fire after every tool call (non-blocking). Their
+        // output is injected as a system message so the model sees what the
+        // hook did without polluting the tool_call/tool_result pairing.
+        if (this.hookInvoker) {
+          const post = await this.hookInvoker.run("post-tool", {
+            toolName: call.name,
+          });
+          if (post.summary) {
+            this.messages.push({ role: "system", content: post.summary });
+          }
+        }
       }
       // Loop again so the model can react to the tool results.
     }
