@@ -362,7 +362,11 @@ const HELP_TEXT = `commands:
   /model [model]           show or switch the active model (resets history)
   /save [path]             save history to a Markdown transcript (default ./mathran-chat-<ts>.md)
   /load <path>             load history from a .jsonl file (the disk format used by serve)
-type anything else to chat; Ctrl-C / Ctrl-D also quit.`;
+type anything else to chat; Ctrl-C / Ctrl-D also quit.
+
+models: use \`provider/model\` syntax in config.toml or the --model flag
+  (e.g. --model copilot/claude-opus-4.8). dispatch_subagent accepts an
+  optional per-subagent \`model\` override; see /agents for recommended picks.`;
 
 const MEMORY_HELP_TEXT = `/memory commands:
   /memory                  print both memory files (with paths and byte counts)
@@ -515,10 +519,17 @@ export async function handleSlashCommand(
     }
 
     case "/agents": {
-      const kinds = defaultSubagentRegistry().list();
+      const reg = defaultSubagentRegistry();
+      const meta = reg.listWithMeta();
+      const recommended: Record<string, string | undefined> = {};
+      for (const m of meta) recommended[m.type] = m.recommendedModel;
       return {
         kind: "continue",
-        output: formatAgentsList({ kinds, active: [] }),
+        output: formatAgentsList({
+          kinds: meta.map((m) => m.type),
+          active: [],
+          recommended,
+        }),
       };
     }
 
