@@ -11,7 +11,7 @@
  *     persisted `LLMMessage[]`.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { marked } from "marked";
 // v0.17 follow-up: KaTeX + LLM-math-delimiter preprocess registration
 // has moved to `lib/markdown.ts` which is imported once from `main.tsx`.
@@ -43,7 +43,7 @@ import GoalAutonomyCard from "./GoalAutonomyCard.tsx";
 import { TodoListPanel } from "./TodoListPanel.tsx";
 import PlanRunOverlay from "./PlanRunOverlay.tsx";
 import { AgentStatusPanel, type ChatEventPhase } from "./AgentStatusPanel.tsx";
-import { api, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
+import { api, chatScopeBase, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
 import {
   historyToBubbles,
   type Bubble,
@@ -62,6 +62,22 @@ import ContextMeter from "./ContextMeter.tsx";
 import ToolCallGroup from "./ToolCallGroup.tsx";
 import { ThreadDrawer } from "./ThreadDrawer.tsx";
 import { SubagentTreePanel } from "./SubagentTreePanel.tsx";
+import SlashSuggester from "./SlashSuggester.tsx";
+import {
+  parseSlashInput,
+  activeSlashPrefix,
+  buildSuggesterItems,
+  filterCommands,
+  moveSelection,
+  fetchSlashCommands,
+  fetchSkills,
+  fetchActiveAgents,
+  postChatSlash,
+  parseCdTarget,
+  buildCustomPromptFromItem,
+  REVIEW_FALLBACK_PROMPT,
+  type SuggesterItem,
+} from "../lib/slash-commands.ts";
 
 /**
  * Build the `GET /api/uploads/<encoded-path>` URL for a persisted
@@ -277,6 +293,13 @@ export default function ChatPanel({
     | { id: string; status: "error"; filename: string; error: string };
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
+
+  // ─── Slash commands (SPA Slash Commands task) ──────────────────────────
+  // Full builtin+custom suggester list, fetched once on mount (best-effort).
+  const [slashItems, setSlashItems] = useState<SuggesterItem[]>([]);
+  // Highlighted row index within the *filtered* suggester list.
+  const [slashSelected, setSlashSelected] = useState(0);
+  const navigate = useNavigate();
   // Lightbox state for clicking an image chip in a user bubble. Holds the
   // attachment ref we're previewing; null = closed. Escape / backdrop
   // click clears it. Decoupled from the chip render so any image chip,
@@ -918,10 +941,256 @@ export default function ChatPanel({
     }
   }
 
+  // ─── Slash commands: load list, derive filter, dispatch ────────────────
+  // Fetch builtin + custom commands once on mount. Best-effort: the lib
+  // falls back to the builtin-only list if the endpoint is unreachable so
+  // the suggester always works.
+  useEffect(() => {
+    let cancelled = false;
+    void fetchSlashCommands().then((res) => {
+      if (cancelled) return;
+      setSlashItems(buildSuggesterItems(res.builtin, res.custom));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // The prefix currently being typed after `/` (null once a space is typed
+  // or the text isn't a slash invocation). Drives the suggester filter.
+  const slashPrefix = activeSlashPrefix(input);
+  const slashFiltered = useMemo(
+    () => (slashPrefix === null ? [] : filterCommands(slashItems, slashPrefix)),
+    [slashItems, slashPrefix],
+  );
+  // Open while typing a command name that matches ≥1 command, and not while
+  // a stream is in flight (Enter steers when busy — see onKeyDown).
+  const slashOpen = !busy && slashPrefix !== null && slashFiltered.length > 0;
+
+  // Clamp the highlight whenever the filtered list shrinks/changes.
+  useEffect(() => {
+    setSlashSelected((s) => (s >= slashFiltered.length ? 0 : s));
+  }, [slashFiltered.length]);
+
+  // Set of command names the composer recognises (builtin + custom). Anything
+  // else starting with `/` is treated as ordinary chat text.
+  const recognizedSlashNames = useMemo(
+    () => new Set(slashItems.map((i) => i.name)),
+    [slashItems],
+  );
+
+  // Append a local, non-persisted info bubble (used by client-only query
+  // commands like /skills, /agents, /context). These are informational and
+  // intentionally not written to server history (MVP).
+  const pushInfoBubble = useCallback((text: string) => {
+    setBubbles((b) => [...b, { kind: "assistant", text }]);
+  }, []);
+
+  // Accept the highlighted suggester item: complete the composer to
+  // `/<name> ` and keep focus so the user can type args.
+  const acceptSlashItem = useCallback((item: SuggesterItem) => {
+    setInput(`/${item.name} `);
+    setSlashSelected(0);
+    composerRef.current?.focus();
+  }, []);
+
+  /**
+   * Handle a recognised slash command. Returns either `{ handled: true }`
+   * (fully handled client-side — caller should stop) or
+   * `{ handled: false, chatText }` (the command expands into a normal chat
+   * turn the caller should send, e.g. custom commands and /review).
+   *
+   * MVP stubs (PLAN decision #2): /review sends a preset prompt, /diff shows
+   * a toast, /effort only stores the level.
+   */
+  const dispatchSlashCommand = useCallback(
+    async (
+      name: string,
+      args: string,
+    ): Promise<{ handled: true } | { handled: false; chatText: string }> => {
+      // Custom command → inject its body (with $ARGUMENTS) as a chat turn.
+      const custom = slashItems.find((i) => i.source === "custom" && i.name === name);
+      if (custom) {
+        return { handled: false, chatText: buildCustomPromptFromItem(custom, args) };
+      }
+
+      switch (name) {
+        case "skills": {
+          setInput("");
+          const skills = await fetchSkills();
+          if (skills.length === 0) {
+            pushInfoBubble("**/skills** — no skills found in any layer.");
+          } else {
+            const lines = skills
+              .map((s) => `- \`${s.name}\` _(${s.layer})_${s.description ? ` — ${s.description}` : ""}`)
+              .join("\n");
+            pushInfoBubble(`**Skills (${skills.length})**\n\n${lines}`);
+          }
+          return { handled: true };
+        }
+
+        case "agents": {
+          setInput("");
+          const { kinds, active } = await fetchActiveAgents();
+          const kindLine = kinds.length ? kinds.map((k) => `\`${k}\``).join(", ") : "_(none)_";
+          const activeLine = active.length
+            ? active.map((a) => `- ${a.id} (${a.type})${a.status ? ` — ${a.status}` : ""}`).join("\n")
+            : "_(none running)_";
+          pushInfoBubble(
+            `**Sub-agents**\n\nAvailable kinds: ${kindLine}\n\nActive:\n${activeLine}`,
+          );
+          return { handled: true };
+        }
+
+        case "context": {
+          setInput("");
+          if (usage) {
+            pushInfoBubble(
+              `**Context** — ${usage.tokens.toLocaleString()} tokens / ` +
+                `${usage.contextWindow.toLocaleString()} window (**${usage.percentage}%**)` +
+                (usage.warning ? `\n\n⚠ ${usage.warning}` : ""),
+            );
+          } else {
+            pushInfoBubble("**Context** — usage data not available yet (send a message first).");
+          }
+          return { handled: true };
+        }
+
+        case "diff": {
+          setInput("");
+          // MVP stub (PLAN decision #2): real diff view needs git-backed
+          // efforts (follow-up PR). Show a toast + the current effort id.
+          const effortId =
+            scope.kind === "effort" ? (scope as { effortSlug: string }).effortSlug : null;
+          setPlanSavedToast(
+            `🔍 diff view coming soon${effortId ? ` (effort: ${effortId})` : " (no effort scope)"}`,
+          );
+          window.setTimeout(() => setPlanSavedToast(null), 6000);
+          return { handled: true };
+        }
+
+        case "plan": {
+          // Open the existing plan runner; seed its objective with the args.
+          if (args) setInput(args);
+          else setInput("");
+          setPlanOverlayOpen(true);
+          return { handled: true };
+        }
+
+        case "compact": {
+          setInput("");
+          if (!conversationId) {
+            pushInfoBubble("**/compact** — start a conversation first.");
+            return { handled: true };
+          }
+          try {
+            const k = Number.parseInt(args, 10);
+            const res = await fetch(`${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/compact`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(Number.isFinite(k) && k > 0 ? { keepRecentRounds: k } : {}),
+            });
+            if (!res.ok) {
+              const body = await res.json().catch(() => ({}));
+              throw new Error((body as { error?: string }).error ?? `failed (${res.status})`);
+            }
+            setReloadTick((t) => t + 1);
+          } catch (err) {
+            setError(`compact failed: ${(err as Error).message}`);
+          }
+          return { handled: true };
+        }
+
+        case "effort": {
+          setInput("");
+          const level = args.trim().toLowerCase();
+          if (!["low", "med", "medium", "high"].includes(level)) {
+            pushInfoBubble("**/effort** — usage: `/effort <low|med|high>`");
+            return { handled: true };
+          }
+          // Best-effort persist on the server session (MVP: stored only).
+          if (conversationId) {
+            try {
+              await postChatSlash(conversationId, "effort", level);
+            } catch {
+              /* best-effort — still confirm locally */
+            }
+          }
+          pushInfoBubble(
+            `**/effort** — reasoning effort set to \`${level === "medium" ? "med" : level}\` ` +
+              "_(MVP: stored only; model router unchanged)_",
+          );
+          return { handled: true };
+        }
+
+        case "review": {
+          setInput("");
+          // MVP stub: send a preset review prompt as a normal chat turn.
+          let prompt = REVIEW_FALLBACK_PROMPT;
+          if (conversationId) {
+            try {
+              const res = await postChatSlash(conversationId, "review", "");
+              if (res.prompt) prompt = res.prompt;
+            } catch {
+              /* fall back to the local preset */
+            }
+          }
+          return { handled: false, chatText: prompt };
+        }
+
+        case "cd": {
+          setInput("");
+          const parsed = parseCdTarget(args);
+          if ("error" in parsed) {
+            setError(parsed.error);
+            return { handled: true };
+          }
+          // Strict sandbox: the slug must be an existing project directory.
+          try {
+            const projects = await api.listProjects();
+            if (!projects.some((p) => p.slug === parsed.slug)) {
+              setError(`/cd: project "${parsed.slug}" not found under projects/`);
+              return { handled: true };
+            }
+          } catch {
+            setError("/cd: could not verify projects (server unreachable)");
+            return { handled: true };
+          }
+          navigate(`/projects/${parsed.slug}/chat`);
+          return { handled: true };
+        }
+
+        default:
+          // Recognised builtin with no client handler (e.g. /help, /reset,
+          // /memory, /system, /model live in the CLI). Show a hint rather
+          // than silently sending to the LLM.
+          setInput("");
+          pushInfoBubble(`**/${name}** is a CLI-only command and isn't available in the web composer.`);
+          return { handled: true };
+      }
+    },
+    [slashItems, usage, scope, conversationId, navigate, pushInfoBubble],
+  );
+
   // ─── Send a message ────────────────────────────────────────────────────
   async function send(e: React.FormEvent) {
     e.preventDefault();
-    const rawText = input.trim();
+    let rawText = input.trim();
+
+    // Slash-command interception (SPA Slash Commands task). Only fires for
+    // recognised builtin/custom names; unknown `/...` text falls through to
+    // ordinary chat. Never while busy (Enter steers instead).
+    if (!busy) {
+      const parsed = parseSlashInput(rawText);
+      if (parsed && recognizedSlashNames.has(parsed.name)) {
+        const result = await dispatchSlashCommand(parsed.name, parsed.args);
+        if (result.handled) return;
+        // Command expands into a normal chat turn (custom command / review).
+        rawText = result.chatText.trim();
+        if (!rawText) return;
+      }
+    }
+
     // v0.17 mathub parity W2: Send is enabled when there's text OR at
     // least one ready attachment. Uploading attachments block the
     // send (we don't want to ship `path:undefined` to the server).
@@ -2729,6 +2998,7 @@ export default function ChatPanel({
             >
               📎
             </button>
+            <div className="relative flex-1">
             <textarea
               ref={composerRef}
               value={input}
@@ -2761,6 +3031,51 @@ export default function ChatPanel({
                 }
               }}
               onKeyDown={(e) => {
+                // Slash suggester navigation takes priority while it's open.
+                if (slashOpen) {
+                  if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    setSlashSelected((s) => moveSelection(s, 1, slashFiltered.length));
+                    return;
+                  }
+                  if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setSlashSelected((s) => moveSelection(s, -1, slashFiltered.length));
+                    return;
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    // Collapse the suggester without clearing the text by
+                    // appending a space (moves past the command name).
+                    setInput((t) => (activeSlashPrefix(t) !== null ? `${t} ` : t));
+                    return;
+                  }
+                  if (e.key === "Tab") {
+                    e.preventDefault();
+                    const item = slashFiltered[slashSelected];
+                    if (item) acceptSlashItem(item);
+                    return;
+                  }
+                  if (
+                    e.key === "Enter" &&
+                    !e.shiftKey &&
+                    !e.nativeEvent.isComposing &&
+                    !isComposingRef.current &&
+                    e.keyCode !== 229
+                  ) {
+                    e.preventDefault();
+                    const item = slashFiltered[slashSelected];
+                    if (!item) return;
+                    // If the full command name is already typed, Enter
+                    // executes; otherwise Enter accepts the completion.
+                    if (activeSlashPrefix(input) === item.name) {
+                      e.currentTarget.form?.requestSubmit();
+                    } else {
+                      acceptSlashItem(item);
+                    }
+                    return;
+                  }
+                }
                 // Enter sends, Shift+Enter inserts a newline. Skip while
                 // an IME composition is active or while a stream is
                 // running. keyCode 229 is the "composition in progress"
@@ -2800,8 +3115,17 @@ export default function ChatPanel({
                 8,
                 Math.max(1, input.split("\n").length),
               )}
-              className="flex-1 resize-none rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
+              className="w-full resize-none rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
             />
+            {slashOpen && (
+              <SlashSuggester
+                items={slashFiltered}
+                selectedIndex={slashSelected}
+                onSelect={acceptSlashItem}
+                onHover={setSlashSelected}
+              />
+            )}
+            </div>
             {busy ? (
               // While a stream is open the composer offers two actions:
               //   - Steer (v0.17 mathub parity W9): post the current

@@ -32,6 +32,7 @@ import {
   makeEmbeddedAssetHandler,
 } from "./static-assets.js";
 import { registerUploadRoutes } from "./upload-routes.js";
+import { registerSlashRoutes } from "./slash-routes.js";
 import {
   buildUserMessageWithAttachments,
   BadAttachmentError,
@@ -3896,6 +3897,14 @@ function buildApp(
 
   // ─── Chat (T1-C) ────────────────────────────────────────────────────────────────────────
   registerChatRoutes(app, workspace, sessions);
+
+  // ─── Slash commands (SPA Slash Commands task) ────────────────────────────
+  registerSlashRoutes(app, {
+    workspace,
+    store: sessions,
+    computeUsageStats,
+    subagentKinds: () => defaultSubagentRegistry().list(),
+  });
 
   // ─── Static hosting / placeholder ──────────────────────────────────────────
   // Three layers (v0.15 §3 single-binary support):
