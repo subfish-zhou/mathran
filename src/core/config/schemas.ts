@@ -144,13 +144,50 @@ export type MathranSettings = z.infer<typeof MathranSettingsSchema>;
 // ──────────────────────────────────────────────────────────────────────
 
 /**
+ * A skill trigger: either a simple keyword substring, or an object combining
+ * a list of keywords and/or a regex. Absent trigger ⇒ the skill is "always"
+ * active (injected at session start, like the pre-extension behaviour).
+ */
+export const SkillTriggerSchema = z.union([
+  z.string(),
+  z
+    .object({
+      keywords: z.array(z.string()).optional(),
+      regex: z.string().optional(),
+    })
+    .passthrough(),
+]);
+
+export type SkillTrigger = z.infer<typeof SkillTriggerSchema>;
+
+/**
  * `SKILL.md` frontmatter (Codex-style). `name` is required; everything else
  * is optional and extra keys are preserved.
+ *
+ * Skills/Plugins 二层 extends the base frontmatter with:
+ *   - `trigger`        — keyword / regex match deciding WHEN the skill injects.
+ *   - `promptTemplate` — text injected into the system prompt on activation
+ *                        (supports the `{{userMessage}}` placeholder). When
+ *                        absent the skill body is injected instead.
+ *   - `allowedTools`   — tools auto-approved while the skill is active. Each
+ *                        entry is a tool name (`"bash"`) or `tool:prefix`
+ *                        (`"bash:lake"`).
+ *   - `argHints`       — free-form hints describing user-supplied args.
+ *   - `version` / `author` / `tags` — metadata.
+ *
+ * All new fields are optional, so pre-existing SKILL.md files keep loading.
  */
 export const SkillManifestSchema = z
   .object({
     name: z.string().min(1),
     description: z.string().optional(),
+    trigger: SkillTriggerSchema.optional(),
+    promptTemplate: z.string().optional(),
+    allowedTools: z.array(z.string()).optional(),
+    argHints: z.record(z.string(), z.string()).optional(),
+    version: z.string().optional(),
+    author: z.string().optional(),
+    tags: z.array(z.string()).optional(),
   })
   .passthrough();
 

@@ -69,6 +69,51 @@ describe("SkillManifestSchema", () => {
   it("rejects empty name", () => {
     expect(() => SkillManifestSchema.parse({ name: "" })).toThrow();
   });
+
+  it("accepts a string trigger", () => {
+    const m = SkillManifestSchema.parse({ name: "s", trigger: "lean is stuck" });
+    expect(m.trigger).toBe("lean is stuck");
+  });
+
+  it("accepts an object trigger with keywords + regex", () => {
+    const m = SkillManifestSchema.parse({
+      name: "s",
+      trigger: { keywords: ["lean", "stuck"], regex: "loop\\s+forever" },
+    });
+    expect(m.trigger).toMatchObject({
+      keywords: ["lean", "stuck"],
+      regex: "loop\\s+forever",
+    });
+  });
+
+  it("accepts the full extended frontmatter", () => {
+    const m = SkillManifestSchema.parse({
+      name: "lean-stuck-debugger",
+      description: "debug stuck lean",
+      trigger: { keywords: ["lean"] },
+      promptTemplate: "User said: {{userMessage}}",
+      allowedTools: ["bash:lake", "read_file", "edit_file"],
+      argHints: { target: "the file to inspect" },
+      version: "1.2.3",
+      author: "ziyu",
+      tags: ["lean", "debug"],
+    });
+    expect(m.allowedTools).toEqual(["bash:lake", "read_file", "edit_file"]);
+    expect(m.promptTemplate).toContain("{{userMessage}}");
+    expect(m.argHints).toMatchObject({ target: "the file to inspect" });
+    expect(m.version).toBe("1.2.3");
+    expect(m.tags).toEqual(["lean", "debug"]);
+  });
+
+  it("rejects a non-string allowedTools entry", () => {
+    expect(() =>
+      SkillManifestSchema.parse({ name: "s", allowedTools: [42] }),
+    ).toThrow();
+  });
+
+  it("rejects a bad trigger type", () => {
+    expect(() => SkillManifestSchema.parse({ name: "s", trigger: 123 })).toThrow();
+  });
 });
 
 describe("CommandManifestSchema", () => {
