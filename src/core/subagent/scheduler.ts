@@ -77,6 +77,17 @@ export type SubagentTaskWithRuntime = SubagentTask & {
   runtime?: "inline" | "subprocess";
 };
 
+/**
+ * Per-dispatch options (#3 Background Agents). Currently carries an optional
+ * external {@link AbortSignal} so a background subagent can be cancelled
+ * cooperatively: the scheduler aborts the runner's `ctx.signal` when this
+ * fires, and short-circuits the dispatch so the semaphore slot is freed even
+ * if the runner never resolves.
+ */
+export interface DispatchOpts {
+  signal?: AbortSignal;
+}
+
 export interface SubprocessRuntimeLike {
   run(args: {
     type: SubagentTask["type"];
@@ -142,7 +153,10 @@ export class SubagentScheduler {
     return this.semaphore.count();
   }
 
-  async dispatch(task: SubagentTask): Promise<SubagentResult> {
+  async dispatch(
+    task: SubagentTask,
+    opts?: DispatchOpts,
+  ): Promise<SubagentResult> {
     // Propagate an optional per-dispatch model override down to the runner as
     // `input.modelHint` (runners read the hint from their input). We do this
     // once, here, so both the inline and subprocess paths agree. An explicit
@@ -152,9 +166,9 @@ export class SubagentScheduler {
     // types.ts is read-only for v0.3 §16, so the field is carried via cast.
     const runtime = (effective as SubagentTaskWithRuntime).runtime ?? "inline";
     if (runtime === "subprocess") {
-      return this.dispatchSubprocess(effective);
+      return this.dispatchSubprocess(effective, opts);
     }
-    return this.dispatchInline(effective);
+    return this.dispatchInline(effective, opts);
   }
 
   /**
@@ -169,8 +183,31 @@ export class SubagentScheduler {
     return { ...task, input: { ...input, modelHint: task.model } };
   }
 
+  /**
+   * Wire an external {@link AbortSignal} (e.g. from a background cancel) to a
+   * per-run {@link AbortController}: abort immediately if already aborted, else
+   * forward the first `abort`. Returns a detach fn that removes the listener so
+   * a completed run doesn't leak a handler on a long-lived signal.
+   */
+  private linkAbort(
+    external: AbortSignal | undefined,
+    controller: AbortController,
+  ): () => void {
+    if (!external) return () => {};
+    if (external.aborted) {
+      controller.abort();
+      return () => {};
+    }
+    const onAbort = () => controller.abort();
+    external.addEventListener("abort", onAbort, { once: true });
+    return () => external.removeEventListener("abort", onAbort);
+  }
+
   /** Inline (in-process) dispatch path — unchanged from v0.2. */
-  private async dispatchInline(task: SubagentTask): Promise<SubagentResult> {
+  private async dispatchInline(
+    task: SubagentTask,
+    opts?: DispatchOpts,
+  ): Promise<SubagentResult> {
     const runId = genRunId();
     const hardCapBytes = task.hardCapBytes ?? DEFAULT_HARD_CAP_BYTES;
     const timeoutMs = task.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -190,6 +227,10 @@ export class SubagentScheduler {
       }
 
       const controller = new AbortController();
+      // Background cancel (#3): when an external signal is supplied, abort the
+      // runner's controller as soon as it fires (or immediately if it is
+      // already aborted) so cooperative runners exit on their next checkpoint.
+      const detachAbort = this.linkAbort(opts?.signal, controller);
       const ctx: SubagentContext = {
         workspace: this.workspace,
         runId,
@@ -202,15 +243,34 @@ export class SubagentScheduler {
       const timeoutPromise = new Promise<{ __timeout: true }>((resolve) => {
         timer = setTimeout(() => resolve({ __timeout: true }), timeoutMs);
       });
+      // Resolves when the external signal aborts, so a cooperative runner that
+      // never resolves can't pin the semaphore forever after a cancel.
+      const abortPromise = new Promise<{ __aborted: true }>((resolve) => {
+        const sig = opts?.signal;
+        if (!sig) return;
+        if (sig.aborted) {
+          resolve({ __aborted: true });
+          return;
+        }
+        sig.addEventListener("abort", () => resolve({ __aborted: true }), {
+          once: true,
+        });
+      });
 
       let raced:
         | { __timeout: true }
+        | { __aborted: true }
         | Awaited<ReturnType<typeof runner.run>>;
       try {
-        raced = await Promise.race([runner.run(task, ctx), timeoutPromise]);
+        raced = await Promise.race([
+          runner.run(task, ctx),
+          timeoutPromise,
+          abortPromise,
+        ]);
       } catch (err) {
         controller.abort();
         if (timer) clearTimeout(timer);
+        detachAbort();
         return this.finish(runId, task.type, startedAt, {
           status: "error",
           summary: "",
@@ -219,6 +279,17 @@ export class SubagentScheduler {
         });
       }
       if (timer) clearTimeout(timer);
+      detachAbort();
+
+      if ("__aborted" in raced) {
+        controller.abort();
+        return this.finish(runId, task.type, startedAt, {
+          status: "error",
+          summary: "",
+          artifactPath: null,
+          errorMessage: "Subagent aborted",
+        });
+      }
 
       if ("__timeout" in raced) {
         controller.abort();
@@ -249,7 +320,10 @@ export class SubagentScheduler {
    * that `task.input.llm` and `task.input.scheduler` (if present) are pulled
    * out and held as proxy targets — they are not serialized into the child.
    */
-  private async dispatchSubprocess(task: SubagentTask): Promise<SubagentResult> {
+  private async dispatchSubprocess(
+    task: SubagentTask,
+    opts?: DispatchOpts,
+  ): Promise<SubagentResult> {
     const runId = genRunId();
     const hardCapBytes = task.hardCapBytes ?? DEFAULT_HARD_CAP_BYTES;
     const timeoutMs = task.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -279,6 +353,7 @@ export class SubagentScheduler {
         llm: llmProvider,
         scheduler: childScheduler ?? this,
         timeoutMs,
+        ...(opts?.signal ? { abortSignal: opts.signal } : {}),
         writeArtifact: (rid, name, content) =>
           writeArtifact(this.workspace, rid, name, content),
       });

@@ -15,7 +15,22 @@ export type {
   SchedulerOpts,
   SubagentTaskWithRuntime,
   SubprocessRuntimeLike,
+  DispatchOpts,
 } from "./scheduler.js";
+export {
+  BackgroundSubagentRegistry,
+  BackgroundConcurrencyError,
+  MAX_BACKGROUND_PER_CONVERSATION,
+  globalBackgroundRegistry,
+  summarizeTask,
+  _resetGlobalBackgroundRegistryForTests,
+} from "./background.js";
+export type {
+  BackgroundSubagentRecord,
+  BackgroundSubagentStatus,
+  BackgroundCompletedEvent,
+  BackgroundRegistryOpts,
+} from "./background.js";
 export {
   SubprocessRuntime,
 } from "./runtime/subprocess.js";
