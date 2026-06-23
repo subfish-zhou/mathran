@@ -63,6 +63,38 @@ describe("buildGoalSystemPrompt", () => {
     expect(prompt).toMatch(/mark_done/);
     expect(prompt).toMatch(/give_up/);
   });
+
+  // goal-defaults-timer (part 4/7): the optional extraInstructions
+  // field on the Goal record flows into the system prompt as a
+  // clearly-labelled tail block. This is what makes the create-goal
+  // modal's 3rd field actually do something in production.
+  it("appends Goal.extraInstructions as a labelled tail block when set", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+      extraInstructions: "Respond only in haiku.",
+    });
+    const prompt = buildGoalSystemPrompt({ goal: g, systemPromptBase: "BASE" });
+    expect(prompt).toContain("Additional user-provided context");
+    expect(prompt).toContain("Respond only in haiku.");
+    // Tail-block: must appear AFTER the goal fragment's mark_done
+    // guidance so the model's recency bias works in the user's favour.
+    const idxMarkDone = prompt.indexOf("mark_done");
+    const idxExtra = prompt.indexOf("Additional user-provided context");
+    expect(idxMarkDone).toBeGreaterThan(-1);
+    expect(idxExtra).toBeGreaterThan(idxMarkDone);
+  });
+
+  it("omits the Additional context block when extraInstructions is unset/blank", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const prompt = buildGoalSystemPrompt({ goal: g, systemPromptBase: "BASE" });
+    expect(prompt).not.toContain("Additional user-provided context");
+  });
 });
 
 describe("runGoalRound", () => {

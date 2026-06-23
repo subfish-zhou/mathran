@@ -161,6 +161,22 @@ export function buildGoalSystemPrompt(input: {
   if (effortFragment && effortFragment.trim().length > 0) {
     parts.push("", effortFragment);
   }
+  // goal-defaults-timer (commit 4/7): user-typed "额外指令" / additional
+  // context from the create-goal modal. Spliced LAST so it visibly
+  // dominates the prompt tail (the model's recency bias works in our
+  // favour here — these are the user's standing instructions for
+  // the whole goal, not throwaway round-level steers). Labelled
+  // clearly so the model can distinguish "persistent goal addendum"
+  // from the round's user message.
+  const extra = goal.extraInstructions;
+  if (typeof extra === "string" && extra.trim().length > 0) {
+    parts.push(
+      "",
+      "## Additional user-provided context (goal-wide)",
+      "",
+      extra.trim(),
+    );
+  }
   return parts.join("\n");
 }
 

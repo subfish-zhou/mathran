@@ -3105,6 +3105,14 @@ function buildApp(
       );
     const effRounds = layerHas("defaultMaxRounds") ? auto!.effective.defaultMaxRounds : undefined;
     const effTokens = layerHas("defaultTokensCap") ? auto!.effective.defaultTokensCap : undefined;
+    // goal-defaults-timer (part 3/3): the create-goal modal's third
+    // field. Coerce string → trimmed string → undefined when empty so
+    // createGoal's defensive blank-strip is symmetric with what we
+    // accept here. Anything non-string (number, array, object) is
+    // ignored rather than 400'd — future-friendly to clients that
+    // might pass structured hints we don't yet understand.
+    const rawExtra = typeof body?.extraInstructions === "string" ? body.extraInstructions : "";
+    const extraInstructions = rawExtra.trim().length > 0 ? rawExtra : undefined;
     const goal = await createGoal(workspace, {
       objective,
       scope: parsed.scope,
@@ -3117,6 +3125,7 @@ function buildApp(
         typeof body?.maxRounds === "number" && body.maxRounds > 0
           ? body.maxRounds
           : (typeof effRounds === "number" && effRounds > 0 ? effRounds : null),
+      extraInstructions,
     });
     return c.json({ goal }, 201);
   });

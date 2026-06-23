@@ -37,6 +37,16 @@ afterEach(async () => {
   await fs.rm(home, { recursive: true, force: true });
 });
 
+describe("DEFAULT_GOAL_AUTONOMY (goal-defaults-timer)", () => {
+  it("ships defaultMaxRounds=200 and defaultTokensCap=12_800_000", () => {
+    // Pinned to catch accidental downgrades — these values are the
+    // "effectively uncapped for normal use" rationale documented in
+    // goal-autonomy.ts.
+    expect(DEFAULT_GOAL_AUTONOMY.defaultMaxRounds).toBe(200);
+    expect(DEFAULT_GOAL_AUTONOMY.defaultTokensCap).toBe(12_800_000);
+  });
+});
+
 describe("validateGoalAutonomyPatch", () => {
   it("accepts a well-formed full patch", () => {
     const r = validateGoalAutonomyPatch({
@@ -161,6 +171,14 @@ describe("mergeGoalAutonomy", () => {
     const project = { updatedAt: 2 }; // no defaultTokensCap key
     const eff = mergeGoalAutonomy(global, project);
     expect(eff.defaultTokensCap).toBe(50_000);
+  });
+
+  it("both layers omitting defaultTokensCap falls through to DEFAULT (12.8M)", () => {
+    // goal-defaults-timer: previously this would have come back undefined
+    // because mergeGoalAutonomy deleted the field; the strip is gone now,
+    // so callers can rely on a real number being present.
+    const eff = mergeGoalAutonomy({ updatedAt: 1 }, { updatedAt: 2 });
+    expect(eff.defaultTokensCap).toBe(DEFAULT_GOAL_AUTONOMY.defaultTokensCap);
   });
 
   it("takes max updatedAt across layers", () => {

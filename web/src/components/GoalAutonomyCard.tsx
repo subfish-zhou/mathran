@@ -292,7 +292,7 @@ export function GoalAutonomyCard({ scope, initiallyOpen = false }: Props) {
               defaultValue={
                 editing && "defaultMaxRounds" in editing
                   ? editing.defaultMaxRounds
-                  : (eff?.defaultMaxRounds ?? 12)
+                  : (eff?.defaultMaxRounds ?? 200)
               }
               key={`maxr-${editLayer}-${editing?.updatedAt ?? 0}`}
               onBlur={(e) => {

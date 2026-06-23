@@ -58,6 +58,41 @@ describe("createGoal + readGoal", () => {
     expect(g.budget.roundsMax).toBe(5);
   });
 
+  // goal-defaults-timer (part 2/3): the "额外指令" / additional context
+  // field flows from CreateGoalInput.extraInstructions → Goal.extraInstructions
+  // and is persisted to disk. The runner picks it up on every round.
+  it("persists extraInstructions when provided", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "m",
+      extraInstructions: "Speak in haiku.",
+    });
+    expect(g.extraInstructions).toBe("Speak in haiku.");
+    const round = await readGoal(workspace, g.id);
+    expect(round?.extraInstructions).toBe("Speak in haiku.");
+  });
+
+  it("omits extraInstructions when empty or whitespace", async () => {
+    // The REST layer is supposed to strip empty strings before they
+    // reach us, but defence-in-depth: createGoal also drops blanks so
+    // the on-disk record stays clean (no "extraInstructions":"").
+    const g1 = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "m",
+    });
+    expect(g1.extraInstructions).toBeUndefined();
+
+    const g2 = await createGoal(workspace, {
+      objective: "y",
+      scope: { kind: "global" },
+      model: "m",
+      extraInstructions: "   ",
+    });
+    expect(g2.extraInstructions).toBeUndefined();
+  });
+
   it("writes goal under <workspace>/.mathran/goals/", async () => {
     const g = await createGoal(workspace, {
       objective: "x",

@@ -81,8 +81,13 @@ describe("GET /api/scopes/:scopeId/goal-autonomy", () => {
     expect(j.global).toBeNull();
     expect(j.project).toBeNull();
     expect(j.effective.autonomyLevel).toBe("balanced");
-    expect(j.effective.defaultMaxRounds).toBe(12);
-    expect(j.defaults.defaultMaxRounds).toBe(12);
+    // goal-defaults-timer (commit 1/7) bumped these:
+    //   defaultMaxRounds: 12  → 200
+    //   defaultTokensCap: absent → 12_800_000
+    expect(j.effective.defaultMaxRounds).toBe(200);
+    expect(j.defaults.defaultMaxRounds).toBe(200);
+    expect(j.effective.defaultTokensCap).toBe(12_800_000);
+    expect(j.defaults.defaultTokensCap).toBe(12_800_000);
   });
 
   it("rejects an invalid scopeId with 400", async () => {

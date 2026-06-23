@@ -96,6 +96,17 @@ export interface Goal {
    *  the conversation they produced is still worth inspecting. */
   subGoalIds?: string[];
   /**
+   * goal-defaults-timer (2026-06-23): optional free-form addendum the
+   * user types into the create-goal modal's third field ("额外指令" /
+   * "Additional context"). When set, the runner appends it to the system
+   * prompt as a labelled "Additional user-provided context" block on
+   * every round. Persisted so resume + sub-agent goal trees inherit the
+   * same instructions without the user having to retype them.
+   *
+   * Optional / missing on legacy records.
+   */
+  extraInstructions?: string;
+  /**
    * v0.17 W8: monotonic unix-ms timestamp the runner stamps at the top of
    * every round. The SPA's `GoalRunStatusPanel` uses this to render a
    * "heartbeat freshness" indicator ("active 12s ago" / "stale") so users
@@ -210,6 +221,11 @@ export interface CreateGoalInput {
    *  separate so a parent goal that's currently being read for other
    *  reasons doesn't race against `createGoal`'s write of the child. */
   parentGoalId?: string | null;
+  /** goal-defaults-timer: free-form addendum that flows straight into
+   *  `Goal.extraInstructions` and ends up appended to every round's
+   *  system prompt. Trim by the REST layer; empty strings become
+   *  undefined here so the persisted record stays clean. */
+  extraInstructions?: string;
 }
 
 /**
@@ -238,6 +254,9 @@ export async function createGoal(
     conversationIds: [],
     parentGoalId: input.parentGoalId ?? null,
     subGoalIds: [],
+    ...(input.extraInstructions && input.extraInstructions.trim().length > 0
+      ? { extraInstructions: input.extraInstructions }
+      : {}),
     steps: [
       { at: now, kind: "objective", payload: input.objective },
     ],

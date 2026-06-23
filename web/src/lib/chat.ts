@@ -648,6 +648,10 @@ export interface GoalRow {
   stats: { tokensUsed: number; roundsRun: number; toolCallCount: number };
   createdAt: string;
   updatedAt: string;
+  /** goal-defaults-timer (2026-06-23): optional free-form addendum the
+   *  user typed into the create-goal modal's third field. The runner
+   *  splices it into the system prompt as a labelled tail block. */
+  extraInstructions?: string;
 }
 
 export interface SubGoalStub {
@@ -744,6 +748,10 @@ export interface CreateGoalInput {
   budgetTokens?: number | null;
   /** Hard round cap. null/omitted = no cap. */
   maxRounds?: number | null;
+  /** goal-defaults-timer: optional "additional context" textarea from
+   *  the create-goal modal. Server trims empty/whitespace to undefined,
+   *  so passing "" here is fine. */
+  extraInstructions?: string;
 }
 
 export async function createGoal(input: CreateGoalInput): Promise<GoalRow> {
