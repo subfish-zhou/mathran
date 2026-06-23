@@ -164,6 +164,8 @@ export interface ExploreConfig {
   maxPapers: number;
   /** Papers already known (skip during dedup) */
   knownPaperIds?: Set<string>;
+  /** Problem context for LLM relevance scoring. */
+  problem?: { title: string; formalStatement: string; tags: string[] };
 }
 
 export interface ExploreResult {

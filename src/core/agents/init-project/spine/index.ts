@@ -34,3 +34,15 @@ export {
   wikiDir,
   type WikiFromSpineConfig,
 } from "./wiki-from-spine.js";
+export {
+  explorePaperGraph,
+  type ExplorePipelineDeps,
+} from "./explore-pipeline.js";
+export {
+  exploreCitationGraph,
+  CITATION_MAX_DEPTH,
+  CITATION_MAX_NODES,
+  type CitationExplorerConfig,
+  type CitationExplorerDeps,
+  type NeighborPaper,
+} from "../citation-explorer.js";
