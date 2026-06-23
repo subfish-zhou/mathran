@@ -44,6 +44,7 @@ import YAML from "yaml";
 import { createTwoFilesPatch } from "diff";
 
 import { resolveWorkspaceRoot, initProject } from "../cli/commands/project.js";
+import { registerInitProjectRoutes } from "./init-project-routes.js";
 import { resolveScopeRoot } from "../cli/commands/scope-paths.js";
 import { loadConfig } from "../core/config.js";
 import {
@@ -2560,6 +2561,17 @@ function buildApp(
     const project = await readProject(workspace, slug);
     if (!project) return c.json({ error: "project not found" }, 404);
     return c.json(project);
+  });
+
+  // ─── Init-project agent (fs-only, DB-free) ─────────────────────────────────
+  // Reuses the goalLlmFactory seam as the LLM source so tests can inject a fake
+  // provider; falls back to a ModelRouter wired from <workspace>/config.toml.
+  registerInitProjectRoutes(app, {
+    workspace,
+    llmFor: (model) =>
+      goalLlmFactory
+        ? goalLlmFactory({ model })
+        : new ModelRouter(loadConfig(configPathFor(workspace))),
   });
 
   app.get("/api/projects/:slug/wiki", async (c) => {

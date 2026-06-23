@@ -12,6 +12,7 @@ import { api, type ProjectSummary } from "../lib/api.ts";
 export default function ProjectsPanel() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [name, setName] = useState("");
+  const [aiAssist, setAiAssist] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
@@ -36,10 +37,19 @@ export default function ProjectsPanel() {
     setLoading(true);
     setError(null);
     try {
-      const created = await api.createProject(trimmed);
-      setName("");
-      await refresh();
-      navigate(`/projects/${created.slug}`);
+      if (aiAssist) {
+        // AI-assist init: scaffold + kick off the init-project agent (the agent
+        // runs in the background; the wiki fills in as it progresses).
+        const { projectSlug } = await api.initProjectAi(trimmed);
+        setName("");
+        await refresh();
+        navigate(`/projects/${projectSlug}`);
+      } else {
+        const created = await api.createProject(trimmed);
+        setName("");
+        await refresh();
+        navigate(`/projects/${created.slug}`);
+      }
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -56,20 +66,34 @@ export default function ProjectsPanel() {
         attempts, formalizations, counter-example searches, ...).
       </p>
 
-      <form onSubmit={create} className="mb-6 flex gap-2">
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="New project name (e.g. Twin Primes)"
-          className="flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500"
-        />
-        <button
-          type="submit"
-          disabled={loading || !name.trim()}
-          className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-        >
-          {loading ? "…" : "Create"}
-        </button>
+      <form onSubmit={create} className="mb-6 flex flex-col gap-2">
+        <div className="flex gap-2">
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="New project name (e.g. Twin Primes)"
+            className="flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500"
+          />
+          <button
+            type="submit"
+            disabled={loading || !name.trim()}
+            className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+          >
+            {loading ? "…" : aiAssist ? "AI Init" : "Create"}
+          </button>
+        </div>
+        <label className="flex items-center gap-2 text-sm text-slate-600">
+          <input
+            type="checkbox"
+            checked={aiAssist}
+            onChange={(e) => setAiAssist(e.target.checked)}
+            className="h-4 w-4 rounded border-slate-300"
+          />
+          AI-assist init
+          <span className="text-xs text-slate-400">
+            — research seed papers &amp; draft a wiki automatically
+          </span>
+        </label>
       </form>
 
       {error && (
