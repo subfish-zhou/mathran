@@ -46,8 +46,27 @@ export interface ToolBubble {
    *  once the answer is submitted (the placeholder tool message is
    *  patched with the reply, so this bubble re-renders as a normal
    *  tool-result). */
+  /** v0.16 §11: this tool call paused on `ask_user` and is waiting for
+   *  the user's reply. Set when the SSE stream emits `ask_user` or when
+   *  the conversation loads with a `pendingAsk` sidecar slot. Cleared
+   *  once the answer is submitted (the placeholder tool message is
+   *  patched with the reply, so this bubble re-renders as a normal
+   *  tool-result).
+   *
+   *  v0.19 Codex parity — four optional structured fields the model
+   *  may have supplied via `ask_user({ options, default, timeoutSeconds,
+   *  allowCustom })`. When present the SPA renders a richer answer
+   *  surface (button list / countdown / default hint). All optional;
+   *  bare ask_user calls render the same textarea-only widget as
+   *  before. `timeoutAt` mirrors the sidecar's `timeoutAt` deadline so
+   *  the SPA can render a countdown that survives a reload. */
   askPending?: {
     question: string;
+    options?: string[];
+    default?: string;
+    timeoutSeconds?: number;
+    allowCustom?: boolean;
+    timeoutAt?: number;
   };
 }
 

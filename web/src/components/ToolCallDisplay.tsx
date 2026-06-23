@@ -172,6 +172,37 @@ export function ToolCallDisplay({
   const [askDraft, setAskDraft] = useState("");
   const [askSubmitting, setAskSubmitting] = useState(false);
 
+  // v0.19 Codex parity — derive the structured-ask mode + helpers.
+  // `askPending` may carry options/default/timeoutSeconds/allowCustom
+  // (any subset). The widget below renders extra surfaces when those
+  // are present and falls back to the legacy textarea otherwise.
+  const askPending = toolCall.askPending;
+  const hasOptions = Boolean(
+    askPending?.options && askPending.options.length > 0,
+  );
+  // When options is set, allowCustom defaults to true (matches the
+  // resolver contract in ask-user.ts). Only an explicit `false` locks
+  // the reply to the supplied buttons.
+  const allowCustom = !hasOptions || askPending?.allowCustom !== false;
+  // Default-hint applies to the textarea: "Press Enter to use default: …".
+  const askDefault = askPending?.default;
+
+  // v0.19 — live countdown for timeoutSeconds. Tick once per second so
+  // the visible "⏱ Auto-reply in Xs" updates without burning CPU. We
+  // intentionally compute `secondsLeft` from `timeoutAt` (epoch ms) so
+  // a tab reloaded mid-countdown shows the right remaining time.
+  const timeoutAt = askPending?.timeoutAt;
+  const [now, setNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    if (timeoutAt === undefined) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [timeoutAt]);
+  const secondsLeft =
+    timeoutAt === undefined
+      ? null
+      : Math.max(0, Math.ceil((timeoutAt - now) / 1000));
+
   useEffect(() => {
     if (toolCall.result !== undefined && completedAt === null) {
       setCompletedAt(Date.now());
@@ -283,59 +314,151 @@ export function ToolCallDisplay({
           `askPending` is set so the user doesn't have to expand the card
           to reply. Submitting calls back into ChatPanel which dispatches
           `streamAnswerAsk` and clears `askPending` once the resumed
-          round emits its first tool-result. */}
-      {toolCall.askPending && (
+          round emits its first tool-result.
+
+          v0.19 Codex parity — four conditional surfaces layered on top:
+            • if `options[]`: button list + (when allowCustom) "Other"
+              opens the textarea fallback.
+            • if `timeoutSeconds`: live "⏱ Auto-reply in Xs" countdown.
+            • if `default`: "Press Enter to use default: …" hint above
+              the textarea / submit button.
+            • layout: structured surfaces render BEFORE the textarea so
+              the user's eye lands on the buttons first. */}
+      {askPending && (
         <div className="border-t border-amber-200 bg-amber-100/40 px-3 py-2 space-y-2">
-          <div className="text-[11px] font-medium text-amber-900">
-            ❓ {toolCall.askPending.question}
+          <div className="flex items-start justify-between gap-2">
+            <div className="text-[11px] font-medium text-amber-900">
+              ❓ {askPending.question}
+            </div>
+            {secondsLeft !== null && (
+              <div
+                className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-mono ${
+                  secondsLeft <= 5
+                    ? "bg-red-200 text-red-900"
+                    : "bg-amber-200 text-amber-900"
+                }`}
+                title={`Auto-reply with ${askDefault ? `\"${askDefault}\"` : "the canned fallback"} after this counter hits 0`}
+              >
+                ⏱ Auto-reply in {secondsLeft}s
+              </div>
+            )}
           </div>
-          <textarea
-            value={askDraft}
-            onChange={(e) => setAskDraft(e.target.value)}
-            disabled={askSubmitting || !onAnswerAsk}
-            rows={2}
-            placeholder="Type your reply… (Ctrl+Enter to send)"
-            className="w-full resize-y rounded border border-amber-300 bg-white px-2 py-1 text-[12px] text-slate-800 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:bg-slate-100 disabled:text-slate-500"
-            onKeyDown={(e) => {
-              if (
-                (e.key === "Enter" && (e.ctrlKey || e.metaKey)) &&
-                !askSubmitting &&
-                onAnswerAsk &&
-                askDraft.trim().length > 0
-              ) {
-                e.preventDefault();
-                setAskSubmitting(true);
-                Promise.resolve(onAnswerAsk(toolCall.id, askDraft))
-                  .finally(() => {
-                    // Don't clear the draft on completion — the bubble
-                    // re-renders without `askPending` once the round
-                    // resumes, which unmounts this widget entirely.
-                    setAskSubmitting(false);
-                  });
-              }
-            }}
-          />
+
+          {hasOptions && askPending.options && (
+            <div className="flex flex-wrap gap-1.5">
+              {askPending.options.map((opt) => (
+                <button
+                  type="button"
+                  key={opt}
+                  disabled={askSubmitting || !onAnswerAsk}
+                  onClick={() => {
+                    if (!onAnswerAsk) return;
+                    setAskSubmitting(true);
+                    Promise.resolve(onAnswerAsk(toolCall.id, opt)).finally(
+                      () => setAskSubmitting(false),
+                    );
+                  }}
+                  className="rounded border border-amber-400 bg-white px-2 py-0.5 text-[11px] text-amber-900 hover:bg-amber-200 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+                >
+                  {opt}
+                </button>
+              ))}
+              {!allowCustom && (
+                <span className="text-[10px] text-amber-800 italic self-center">
+                  (one of the above)
+                </span>
+              )}
+            </div>
+          )}
+
+          {allowCustom && (
+            <>
+              <textarea
+                value={askDraft}
+                onChange={(e) => setAskDraft(e.target.value)}
+                disabled={askSubmitting || !onAnswerAsk}
+                rows={2}
+                placeholder={
+                  hasOptions
+                    ? "…or type a custom reply (Ctrl+Enter to send)"
+                    : "Type your reply… (Ctrl+Enter to send)"
+                }
+                className="w-full resize-y rounded border border-amber-300 bg-white px-2 py-1 text-[12px] text-slate-800 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:bg-slate-100 disabled:text-slate-500"
+                onKeyDown={(e) => {
+                  if (
+                    e.key === "Enter" &&
+                    (e.ctrlKey || e.metaKey) &&
+                    !askSubmitting &&
+                    onAnswerAsk &&
+                    askDraft.trim().length > 0
+                  ) {
+                    e.preventDefault();
+                    setAskSubmitting(true);
+                    Promise.resolve(
+                      onAnswerAsk(toolCall.id, askDraft),
+                    ).finally(() => {
+                      // Don't clear the draft on completion — the bubble
+                      // re-renders without `askPending` once the round
+                      // resumes, which unmounts this widget entirely.
+                      setAskSubmitting(false);
+                    });
+                  }
+                  // v0.19 — bare Enter (no modifier) with empty draft
+                  // submits the `default` when one was supplied. Mirrors
+                  // Codex's "Press Enter to use default" UX.
+                  if (
+                    e.key === "Enter" &&
+                    !e.ctrlKey &&
+                    !e.metaKey &&
+                    !e.shiftKey &&
+                    askDefault !== undefined &&
+                    askDraft.trim().length === 0 &&
+                    !askSubmitting &&
+                    onAnswerAsk
+                  ) {
+                    e.preventDefault();
+                    setAskSubmitting(true);
+                    Promise.resolve(
+                      onAnswerAsk(toolCall.id, askDefault),
+                    ).finally(() => setAskSubmitting(false));
+                  }
+                }}
+              />
+              {askDefault !== undefined && (
+                <div className="text-[10px] text-amber-800 italic">
+                  Press Enter to use default:{" "}
+                  <code className="font-mono bg-amber-200/60 px-1 rounded">
+                    {askDefault}
+                  </code>
+                </div>
+              )}
+            </>
+          )}
+
           <div className="flex items-center justify-end gap-2">
             {!onAnswerAsk && (
               <span className="text-[10px] text-slate-500 italic">
                 Answering disabled in this view
               </span>
             )}
-            <button
-              type="button"
-              disabled={
-                askSubmitting || !onAnswerAsk || askDraft.trim().length === 0
-              }
-              onClick={() => {
-                if (!onAnswerAsk) return;
-                setAskSubmitting(true);
-                Promise.resolve(onAnswerAsk(toolCall.id, askDraft))
-                  .finally(() => setAskSubmitting(false));
-              }}
-              className="rounded bg-amber-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-amber-700 disabled:cursor-not-allowed disabled:bg-slate-300"
-            >
-              {askSubmitting ? "Sending…" : "Send reply"}
-            </button>
+            {allowCustom && (
+              <button
+                type="button"
+                disabled={
+                  askSubmitting || !onAnswerAsk || askDraft.trim().length === 0
+                }
+                onClick={() => {
+                  if (!onAnswerAsk) return;
+                  setAskSubmitting(true);
+                  Promise.resolve(
+                    onAnswerAsk(toolCall.id, askDraft),
+                  ).finally(() => setAskSubmitting(false));
+                }}
+                className="rounded bg-amber-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-amber-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+              >
+                {askSubmitting ? "Sending…" : "Send reply"}
+              </button>
+            )}
           </div>
         </div>
       )}

@@ -516,10 +516,25 @@ export default function ChatPanel({
           for (let i = 0; i < initialBubbles.length; i++) {
             const b = initialBubbles[i];
             if (b.kind === "tool" && b.id === pending.callId) {
-              initialBubbles[i] = {
-                ...b,
-                askPending: { question: pending.question },
+              // v0.19 Codex parity — forward every structured field the
+              // sidecar carries so a tab reload after the SSE stream
+              // closed still renders the button list / countdown /
+              // default hint, not just the bare question.
+              const askPending: ToolBubble["askPending"] = {
+                question: pending.question,
               };
+              if (pending.options !== undefined) askPending.options = pending.options;
+              if (pending.default !== undefined) askPending.default = pending.default;
+              if (pending.timeoutSeconds !== undefined) {
+                askPending.timeoutSeconds = pending.timeoutSeconds;
+              }
+              if (pending.allowCustom !== undefined) {
+                askPending.allowCustom = pending.allowCustom;
+              }
+              if (pending.timeoutAt !== undefined) {
+                askPending.timeoutAt = pending.timeoutAt;
+              }
+              initialBubbles[i] = { ...b, askPending };
               break;
             }
           }
@@ -910,6 +925,27 @@ export default function ChatPanel({
             // shows the inline answer box. If for any reason the
             // tool-call event didn't land first, synthesize a bubble
             // so the answer UI still shows up.
+            //
+            // v0.19 Codex parity — forward every structured field the
+            // SSE event carries. Build the askPending object once and
+            // reuse it whether we patch an existing bubble or
+            // synthesize a new one. `timeoutAt` is derived locally from
+            // `Date.now() + timeoutSeconds * 1000` since the SSE event
+            // doesn't carry the deadline (the server-side timer was
+            // started in the same tick that emitted the event — the
+            // drift is sub-second).
+            const livePending: ToolBubble["askPending"] = {
+              question: ev.question,
+            };
+            if (ev.options !== undefined) livePending.options = ev.options;
+            if (ev.default !== undefined) livePending.default = ev.default;
+            if (ev.timeoutSeconds !== undefined) {
+              livePending.timeoutSeconds = ev.timeoutSeconds;
+              livePending.timeoutAt = Date.now() + ev.timeoutSeconds * 1000;
+            }
+            if (ev.allowCustom !== undefined) {
+              livePending.allowCustom = ev.allowCustom;
+            }
             const idx = next.findIndex(
               (x) => x.kind === "tool" && (x as ToolBubble).id === ev.id,
             );
@@ -917,7 +953,7 @@ export default function ChatPanel({
               const prevTool = next[idx] as ToolBubble;
               next[idx] = {
                 ...prevTool,
-                askPending: { question: ev.question },
+                askPending: livePending,
               };
             } else {
               next.push({
@@ -925,7 +961,7 @@ export default function ChatPanel({
                 id: ev.id,
                 name: ev.name,
                 args: JSON.stringify({ question: ev.question }),
-                askPending: { question: ev.question },
+                askPending: livePending,
               });
             }
           } else if (ev.type === "error") {
