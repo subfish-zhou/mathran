@@ -25,6 +25,7 @@ import type { ToolSpec } from "../chat/session.js";
 import { McpClient, type McpClientState, type McpClientFactory } from "./client.js";
 import { loadMcpConfig, type LoadMcpConfigOpts, type McpServerConfig } from "./schema.js";
 import { namespaceToolName, parseMcpToolName } from "./naming.js";
+import { diffServerConfigs, type ServerConfigDiff } from "./watcher.js";
 
 export type McpServerStatus = "connected" | "disconnected" | "disabled";
 
@@ -33,9 +34,13 @@ export interface McpServerStatusInfo {
   status: McpServerStatus;
   state: McpClientState;
   toolCount: number;
+  promptCount: number;
+  resourceCount: number;
   retries: number;
   lastError: string | null;
   command: string;
+  transport: "stdio" | "http";
+  scope: "global" | "per-conversation";
 }
 
 export interface McpRegistryOptions {
@@ -84,8 +89,14 @@ export class McpRegistry {
    * Load config + connect every enabled server. Idempotent: a second call is a
    * no-op (use `reloadAll()` to re-read config). Never throws — connect
    * failures land in each server's status.
+   *
+   * By default only `scope: "global"` servers are connected; servers marked
+   * `scope: "per-conversation"` are owned by individual {@link ChatSession}s
+   * (see {@link createPerConversationRegistry}) and skipped here. Pass
+   * `scopeFilter` to override (e.g. a per-conversation registry asks for the
+   * complementary set).
    */
-  async init(opts: LoadMcpConfigOpts): Promise<void> {
+  async init(opts: LoadMcpConfigOpts & { scopeFilter?: (s: McpServerConfig) => boolean }): Promise<void> {
     if (this.initialized) return;
     this.initialized = true;
     const { servers, warnings } = loadMcpConfig(opts);
@@ -94,8 +105,9 @@ export class McpRegistry {
       // eslint-disable-next-line no-console
       console.warn(w);
     }
+    const scopeFilter = opts.scopeFilter ?? ((s) => s.scope === "global");
     await Promise.all(
-      servers.map(async (config) => {
+      servers.filter(scopeFilter).map(async (config) => {
         if (!config.enabled) {
           this.servers.set(config.name, {
             config,
@@ -188,9 +200,13 @@ export class McpRegistry {
       status: m.status,
       state: m.client.state,
       toolCount: m.status === "connected" ? m.client.tools.length : 0,
+      promptCount: m.status === "connected" ? m.client.prompts.length : 0,
+      resourceCount: m.status === "connected" ? m.client.resources.length : 0,
       retries: m.retries,
       lastError: m.client.lastError,
-      command: [m.config.command, ...m.config.args].join(" "),
+      command: [m.config.command ?? m.config.url ?? "", ...m.config.args].join(" ").trim(),
+      transport: m.config.transport,
+      scope: m.config.scope,
     }));
   }
 
@@ -232,6 +248,9 @@ export class McpRegistry {
    *   - is `riskClass: "exec"` so it flows through the approval policy exactly
    *     like `dispatch_subagent` (PLAN 安全),
    *   - dispatches back through `callTool`.
+   *
+   * When any connected server advertises resources, a single
+   * `get_mcp_resource` tool is appended so the LLM can pull a resource by URI.
    */
   toolSpecs(): ToolSpec[] {
     const specs: ToolSpec[] = [];
@@ -253,7 +272,128 @@ export class McpRegistry {
         });
       }
     }
+    if (this.listAllResources().length > 0) {
+      specs.push(this.makeGetResourceTool());
+    }
     return specs;
+  }
+
+  /** Every connected server's prompts, namespaced `mcp__<server>__<prompt>`. */
+  listAllPrompts(): Array<{
+    server: string;
+    name: string;
+    namespaced: string;
+    description?: string;
+  }> {
+    const out: Array<{ server: string; name: string; namespaced: string; description?: string }> = [];
+    for (const m of this.servers.values()) {
+      if (m.status !== "connected") continue;
+      for (const p of m.client.prompts) {
+        out.push({
+          server: m.config.name,
+          name: p.name,
+          namespaced: namespaceToolName(m.config.name, p.name),
+          ...(p.description ? { description: p.description } : {}),
+        });
+      }
+    }
+    return out;
+  }
+
+  /** Bare prompt descriptors for one connected server (for `/mcp <name> prompts`). */
+  promptsFor(name: string): Array<{ name: string; description?: string }> {
+    const managed = this.servers.get(name);
+    if (!managed || managed.status !== "connected") return [];
+    return managed.client.prompts.map((p) => ({
+      name: p.name,
+      ...(p.description ? { description: p.description } : {}),
+    }));
+  }
+
+  /** Every connected server's resources. */
+  listAllResources(): Array<{
+    server: string;
+    uri: string;
+    name?: string;
+    description?: string;
+    mimeType?: string;
+  }> {
+    const out: Array<{ server: string; uri: string; name?: string; description?: string; mimeType?: string }> = [];
+    for (const m of this.servers.values()) {
+      if (m.status !== "connected") continue;
+      for (const r of m.client.resources) {
+        out.push({
+          server: m.config.name,
+          uri: r.uri,
+          ...(r.name ? { name: r.name } : {}),
+          ...(r.description ? { description: r.description } : {}),
+          ...(r.mimeType ? { mimeType: r.mimeType } : {}),
+        });
+      }
+    }
+    return out;
+  }
+
+  /** Bare resource descriptors for one connected server. */
+  resourcesFor(name: string): Array<{ uri: string; name?: string; description?: string }> {
+    const managed = this.servers.get(name);
+    if (!managed || managed.status !== "connected") return [];
+    return managed.client.resources.map((r) => ({
+      uri: r.uri,
+      ...(r.name ? { name: r.name } : {}),
+      ...(r.description ? { description: r.description } : {}),
+    }));
+  }
+
+  /** Fetch a prompt's text. `name` may be bare (with `server`) or namespaced. */
+  async getPrompt(
+    serverName: string,
+    promptName: string,
+    args: Record<string, string> = {},
+  ): Promise<{ ok: boolean; content: string }> {
+    const managed = this.servers.get(serverName);
+    if (!managed || managed.status !== "connected") {
+      return { ok: false, content: `mcp server "${serverName}" is not connected` };
+    }
+    return managed.client.getPrompt(promptName, args);
+  }
+
+  /** Read a resource by URI from a given server. */
+  async readResource(serverName: string, uri: string): Promise<{ ok: boolean; content: string }> {
+    const managed = this.servers.get(serverName);
+    if (!managed || managed.status !== "connected") {
+      return { ok: false, content: `mcp server "${serverName}" is not connected` };
+    }
+    return managed.client.readResource(uri);
+  }
+
+  /**
+   * Single `get_mcp_resource` tool exposed to the LLM. Args: `{ server, uri }`.
+   * `riskClass: "read"` — resources are read-only by definition.
+   */
+  private makeGetResourceTool(): ToolSpec {
+    return {
+      name: "get_mcp_resource",
+      riskClass: "read",
+      description:
+        "Read a resource advertised by a connected MCP server. Provide the server name and the resource uri (see /mcp <server> resources).",
+      parameters: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server name." },
+          uri: { type: "string", description: "Resource URI to read." },
+        },
+        required: ["server", "uri"],
+      },
+      execute: async (args: Record<string, unknown>) => {
+        const server = typeof args.server === "string" ? args.server : "";
+        const uri = typeof args.uri === "string" ? args.uri : "";
+        if (!server || !uri) {
+          return { ok: false, content: "get_mcp_resource requires { server, uri }" };
+        }
+        return this.readResource(server, uri);
+      },
+    };
   }
 
   /** Route a call to the owning client. `toolName` is the BARE upstream name. */
@@ -310,6 +450,69 @@ export class McpRegistry {
   async reloadAll(): Promise<McpServerStatusInfo[]> {
     await Promise.all([...this.servers.keys()].map((n) => this.reload(n)));
     return this.status();
+  }
+
+  /**
+   * Add a server config at runtime (hot reload `added`). Connects it when
+   * enabled. A name collision replaces the existing entry (use `reload` to keep
+   * the same config). Never throws.
+   */
+  async addServer(config: McpServerConfig): Promise<McpServerStatusInfo | null> {
+    const existing = this.servers.get(config.name);
+    if (existing) await existing.client.disconnect();
+    const managed: ManagedServer = {
+      config,
+      client: this.makeClient(config),
+      status: config.enabled ? "disconnected" : "disabled",
+      retries: 0,
+    };
+    this.servers.set(config.name, managed);
+    if (config.enabled) await this.connectServer(managed);
+    return this.statusFor(config.name);
+  }
+
+  /** Remove + disconnect a server at runtime (hot reload `removed`). */
+  async removeServer(name: string): Promise<boolean> {
+    const managed = this.servers.get(name);
+    if (!managed) return false;
+    await managed.client.disconnect();
+    this.servers.delete(name);
+    return true;
+  }
+
+  /** Names of all currently-managed servers (any status). */
+  serverNames(): string[] {
+    return [...this.servers.keys()];
+  }
+
+  /**
+   * Re-read the on-disk config and apply the delta to the live set without
+   * tearing down unaffected servers (PLAN #4 hot reload). Returns the diff.
+   * Even when the registry hasn't been `init()`ed this works (it just adds).
+   */
+  async reloadFromConfig(
+    opts: LoadMcpConfigOpts & { scopeFilter?: (s: McpServerConfig) => boolean },
+  ): Promise<ServerConfigDiff> {
+    const { servers, warnings } = loadMcpConfig(opts);
+    this.warnings = warnings;
+    const scopeFilter = opts.scopeFilter ?? ((s) => s.scope === "global");
+    const scoped = servers.filter(scopeFilter);
+    const current = [...this.servers.values()].map((m) => m.config);
+    const diff = diffServerConfigs(current, scoped);
+    for (const name of diff.removed) {
+      await this.removeServer(name);
+    }
+    for (const cfg of diff.added) {
+      await this.addServer(cfg);
+    }
+    for (const cfg of diff.changed) {
+      // Replace config then reload so the new command/url/transport takes effect.
+      const managed = this.servers.get(cfg.name);
+      if (managed) managed.config = cfg;
+      await this.addServer(cfg);
+    }
+    this.initialized = true;
+    return diff;
   }
 
   /** Tear down every server. Safe to call multiple times. */

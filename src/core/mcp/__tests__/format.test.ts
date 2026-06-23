@@ -12,9 +12,13 @@ const info = (over: Partial<McpServerStatusInfo> = {}): McpServerStatusInfo => (
   status: "connected",
   state: "connected",
   toolCount: 2,
+  promptCount: 0,
+  resourceCount: 0,
   retries: 0,
   lastError: null,
   command: "node server.js",
+  transport: "stdio",
+  scope: "global",
   ...over,
 });
 

@@ -111,6 +111,31 @@ program
     await runChatEntry(opts);
   });
 
+program
+  .command("mcp-server")
+  .description("Run mathran AS an MCP server (stdio or http) for external clients (Claude Desktop / Cursor)")
+  .option("--workspace <dir>", "Workspace root (overrides MATHRAN_WORKSPACE and the default)")
+  .option("--config <path>", "Path to a JSON file with a server config block (overrides .mathran/mcp.json#server)")
+  .option("--transport <kind>", "Transport: stdio (default) or http")
+  .option("--host <host>", "HTTP bind host (default 127.0.0.1; 0.0.0.0 must be explicit)")
+  .option("--port <port>", "HTTP port (default 7333)")
+  .option("--token <token>", "HTTP bearer token (required for http transport)")
+  .option("--expose-mutating", "Expose mutate tools (write_file/edit_file). Default false (read-only).", false)
+  .action(
+    async (opts: {
+      workspace?: string;
+      config?: string;
+      transport?: "stdio" | "http";
+      host?: string;
+      port?: string;
+      token?: string;
+      exposeMutating?: boolean;
+    }) => {
+      const { runMcpServer } = await import("./commands/mcp-server.js");
+      process.exit(await runMcpServer(opts));
+    },
+  );
+
 const projectCmd = program
   .command("project")
   .description("Manage mathran projects in the workspace");

@@ -29,12 +29,18 @@ import { randomUUID } from "node:crypto";
 import { loadConfig } from "../../core/config.js";
 import {
   getGlobalMcpRegistry,
+  McpConfigWatcher,
+  createPerConversationRegistry,
+  MergedMcpView,
+  formatConfigDiff,
   type McpRegistry,
 } from "../../core/mcp/index.js";
 import {
   formatMcpStatusList,
   formatMcpServerDetail,
   formatMcpToolsList,
+  formatMcpPromptsList,
+  formatMcpResourcesList,
   parseMcpSubcommand,
 } from "../../core/mcp/format.js";
 import {
@@ -173,6 +179,14 @@ export interface BuildSessionOptions {
    * callers omit it (no MCP tools).
    */
   mcpRegistry?: McpRegistry;
+  /**
+   * Optional MCP tool source injected into the session in place of
+   * `mcpRegistry` (v1.5 #6). The REPL passes a {@link MergedMcpView} unioning
+   * the global registry with this conversation's per-conversation servers so
+   * the session sees global + its own per-conv tools. Falls back to
+   * `mcpRegistry` when unset.
+   */
+  mcpToolSource?: { toolSpecs(): import("../../core/chat/session.js").ToolSpec[] };
 }
 
 /**
@@ -517,7 +531,11 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
       : { layeredMemory: { workspace } }),
     ...(layeredSkills.length > 0 ? { layeredSkills } : {}),
     ...(profile ? { profile } : {}),
-    ...(opts.mcpRegistry ? { mcpRegistry: opts.mcpRegistry } : {}),
+    ...(opts.mcpToolSource
+      ? { mcpRegistry: opts.mcpToolSource }
+      : opts.mcpRegistry
+        ? { mcpRegistry: opts.mcpRegistry }
+        : {}),
   });
 
   return { session, model, providerKey, hookInvoker, conversationId, ...(profile ? { profile } : {}) };
@@ -727,6 +745,8 @@ export interface SlashContext {
   checkpointWorkspace?: string;
   /** MCP registry (#4) for the `/mcp` slash command. */
   mcpRegistry?: McpRegistry;
+  /** MCP config hot-reload watcher (#4, v1.5) for `/mcp watch` + `/mcp reload-config`. */
+  mcpWatcher?: McpConfigWatcher;
 }
 
 const HELP_TEXT = `commands:
@@ -1053,6 +1073,16 @@ export async function handleSlashCommand(
             kind: "continue",
             output: formatMcpToolsList(sub.server, registry.toolsFor(sub.server)),
           };
+        case "prompts":
+          return {
+            kind: "continue",
+            output: formatMcpPromptsList(sub.server, registry.promptsFor(sub.server)),
+          };
+        case "resources":
+          return {
+            kind: "continue",
+            output: formatMcpResourcesList(sub.server, registry.resourcesFor(sub.server)),
+          };
         case "reload": {
           const info = await registry.reload(sub.server);
           if (!info) {
@@ -1073,6 +1103,26 @@ export async function handleSlashCommand(
             kind: "continue",
             output: `reloaded ${all.length} server(s).\n${formatMcpStatusList(all)}`,
           };
+        }
+        case "reload-config": {
+          const ws = ctx.memoryWorkspace ?? process.cwd();
+          const diff = await registry.reloadFromConfig({ workspace: ws });
+          return {
+            kind: "continue",
+            output: `${formatConfigDiff(diff)}\n${formatMcpStatusList(registry.status())}`,
+          };
+        }
+        case "watch": {
+          const w = ctx.mcpWatcher;
+          if (!w) {
+            return { kind: "continue", output: "MCP config watching is not available in this session." };
+          }
+          if (sub.on) {
+            w.start();
+            return { kind: "continue", output: "MCP config watching: on (changes to .mathran/mcp.json reload live)." };
+          }
+          w.stop();
+          return { kind: "continue", output: "MCP config watching: off." };
         }
         case "error":
           return { kind: "continue", output: `mathran: ${sub.message}` };
@@ -1343,6 +1393,35 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
     console.error(`mathran: MCP init failed: ${(err as Error)?.message ?? err}`);
   }
 
+  // v1.5 #4: hot-reload watcher — edits to .mathran/mcp.json reconnect servers
+  // live without restarting the REPL. Started on by default; `/mcp watch off`
+  // disables it. Diffs are logged so the user sees what changed.
+  const mcpWatcher = new McpConfigWatcher({
+    workspace,
+    home: os.homedir(),
+    registry: mcpRegistry,
+    onReload: (diff) => {
+      const summary = formatConfigDiff(diff);
+      if (summary !== "no MCP config changes") console.log(`\n[mcp] ${summary}`);
+    },
+  });
+  mcpWatcher.start();
+
+  // v1.5 #6: per-conversation servers (scope: "per-conversation") are owned by
+  // this REPL conversation — spun up here, merged with the global view for the
+  // session, and torn down on exit. Other conversations never see them.
+  let perConvRegistry: McpRegistry | null = null;
+  try {
+    perConvRegistry = await createPerConversationRegistry({ workspace });
+    if (perConvRegistry.serverNames().length === 0) {
+      await perConvRegistry.shutdown();
+      perConvRegistry = null;
+    }
+  } catch {
+    perConvRegistry = null;
+  }
+  const mcpToolSource = new MergedMcpView(mcpRegistry, perConvRegistry);
+
   // v0.16 §11: create the readline interface BEFORE the ChatSession so
   // we can hand the session an `ask_user` resolver bound to this rl. We
   // pause the prompt while the resolver awaits input so the user's reply
@@ -1367,6 +1446,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
       approvalResolver,
       ruleProposalResolver,
       mcpRegistry,
+      mcpToolSource,
       ...(opts.profile ? { profile: opts.profile } : {}),
     });
 
@@ -1422,6 +1502,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           checkpointConversationId: conversationId,
           checkpointWorkspace: workspace,
           mcpRegistry,
+          mcpWatcher,
           ...(profile ? { profileName: profile.name } : {}),
         });
         if (result.output) console.log(result.output);
@@ -1433,6 +1514,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
             approvalResolver,
             ruleProposalResolver,
             mcpRegistry,
+            mcpToolSource,
           });
           session = built.session;
           model = built.model;
@@ -1460,6 +1542,8 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
   }
 
   rl.close();
+  mcpWatcher.stop();
+  if (perConvRegistry) await perConvRegistry.shutdown().catch(() => {});
   await mcpRegistry.shutdown().catch(() => {});
   console.log("bye.");
   return 0;

@@ -84,3 +84,73 @@ describe("mcp schema", () => {
     fs.rmSync(home, { recursive: true, force: true });
   });
 });
+
+import {
+  McpServerExposureConfigSchema,
+  normalizeServerConfig,
+  DEFAULT_LOAD,
+  NEVER_EXPOSED_TOOLS,
+} from "../schema.js";
+
+describe("mcp v1.5 schema extensions", () => {
+  it("defaults transport to stdio and load to all three", () => {
+    const c = McpServerConfigSchema.parse({ name: "fs", command: "node" });
+    expect(c.transport).toBe("stdio");
+    expect(c.scope).toBe("global");
+    expect(c.load).toEqual(DEFAULT_LOAD);
+  });
+
+  it("requires url for http transport", () => {
+    const bad = McpServerConfigSchema.safeParse({ name: "h", transport: "http" });
+    expect(bad.success).toBe(false);
+    const ok = McpServerConfigSchema.safeParse({
+      name: "h",
+      transport: "http",
+      url: "https://example.com/sse",
+    });
+    expect(ok.success).toBe(true);
+  });
+
+  it("requires command for stdio transport", () => {
+    const bad = McpServerConfigSchema.safeParse({ name: "s", transport: "stdio" });
+    expect(bad.success).toBe(false);
+  });
+
+  it("accepts per-conversation scope and a narrowed load list", () => {
+    const c = McpServerConfigSchema.parse({
+      name: "x",
+      command: "node",
+      scope: "per-conversation",
+      load: ["tools"],
+    });
+    expect(c.scope).toBe("per-conversation");
+    expect(c.load).toEqual(["tools"]);
+  });
+
+  it("server-side config defaults to disabled, read-only, stdio, loopback", () => {
+    const c = McpServerExposureConfigSchema.parse({});
+    expect(c.enabled).toBe(false);
+    expect(c.exposeMutating).toBe(false);
+    expect(c.transport).toBe("stdio");
+    expect(c.host).toBe("127.0.0.1");
+  });
+
+  it("warns when binding the http transport to a non-loopback host", () => {
+    const { config, warnings } = normalizeServerConfig({
+      transport: "http",
+      host: "0.0.0.0",
+      token: "secret",
+    });
+    expect(config.host).toBe("0.0.0.0");
+    expect(warnings.some((w) => w.includes("non-loopback"))).toBe(true);
+  });
+
+  it("does not warn for a loopback http bind", () => {
+    const { warnings } = normalizeServerConfig({ transport: "http", host: "127.0.0.1" });
+    expect(warnings).toEqual([]);
+  });
+
+  it("bash is on the permanent never-exposed denylist", () => {
+    expect(NEVER_EXPOSED_TOOLS).toContain("bash");
+  });
+});

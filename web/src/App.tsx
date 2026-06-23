@@ -31,6 +31,7 @@ import ChatPanel from "./components/ChatPanel.tsx";
 import ProvidersPanel from "./components/ProvidersPanel.tsx";
 import SettingsPanel from "./components/SettingsPanel.tsx";
 import McpServersPanel from "./components/McpServersPanel.tsx";
+import McpConfigForm from "./components/McpConfigForm.tsx";
 import EffortsPanel from "./components/EffortsPanel.tsx";
 import EffortDocumentPanel from "./components/EffortDocumentPanel.tsx";
 
@@ -48,6 +49,7 @@ export default function App() {
           <Route path="/settings" element={<SettingsPanel />} />
           <Route path="/settings/providers" element={<ProvidersPanel />} />
           <Route path="/settings/mcp" element={<McpServersPanel />} />
+          <Route path="/settings/mcp/config" element={<McpConfigForm />} />
 
           <Route path="/projects/:slug" element={<ProjectLayout />}>
             <Route index element={<ProjectHome />} />
@@ -116,6 +118,9 @@ function GlobalSidebar() {
       </NavLink>
       <NavLink to="/settings/mcp" className={linkClass}>
         🔌 MCP servers
+      </NavLink>
+      <NavLink to="/settings/mcp/config" className={linkClass}>
+        🛠 MCP config
       </NavLink>
 
       <div className="mt-6 px-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
