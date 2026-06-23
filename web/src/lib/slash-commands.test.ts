@@ -7,8 +7,24 @@ import {
   filterCommands,
   moveSelection,
   parseCdTarget,
+  FALLBACK_BUILTINS,
   type SuggesterItem,
 } from "./slash-commands.ts";
+
+describe("FALLBACK_BUILTINS includes /diff and /rewind", () => {
+  it("exposes diff + rewind with checkpoint-aware copy", () => {
+    const byName = new Map(FALLBACK_BUILTINS.map((b) => [b.name, b]));
+    expect(byName.has("diff")).toBe(true);
+    expect(byName.has("rewind")).toBe(true);
+    expect(byName.get("diff")!.description).toMatch(/checkpoint/i);
+    expect(byName.get("rewind")!.description).toMatch(/checkpoint/i);
+  });
+
+  it("stays alphabetically sorted by name", () => {
+    const names = FALLBACK_BUILTINS.map((b) => b.name);
+    expect([...names]).toEqual([...names].sort((a, b) => a.localeCompare(b)));
+  });
+});
 
 describe("isSlashTrigger", () => {
   it("matches leading slash only", () => {

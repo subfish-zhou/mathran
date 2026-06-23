@@ -1127,15 +1127,30 @@ export default function ChatPanel({
         }
 
         case "diff": {
+          // /diff + checkpoint/rewind: server-rendered checkpoint list or a
+          // single checkpoint's diff. Mirrors the CLI `/diff` output.
           setInput("");
-          // MVP stub (PLAN decision #2): real diff view needs git-backed
-          // efforts (follow-up PR). Show a toast + the current effort id.
-          const effortId =
-            scope.kind === "effort" ? (scope as { effortSlug: string }).effortSlug : null;
-          setPlanSavedToast(
-            `🔍 diff view coming soon${effortId ? ` (effort: ${effortId})` : " (no effort scope)"}`,
-          );
-          window.setTimeout(() => setPlanSavedToast(null), 6000);
+          try {
+            const res = await postChatSlash(conversationId ?? "global", "diff", args);
+            pushInfoBubble("```diff\n" + (res.text ?? "(no output)") + "\n```");
+          } catch (err) {
+            pushInfoBubble(`**/diff** — ${(err as Error).message}`);
+          }
+          return { handled: true };
+        }
+
+        case "rewind": {
+          // /diff + checkpoint/rewind: restore files to before a checkpoint
+          // (or the newest N). The server applies the rollback + appends a
+          // `[Rewound …]` system note; we re-read history to show it.
+          setInput("");
+          try {
+            const res = await postChatSlash(conversationId ?? "global", "rewind", args);
+            pushInfoBubble("```\n" + (res.text ?? "(no output)") + "\n```");
+            setReloadTick((t) => t + 1);
+          } catch (err) {
+            pushInfoBubble(`**/rewind** — ${(err as Error).message}`);
+          }
           return { handled: true };
         }
 
@@ -1398,6 +1413,27 @@ export default function ChatPanel({
       );
     },
     [conversationId, runChatStream, scope],
+  );
+
+  // /diff + checkpoint/rewind: handle the CheckpointChip actions on
+  // write_file / edit_file tool cards. Targets the checkpoint by tool-call id
+  // (the store keys checkpoints by it) and renders the server-formatted text.
+  const handleCheckpointAction = useCallback(
+    async (action: "diff" | "rewind", toolCallId: string) => {
+      const cid = conversationId ?? "global";
+      try {
+        const res = await postChatSlash(cid, action, toolCallId);
+        if (action === "diff") {
+          pushInfoBubble("```diff\n" + (res.text ?? "(no output)") + "\n```");
+        } else {
+          pushInfoBubble("```\n" + (res.text ?? "(no output)") + "\n```");
+          setReloadTick((t) => t + 1);
+        }
+      } catch (err) {
+        pushInfoBubble(`**/${action}** — ${(err as Error).message}`);
+      }
+    },
+    [conversationId, pushInfoBubble],
   );
 
   // ─── New / Select / Delete ─────────────────────────────────────────────
@@ -2391,6 +2427,7 @@ export default function ChatPanel({
                   subGoalIdByToolId={subGoalIdByToolId}
                   onOpenThread={handleOpenThread}
                   onAnswerAsk={handleAnswerAsk}
+                  onCheckpointAction={handleCheckpointAction}
                 />
               );
             }

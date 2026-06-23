@@ -13,6 +13,7 @@ import { useEffect, useState } from "react";
 import type { ToolBubble } from "../lib/history-to-bubbles.ts";
 import { fetchThread, type ThreadPayload } from "../lib/chat.ts";
 import { historyToBubbles, type Bubble } from "../lib/history-to-bubbles.ts";
+import { CheckpointChip } from "./CheckpointChip.tsx";
 
 const TOOL_ICONS: Record<string, string> = {
   bash: "🛠",
@@ -145,6 +146,16 @@ interface ToolCallDisplayProps {
    *  history-only views (search results, previews) where resuming
    *  isn't meaningful. */
   onAnswerAsk?: (callId: string, answer: string) => void | Promise<void>;
+  /**
+   * /diff + checkpoint/rewind: called when the user clicks "View diff" or
+   * "Rewind to before this" on a successful `write_file` / `edit_file` card.
+   * Receives the tool-call id (the checkpoint store keys checkpoints by it).
+   * When omitted, the CheckpointChip is not rendered.
+   */
+  onCheckpointAction?: (
+    action: "diff" | "rewind",
+    toolCallId: string,
+  ) => void | Promise<void>;
 }
 
 export function ToolCallDisplay({
@@ -152,6 +163,7 @@ export function ToolCallDisplay({
   subGoalIdForThisCall,
   onOpenThread,
   onAnswerAsk,
+  onCheckpointAction,
 }: ToolCallDisplayProps): JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const [startedAt] = useState<number>(() => Date.now());
@@ -355,6 +367,23 @@ export function ToolCallDisplay({
               </pre>
             </div>
           )}
+
+          {/* /diff + checkpoint/rewind: a checkpoint is recorded before each
+              successful write_file / edit_file. Offer to view its diff or
+              roll the workspace back to before this call. */}
+          {onCheckpointAction &&
+            toolCall.ok === true &&
+            (toolCall.name === "write_file" || toolCall.name === "edit_file") && (
+              <CheckpointChip
+                fileCount={1}
+                onViewDiff={() => {
+                  void onCheckpointAction("diff", toolCall.id);
+                }}
+                onRewind={() => {
+                  void onCheckpointAction("rewind", toolCall.id);
+                }}
+              />
+            )}
 
           {/* ─── spawn_sub_goal: inline preview (v0.16 §5) ─────────────────
               Lazy-loaded mini-history under the spawn card, so the user
