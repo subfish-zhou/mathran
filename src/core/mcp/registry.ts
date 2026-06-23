@@ -33,9 +33,13 @@ export interface McpServerStatusInfo {
   status: McpServerStatus;
   state: McpClientState;
   toolCount: number;
+  promptCount: number;
+  resourceCount: number;
   retries: number;
   lastError: string | null;
   command: string;
+  transport: "stdio" | "http";
+  scope: "global" | "per-conversation";
 }
 
 export interface McpRegistryOptions {
@@ -188,9 +192,13 @@ export class McpRegistry {
       status: m.status,
       state: m.client.state,
       toolCount: m.status === "connected" ? m.client.tools.length : 0,
+      promptCount: m.status === "connected" ? m.client.prompts.length : 0,
+      resourceCount: m.status === "connected" ? m.client.resources.length : 0,
       retries: m.retries,
       lastError: m.client.lastError,
       command: [m.config.command ?? m.config.url ?? "", ...m.config.args].join(" ").trim(),
+      transport: m.config.transport,
+      scope: m.config.scope,
     }));
   }
 
@@ -232,6 +240,9 @@ export class McpRegistry {
    *   - is `riskClass: "exec"` so it flows through the approval policy exactly
    *     like `dispatch_subagent` (PLAN 安全),
    *   - dispatches back through `callTool`.
+   *
+   * When any connected server advertises resources, a single
+   * `get_mcp_resource` tool is appended so the LLM can pull a resource by URI.
    */
   toolSpecs(): ToolSpec[] {
     const specs: ToolSpec[] = [];
@@ -253,7 +264,128 @@ export class McpRegistry {
         });
       }
     }
+    if (this.listAllResources().length > 0) {
+      specs.push(this.makeGetResourceTool());
+    }
     return specs;
+  }
+
+  /** Every connected server's prompts, namespaced `mcp__<server>__<prompt>`. */
+  listAllPrompts(): Array<{
+    server: string;
+    name: string;
+    namespaced: string;
+    description?: string;
+  }> {
+    const out: Array<{ server: string; name: string; namespaced: string; description?: string }> = [];
+    for (const m of this.servers.values()) {
+      if (m.status !== "connected") continue;
+      for (const p of m.client.prompts) {
+        out.push({
+          server: m.config.name,
+          name: p.name,
+          namespaced: namespaceToolName(m.config.name, p.name),
+          ...(p.description ? { description: p.description } : {}),
+        });
+      }
+    }
+    return out;
+  }
+
+  /** Bare prompt descriptors for one connected server (for `/mcp <name> prompts`). */
+  promptsFor(name: string): Array<{ name: string; description?: string }> {
+    const managed = this.servers.get(name);
+    if (!managed || managed.status !== "connected") return [];
+    return managed.client.prompts.map((p) => ({
+      name: p.name,
+      ...(p.description ? { description: p.description } : {}),
+    }));
+  }
+
+  /** Every connected server's resources. */
+  listAllResources(): Array<{
+    server: string;
+    uri: string;
+    name?: string;
+    description?: string;
+    mimeType?: string;
+  }> {
+    const out: Array<{ server: string; uri: string; name?: string; description?: string; mimeType?: string }> = [];
+    for (const m of this.servers.values()) {
+      if (m.status !== "connected") continue;
+      for (const r of m.client.resources) {
+        out.push({
+          server: m.config.name,
+          uri: r.uri,
+          ...(r.name ? { name: r.name } : {}),
+          ...(r.description ? { description: r.description } : {}),
+          ...(r.mimeType ? { mimeType: r.mimeType } : {}),
+        });
+      }
+    }
+    return out;
+  }
+
+  /** Bare resource descriptors for one connected server. */
+  resourcesFor(name: string): Array<{ uri: string; name?: string; description?: string }> {
+    const managed = this.servers.get(name);
+    if (!managed || managed.status !== "connected") return [];
+    return managed.client.resources.map((r) => ({
+      uri: r.uri,
+      ...(r.name ? { name: r.name } : {}),
+      ...(r.description ? { description: r.description } : {}),
+    }));
+  }
+
+  /** Fetch a prompt's text. `name` may be bare (with `server`) or namespaced. */
+  async getPrompt(
+    serverName: string,
+    promptName: string,
+    args: Record<string, string> = {},
+  ): Promise<{ ok: boolean; content: string }> {
+    const managed = this.servers.get(serverName);
+    if (!managed || managed.status !== "connected") {
+      return { ok: false, content: `mcp server "${serverName}" is not connected` };
+    }
+    return managed.client.getPrompt(promptName, args);
+  }
+
+  /** Read a resource by URI from a given server. */
+  async readResource(serverName: string, uri: string): Promise<{ ok: boolean; content: string }> {
+    const managed = this.servers.get(serverName);
+    if (!managed || managed.status !== "connected") {
+      return { ok: false, content: `mcp server "${serverName}" is not connected` };
+    }
+    return managed.client.readResource(uri);
+  }
+
+  /**
+   * Single `get_mcp_resource` tool exposed to the LLM. Args: `{ server, uri }`.
+   * `riskClass: "read"` — resources are read-only by definition.
+   */
+  private makeGetResourceTool(): ToolSpec {
+    return {
+      name: "get_mcp_resource",
+      riskClass: "read",
+      description:
+        "Read a resource advertised by a connected MCP server. Provide the server name and the resource uri (see /mcp <server> resources).",
+      parameters: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server name." },
+          uri: { type: "string", description: "Resource URI to read." },
+        },
+        required: ["server", "uri"],
+      },
+      execute: async (args: Record<string, unknown>) => {
+        const server = typeof args.server === "string" ? args.server : "";
+        const uri = typeof args.uri === "string" ? args.uri : "";
+        if (!server || !uri) {
+          return { ok: false, content: "get_mcp_resource requires { server, uri }" };
+        }
+        return this.readResource(server, uri);
+      },
+    };
   }
 
   /** Route a call to the owning client. `toolName` is the BARE upstream name. */

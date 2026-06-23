@@ -12,6 +12,8 @@ export type McpSubcommand =
   | { kind: "reload-all" }
   | { kind: "status"; server: string }
   | { kind: "tools"; server: string }
+  | { kind: "prompts"; server: string }
+  | { kind: "resources"; server: string }
   | { kind: "reload"; server: string }
   | { kind: "error"; message: string };
 
@@ -37,12 +39,16 @@ export function parseMcpSubcommand(arg: string): McpSubcommand {
       return { kind: "status", server: first };
     case "tools":
       return { kind: "tools", server: first };
+    case "prompts":
+      return { kind: "prompts", server: first };
+    case "resources":
+      return { kind: "resources", server: first };
     case "reload":
       return { kind: "reload", server: first };
     default:
       return {
         kind: "error",
-        message: `unknown /mcp subcommand "${second}" for server "${first}" (try: status, tools, reload)`,
+        message: `unknown /mcp subcommand "${second}" for server "${first}" (try: status, tools, prompts, resources, reload)`,
       };
   }
 }
@@ -99,6 +105,39 @@ export function formatMcpToolsList(
   for (const t of tools) {
     const desc = t.description ? ` — ${t.description.split("\n")[0]}` : "";
     lines.push(`  mcp__${name}__${t.name}${desc}`);
+  }
+  return lines.join("\n");
+}
+
+/** Prompt listing for `/mcp <name> prompts`. */
+export function formatMcpPromptsList(
+  name: string,
+  prompts: ReadonlyArray<{ name: string; description?: string }>,
+): string {
+  if (prompts.length === 0) {
+    return `MCP server "${name}" exposes no prompts (or is not connected).`;
+  }
+  const lines = [`prompts for "${name}" (${prompts.length}):`];
+  for (const p of prompts) {
+    const desc = p.description ? ` — ${p.description.split("\n")[0]}` : "";
+    lines.push(`  mcp__${name}__${p.name}${desc}`);
+  }
+  return lines.join("\n");
+}
+
+/** Resource listing for `/mcp <name> resources`. */
+export function formatMcpResourcesList(
+  name: string,
+  resources: ReadonlyArray<{ uri: string; name?: string; description?: string }>,
+): string {
+  if (resources.length === 0) {
+    return `MCP server "${name}" exposes no resources (or is not connected).`;
+  }
+  const lines = [`resources for "${name}" (${resources.length}):`];
+  for (const r of resources) {
+    const label = r.name ? ` (${r.name})` : "";
+    const desc = r.description ? ` — ${r.description.split("\n")[0]}` : "";
+    lines.push(`  ${r.uri}${label}${desc}`);
   }
   return lines.join("\n");
 }

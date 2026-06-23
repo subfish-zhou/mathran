@@ -35,6 +35,8 @@ import {
   formatMcpStatusList,
   formatMcpServerDetail,
   formatMcpToolsList,
+  formatMcpPromptsList,
+  formatMcpResourcesList,
   parseMcpSubcommand,
 } from "../../core/mcp/format.js";
 import {
@@ -1052,6 +1054,16 @@ export async function handleSlashCommand(
           return {
             kind: "continue",
             output: formatMcpToolsList(sub.server, registry.toolsFor(sub.server)),
+          };
+        case "prompts":
+          return {
+            kind: "continue",
+            output: formatMcpPromptsList(sub.server, registry.promptsFor(sub.server)),
+          };
+        case "resources":
+          return {
+            kind: "continue",
+            output: formatMcpResourcesList(sub.server, registry.resourcesFor(sub.server)),
           };
         case "reload": {
           const info = await registry.reload(sub.server);

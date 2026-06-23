@@ -50,6 +50,8 @@ import {
   formatMcpStatusList,
   formatMcpServerDetail,
   formatMcpToolsList,
+  formatMcpPromptsList,
+  formatMcpResourcesList,
 } from "../core/mcp/format.js";
 
 /** Shape of `computeUsageStats` (defined in serve.ts), injected to avoid cycles. */
@@ -293,6 +295,16 @@ export function registerSlashRoutes(app: Hono, deps: SlashRoutesDeps): void {
             return c.json({
               ok: true,
               text: formatMcpToolsList(sub.server, registry.toolsFor(sub.server)),
+            });
+          case "prompts":
+            return c.json({
+              ok: true,
+              text: formatMcpPromptsList(sub.server, registry.promptsFor(sub.server)),
+            });
+          case "resources":
+            return c.json({
+              ok: true,
+              text: formatMcpResourcesList(sub.server, registry.resourcesFor(sub.server)),
             });
           case "reload": {
             const info = await registry.reload(sub.server);
