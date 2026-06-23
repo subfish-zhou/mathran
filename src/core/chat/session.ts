@@ -102,6 +102,7 @@ import { createScratchpadWriteTool } from "./tools/scratchpad-write.js";
 import { createRunPythonTool } from "./tools/run-python.js";
 import { createRunLatexTool } from "./tools/run-latex.js";
 import { createInstallPythonPackageTool } from "./tools/install-python-package.js";
+import { createSearchArxivTool } from "./tools/search-arxiv.js";
 import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
@@ -468,6 +469,12 @@ export interface ChatSessionOptions {
     run_python?: boolean | { conversationId?: string };
     run_latex?: boolean | { conversationId?: string };
     install_python_package?: boolean | { conversationId?: string };
+    /**
+     * gap #2 — stateless arXiv search. Unlike the python/latex tools this is a
+     * read-only network query with no per-conversation state, so it takes a
+     * plain boolean.
+     */
+    search_arxiv?: boolean;
   };
   /**
    * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
@@ -1236,6 +1243,10 @@ export class ChatSession {
           }),
         ),
       );
+    }
+    // gap #2 — stateless read-only arXiv search; no checkpoint wrapping needed.
+    if (cfg.search_arxiv) {
+      out.push(createSearchArxivTool());
     }
     return out;
   }
