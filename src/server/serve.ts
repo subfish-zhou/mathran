@@ -97,6 +97,7 @@ import {
 import {
   SubagentScheduler,
   defaultSubagentRegistry,
+  globalBackgroundRegistry,
 } from "../core/subagent/index.js";
 import {
   resolveProfile,
@@ -197,6 +198,50 @@ function pipeGoalGradedFrames(stream: {
           type: "goal-graded",
           goalId: ev.goalId,
           outcome: ev.outcome,
+        }),
+      })
+      .catch(() => {
+        /* stream already closed — nothing to do */
+      });
+  });
+}
+
+/**
+ * Background Agents (#3) — subscribe an active SSE stream to background
+ * `subagent-completed` notifications and multicast each (scoped to this
+ * conversation) as a `subagent-completed` frame. Background subagents settle
+ * after their dispatch tool call already returned, so this relays the terminal
+ * result to whatever stream is open. Returns the unsubscribe fn the caller
+ * MUST call in its `finally`.
+ *
+ * Writes are fire-and-forget: a dead/closing stream's rejected write is
+ * swallowed so it can't crash the publisher or leak an unhandled rejection.
+ */
+function pipeSubagentCompletedFrames(
+  stream: { writeSSE: (m: { event: string; data: string }) => Promise<void> },
+  conversationId: string,
+): () => void {
+  return globalBackgroundRegistry().onCompleted((ev) => {
+    if (ev.parentConversationId !== conversationId) return;
+    const result = ev.result;
+    void stream
+      .writeSSE({
+        event: "subagent-completed",
+        data: JSON.stringify({
+          type: "subagent-completed",
+          subagentId: ev.subagentId,
+          status: ev.status,
+          durationMs: ev.durationMs,
+          ...(result
+            ? {
+                result: {
+                  status: result.status,
+                  summary: result.summary,
+                  artifactPath: result.artifactPath,
+                  durationMs: result.stats?.durationMs,
+                },
+              }
+            : {}),
         }),
       })
       .catch(() => {
@@ -856,7 +901,19 @@ export function defaultSessionFactory(
         read_file: true,
         write_file: true,
         edit_file: true,
-        dispatch_subagent: true,
+        // #3 Background Agents: when this session belongs to a conversation,
+        // wire the shared process-local background registry + a companion
+        // get_subagent_result tool so `mode: "background"` is available and the
+        // run is tracked / cancellable / SSE-notified. Conversation-less
+        // sessions (rare) get sync-only dispatch.
+        dispatch_subagent: conversationId
+          ? {
+              background: {
+                registry: globalBackgroundRegistry(),
+                parentConversationId: conversationId,
+              },
+            }
+          : true,
         // v0.16 §11: the serve resolver throws `AskUserPending` to escape
         // the LLM loop. The chat round handler catches it, persists the
         // `pendingAsk` annotation against the conversation sidecar, and
@@ -1140,6 +1197,10 @@ function registerChatScope(
       // cleanly when one of them ends.
       const releaseSteerSlot = markStreamActive(conversationId);
       const releaseGoalGraded = pipeGoalGradedFrames(stream);
+      const releaseSubagentCompleted = pipeSubagentCompletedFrames(
+        stream,
+        conversationId,
+      );
       try {
         await stream.writeSSE({
           event: "session",
@@ -1281,6 +1342,8 @@ function registerChatScope(
         // outcomes 收尾 C-2 — stop relaying background goal-graded frames once
         // this stream is done.
         releaseGoalGraded();
+        // #3 — stop relaying background subagent-completed frames too.
+        releaseSubagentCompleted();
         // Approval Policy 矩阵 — fail-safe: settle any prompt still awaiting a
         // decision (browser closed mid-approval) as a deny so the session never
         // hangs on a dead Promise.
@@ -2403,6 +2466,28 @@ function buildApp(
 
   app.get("/api/health", async (c) => {
     return c.json({ ok: true, version: await readPackageVersion(), workspace });
+  });
+
+  // #3 Background Agents — cooperative cancel: set the abort flag on a running
+  // background subagent. The runner exits on its next signal checkpoint; status
+  // flips to `cancelled` immediately so the next poll reflects it. 404 for an
+  // unknown id; 409 if the run already reached a terminal state. (The matching
+  // GET /api/subagents/active lives in slash-routes.ts alongside its `kinds`.)
+  app.post("/api/subagents/:id/cancel", async (c) => {
+    const id = c.req.param("id");
+    const registry = globalBackgroundRegistry();
+    const record = registry.get(id);
+    if (!record) {
+      return c.json({ error: `unknown subagent "${id}"` }, 404);
+    }
+    const cancelled = registry.cancelSubagent(id);
+    if (!cancelled) {
+      return c.json(
+        { error: `subagent "${id}" is not running (status: ${record.status})`, status: record.status },
+        409,
+      );
+    }
+    return c.json({ ok: true, id, status: "cancelled" });
   });
 
   // v0.17 mathub parity: file-upload endpoint for the SPA attachments flow.
