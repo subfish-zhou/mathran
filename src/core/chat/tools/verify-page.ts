@@ -97,6 +97,7 @@ export function createVerifyPageTool(opts: VerifyPageToolOptions = {}): ToolSpec
   return {
     name: "verify_page",
     riskClass: "write",
+    readOnly: false,
     description:
       "Verify the factual claims of a wiki page with the LLM and record the result in the " +
       "page frontmatter. Reads the page, extracts its claims, scores each (0..1), then writes " +

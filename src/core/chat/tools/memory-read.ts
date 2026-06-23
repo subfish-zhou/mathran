@@ -19,6 +19,7 @@ export function createMemoryReadTool(opts: MemoryReadToolOptions = {}): ToolSpec
   return {
     name: "memory_read",
     riskClass: "read",
+    readOnly: true,
     description:
       "Read the full content of a long-term memory topic. " +
       `Content larger than ${Math.round(maxBytes / 1024)} KiB is truncated.`,

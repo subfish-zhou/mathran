@@ -20,6 +20,7 @@ export function createUpdateProjectMetadataTool(
   return {
     name: "update_project_metadata",
     riskClass: "write",
+    readOnly: false,
     description:
       "Patch the writable subset of `project.toml` for a project: `name`, `description`, `tags`. " +
       "Other fields (mathran_version, created_at) are preserved. At least one field must be provided. " +

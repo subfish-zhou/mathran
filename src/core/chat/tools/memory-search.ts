@@ -21,6 +21,7 @@ export function createMemorySearchTool(
   return {
     name: "memory_search",
     riskClass: "read",
+    readOnly: true,
     description:
       "Case-insensitive substring search across every long-term memory topic. " +
       "Returns matching lines as `topic:lineNum: line`.",

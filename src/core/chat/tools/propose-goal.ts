@@ -195,6 +195,7 @@ export function createProposeGoalTool(opts: ProposeGoalToolOptions): ToolSpec {
   return {
     name: "propose_goal",
     riskClass: "read",
+    readOnly: false,
     description: DESCRIPTION,
     parameters: {
       type: "object",

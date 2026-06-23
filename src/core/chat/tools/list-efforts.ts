@@ -21,6 +21,7 @@ export function createListEffortsTool(
   return {
     name: "list_efforts",
     riskClass: "read",
+    readOnly: true,
     description:
       "List every workspace effort in a mathran project. Each effort is a directory under " +
       "`projects/<slug>/efforts/<effort-slug>/` and represents one unit of mathematical work " +

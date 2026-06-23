@@ -20,6 +20,7 @@ export function createListWikiPagesTool(
   return {
     name: "list_wiki_pages",
     riskClass: "read",
+    readOnly: true,
     description:
       "List every wiki page in a mathran project. Use this to discover what wiki pages exist before calling `read_wiki_page`. " +
       "Output is a JSON-encoded object: `{ project, count, pages: [{ page, title, parent, sortOrder, version, tags, deleted }] }`. " +

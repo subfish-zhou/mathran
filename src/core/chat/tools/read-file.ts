@@ -63,6 +63,7 @@ export function createReadFileTool(opts: ReadFileToolOptions = {}): ToolSpec {
   return {
     name: "read_file",
     riskClass: "read",
+    readOnly: true,
     description:
       "Read a text file from the workspace and return its contents with 1-indexed line numbers (cat -n format). " +
       `Default returns the first ${defaultLimit} lines starting at line 1. ` +

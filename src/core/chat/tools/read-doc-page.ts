@@ -19,6 +19,7 @@ export function createReadDocPageTool(
   return {
     name: "read_doc_page",
     riskClass: "read",
+    readOnly: true,
     description:
       "Read a doc page (`docs/<page>.md`) verbatim — no frontmatter parsing. " +
       "Output: `{ project, page, content }`. Returns ok=false if the file is missing.",

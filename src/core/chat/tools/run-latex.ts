@@ -49,6 +49,7 @@ export function createRunLatexTool(opts: RunLatexToolOptions = {}): ToolSpec {
   return {
     name: "run_latex",
     riskClass: "exec",
+    readOnly: false,
     description:
       "Compile a LaTeX document into a PDF with a host TeX engine " +
       "(pdflatex / xelatex / lualatex). Returns the produced PDF path, or the " +

@@ -28,6 +28,7 @@ export function createSearchWebTool(opts: SearchWebToolOptions = {}): ToolSpec {
   return {
     name: "search_web",
     riskClass: "read",
+    readOnly: true,
     description:
       "Search the public web for information. Returns up to `limit` results " +
       "(default 10, max 20), each `{ title, url, snippet }`. Uses Brave by default " +

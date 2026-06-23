@@ -20,6 +20,7 @@ export function createListEffortVersionsTool(
   return {
     name: "list_effort_versions",
     riskClass: "read",
+    readOnly: true,
     description:
       "List the snapshot versions of an effort. Each version was created by a `snapshot_effort` " +
       "call and contains a frozen copy of document.md + files/. " +

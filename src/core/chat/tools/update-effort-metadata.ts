@@ -23,6 +23,7 @@ export function createUpdateEffortMetadataTool(
   return {
     name: "update_effort_metadata",
     riskClass: "write",
+    readOnly: false,
     description:
       "Patch effort.toml fields (title, description, status, type). Freeform — bypasses the " +
       "VALID_TRANSITIONS state machine. For audited status transitions use " +

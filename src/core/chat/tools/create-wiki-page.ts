@@ -21,6 +21,7 @@ export function createCreateWikiPageTool(
   return {
     name: "create_wiki_page",
     riskClass: "write",
+    readOnly: false,
     description:
       "Create a brand-new wiki page in a project. Fails (ok=false) if the page slug already exists — " +
       "use `update_wiki_page` for existing pages. The `body` is markdown without frontmatter; the tool prepends " +

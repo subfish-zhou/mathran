@@ -69,6 +69,7 @@ export function createEditFileTool(opts: EditFileToolOptions = {}): ToolSpec {
   return {
     name: "edit_file",
     riskClass: "write",
+    readOnly: false,
     description:
       "Edit a file by replacing `old_string` with `new_string`. " +
       "By default `old_string` must match exactly once — include surrounding lines if your initial snippet is ambiguous. " +

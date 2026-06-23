@@ -20,6 +20,7 @@ export function createSnapshotEffortTool(
   return {
     name: "snapshot_effort",
     riskClass: "write",
+    readOnly: false,
     description:
       "Take a versioned snapshot of an effort: copies `document.md` + `files/` into " +
       "`.versions/v<N>/` (N = currentVersion + 1) and bumps `currentVersion` in effort.toml. " +

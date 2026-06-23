@@ -22,6 +22,7 @@ export function createCreateEffortTool(
   return {
     name: "create_effort",
     riskClass: "write",
+    readOnly: false,
     description:
       "Scaffold a new workspace effort inside a project. Creates the effort directory with " +
       "`effort.toml` (status=DRAFT) + empty `document.md` + `files/`. " +

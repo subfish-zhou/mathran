@@ -20,6 +20,7 @@ export function createUpdateWikiPageTool(
   return {
     name: "update_wiki_page",
     riskClass: "write",
+    readOnly: false,
     description:
       "Update (overwrite) an existing wiki page. Fails (ok=false) if the page does not exist — " +
       "use `create_wiki_page` first. The previous body is automatically snapshotted into " +

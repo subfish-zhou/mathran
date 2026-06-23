@@ -167,6 +167,29 @@ export interface ToolSpec {
    */
   riskClass?: RiskClass;
   /**
+   * Plan-mode ACL flag (Part B1).
+   *
+   * When the chat session is in **plan mode** (a read-only "thinking"
+   * phase opted into via `enter_plan_mode`), the dispatcher only allows
+   * tools with `readOnly === true` to execute. All other tools (write,
+   * exec, mutating semantics, side-effecting external calls) are blocked
+   * with `PlanModeBlockedError`, surfaced back to the model as an
+   * `ok: false` tool result so the loop can keep reasoning without
+   * mutating state.
+   *
+   * Optional / defaults to `false`. Backward-compat: any tool that does
+   * not opt in to `readOnly: true` is treated as mutating and therefore
+   * blocked in plan mode. This conservative default mirrors Claude Code's
+   * Plan Mode — unknown / un-classified tools are never silently allowed.
+   *
+   * Note: this is independent of `riskClass`. A tool may have
+   * `riskClass: "read"` and still be `readOnly: false` (e.g.
+   * `propose_goal` / `propose_plan` carry a read risk class but write
+   * goal / plan records to disk on user confirmation). Always classify
+   * `readOnly` by *side effects*, not by the approval risk bucket.
+   */
+  readOnly?: boolean;
+  /**
    * Execute the tool. `args` is the parsed JSON arguments object (or `{}` if
    * the model emitted no/invalid JSON). `ctx` carries optional workspace/scope
    * hints — tools should treat it as advisory and fall back to safe defaults

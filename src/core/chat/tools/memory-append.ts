@@ -16,6 +16,7 @@ export function createMemoryAppendTool(
   return {
     name: "memory_append",
     riskClass: "write",
+    readOnly: false,
     description:
       "Append a single line to a long-term memory topic, creating it if absent. " +
       "A trailing newline is added automatically.",

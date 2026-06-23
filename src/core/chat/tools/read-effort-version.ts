@@ -22,6 +22,7 @@ export function createReadEffortVersionTool(
   return {
     name: "read_effort_version",
     riskClass: "read",
+    readOnly: true,
     description:
       "Read the `document.md` from a specific snapshot version of an effort. " +
       "Versions are integer Ns created via `snapshot_effort`. " +

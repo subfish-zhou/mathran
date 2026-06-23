@@ -20,6 +20,7 @@ export function createReadProjectMetadataTool(
   return {
     name: "read_project_metadata",
     riskClass: "read",
+    readOnly: true,
     description:
       "Read a project's `project.toml` and the top-level entries of `projects/<slug>/`. " +
       "Output: `{ slug, project: {...toml...}, entries: ['wiki/', 'efforts/', 'project.toml', ...] }`.",

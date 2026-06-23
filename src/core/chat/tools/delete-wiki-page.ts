@@ -20,6 +20,7 @@ export function createDeleteWikiPageTool(
   return {
     name: "delete_wiki_page",
     riskClass: "write",
+    readOnly: false,
     description:
       "Soft-delete a wiki page by setting `frontmatter.deleted = true` and bumping the version. " +
       "The page contents are preserved on disk (so `update_wiki_page` can resurrect it). " +

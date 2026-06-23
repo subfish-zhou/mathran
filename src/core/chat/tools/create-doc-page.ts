@@ -19,6 +19,7 @@ export function createCreateDocPageTool(
   return {
     name: "create_doc_page",
     riskClass: "write",
+    readOnly: false,
     description:
       "Create a new `docs/<page>.md` in a project. Fails (ok=false) if the page already exists — " +
       "use `update_doc_page` then. No frontmatter is added; the body is written verbatim. " +

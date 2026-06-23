@@ -20,6 +20,7 @@ export function createUpdateEffortDocumentTool(
   return {
     name: "update_effort_document",
     riskClass: "write",
+    readOnly: false,
     description:
       "Replace the full `document.md` body of a workspace effort. Use this when rewriting the " +
       "whole document; for incremental notes use `append_effort_document` instead. " +
