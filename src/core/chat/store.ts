@@ -713,7 +713,8 @@ export class ScopedChatSessionStore {
 function deriveTitle(history: LLMMessage[]): string {
   const first = history.find((m) => m.role === "user");
   if (!first) return "New chat";
-  const trimmed = first.content.trim().split("\n")[0];
+  const text = typeof first.content === "string" ? first.content : "";
+  const trimmed = text.trim().split("\n")[0];
   if (trimmed.length === 0) return "New chat";
   return trimmed.length > 80 ? trimmed.slice(0, 77) + "..." : trimmed;
 }

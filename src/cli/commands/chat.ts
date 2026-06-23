@@ -50,6 +50,7 @@ import {
 } from "../../core/chat/index.js";
 import type { ChatEvent } from "../../core/chat/index.js";
 import type { LLMMessage } from "../../core/providers/llm.js";
+import { contentToString } from "../../core/providers/llm.js";
 import { ModelRouter, LocalLeanProvider } from "../../providers/index.js";
 import {
   SubagentScheduler,
@@ -841,7 +842,7 @@ export async function handleSlashCommand(
       if (h.length === 0) return { kind: "continue", output: "(empty)" };
       const lines = h.map((m, i) => {
         const role = m.role;
-        const body = (m.content ?? "").replace(/\s+/g, " ").slice(0, 80);
+        const body = contentToString(m.content ?? "").replace(/\s+/g, " ").slice(0, 80);
         return `  ${String(i + 1).padStart(3)}. ${role.padEnd(9)} ${body}${
           body.length === 80 ? "…" : ""
         }`;

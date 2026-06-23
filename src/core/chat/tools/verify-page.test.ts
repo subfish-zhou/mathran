@@ -30,7 +30,7 @@ class FakeLLM implements LLMProvider {
     return { name: "fake" };
   }
   async chat(req: LLMRequest): Promise<LLMResponse> {
-    const sys = req.messages.find((m) => m.role === "system")?.content ?? "";
+    const sys = (req.messages.find((m) => m.role === "system")?.content ?? "") as string;
     const text = /enumerate|list every distinct/i.test(sys)
       ? this.replies.extract
       : this.replies.score;

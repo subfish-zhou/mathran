@@ -25,6 +25,7 @@ import { buildRubricMessages, parseRubricReply } from "./rubric-prompt.js";
 import { writeOutcome } from "./store.js";
 import { publishOutcomeGraded } from "./events.js";
 import type { LLMMessage, LLMProvider } from "../providers/llm.js";
+import { contentToString } from "../providers/llm.js";
 
 /** Map the runner's completion outcome to an outcome resolution. */
 export function resolutionFromCompletion(
@@ -46,16 +47,16 @@ export function buildTraceFromHistory(
   for (const m of history) {
     if (m.role === "system") continue;
     if (m.role === "assistant") {
-      const text = (m.content ?? "").trim();
+      const text = contentToString(m.content ?? "").trim();
       if (text) parts.push(`ASSISTANT: ${text}`);
       for (const tc of m.toolCalls ?? []) {
         parts.push(`  → tool ${tc.name}(${tc.arguments})`);
       }
     } else if (m.role === "tool") {
-      const text = (m.content ?? "").trim();
+      const text = contentToString(m.content ?? "").trim();
       if (text) parts.push(`TOOL[${m.name ?? "result"}]: ${truncate(text, 600)}`);
     } else if (m.role === "user") {
-      const text = (m.content ?? "").trim();
+      const text = contentToString(m.content ?? "").trim();
       if (text) parts.push(`USER: ${truncate(text, 800)}`);
     }
   }

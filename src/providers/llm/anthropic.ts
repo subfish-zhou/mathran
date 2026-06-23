@@ -13,6 +13,7 @@ import type {
   LLMStreamChunk,
   LLMMessage,
 } from "../../core/providers/llm.js";
+import { contentToString } from "../../core/providers/llm.js";
 import { buildAnthropicEffortPatch, isReasoningEffortLevel } from "../../core/reasoning-effort/index.js";
 import { createAnthropicTokenCounter, type TokenCounter } from "../../core/chat/token-counter.js";
 
@@ -54,14 +55,14 @@ export function toAnthropicMessages(messages: LLMMessage[]): {
   const out: any[] = [];
   for (const m of messages) {
     if (m.role === "system") {
-      systemParts.push(m.content);
+      systemParts.push(contentToString(m.content));
       continue;
     }
     if (m.role === "tool") {
       out.push({
         role: "user",
         content: [
-          { type: "tool_result", tool_use_id: m.toolCallId ?? "", content: m.content },
+          { type: "tool_result", tool_use_id: m.toolCallId ?? "", content: contentToString(m.content) },
         ],
       });
       continue;
@@ -71,8 +72,9 @@ export function toAnthropicMessages(messages: LLMMessage[]): {
       // text + tool_use blocks. Anthropic rejects assistant turns that have
       // a trailing tool_result without a matching tool_use.
       const blocks: any[] = [];
-      if (m.content && m.content.length > 0) {
-        blocks.push({ type: "text", text: m.content });
+      const assistantText = contentToString(m.content);
+      if (assistantText && assistantText.length > 0) {
+        blocks.push({ type: "text", text: assistantText });
       }
       for (const c of m.toolCalls) {
         let parsed: unknown = {};
@@ -88,7 +90,7 @@ export function toAnthropicMessages(messages: LLMMessage[]): {
       out.push({ role: "assistant", content: blocks });
       continue;
     }
-    out.push({ role: m.role, content: m.content });
+    out.push({ role: m.role, content: contentToString(m.content) });
   }
   return { system: systemParts.length ? systemParts.join("\n\n") : undefined, messages: out };
 }

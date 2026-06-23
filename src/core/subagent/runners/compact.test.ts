@@ -131,8 +131,10 @@ describe("compact runner — computeCompacted (normal case)", () => {
     expect(result.newMessages[0].role).toBe("system");
     expect(result.newMessages[0].content).toBe("You are mathran.");
     expect(result.newMessages[1].role).toBe("system");
-    expect(result.newMessages[1].content.startsWith(COMPACT_SUMMARY_PREFIX)).toBe(true);
-    expect(result.newMessages[1].content).toContain(summary);
+    const compactSummary = result.newMessages[1].content;
+    if (typeof compactSummary !== "string") throw new Error("expected string content");
+    expect(compactSummary.startsWith(COMPACT_SUMMARY_PREFIX)).toBe(true);
+    expect(compactSummary).toContain(summary);
 
     // Last user msg in the new history is the last user round.
     const lastUser = [...result.newMessages].reverse().find((m) => m.role === "user");

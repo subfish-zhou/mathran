@@ -495,7 +495,7 @@ describe("POST /api/chat/:id/rerun (v0.16 §1)", () => {
         async describe() { return { name: "capture" }; },
         async chat(req: LLMRequest): Promise<LLMResponse> {
           const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
-          lastUserText = lastUser?.content ?? "";
+          lastUserText = (lastUser?.content ?? "") as string;
           return {
             async *stream(): AsyncIterable<LLMStreamChunk> {
               yield { type: "text", delta: `saw=${lastUserText}` };

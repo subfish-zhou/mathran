@@ -6,6 +6,7 @@
  */
 
 import type { LLMProvider, LLMRequest, LLMResponse, LLMStreamChunk, LLMMessage } from "../../core/providers/llm.js";
+import { contentToString } from "../../core/providers/llm.js";
 import { copilotChat, type CopilotChatRequest } from "./copilot.js";
 import { createOpenAITokenCounter, type TokenCounter } from "../../core/chat/token-counter.js";
 
@@ -39,11 +40,11 @@ export class CopilotAdapter implements LLMProvider {
     const messages: CopilotChatRequest["messages"] = [];
     for (const m of req.messages) {
       if (m.role === "system") {
-        systemParts.push(m.content);
+        systemParts.push(contentToString(m.content));
       } else if (m.role === "user" || m.role === "assistant") {
         const out: CopilotChatRequest["messages"][number] = {
           role: m.role,
-          content: m.content,
+          content: contentToString(m.content),
         };
         if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
           out.toolCalls = m.toolCalls.map((c) => ({
@@ -56,7 +57,7 @@ export class CopilotAdapter implements LLMProvider {
       } else if (m.role === "tool") {
         messages.push({
           role: "tool",
-          content: m.content,
+          content: contentToString(m.content),
           ...(m.toolCallId !== undefined ? { toolCallId: m.toolCallId } : {}),
           ...(m.name !== undefined ? { name: m.name } : {}),
         });
