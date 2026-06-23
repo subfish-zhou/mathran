@@ -105,6 +105,10 @@ import { createInstallPythonPackageTool } from "./tools/install-python-package.j
 import { createSearchWebTool } from "./tools/search-web.js";
 import { createVerifyPageTool } from "./tools/verify-page.js";
 import { createSearchArxivTool } from "./tools/search-arxiv.js";
+import {
+  createCompletePlanTool,
+  createEnterPlanModeTool,
+} from "./tools/plan-mode-tools.js";
 import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
@@ -529,6 +533,18 @@ export interface ChatSessionOptions {
      * plain boolean.
      */
     search_arxiv?: boolean;
+    /**
+     * Part B1 — chat-level plan mode tools (`enter_plan_mode` /
+     * `complete_plan`). Default ON when the host explicitly enables them.
+     * The flag itself is a plain boolean; the tools take no host wiring
+     * beyond a pair of callbacks pointing at
+     * {@link ChatSession.enablePlanMode} /
+     * {@link ChatSession.disablePlanMode}, which the builder wires up.
+     *
+     * Plan mode is an in-memory session flag; it does NOT persist across
+     * session restarts.
+     */
+    plan_mode?: boolean;
   };
   /**
    * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
@@ -1361,6 +1377,18 @@ export class ChatSession {
     // gap #2 — stateless read-only arXiv search; no checkpoint wrapping needed.
     if (cfg.search_arxiv) {
       out.push(createSearchArxivTool());
+    }
+    // Part B1 — chat-level plan mode tools. Both tools are readOnly so the
+    // model can always *exit* plan mode after entering it. We bind to
+    // arrow callbacks (NOT bound methods) so the closures keep working
+    // even if the host swaps the session reference later in tests.
+    if (cfg.plan_mode) {
+      const planOpts = {
+        enablePlanMode: () => this.enablePlanMode(),
+        disablePlanMode: () => this.disablePlanMode(),
+      };
+      out.push(createEnterPlanModeTool(planOpts));
+      out.push(createCompletePlanTool(planOpts));
     }
     return out;
   }
