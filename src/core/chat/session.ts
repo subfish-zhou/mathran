@@ -102,6 +102,8 @@ import { createScratchpadWriteTool } from "./tools/scratchpad-write.js";
 import { createRunPythonTool } from "./tools/run-python.js";
 import { createRunLatexTool } from "./tools/run-latex.js";
 import { createInstallPythonPackageTool } from "./tools/install-python-package.js";
+import { createSearchWebTool } from "./tools/search-web.js";
+import { createVerifyPageTool } from "./tools/verify-page.js";
 import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
@@ -468,6 +470,20 @@ export interface ChatSessionOptions {
     run_python?: boolean | { conversationId?: string };
     run_latex?: boolean | { conversationId?: string };
     install_python_package?: boolean | { conversationId?: string };
+    /**
+     * gap #5 — `search_web` web search tool. `true` enables it with the
+     * default provider (brave) reading the API key from the
+     * `BRAVE_SEARCH_API_KEY` / `SERPAPI_API_KEY` env. Pass an object to pin a
+     * `provider` and/or supply an explicit `apiKey` from host config. With no
+     * key the tool returns a friendly ok=false (never throws).
+     */
+    search_web?: boolean | { provider?: "brave" | "serpapi"; apiKey?: string };
+    /**
+     * gap #5 — `verify_page` LLM claim-verification tool. Reads a wiki page,
+     * scores its claims, and writes `verification` frontmatter. Uses the
+     * session LLM by default; pass an object to override the `model`.
+     */
+    verify_page?: boolean | { model?: string };
   };
   /**
    * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
@@ -1233,6 +1249,27 @@ export class ChatSession {
           createInstallPythonPackageTool({
             ...(this.workspace ? { workspace: this.workspace } : {}),
             ...(convId ? { conversationId: convId } : {}),
+          }),
+        ),
+      );
+    }
+    if (cfg.search_web) {
+      const swCfg = typeof cfg.search_web === "object" ? cfg.search_web : {};
+      out.push(
+        createSearchWebTool({
+          ...(swCfg.provider ? { provider: swCfg.provider } : {}),
+          ...(swCfg.apiKey ? { apiKey: swCfg.apiKey } : {}),
+        }),
+      );
+    }
+    if (cfg.verify_page) {
+      const vpCfg = typeof cfg.verify_page === "object" ? cfg.verify_page : {};
+      out.push(
+        this.maybeCheckpoint(
+          createVerifyPageTool({
+            ...(this.workspace ? { workspace: this.workspace } : {}),
+            llm: this.llm,
+            model: vpCfg.model ?? this.model ?? "",
           }),
         ),
       );

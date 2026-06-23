@@ -67,6 +67,16 @@ export interface WikiFrontmatter {
   version?: number;
   /** Soft-delete marker; `delete_wiki_page` sets this. */
   deleted?: boolean;
+  /**
+   * gap #5 — claim-verification result written by the `verify_page` tool.
+   * `score` is a 0..1 aggregate confidence, `verifiedAt` is an ISO-8601
+   * timestamp, `issues` lists human-readable problems found per claim.
+   */
+  verification?: {
+    score: number;
+    verifiedAt: string;
+    issues: string[];
+  };
 }
 
 export interface ParsedFrontmatter {
@@ -104,6 +114,9 @@ export function stringifyFrontmatter(fm: WikiFrontmatter): string {
   if (fm.updatedAt !== undefined) lines.push(`updatedAt: ${fm.updatedAt}`);
   if (fm.version !== undefined) lines.push(`version: ${fm.version}`);
   if (fm.deleted !== undefined) lines.push(`deleted: ${fm.deleted}`);
+  if (fm.verification !== undefined) {
+    lines.push(`verification: ${JSON.stringify(fm.verification)}`);
+  }
   lines.push("---", "");
   return lines.join("\n");
 }
@@ -207,6 +220,8 @@ export interface WriteWikiPageOpts {
   tags?: string[];
   /** Set `frontmatter.deleted` to this value (used by soft-delete). */
   deleted?: boolean;
+  /** gap #5 — set/replace the claim-verification block (used by `verify_page`). */
+  verification?: { score: number; verifiedAt: string; issues: string[] };
 }
 
 /**
@@ -261,6 +276,11 @@ export async function writeWikiPage(
     updatedAt: now,
     version: oldVersion + 1,
     ...(opts.deleted !== undefined ? { deleted: opts.deleted } : existingFm.deleted ? { deleted: existingFm.deleted } : {}),
+    ...(opts.verification !== undefined
+      ? { verification: opts.verification }
+      : existingFm.verification !== undefined
+        ? { verification: existingFm.verification }
+        : {}),
   };
   await fs.writeFile(file, stringifyFrontmatter(next) + body, "utf-8");
   const result = await readWikiPage(workspace, project, page);
