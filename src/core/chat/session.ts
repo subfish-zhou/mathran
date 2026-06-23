@@ -56,6 +56,31 @@ import { createBashTool } from "./tools/bash.js";
 import { createReadFileTool } from "./tools/read-file.js";
 import { createWriteFileTool } from "./tools/write-file.js";
 import { createEditFileTool } from "./tools/edit-file.js";
+import { createReadWikiPageTool } from "./tools/read-wiki-page.js";
+import { createListWikiPagesTool } from "./tools/list-wiki-pages.js";
+import { createCreateWikiPageTool } from "./tools/create-wiki-page.js";
+import { createUpdateWikiPageTool } from "./tools/update-wiki-page.js";
+import { createDeleteWikiPageTool } from "./tools/delete-wiki-page.js";
+import { createSearchWikiTool } from "./tools/search-wiki.js";
+import { createListEffortsTool } from "./tools/list-efforts.js";
+import { createReadEffortTool } from "./tools/read-effort.js";
+import { createCreateEffortTool } from "./tools/create-effort.js";
+import { createUpdateEffortDocumentTool } from "./tools/update-effort-document.js";
+import { createAppendEffortDocumentTool } from "./tools/append-effort-document.js";
+import { createUpdateEffortMetadataTool } from "./tools/update-effort-metadata.js";
+import { createTransitionEffortStatusTool } from "./tools/transition-effort-status.js";
+import { createSnapshotEffortTool } from "./tools/snapshot-effort.js";
+import { createListEffortVersionsTool } from "./tools/list-effort-versions.js";
+import { createReadEffortVersionTool } from "./tools/read-effort-version.js";
+import { createAddEffortRelationTool } from "./tools/add-effort-relation.js";
+import { createListEffortRelationsTool } from "./tools/list-effort-relations.js";
+import { createListProjectsTool } from "./tools/list-projects.js";
+import { createReadProjectMetadataTool } from "./tools/read-project-metadata.js";
+import { createUpdateProjectMetadataTool } from "./tools/update-project-metadata.js";
+import { createListDocPagesTool } from "./tools/list-doc-pages.js";
+import { createReadDocPageTool } from "./tools/read-doc-page.js";
+import { createCreateDocPageTool } from "./tools/create-doc-page.js";
+import { createUpdateDocPageTool } from "./tools/update-doc-page.js";
 import { createDispatchSubagentTool } from "./tools/dispatch-subagent.js";
 import { createGetSubagentResultTool } from "./tools/get-subagent-result.js";
 import {
@@ -337,6 +362,29 @@ export interface ChatSessionOptions {
     read_file?: boolean;
     write_file?: boolean;
     edit_file?: boolean;
+    /**
+     * Gap #1 (wiki / effort / project chat tools) — enables 25 LLM-callable
+     * tools that wrap the wiki/effort/project filesystem stores into chat
+     * shape so the model can read+write project content directly without an
+     * HTTP round-trip through the REST layer.
+     *
+     * Tools registered (when `true`):
+     *   - Wiki (6):    read_wiki_page, list_wiki_pages, create_wiki_page,
+     *                  update_wiki_page, delete_wiki_page, search_wiki
+     *   - Effort (12): list_efforts, read_effort, create_effort,
+     *                  update_effort_document, append_effort_document,
+     *                  update_effort_metadata, transition_effort_status,
+     *                  snapshot_effort, list_effort_versions,
+     *                  read_effort_version, add_effort_relation,
+     *                  list_effort_relations
+     *   - Project (7): list_projects, read_project_metadata,
+     *                  update_project_metadata, list_doc_pages,
+     *                  read_doc_page, create_doc_page, update_doc_page
+     *
+     * All tools accept a builder-time `workspace` (baked from
+     * `this.workspace`) and fall back to `ctx.workspace` then `process.cwd()`.
+     */
+    gap1_project_tools?: boolean;
     /**
      * `dispatch_subagent` (v0.5 wire-up Gap #4 + #5; #3 background). `true`
      * enables sync-only dispatch. Pass an object with `background` to also
@@ -975,6 +1023,41 @@ export class ChatSession {
           createEditFileTool(this.workspace ? { workspace: this.workspace } : {}),
         ),
       );
+    }
+    // Gap #1 (wiki / effort / project chat tools). All 25 tools share the
+    // builder-time `workspace` injection pattern; each is wrapped via
+    // `maybeCheckpoint` for write-class tools so the existing checkpoint
+    // middleware (write_file / edit_file) also covers wiki/effort/doc mutations.
+    if (cfg.gap1_project_tools) {
+      const wsOpts = this.workspace ? { workspace: this.workspace } : {};
+      // Wiki tools.
+      out.push(createReadWikiPageTool(wsOpts));
+      out.push(createListWikiPagesTool(wsOpts));
+      out.push(this.maybeCheckpoint(createCreateWikiPageTool(wsOpts)));
+      out.push(this.maybeCheckpoint(createUpdateWikiPageTool(wsOpts)));
+      out.push(this.maybeCheckpoint(createDeleteWikiPageTool(wsOpts)));
+      out.push(createSearchWikiTool(wsOpts));
+      // Effort tools.
+      out.push(createListEffortsTool(wsOpts));
+      out.push(createReadEffortTool(wsOpts));
+      out.push(this.maybeCheckpoint(createCreateEffortTool(wsOpts)));
+      out.push(this.maybeCheckpoint(createUpdateEffortDocumentTool(wsOpts)));
+      out.push(this.maybeCheckpoint(createAppendEffortDocumentTool(wsOpts)));
+      out.push(this.maybeCheckpoint(createUpdateEffortMetadataTool(wsOpts)));
+      out.push(this.maybeCheckpoint(createTransitionEffortStatusTool(wsOpts)));
+      out.push(this.maybeCheckpoint(createSnapshotEffortTool(wsOpts)));
+      out.push(createListEffortVersionsTool(wsOpts));
+      out.push(createReadEffortVersionTool(wsOpts));
+      out.push(this.maybeCheckpoint(createAddEffortRelationTool(wsOpts)));
+      out.push(createListEffortRelationsTool(wsOpts));
+      // Project / doc tools.
+      out.push(createListProjectsTool(wsOpts));
+      out.push(createReadProjectMetadataTool(wsOpts));
+      out.push(this.maybeCheckpoint(createUpdateProjectMetadataTool(wsOpts)));
+      out.push(createListDocPagesTool(wsOpts));
+      out.push(createReadDocPageTool(wsOpts));
+      out.push(this.maybeCheckpoint(createCreateDocPageTool(wsOpts)));
+      out.push(this.maybeCheckpoint(createUpdateDocPageTool(wsOpts)));
     }
     // v0.5 wire-up Gap #4 + #5: generic dispatch tool. Requires a scheduler
     // to be wired (callers that opt in but forget to pass one get a console
