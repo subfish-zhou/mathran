@@ -100,6 +100,33 @@ describe("GET /api/uploads/<encoded-path>", () => {
     expect(Buffer.from(got).equals(Buffer.from(png))).toBe(true);
   });
 
+  it("forces Content-Disposition: attachment for SVG to block inline render", async () => {
+    const svg = new TextEncoder().encode(
+      '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+    );
+    const full = await seedUpload("evil.svg", svg);
+
+    const res = await fetch(uploadUrl(full));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/svg+xml");
+    // The attachment disposition stops the browser from rendering the SVG
+    // (and any inline <script>) same-origin.
+    const disp = res.headers.get("content-disposition");
+    expect(disp).toMatch(/^attachment;/);
+    expect(disp).toContain("evil.svg");
+  });
+
+  it("keeps raster images (PNG) inline — no attachment disposition", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const full = await seedUpload("inline.png", png);
+
+    const res = await fetch(uploadUrl(full));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    // PNG carries no script — it must stay inline so thumbnails render.
+    expect(res.headers.get("content-disposition")).toBeNull();
+  });
+
   it("infers Content-Type from extension for text/markdown/json/pdf", async () => {
     // Each entry: filename, declared mime we expect on the response.
     const cases: Array<{ name: string; mime: string }> = [
