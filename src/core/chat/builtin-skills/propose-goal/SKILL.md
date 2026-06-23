@@ -38,3 +38,10 @@ When NOT to call `propose_goal`:
 Suggesting budget: pick `suggestedMaxRounds` from 50 (small refactor)
 to 200 (whole-repo audit). Omit `suggestedTokensCap` unless the task
 clearly needs a hard ceiling.
+
+Learning from past outcomes: when you call `propose_goal`, the system
+retrieves similar past goals' self-graded outcomes (score + lessons) and
+returns them in the tool result under `pastOutcomes`. Read them — they
+capture what worked, what to avoid, and gotchas from comparable goals.
+Let those lessons shape your plan and approach for the new goal. Browse
+all graded outcomes with the `/outcomes` slash command.

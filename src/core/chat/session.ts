@@ -827,13 +827,25 @@ export class ChatSession {
     // the createGoal write on confirm; serve.ts watches for tool-result
     // name=propose_goal and emits a `goal-proposed` SSE frame.
     if (cfg.propose_goal && cfg.propose_goal.resolver) {
+      const pgWorkspace = cfg.propose_goal.workspace;
       out.push(
         createProposeGoalTool({
           resolver: cfg.propose_goal.resolver,
-          workspace: cfg.propose_goal.workspace,
+          workspace: pgWorkspace,
           scope: cfg.propose_goal.scope,
           model: cfg.propose_goal.model,
           autoRunner: cfg.propose_goal.autoRunner,
+          // #5: keyword/tag retrieval over .mathran/cache/outcomes for
+          // few-shot context. Lazy import keeps the outcomes module off the
+          // ChatSession hot path when propose_goal is unused.
+          retrieveFewShot: async (objective: string) => {
+            const { retrieveSimilarOutcomes, formatOutcomesFewShot } =
+              await import("../outcomes/retrieve.js");
+            const hits = await retrieveSimilarOutcomes(pgWorkspace, objective, {
+              limit: 3,
+            });
+            return formatOutcomesFewShot(hits);
+          },
         }),
       );
     }

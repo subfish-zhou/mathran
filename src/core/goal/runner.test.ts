@@ -624,6 +624,70 @@ describe("runGoalRound summary on completion", () => {
     expect(lastUserMsg.content).toBe(GOAL_SUMMARY_PROMPT_DONE);
   });
 
+  it("selfGrade:true writes an Outcome record after a top-level mark_done", async () => {
+    const { readOutcome } = await import("../outcomes/store.js");
+    const g = await createGoal(workspace, { objective: "prove L", scope: { kind: "global" }, model: "fake" });
+    const { llm } = capturingLLM([
+      // Turn 1: assistant calls mark_done.
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "done" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      // Turn 2: follow-up text.
+      [
+        { type: "text", delta: "all set" },
+        { type: "done", finishReason: "stop" },
+      ],
+      // Turn 3: summary round.
+      [
+        { type: "text", delta: "summary text" },
+        { type: "done", finishReason: "stop" },
+      ],
+      // Turn 4: the background self-grade JSON reply.
+      [
+        {
+          type: "text",
+          delta:
+            '{"rubric":{"correctness":5,"completeness":4,"efficiency":4},"lessons":"Reduced to a known fact.","contextTags":["lean","proof"]}',
+        },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [], selfGrade: true });
+    expect(r.completed).toBe(true);
+
+    // Self-grade is fire-and-forget (deferred via setImmediate) — let it settle.
+    await new Promise((res) => setTimeout(res, 30));
+    const outcome = await readOutcome(workspace, g.id);
+    expect(outcome).not.toBeNull();
+    expect(outcome!.resolution).toBe("complete");
+    expect(outcome!.averageScore).toBeCloseTo(4.3, 5);
+    expect(outcome!.contextTags).toEqual(["lean", "proof"]);
+  });
+
+  it("does NOT write an Outcome when selfGrade is omitted (default off)", async () => {
+    const { readOutcome } = await import("../outcomes/store.js");
+    const g = await createGoal(workspace, { objective: "prove L", scope: { kind: "global" }, model: "fake" });
+    const { llm } = capturingLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "done" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "all set" },
+        { type: "done", finishReason: "stop" },
+      ],
+      [
+        { type: "text", delta: "summary text" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    expect(r.completed).toBe(true);
+    await new Promise((res) => setTimeout(res, 30));
+    expect(await readOutcome(workspace, g.id)).toBeNull();
+  });
+
   it("give_up triggers a summary file with abandoned framing in the header", async () => {
     const g = await createGoal(workspace, { objective: "try X", scope: { kind: "global" }, model: "fake" });
     const { llm, calls } = capturingLLM([

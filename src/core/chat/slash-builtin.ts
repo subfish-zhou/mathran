@@ -59,6 +59,7 @@ export const NEW_BUILTIN_SLASH_COMMANDS: readonly BuiltinSlashCommandSpec[] = [
   { name: "agents", description: "List available and active sub-agents" },
   { name: "skills", description: "List layered skills (project / workspace / user)" },
   { name: "hooks", description: "List/log/bypass layered hooks (post-edit / pre-commit / …)" },
+  { name: "outcomes", description: "List self-graded goal outcomes (use /outcomes <id> | delete <id>)" },
 ];
 
 /** Full builtin list (existing + new), de-duplicated by name, sorted by name. */
@@ -362,3 +363,69 @@ export function parseHooksSubcommand(arg: string): HooksSubcommand {
 }
 
 export { isBlockingHookType };
+
+// ── /outcomes ──────────────────────────────────────────────────────────────
+
+import type { Outcome, OutcomeIndexEntry } from "../outcomes/schema.js";
+
+/** Parsed `/outcomes` subcommand. */
+export type OutcomesSubcommand =
+  | { kind: "list" }
+  | { kind: "show"; goalId: string }
+  | { kind: "delete"; goalId: string }
+  | { kind: "error"; message: string };
+
+/** Parse a `/outcomes` argument string into a subcommand. */
+export function parseOutcomesSubcommand(arg: string): OutcomesSubcommand {
+  const trimmed = arg.trim();
+  if (!trimmed || trimmed === "list") return { kind: "list" };
+  const [sub, ...rest] = trimmed.split(/\s+/);
+  const name = rest.join(" ").trim();
+  if (sub === "delete" || sub === "rm") {
+    if (!name) return { kind: "error", message: "usage: /outcomes delete <goalId>" };
+    return { kind: "delete", goalId: name };
+  }
+  // Bare `/outcomes <id>` shows one outcome's detail.
+  return { kind: "show", goalId: sub };
+}
+
+/** Render the most-recent outcomes as a one-line-per-outcome overview. */
+export function formatOutcomesList(
+  entries: readonly OutcomeIndexEntry[],
+  limit = 10,
+): string {
+  if (entries.length === 0) {
+    return "no self-graded outcomes yet — finish a goal (mark_done / give_up) to record one.";
+  }
+  const shown = entries.slice(0, limit);
+  const lines: string[] = [`Recent outcomes (${shown.length} of ${entries.length}):`];
+  for (const e of shown) {
+    const tags = e.contextTags.length > 0 ? ` [${e.contextTags.join(", ")}]` : "";
+    const shortId = e.goalId.slice(0, 8);
+    const goal = e.goalText.length > 60 ? e.goalText.slice(0, 57) + "…" : e.goalText;
+    lines.push(
+      `  ${e.averageScore.toFixed(1)}  ${e.resolution.padEnd(9)} ${shortId}  ${goal}${tags}`,
+    );
+  }
+  lines.push("");
+  lines.push("use `/outcomes <id>` for lessons, `/outcomes delete <id>` to remove.");
+  return lines.join("\n");
+}
+
+/** Render one outcome's full detail (rubric + lessons). */
+export function formatOutcomeDetail(outcome: Outcome): string {
+  const r = outcome.rubric;
+  const lines: string[] = [
+    `Outcome for goal ${outcome.goalId}`,
+    `  objective:   ${outcome.goalText}`,
+    `  resolution:  ${outcome.resolution}`,
+    `  average:     ${outcome.averageScore.toFixed(1)} / 5`,
+    `  rubric:      correctness=${r.correctness} completeness=${r.completeness} efficiency=${r.efficiency}`,
+    `  tags:        ${outcome.contextTags.length > 0 ? outcome.contextTags.join(", ") : "(none)"}`,
+    `  ended:       ${new Date(outcome.endedAt).toISOString()}`,
+    "",
+    "lessons:",
+    outcome.lessons,
+  ];
+  return lines.join("\n");
+}

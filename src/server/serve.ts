@@ -2246,6 +2246,7 @@ function buildApp(
             toolContext: { workspace, scope: g.scope },
             signal: controller.signal,
             bootstrapPlan: "auto",
+            selfGrade: true,
           });
         } finally {
           inflightGoals.delete(goalId);
@@ -3197,6 +3198,7 @@ function buildApp(
         // so spending one upfront `runPlan` round is a good trade for
         // grounding every subsequent round in a stable checklist.
         bootstrapPlan: "auto",
+        selfGrade: true,
       });
       return c.json({
         goal: r.goal,
@@ -3322,6 +3324,7 @@ function buildApp(
           toolContext: { workspace, scope: g.scope },
           signal: controller.signal,
           bootstrapPlan: "auto",
+          selfGrade: true,
           onEvent: (ev) => {
             queue.push({ event: ev.type, data: JSON.stringify(ev) });
             wakePump();

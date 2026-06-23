@@ -92,6 +92,16 @@ export interface ProposeGoalToolOptions {
    * If omitted, the tool ships in seed-only mode — Phase 1 behaviour.
    */
   autoRunner?: (goalId: string, userMessage: string) => void;
+  /**
+   * #5 (outcomes few-shot): optional retriever that returns a formatted
+   * "Past outcomes for similar goals…" block for a given objective. When
+   * provided, the tool retrieves similar past outcomes BEFORE asking the user
+   * to confirm and surfaces them in the tool-result so the model can refine
+   * its approach with hindsight on the next round. Wired by `session.ts` to
+   * the keyword retriever over `.mathran/cache/outcomes/`. Errors are
+   * swallowed — retrieval is advisory and must never block a proposal.
+   */
+  retrieveFewShot?: (objective: string) => Promise<string>;
 }
 
 export interface ProposeGoalToolResult {
@@ -181,7 +191,7 @@ export function formatProposeGoalQuestion(input: {
 }
 
 export function createProposeGoalTool(opts: ProposeGoalToolOptions): ToolSpec {
-  const { resolver, workspace, scope, model, autoRunner } = opts;
+  const { resolver, workspace, scope, model, autoRunner, retrieveFewShot } = opts;
   return {
     name: "propose_goal",
     riskClass: "read",
@@ -248,6 +258,17 @@ export function createProposeGoalTool(opts: ProposeGoalToolOptions): ToolSpec {
         suggestedTokensCap,
       });
 
+      // #5: retrieve similar past outcomes (best-effort) so the model can
+      // learn from history. Surfaced in the tool-result below.
+      let fewShot = "";
+      if (retrieveFewShot) {
+        try {
+          fewShot = (await retrieveFewShot(objective)) ?? "";
+        } catch {
+          fewShot = "";
+        }
+      }
+
       const callId =
         ctx && typeof ctx.toolCallId === "string" ? ctx.toolCallId : "propose_goal";
       const reply = await resolver(question, { callId });
@@ -306,6 +327,7 @@ export function createProposeGoalTool(opts: ProposeGoalToolOptions): ToolSpec {
           tokensCap: decision.tokensCap,
           scope,
           autoRun: Boolean(autoRunner),
+          ...(fewShot ? { pastOutcomes: fewShot } : {}),
           hint: autoRunner
             ? "Goal created and kicked off in the background. The SPA will auto-open the goal page; you may stop here so the user can watch progress unfold."
             : "Goal created. The SPA will surface a notification with a 'open goal' link; you may continue this chat round or stop here and let the user kick off the goal from the goal panel.",
