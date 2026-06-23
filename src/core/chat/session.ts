@@ -109,6 +109,7 @@ import {
   createCompletePlanTool,
   createEnterPlanModeTool,
 } from "./tools/plan-mode-tools.js";
+import { createGitTools } from "./tools/git-tools.js";
 import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
@@ -545,6 +546,16 @@ export interface ChatSessionOptions {
      * session restarts.
      */
     plan_mode?: boolean;
+    /**
+     * Part B2 — git inspect/commit chat tools. Registers 4 read-only
+     * tools by default: `git_status`, `git_diff`, `git_log`, `git_branch`.
+     * Pass an object with `allowCommit: true` to additionally register
+     * `git_commit` (riskClass: write, gated by the approval broker).
+     *
+     * cwd is the session workspace; the tools refuse to run outside it
+     * by virtue of being workspace-scoped.
+     */
+    git?: boolean | { allowCommit?: boolean };
   };
   /**
    * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
@@ -1389,6 +1400,18 @@ export class ChatSession {
       };
       out.push(createEnterPlanModeTool(planOpts));
       out.push(createCompletePlanTool(planOpts));
+    }
+    // Part B2 — git inspect / commit tools. Always workspace-scoped; the
+    // commit tool is opt-in via `cfg.git.allowCommit`. `cfg.git === true`
+    // is treated as `{ allowCommit: false }` (inspect-only).
+    if (cfg.git) {
+      const gitCfg = typeof cfg.git === "object" ? cfg.git : {};
+      out.push(
+        ...createGitTools({
+          ...(this.workspace ? { workspace: this.workspace } : {}),
+          ...(gitCfg.allowCommit ? { allowCommit: true } : {}),
+        }),
+      );
     }
     return out;
   }
