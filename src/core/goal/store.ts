@@ -137,7 +137,8 @@ export interface GoalStep {
     | "tool-result"
     | "plan"
     | "reflect"
-    | "status";
+    | "status"
+    | "ask-user-auto-resolved";
   payload: Record<string, unknown> | string;
 }
 

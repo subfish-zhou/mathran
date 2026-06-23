@@ -1458,6 +1458,62 @@ describe("runGoalRound ask_user goal-mode auto-reply (v0.16 §11)", () => {
     // surface it to.
     expect(round?.stats.toolCallCount).toBe(1);
   });
+
+  it("emits an ask-user-auto-resolved audit step carrying the original question", async () => {
+    // v0.17 W14 observability: even though the resolver short-circuits
+    // the round with the canned reply, operators should still be able
+    // to see what the model would have asked. We assert the dedicated
+    // step kind + payload shape so a future SPA panel can render it.
+    const g = await createGoal(workspace, {
+      objective: "build it",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+
+    const llm = fakeLLM([
+      [
+        {
+          type: "tool-call",
+          id: "ask_g2",
+          name: "ask_user",
+          argsDelta: '{"question":"Which dataset should I use?"}',
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "defaulting to dataset A" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+
+    const result = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "start",
+      llm,
+      tools: [],
+    });
+    expect(result.failed).toBe(false);
+
+    const round = await readGoal(workspace, g.id);
+    const audit = round?.steps.find((s) => s.kind === "ask-user-auto-resolved");
+    expect(audit).toBeDefined();
+    expect((audit!.payload as { question: string }).question).toBe(
+      "Which dataset should I use?",
+    );
+    // The audit step should land BEFORE the tool-result step that
+    // carries the canned reply — otherwise a viewer could see the
+    // "resolved" marker without ever seeing what was asked.
+    const stepIdxAudit = round!.steps.findIndex(
+      (s) => s.kind === "ask-user-auto-resolved",
+    );
+    const stepIdxToolResult = round!.steps.findIndex(
+      (s) => s.kind === "tool-result" && (s.payload as any).name === "ask_user",
+    );
+    expect(stepIdxAudit).toBeGreaterThanOrEqual(0);
+    expect(stepIdxToolResult).toBeGreaterThanOrEqual(0);
+    expect(stepIdxAudit).toBeLessThan(stepIdxToolResult);
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────────

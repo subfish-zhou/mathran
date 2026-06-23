@@ -1837,9 +1837,19 @@ function registerChatScope(
     const sidecar = await loadAnnotations(store.getWorkspace(), scope, id);
     const pending = sidecar.pendingAsk;
     if (!pending) {
+      // v0.17 W14 fix: goal-mode runner auto-resolves `ask_user`, so a
+      // 404 here is almost always a stale sidecar slot from a previous
+      // (pre-goal) chat round whose pending was cleared as the round
+      // advanced. Returning a hard 404 surfaces "no pending ask_user"
+      // as an error in the SPA; instead we 200 with `ignored: true`
+      // so the answer-ask client can silently drop the inline answer
+      // box without showing a toast.
+      console.warn(
+        `[mathran] /answer-ask for ${id}: no pending ask_user; ignoring (likely stale sidecar)`,
+      );
       return c.json(
-        { error: "no pending ask_user for this conversation" },
-        404,
+        { ok: true, ignored: true, reason: "no pending ask_user" },
+        200,
       );
     }
     if (claimedCallId && claimedCallId !== pending.callId) {
