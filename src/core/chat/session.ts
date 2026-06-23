@@ -22,6 +22,7 @@ import type {
   LLMRequest,
   LLMStreamChunk,
 } from "../providers/llm.js";
+import type { ReasoningEffortLevel } from "../reasoning-effort/index.js";
 import { capToolOutput } from "./tool-output-cap.js";
 import {
   compactRunner,
@@ -204,6 +205,14 @@ export interface ChatSessionOptions {
   systemPrompt?: string;
   temperature?: number;
   maxTokens?: number;
+  /**
+   * Reasoning-effort budget (#6): `low | medium | high | max`. A pure
+   * passthrough threaded into every `LLMRequest` so the provider adapter can
+   * inject its "think harder" fields. Can be changed live via {@link
+   * ChatSession.setEffort} (the `/effort` slash command). Omitting it sends no
+   * `effort` on the wire (provider defaults apply).
+   */
+  effort?: ReasoningEffortLevel;
   /** Safety cap on tool-call round-trips per `send()`. Default 8. */
   maxToolRounds?: number;
   /**
@@ -536,6 +545,8 @@ export class ChatSession {
   readonly model?: string;
   private temperature?: number;
   private maxTokens?: number;
+  /** Reasoning-effort budget threaded into each LLMRequest (#6). */
+  private currentEffort?: ReasoningEffortLevel;
   private readonly toolContext?: ToolExecuteContext;
   readonly sessionId: string;
   private readonly toolOutputCap?: { maxInlineBytes?: number; workspace?: string | null };
@@ -590,6 +601,7 @@ export class ChatSession {
     this.maxToolRounds = opts.maxToolRounds ?? 50;
     this.temperature = opts.temperature;
     this.maxTokens = opts.maxTokens;
+    this.currentEffort = opts.effort;
     this.toolContext = opts.toolContext;
     this.sessionId = opts.sessionId ?? randomUUID();
     this.toolOutputCap = opts.toolOutputCap;
@@ -706,6 +718,22 @@ export class ChatSession {
   /** Current conversation history (read-only copy). */
   history(): LLMMessage[] {
     return this.messages.map((m) => ({ ...m }));
+  }
+
+  /**
+   * Reasoning-effort budget for this session (#6). `undefined` means no
+   * `effort` is sent on the wire (provider defaults apply).
+   */
+  getEffort(): ReasoningEffortLevel | undefined {
+    return this.currentEffort;
+  }
+
+  /**
+   * Set the reasoning-effort budget live (the `/effort` slash command). Takes
+   * effect on the next `send()`. Pass `undefined` to clear it.
+   */
+  setEffort(level: ReasoningEffortLevel | undefined): void {
+    this.currentEffort = level;
   }
 
   /** Clear history, keeping any leading system prompt(s). */
@@ -1409,6 +1437,7 @@ export class ChatSession {
         model: this.model ?? "",
         ...(this.temperature !== undefined ? { temperature: this.temperature } : {}),
         ...(this.maxTokens !== undefined ? { maxTokens: this.maxTokens } : {}),
+        ...(this.currentEffort !== undefined ? { effort: this.currentEffort } : {}),
         ...(signal ? { signal } : {}),
         ...(this.tools.length > 0
           ? {

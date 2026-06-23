@@ -48,6 +48,7 @@ interface TopLevelOpts {
   prompt?: string;
   model?: string;
   profile?: string;
+  effort?: string;
 }
 
 /**
@@ -80,8 +81,8 @@ async function runChatEntry(opts: TopLevelOpts): Promise<never> {
   const prompt = await resolvePrompt(opts);
   const code =
     prompt !== null
-      ? await runOneShot({ prompt, model: opts.model, ...(opts.profile ? { profile: opts.profile } : {}) })
-      : await runRepl({ model: opts.model, ...(opts.profile ? { profile: opts.profile } : {}) });
+      ? await runOneShot({ prompt, model: opts.model, ...(opts.profile ? { profile: opts.profile } : {}), effort: opts.effort })
+      : await runRepl({ model: opts.model, ...(opts.profile ? { profile: opts.profile } : {}), effort: opts.effort });
   process.exit(code);
 }
 
@@ -94,6 +95,7 @@ program
   .option("-p, --prompt <text>", 'One-shot prompt (use "-" or pipe stdin to read from stdin), then exit')
   .option("-m, --model <model>", "LLM model to use (e.g. copilot/gpt-5.5); defaults to config.defaultModel")
   .option("--profile <name>", "Permission profile to apply (dev|ci|review or a custom .mathran/profiles/<name>.json)")
+  .option("--effort <level>", "Reasoning-effort budget: low | medium | high | max")
   .action(async (opts: TopLevelOpts) => {
     await runChatEntry(opts);
   });
@@ -104,6 +106,7 @@ program
   .option("-p, --prompt <text>", 'One-shot prompt (use "-" or pipe stdin to read from stdin), then exit')
   .option("-m, --model <model>", "LLM model to use (e.g. copilot/gpt-5.5); defaults to config.defaultModel")
   .option("--profile <name>", "Permission profile to apply (dev|ci|review or a custom .mathran/profiles/<name>.json)")
+  .option("--effort <level>", "Reasoning-effort budget: low | medium | high | max")
   .action(async (opts: TopLevelOpts) => {
     await runChatEntry(opts);
   });

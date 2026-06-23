@@ -13,6 +13,7 @@ import type {
   LLMStreamChunk,
   LLMMessage,
 } from "../../core/providers/llm.js";
+import { buildAnthropicEffortPatch, isReasoningEffortLevel } from "../../core/reasoning-effort/index.js";
 import { createAnthropicTokenCounter, type TokenCounter } from "../../core/chat/token-counter.js";
 
 type FinishReason = Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
@@ -130,10 +131,32 @@ export class AnthropicAdapter implements LLMProvider {
         input_schema: t.parameters,
       }));
     }
+    applyAnthropicEffort(params, req.effort);
     if (req.extra) Object.assign(params, req.extra);
 
     const signal = req.signal;
     return { stream: () => streamAnthropic(client, params, signal) };
+  }
+}
+
+/**
+ * Inject the reasoning-effort fields (#6) into an Anthropic params object.
+ *
+ * - `low`  → no `thinking` field (extended thinking disabled).
+ * - others → `thinking: { type: "enabled", budget_tokens }` and a `max_tokens`
+ *   raised above the budget (Anthropic requires `max_tokens > budget_tokens`).
+ *
+ * Extended thinking also forbids a custom `temperature`, so we drop it when
+ * thinking is enabled. A no-op when `effort` is absent / not canonical.
+ */
+export function applyAnthropicEffort(params: any, effort: LLMRequest["effort"]): void {
+  if (!isReasoningEffortLevel(effort)) return;
+  const patch = buildAnthropicEffortPatch(effort, params.max_tokens);
+  if (patch.thinking) {
+    params.thinking = patch.thinking;
+    if (patch.max_tokens !== undefined) params.max_tokens = patch.max_tokens;
+    // Extended thinking requires temperature unset (or 1). Drop any custom one.
+    delete params.temperature;
   }
 }
 

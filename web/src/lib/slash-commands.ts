@@ -47,7 +47,7 @@ export const FALLBACK_BUILTINS: BuiltinSlashCommand[] = [
   { name: "compact", description: "Compact conversation history (keep last k rounds)" },
   { name: "context", description: "Show token usage and context-window percentage" },
   { name: "diff", description: "Open the diff view for the current effort (coming soon)" },
-  { name: "effort", description: "Set reasoning effort: low | med | high" },
+  { name: "effort", description: "Set reasoning effort: low | medium | high | max" },
   { name: "help", description: "Show the command list" },
   { name: "plan", description: "Open the plan runner for the current objective" },
   { name: "review", description: "Ask the reviewer to look at the latest exchange (MVP stub)" },

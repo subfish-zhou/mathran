@@ -5,6 +5,7 @@
 import OpenAI from "openai";
 import type { LLMProvider, LLMRequest, LLMResponse, LLMMessage } from "../../core/providers/llm.js";
 import { buildOpenAIParams, streamOpenAI } from "./openai-common.js";
+import { buildOpenAIEffortPatch, isReasoningEffortLevel } from "../../core/reasoning-effort/index.js";
 import { createOpenAITokenCounter, type TokenCounter } from "../../core/chat/token-counter.js";
 
 export interface OpenAIAdapterOptions {
@@ -36,6 +37,20 @@ export class OpenAIAdapter implements LLMProvider {
   async chat(req: LLMRequest): Promise<LLMResponse> {
     const client = this.client;
     const params = buildOpenAIParams(req, req.model || this.defaultModel || "");
+    applyOpenAIEffort(params, req.effort);
     return { stream: () => streamOpenAI(client, params, req.signal) };
   }
+}
+
+/**
+ * Inject the reasoning-effort fields (#6) into an OpenAI params object. A
+ * no-op when `effort` is absent or not a canonical level — so callers that
+ * never set effort behave exactly as before. The `max` level also raises
+ * `max_tokens` to the provider output ceiling.
+ */
+export function applyOpenAIEffort(params: any, effort: LLMRequest["effort"]): void {
+  if (!isReasoningEffortLevel(effort)) return;
+  const patch = buildOpenAIEffortPatch(effort, params.max_tokens);
+  params.reasoning = { ...(params.reasoning ?? {}), ...patch.reasoning };
+  if (patch.max_tokens !== undefined) params.max_tokens = patch.max_tokens;
 }

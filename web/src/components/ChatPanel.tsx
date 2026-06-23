@@ -1158,7 +1158,7 @@ export default function ChatPanel({
           setInput("");
           const level = args.trim().toLowerCase();
           if (!["low", "med", "medium", "high"].includes(level)) {
-            pushInfoBubble("**/effort** — usage: `/effort <low|med|high>`");
+            pushInfoBubble("**/effort** — usage: `/effort <low|medium|high|max>`");
             return { handled: true };
           }
           // Best-effort persist on the server session (MVP: stored only).
