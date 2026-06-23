@@ -262,11 +262,24 @@ export type ChatEvent =
       /** v0.16 §11 — the model called `ask_user`; the host (serve) will
        *  persist a pending annotation and end the stream so the user can
        *  reply via `POST /answer-ask`. CLI / goal hosts never see this
-       *  event because their resolvers return synchronously. */
+       *  event because their resolvers return synchronously.
+       *
+       *  v0.19 Codex parity — when the model supplied a structured
+       *  `options` / `default` / `timeoutSeconds` / `allowCustom`, those
+       *  flow through the event so SSE consumers (the SPA's
+       *  ToolCallDisplay askPending card) can render the richer UI
+       *  without having to refetch the conversation annotations
+       *  sidecar. All four fields are optional — a plain
+       *  `ask_user({ question })` call still emits the same shape it
+       *  always did. */
       type: "ask_user";
       id: string;
       name: string;
       question: string;
+      options?: string[];
+      default?: string;
+      timeoutSeconds?: number;
+      allowCustom?: boolean;
     }
   | {
       /** v0.17 mathub parity W7 — emitted by the *goal* runner (NOT the
@@ -2220,6 +2233,25 @@ export class ChatSession {
                   id: call.id,
                   name: call.name,
                   question: (err as AskUserPending).question,
+                  // v0.19 Codex parity — forward the structured payload
+                  // (only if the AskUserPending carried it) so the SPA's
+                  // SSE handler can populate askPending.options / default /
+                  // timeoutSeconds / allowCustom on the matching tool
+                  // bubble. Older serve resolvers that don't pass these
+                  // fields stay 100% compatible — the consumer just sees
+                  // `undefined` for each absent slot.
+                  ...(((err as AskUserPending).options !== undefined)
+                    ? { options: (err as AskUserPending).options }
+                    : {}),
+                  ...(((err as AskUserPending).default !== undefined)
+                    ? { default: (err as AskUserPending).default }
+                    : {}),
+                  ...(((err as AskUserPending).timeoutSeconds !== undefined)
+                    ? { timeoutSeconds: (err as AskUserPending).timeoutSeconds }
+                    : {}),
+                  ...(((err as AskUserPending).allowCustom !== undefined)
+                    ? { allowCustom: (err as AskUserPending).allowCustom }
+                    : {}),
                 };
                 throw err;
               }

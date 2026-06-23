@@ -932,8 +932,23 @@ export function defaultSessionFactory(
         // answer box. `POST <chatBase>/:id/answer-ask` patches the
         // placeholder tool message with the reply and resumes the round.
         ask_user: {
-          resolver: async (question, { callId }) => {
-            throw new AskUserPending({ question, callId });
+          resolver: async (question, ctx) => {
+            // v0.19 Codex parity — forward the structured fields from the
+            // tool's parsed args into the pending payload so the SSE
+            // event + sidecar + SPA UI all see the same options/default/
+            // timeoutSeconds/allowCustom the model emitted.
+            throw new AskUserPending({
+              question,
+              callId: ctx.callId,
+              ...(ctx.options !== undefined ? { options: ctx.options } : {}),
+              ...(ctx.default !== undefined ? { default: ctx.default } : {}),
+              ...(ctx.timeoutSeconds !== undefined
+                ? { timeoutSeconds: ctx.timeoutSeconds }
+                : {}),
+              ...(ctx.allowCustom !== undefined
+                ? { allowCustom: ctx.allowCustom }
+                : {}),
+            });
           },
         },
         // v0.17 follow-up — chat-mode goal proposal. Same `AskUserPending`
