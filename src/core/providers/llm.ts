@@ -55,6 +55,14 @@ export interface LLMRequest {
   /** Provider-opaque options (e.g. seed, response_format). Pass-through. */
   extra?: Record<string, unknown>;
   /**
+   * Reasoning-effort budget (#6): `low | medium | high | max`. A PURE
+   * passthrough hint — it never affects routing or model selection. Adapters
+   * that understand it inject the provider-specific "think harder" fields
+   * (OpenAI `reasoning.effort`, Anthropic `thinking`); adapters that don't
+   * (Ollama, Azure, Copilot) silently ignore it.
+   */
+  effort?: "low" | "medium" | "high" | "max";
+  /**
    * Optional cancellation signal. When provided, adapters thread it into the
    * underlying transport (SDK request options / `fetch`) so an in-flight
    * completion can be aborted mid-stream. Aborting rejects the stream with a
