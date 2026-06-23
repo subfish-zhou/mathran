@@ -10,6 +10,8 @@ export interface AiInitPayload {
   useSpine: boolean;
   enableWiki: boolean;
   seedReferences: string[];
+  /** Absolute on-disk paths of uploaded seed files (from `POST /api/uploads`). */
+  seedPdfs: string[];
 }
 
 /** Matches `1234.5678`, `arXiv:1234.5678`, optional version suffix `v2`. */
@@ -49,4 +51,28 @@ export function parseSeedReferences(text: string): { valid: string[]; invalid: s
 export function validateTitle(t: string): string | null {
   if (!t.trim()) return "Title is required";
   return null;
+}
+
+export interface BuildAiInitPayloadArgs {
+  title: string;
+  searchDepth: "quick" | "standard" | "deep";
+  useSpine: boolean;
+  enableWiki: boolean;
+  seedReferences: string[];
+  seedPdfs: string[];
+}
+
+/**
+ * Assemble a normalized `AiInitPayload` from the form fields. Trims the title
+ * and passes the (already-validated) reference/pdf lists through unchanged.
+ */
+export function buildAiInitPayload(args: BuildAiInitPayloadArgs): AiInitPayload {
+  return {
+    title: args.title.trim(),
+    searchDepth: args.searchDepth,
+    useSpine: args.useSpine,
+    enableWiki: args.enableWiki,
+    seedReferences: args.seedReferences,
+    seedPdfs: args.seedPdfs,
+  };
 }

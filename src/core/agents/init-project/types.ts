@@ -43,6 +43,12 @@ export interface InitAgentInput {
   problem: FormalizedProblem;
   seedReferences: ParsedReference[];
   aiInit: AiInitConfig;
+  /**
+   * Absolute on-disk paths of seed PDFs/files uploaded via `POST /api/uploads`.
+   * Stored in the run snapshot for later phases; v1a/v1b do not yet read the
+   * file contents (parsing lands in v0.19).
+   */
+  seedPdfs?: string[];
 }
 
 /**

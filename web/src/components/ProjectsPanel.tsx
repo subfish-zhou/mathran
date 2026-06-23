@@ -10,9 +10,11 @@
  */
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, type ProjectSummary } from "../lib/api.ts";
+import { api, type ProjectSummary, type InitAgentResult, type RunLedgerSnapshot } from "../lib/api.ts";
 import AiInitConfig, { type AiInitPayload } from "./create-project/AiInitConfig.tsx";
 import InitAgentProgress from "./create-project/InitAgentProgress.tsx";
+import InitResultView from "./create-project/InitResultView.tsx";
+import { extractInitResult } from "./create-project/init-result-helpers.ts";
 
 export default function ProjectsPanel() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -21,11 +23,13 @@ export default function ProjectsPanel() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  // AI-assist modal flow: "config" → form, "progress" → SSE dashboard.
-  const [modal, setModal] = useState<null | "config" | "progress">(null);
+  // AI-assist modal flow: "config" → form, "progress" → SSE dashboard,
+  // "result" → final summary card.
+  const [modal, setModal] = useState<null | "config" | "progress" | "result">(null);
   const [runId, setRunId] = useState<string | null>(null);
   const [initMode, setInitMode] = useState<"v1a" | "spine">("spine");
   const [pendingSlug, setPendingSlug] = useState<string | null>(null);
+  const [initResult, setInitResult] = useState<InitAgentResult | null>(null);
 
   const navigate = useNavigate();
 
@@ -46,6 +50,7 @@ export default function ProjectsPanel() {
     setModal(null);
     setRunId(null);
     setPendingSlug(null);
+    setInitResult(null);
     setLoading(false);
   }
 
@@ -82,6 +87,7 @@ export default function ProjectsPanel() {
         searchDepth: payload.searchDepth,
         useSpine: payload.useSpine,
         seedReferences: payload.seedReferences,
+        seedPdfs: payload.seedPdfs,
       });
       setName("");
       setPendingSlug(projectSlug);
@@ -103,7 +109,25 @@ export default function ProjectsPanel() {
     }
   }
 
-  async function handleComplete() {
+  async function handleRunComplete(snapshot: RunLedgerSnapshot) {
+    const slug = pendingSlug;
+    if (!slug) {
+      closeModal();
+      await refresh();
+      return;
+    }
+    let wikiPages: string[] = [];
+    try {
+      wikiPages = (await api.listWiki(slug)).map((p) => p.page);
+    } catch {
+      /* best-effort — fall back to an empty page list */
+    }
+    setInitResult(extractInitResult(snapshot, { slug, mode: initMode, wikiPages }));
+    setModal("result");
+    void refresh();
+  }
+
+  async function goToProject() {
     const slug = pendingSlug;
     closeModal();
     await refresh();
@@ -187,19 +211,27 @@ export default function ProjectsPanel() {
                 <InitAgentProgress
                   runId={runId}
                   mode={initMode}
-                  onComplete={handleComplete}
+                  onComplete={handleRunComplete}
                   onError={(msg) => setError(msg)}
                 />
                 <div className="mt-4 flex justify-end">
                   <button
                     type="button"
-                    onClick={handleComplete}
+                    onClick={goToProject}
                     className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50"
                   >
                     Open project
                   </button>
                 </div>
               </>
+            )}
+            {modal === "result" && runId && initResult && pendingSlug && (
+              <InitResultView
+                runId={runId}
+                slug={pendingSlug}
+                result={initResult}
+                onOpen={closeModal}
+              />
             )}
           </div>
         </div>
