@@ -204,17 +204,26 @@ describe("POST /api/goals/:id/run/stream — round-start SSE contract (W7)", () 
     }
   });
 
-  it("emits `round-start` even when the goal has no roundsMax cap (omits `maxRounds`)", async () => {
-    // Fresh goal without `roundsMax` — the SSE frame should omit
-    // `maxRounds` (or set it to undefined / null) rather than fabricate
-    // a cap.
+  it("emits `round-start` with DEFAULT_GOAL_AUTONOMY budget when no caller cap (exp-1894)", async () => {
+    // exp-1894 Bug C fix: a fresh goal without an explicit `maxRounds`
+    // inherits DEFAULT_GOAL_AUTONOMY (200), so the SSE frame should
+    // carry maxRounds=200 — not omit it.
+    //
+    // Pre-exp-1894 behaviour: every fresh goal was effectively uncapped
+    // because the serve handler only used effective autonomy when a
+    // project/global layer was on-disk. The bug surfaced as long-running
+    // research goals silently exceeding the documented 200-round budget.
     const created = await fetch(`${base}/api/goals`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ objective: "uncapped goal" }),
+      body: JSON.stringify({ objective: "default-budget goal" }),
     });
     const { goal } = await created.json();
     expect(goal.id).toBeTruthy();
+    // Sanity: the goal record itself carries the DEFAULT_GOAL_AUTONOMY
+    // values — confirms `POST /api/goals` is wiring the autonomy layer
+    // through correctly.
+    expect(goal.budget.roundsMax).toBe(200);
 
     const res = await fetch(`${base}/api/goals/${goal.id}/run/stream`, {
       method: "POST",
@@ -228,12 +237,8 @@ describe("POST /api/goals/:id/run/stream — round-start SSE contract (W7)", () 
     expect(roundStarts.length).toBe(1);
     expect(roundStarts[0]!.data.type).toBe("round-start");
     expect(roundStarts[0]!.data.round).toBe(1);
-
-    // When `roundsMax` is not set on the goal record, the SSE frame
-    // should not carry a fabricated `maxRounds`. We accept either
-    // `undefined` (key omitted by JSON.stringify) or `null` here, but
-    // NOT a finite number.
-    const max = roundStarts[0]!.data.maxRounds;
-    expect(max === undefined || max === null).toBe(true);
+    // DEFAULT_GOAL_AUTONOMY.defaultMaxRounds = 200 (set by
+    // goal-defaults-timer commit 5f329e8).
+    expect(roundStarts[0]!.data.maxRounds).toBe(200);
   });
 });

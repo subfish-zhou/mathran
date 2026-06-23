@@ -280,4 +280,29 @@ describe("POST /api/goals defaults", () => {
     const j = await res.json();
     expect(j.goal.budget.roundsMax).toBe(99);
   });
+
+  // exp-1894 Bug C fix: with NO on-disk autonomy layer at all, a freshly
+  // created goal should inherit DEFAULT_GOAL_AUTONOMY (200 / 12.8M) rather
+  // than fall back to `{ roundsMax: null, tokensMax: null }` (which made
+  // every long-running research goal effectively uncapped, the exact
+  // opposite of what the worker that bumped DEFAULT_GOAL_AUTONOMY
+  // intended).
+  it("exp-1894: inherits DEFAULT_GOAL_AUTONOMY when no on-disk layer is set", async () => {
+    // beforeEach already deleted both layer files. Sanity check that the
+    // GET surface reflects DEFAULT_GOAL_AUTONOMY before we create a goal.
+    const checkAuto = await fetch(`${base}/api/scopes/global/goal-autonomy`);
+    const autoJson = await checkAuto.json();
+    expect(autoJson.effective.defaultMaxRounds).toBe(200);
+    expect(autoJson.effective.defaultTokensCap).toBe(12_800_000);
+
+    const res = await fetch(`${base}/api/goals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "test goal", model: "openai/gpt-4o" }),
+    });
+    expect(res.status).toBe(201);
+    const j = await res.json();
+    expect(j.goal.budget.roundsMax).toBe(200);
+    expect(j.goal.budget.tokensMax).toBe(12_800_000);
+  });
 });

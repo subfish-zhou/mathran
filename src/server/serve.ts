@@ -1202,6 +1202,33 @@ export function defaultSessionFactory(
   };
 }
 
+/**
+ * Goal-mode builtin tool set. Goal mode runs unattended, so the LLM
+ * needs the same filesystem/search/exec capabilities as chat mode to
+ * actually accomplish a research task (read papers, write .tex,
+ * compile pdf, grep workspace). We deliberately exclude:
+ *
+ *  - dispatch_subagent / propose_goal / propose_plan: goal mode already
+ *    has spawn_sub_goal, and the propose_* tools throw AskUserPending
+ *    which goal mode's runner can't handle (no UI to render).
+ *  - ask_user is NOT listed here because goal mode's runner installs its
+ *    own auto-resolver via runner.ts builtinTools.ask_user (overrides any
+ *    base config). We leave it off the base set so callers can opt in via
+ *    the runner's spread without us double-registering.
+ *
+ * Bug exp-1894 fix: previously goal mode shipped with ONLY lean_check,
+ * leaving the LLM unable to read its own workspace files. See
+ * `_tasks/exp-1894-bugs/REPORT.md` Bug A.
+ */
+export const GOAL_MODE_BUILTIN_TOOLS = {
+  search: true,
+  read_file_summary: true,
+  bash: true,
+  read_file: true,
+  write_file: true,
+  edit_file: true,
+} as const;
+
 /** Append a short scope hint to the system prompt so the model knows where it is. */
 export function buildScopedSystemPrompt(
   scope: ChatScope | undefined,
@@ -2696,6 +2723,7 @@ function buildApp(
             userMessage,
             llm,
             tools,
+            builtinTools: GOAL_MODE_BUILTIN_TOOLS,
             toolContext: { workspace, scope: g.scope },
             signal: controller.signal,
             bootstrapPlan: "auto",
@@ -3372,20 +3400,19 @@ function buildApp(
     if (!parsed.ok) return c.json({ error: parsed.error }, 400);
     const cfg = loadConfig(configPathFor(workspace));
     const model = typeof body?.model === "string" ? body.model : cfg.defaultModel ?? DEFAULT_MODEL;
-    // v0.17 W11: per-scope autonomy defaults fill in missing budgets,
-    // but ONLY when an on-disk layer (project or global) actually
-    // configured a value. We don't synthesise budgets from the
-    // in-code DEFAULT_GOAL_AUTONOMY — a goal with no caller budget
-    // and no user-pinned default should remain uncapped, matching the
-    // pre-W11 contract exercised by sse-round-start.test.ts.
+    // v0.17 W11: per-scope autonomy defaults fill in missing budgets.
+    //
+    // goal-defaults-timer (2026-06-23): DEFAULT_GOAL_AUTONOMY now carries
+    // explicit `defaultMaxRounds=200 / defaultTokensCap=12.8M`, so the
+    // effective merge always has both fields. We use them directly here
+    // and drop the old `layerHas` guard that required a project/global
+    // layer to be on-disk — that guard was the reason a freshly-created
+    // goal still came out with `budget: { tokensMax: null, roundsMax: null }`
+    // even after the worker bumped the defaults. The pre-W11 sse-round-start
+    // test that asserted "no caller budget = uncapped" was updated alongside.
     const auto = await loadGoalAutonomy({ workspace }).catch(() => null);
-    const layerHas = (k: "defaultMaxRounds" | "defaultTokensCap"): boolean =>
-      Boolean(
-        (auto?.project && k in auto.project) ||
-          (auto?.global && k in auto.global),
-      );
-    const effRounds = layerHas("defaultMaxRounds") ? auto!.effective.defaultMaxRounds : undefined;
-    const effTokens = layerHas("defaultTokensCap") ? auto!.effective.defaultTokensCap : undefined;
+    const effRounds = auto?.effective.defaultMaxRounds;
+    const effTokens = auto?.effective.defaultTokensCap;
     // goal-defaults-timer (part 3/3): the create-goal modal's third
     // field. Coerce string → trimmed string → undefined when empty so
     // createGoal's defensive blank-strip is symmetric with what we
@@ -3711,6 +3738,7 @@ function buildApp(
         userMessage,
         llm,
         tools,
+        builtinTools: GOAL_MODE_BUILTIN_TOOLS,
         toolContext: { workspace, scope: g.scope },
         signal: controller.signal,
         // v0.16 §9 audit #4: opt into the plan bootstrap. The HTTP server
@@ -3841,6 +3869,7 @@ function buildApp(
           userMessage,
           llm,
           tools,
+          builtinTools: GOAL_MODE_BUILTIN_TOOLS,
           toolContext: { workspace, scope: g.scope },
           signal: controller.signal,
           bootstrapPlan: "auto",
