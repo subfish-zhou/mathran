@@ -224,16 +224,27 @@ export function registerUploadRoutes(app: Hono, workspace: string): void {
     const ext = path.extname(realFile).toLowerCase();
     const mime = EXT_TO_MIME[ext] ?? "application/octet-stream";
 
-    // Wrap the Buffer in a fresh Uint8Array so it satisfies the BodyInit
-    // type that c.body() expects (Node's Buffer is structurally a
-    // Uint8Array but TS narrows them apart in some lib targets).
-    return c.body(new Uint8Array(bytes), 200, {
+    const headers: Record<string, string> = {
       "Content-Type": mime,
       "Content-Length": String(bytes.byteLength),
       // Make the response cacheable inside the browser tab — these files
       // are content-addressed (UUID prefix + sanitised name) so the URL
       // is effectively immutable.
       "Cache-Control": "private, max-age=31536000, immutable",
-    });
+    };
+
+    // SVG is XML and can carry inline `<script>`; served same-origin it
+    // would execute in the app's security context. Force a download for
+    // SVG so the browser never renders it inline. Raster images
+    // (png/jpg/gif/webp) carry no script and stay inline.
+    if (mime === "image/svg+xml") {
+      const downloadName = path.basename(realFile);
+      headers["Content-Disposition"] = `attachment; filename="${downloadName.replace(/["\\]/g, "_")}"`;
+    }
+
+    // Wrap the Buffer in a fresh Uint8Array so it satisfies the BodyInit
+    // type that c.body() expects (Node's Buffer is structurally a
+    // Uint8Array but TS narrows them apart in some lib targets).
+    return c.body(new Uint8Array(bytes), 200, headers);
   });
 }

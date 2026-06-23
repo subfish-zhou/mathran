@@ -107,8 +107,10 @@ export async function appendPhase(
   data?: Record<string, unknown>,
 ): Promise<void> {
   const record: PhaseRecord = { phase, event, at: new Date().toISOString(), data };
-  await fs.mkdir(runDir(projectDir, runId), { recursive: true });
-  await fs.appendFile(phasesFile(projectDir, runId), JSON.stringify(record) + "\n", "utf-8");
+  await serializeWrite(projectDir, runId, async () => {
+    await fs.mkdir(runDir(projectDir, runId), { recursive: true });
+    await fs.appendFile(phasesFile(projectDir, runId), JSON.stringify(record) + "\n", "utf-8");
+  });
 }
 
 export async function writeCheckpoint(
@@ -130,8 +132,10 @@ export async function appendLog(
   data?: Record<string, unknown>,
 ): Promise<void> {
   const record: LogRecord = { at: new Date().toISOString(), kind, message, data };
-  await fs.mkdir(runDir(projectDir, runId), { recursive: true });
-  await fs.appendFile(logsFile(projectDir, runId), JSON.stringify(record) + "\n", "utf-8");
+  await serializeWrite(projectDir, runId, async () => {
+    await fs.mkdir(runDir(projectDir, runId), { recursive: true });
+    await fs.appendFile(logsFile(projectDir, runId), JSON.stringify(record) + "\n", "utf-8");
+  });
 }
 
 /** Flip a run to a terminal status, recording finishedAt and optional error. */
@@ -195,7 +199,52 @@ export async function listRuns(projectDir: string): Promise<RunRecord[]> {
 }
 
 async function writeJson(file: string, value: unknown): Promise<void> {
-  await fs.writeFile(file, JSON.stringify(value, null, 2) + "\n", "utf-8");
+  await writeJsonAtomic(file, value);
+}
+
+/**
+ * Per-run write serialisation queue. Concurrent appendLog/appendPhase calls
+ * for the same run could otherwise interleave: Node's fs.appendFile is not
+ * atomic for payloads over the pipe-buffer size, so two large records racing
+ * the same file can splice byte-wise and corrupt the JSONL. Chaining every
+ * write for a given run onto a single promise serialises them in call order
+ * while still allowing different runs to proceed in parallel. The map entry
+ * is cleared once its queue drains so it never grows unbounded.
+ */
+const writeQueues = new Map<string, Promise<void>>();
+
+function serializeWrite(projectDir: string, runId: string, fn: () => Promise<void>): Promise<void> {
+  const key = `${projectDir}\u0000${runId}`;
+  const prev = writeQueues.get(key) ?? Promise.resolve();
+  // Run `fn` only after the previous write settles (success or failure), so
+  // one rejected write never stalls the queue for the rest of the run.
+  const next = prev.then(fn, fn);
+  writeQueues.set(key, next);
+  // Drop the map entry once this is the tail of the queue to avoid a leak.
+  void next.finally(() => {
+    if (writeQueues.get(key) === next) writeQueues.delete(key);
+  });
+  return next;
+}
+
+/**
+ * Atomically write a JSON file: serialise to a uniquely-named temp file in
+ * the same directory, then `rename` it over the destination. POSIX `rename`
+ * within a filesystem is atomic, so a reader (readRun/readCheckpoint) ever
+ * sees either the complete old file or the complete new one — never a
+ * half-written truncation. If the process crashes mid-write the destination
+ * keeps its prior good contents and only a stale `.tmp` file is left behind.
+ */
+async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
+  const tmp = `${file}.tmp.${randomBytes(6).toString("hex")}`;
+  const json = JSON.stringify(value, null, 2) + "\n";
+  await fs.writeFile(tmp, json, "utf-8");
+  try {
+    await fs.rename(tmp, file);
+  } catch (err) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
 }
 
 async function readJsonl<T>(file: string): Promise<T[]> {
