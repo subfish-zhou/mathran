@@ -190,7 +190,7 @@ export class McpRegistry {
       toolCount: m.status === "connected" ? m.client.tools.length : 0,
       retries: m.retries,
       lastError: m.client.lastError,
-      command: [m.config.command, ...m.config.args].join(" "),
+      command: [m.config.command ?? m.config.url ?? "", ...m.config.args].join(" ").trim(),
     }));
   }
 

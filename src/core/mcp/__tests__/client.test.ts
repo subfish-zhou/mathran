@@ -6,16 +6,13 @@ import {
   type SdkLikeClient,
   type SdkLikeTransport,
 } from "../client.js";
-import type { McpServerConfig } from "../schema.js";
+import { McpServerConfigSchema, type McpServerConfig } from "../schema.js";
 
-const cfg: McpServerConfig = {
+const cfg: McpServerConfig = McpServerConfigSchema.parse({
   name: "fs",
   command: "node",
   args: ["server.js"],
-  env: {},
-  enabled: true,
-  autoRestart: true,
-};
+});
 
 /** Build a fake SDK client + transport pair, exposing hooks for tests. */
 function fakeFactory(opts: {

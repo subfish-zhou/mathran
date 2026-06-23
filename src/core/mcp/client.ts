@@ -28,6 +28,21 @@ export interface McpToolDescriptor {
   inputSchema: Record<string, unknown>;
 }
 
+/** A prompt descriptor as advertised by an upstream MCP server. */
+export interface McpPromptDescriptor {
+  name: string;
+  description?: string;
+  arguments?: Array<{ name: string; description?: string; required?: boolean }>;
+}
+
+/** A resource descriptor as advertised by an upstream MCP server. */
+export interface McpResourceDescriptor {
+  uri: string;
+  name?: string;
+  description?: string;
+  mimeType?: string;
+}
+
 /** Normalised result of a `callTool` round-trip. */
 export interface McpCallResult {
   ok: boolean;
@@ -62,6 +77,10 @@ export interface McpClientOptions {
 export interface SdkLikeClient {
   connect(transport: unknown): Promise<void>;
   listTools(): Promise<{ tools: Array<{ name: string; description?: string; inputSchema?: unknown }> }>;
+  listPrompts?(): Promise<{ prompts: Array<{ name: string; description?: string; arguments?: unknown }> }>;
+  listResources?(): Promise<{ resources: Array<{ uri: string; name?: string; description?: string; mimeType?: string }> }>;
+  getPrompt?(params: { name: string; arguments?: Record<string, string> }): Promise<unknown>;
+  readResource?(params: { uri: string }): Promise<unknown>;
   callTool(params: { name: string; arguments?: Record<string, unknown> }): Promise<unknown>;
   close(): Promise<void>;
   getServerVersion?(): { name?: string; version?: string } | undefined;
@@ -81,22 +100,44 @@ export interface McpClientFactory {
   create(config: McpServerConfig): Promise<{ client: SdkLikeClient; transport: SdkLikeTransport }>;
 }
 
-/** Default factory: real MCP SDK over stdio. Lazily imported. */
+/** Default factory: real MCP SDK over stdio or http (SSE). Lazily imported. */
 export const defaultMcpClientFactory: McpClientFactory = {
   async create(config: McpServerConfig) {
     const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const client = new Client({ name: "mathran", version: "0.12.0" });
+    if (config.transport === "http") {
+      const { SSEClientTransport } = await import(
+        "@modelcontextprotocol/sdk/client/sse.js"
+      );
+      const headers: Record<string, string> = { ...config.headers };
+      if (config.token) headers["Authorization"] = `Bearer ${config.token}`;
+      const transport = new SSEClientTransport(new URL(config.url as string), {
+        // Attach auth headers to BOTH the SSE GET and the POST messages.
+        eventSourceInit: {
+          fetch: (url: string | URL | Request, init?: RequestInit) =>
+            fetch(url as RequestInfo, {
+              ...init,
+              headers: { ...(init?.headers as Record<string, string>), ...headers },
+            }),
+        } as unknown as Record<string, unknown>,
+        requestInit: { headers },
+      });
+      return {
+        client: client as unknown as SdkLikeClient,
+        transport: transport as unknown as SdkLikeTransport,
+      };
+    }
     const { StdioClientTransport } = await import(
       "@modelcontextprotocol/sdk/client/stdio.js"
     );
     const transport = new StdioClientTransport({
-      command: config.command,
+      command: config.command as string,
       args: config.args,
       // Merge the configured env on top of the SDK's safe default env. The
       // child still inherits PATH etc. from the default-env helper.
       env: { ...config.env },
       stderr: "inherit",
     });
-    const client = new Client({ name: "mathran", version: "0.12.0" });
     return {
       client: client as unknown as SdkLikeClient,
       transport: transport as unknown as SdkLikeTransport,
@@ -138,6 +179,8 @@ export class McpClient {
   private client: SdkLikeClient | null = null;
   private _state: McpClientState = "idle";
   private _tools: McpToolDescriptor[] = [];
+  private _prompts: McpPromptDescriptor[] = [];
+  private _resources: McpResourceDescriptor[] = [];
   private _lastError: string | null = null;
   /** Set while we deliberately tear down, to suppress the crash callback. */
   private intentionalClose = false;
@@ -154,6 +197,14 @@ export class McpClient {
 
   get tools(): McpToolDescriptor[] {
     return this._tools;
+  }
+
+  get prompts(): McpPromptDescriptor[] {
+    return this._prompts;
+  }
+
+  get resources(): McpResourceDescriptor[] {
+    return this._resources;
   }
 
   get lastError(): string | null {
@@ -186,15 +237,44 @@ export class McpClient {
       };
       await client.connect(transport);
       this.client = client;
-      const listed = await client.listTools();
-      this._tools = (listed.tools ?? []).map((t) => ({
-        name: t.name,
-        ...(t.description ? { description: t.description } : {}),
-        inputSchema:
-          t.inputSchema && typeof t.inputSchema === "object"
-            ? (t.inputSchema as Record<string, unknown>)
-            : { type: "object", properties: {} },
-      }));
+      const load = this.config.load ?? ["tools", "prompts", "resources"];
+      if (load.includes("tools")) {
+        const listed = await client.listTools();
+        this._tools = (listed.tools ?? []).map((t) => ({
+          name: t.name,
+          ...(t.description ? { description: t.description } : {}),
+          inputSchema:
+            t.inputSchema && typeof t.inputSchema === "object"
+              ? (t.inputSchema as Record<string, unknown>)
+              : { type: "object", properties: {} },
+        }));
+      }
+      if (load.includes("prompts") && client.listPrompts) {
+        try {
+          const p = await client.listPrompts();
+          this._prompts = (p.prompts ?? []).map((d) => ({
+            name: d.name,
+            ...(d.description ? { description: d.description } : {}),
+            ...(Array.isArray(d.arguments) ? { arguments: d.arguments as McpPromptDescriptor["arguments"] } : {}),
+          }));
+        } catch {
+          // Server doesn't support prompts — not fatal.
+          this._prompts = [];
+        }
+      }
+      if (load.includes("resources") && client.listResources) {
+        try {
+          const r = await client.listResources();
+          this._resources = (r.resources ?? []).map((d) => ({
+            uri: d.uri,
+            ...(d.name ? { name: d.name } : {}),
+            ...(d.description ? { description: d.description } : {}),
+            ...(d.mimeType ? { mimeType: d.mimeType } : {}),
+          }));
+        } catch {
+          this._resources = [];
+        }
+      }
       this._state = "connected";
       return true;
     } catch (err) {
@@ -242,6 +322,35 @@ export class McpClient {
     }
   }
 
+  /**
+   * Fetch a prompt's messages by name, flattened to text. Used to inject MCP
+   * prompts into mathran's prompt library.
+   */
+  async getPrompt(name: string, args: Record<string, string> = {}): Promise<McpCallResult> {
+    if (this._state !== "connected" || !this.client?.getPrompt) {
+      return { ok: false, content: `mcp server "${this.config.name}" cannot getPrompt (state: ${this._state})` };
+    }
+    try {
+      const raw = await this.client.getPrompt({ name, arguments: args });
+      return flattenPromptResult(raw);
+    } catch (err) {
+      return { ok: false, content: `mcp getPrompt ${this.config.name}/${name} failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  /** Read a resource by URI, flattened to text. */
+  async readResource(uri: string): Promise<McpCallResult> {
+    if (this._state !== "connected" || !this.client?.readResource) {
+      return { ok: false, content: `mcp server "${this.config.name}" cannot readResource (state: ${this._state})` };
+    }
+    try {
+      const raw = await this.client.readResource({ uri });
+      return flattenResourceResult(raw);
+    } catch (err) {
+      return { ok: false, content: `mcp readResource ${this.config.name}/${uri} failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
   /** Explicit teardown — does NOT fire the crash callback. Never throws. */
   async disconnect(): Promise<void> {
     this.intentionalClose = true;
@@ -252,6 +361,36 @@ export class McpClient {
     }
     this.client = null;
     this._tools = [];
+    this._prompts = [];
+    this._resources = [];
     this._state = "disconnected";
   }
+}
+
+/** Flatten an SDK `getPrompt` result's `messages[]` into plain text. */
+export function flattenPromptResult(result: unknown): McpCallResult {
+  if (!result || typeof result !== "object") return { ok: true, content: "" };
+  const r = result as { messages?: Array<{ content?: { type?: string; text?: string } }> };
+  const parts: string[] = [];
+  if (Array.isArray(r.messages)) {
+    for (const m of r.messages) {
+      const c = m?.content;
+      if (c && c.type === "text" && typeof c.text === "string") parts.push(c.text);
+    }
+  }
+  return { ok: true, content: parts.join("\n") };
+}
+
+/** Flatten an SDK `readResource` result's `contents[]` into plain text. */
+export function flattenResourceResult(result: unknown): McpCallResult {
+  if (!result || typeof result !== "object") return { ok: true, content: "" };
+  const r = result as { contents?: Array<{ text?: string; uri?: string }> };
+  const parts: string[] = [];
+  if (Array.isArray(r.contents)) {
+    for (const c of r.contents) {
+      if (typeof c?.text === "string") parts.push(c.text);
+      else if (c?.uri) parts.push(`[resource: ${c.uri}]`);
+    }
+  }
+  return { ok: true, content: parts.join("\n") };
 }
