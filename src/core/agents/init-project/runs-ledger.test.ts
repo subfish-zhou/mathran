@@ -132,4 +132,36 @@ describe("runs ledger", () => {
     const after = await readRun(projectDir, run.runId);
     expect(after?.status).toBe("completed");
   });
+
+  it("serializeWrite: 50 concurrent appendLog calls all land as valid JSONL", async () => {
+    const run = await createRun(projectDir);
+    // Fire 50 appendLog calls without awaiting between them (mirrors the
+    // `void appendLog(...)` fire-and-forget pattern in agent.ts).
+    const pending: Promise<void>[] = [];
+    for (let i = 0; i < 50; i++) {
+      const pad = "x".repeat(2000); // push each record past the small-write atomicity window
+      pending.push(appendLog(projectDir, run.runId, "llm_call", `msg-${i}`, { i, pad }));
+    }
+    await Promise.all(pending);
+    const snap = await readRunLedger(projectDir, run.runId);
+    // Every record survived and parses — no byte-interleaving corruption.
+    expect(snap?.logs.length).toBe(50);
+    const seen = new Set(snap?.logs.map((l) => l.data?.i as number));
+    expect(seen.size).toBe(50);
+  });
+
+  it("serializeWrite: appendPhase preserves call order under concurrency", async () => {
+    const run = await createRun(projectDir);
+    const pending: Promise<void>[] = [];
+    for (let i = 0; i < 30; i++) {
+      pending.push(appendPhase(projectDir, run.runId, `phase-${i}`, "start", { i }));
+    }
+    await Promise.all(pending);
+    const snap = await readRunLedger(projectDir, run.runId);
+    expect(snap?.phases.length).toBe(30);
+    // Records are appended in the exact order the calls were issued.
+    expect(snap?.phases.map((p) => p.data?.i)).toEqual(
+      Array.from({ length: 30 }, (_, i) => i),
+    );
+  });
 });
