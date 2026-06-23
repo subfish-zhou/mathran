@@ -44,6 +44,13 @@ import {
 } from "../core/outcomes/store.js";
 import { runDiff } from "../core/checkpoints/diff-run.js";
 import { runRewind } from "../core/checkpoints/rewind.js";
+import type { McpRegistry } from "../core/mcp/registry.js";
+import {
+  parseMcpSubcommand,
+  formatMcpStatusList,
+  formatMcpServerDetail,
+  formatMcpToolsList,
+} from "../core/mcp/format.js";
 
 /** Shape of `computeUsageStats` (defined in serve.ts), injected to avoid cycles. */
 export interface UsageStatsLike {
@@ -60,6 +67,8 @@ export interface SlashRoutesDeps {
   computeUsageStats: (history: LLMMessage[], fallbackModel?: string) => UsageStatsLike;
   /** Returns the registered subagent kinds; defaults to the builtin registry. */
   subagentKinds?: () => string[];
+  /** MCP registry (#4) for the `/mcp` server-side slash command. */
+  mcpRegistry?: McpRegistry;
 }
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -264,6 +273,44 @@ export function registerSlashRoutes(app: Hono, deps: SlashRoutesDeps): void {
           }
         }
         return c.json({ ok: true, text: outcome.text });
+      }
+
+      case "mcp": {
+        const registry = deps.mcpRegistry;
+        if (!registry) {
+          return c.json({ ok: true, text: "MCP is not available on this server." });
+        }
+        const sub = parseMcpSubcommand(args);
+        switch (sub.kind) {
+          case "list":
+            return c.json({ ok: true, text: formatMcpStatusList(registry.status()) });
+          case "status":
+            return c.json({
+              ok: true,
+              text: formatMcpServerDetail(registry.statusFor(sub.server), sub.server),
+            });
+          case "tools":
+            return c.json({
+              ok: true,
+              text: formatMcpToolsList(sub.server, registry.toolsFor(sub.server)),
+            });
+          case "reload": {
+            const info = await registry.reload(sub.server);
+            return c.json({
+              ok: true,
+              text: info
+                ? `reloaded "${sub.server}" → ${info.status} (tools: ${info.toolCount}).`
+                : `no MCP server named "${sub.server}".`,
+            });
+          }
+          case "reload-all": {
+            const all = await registry.reloadAll();
+            return c.json({ ok: true, text: `reloaded ${all.length} server(s).\n${formatMcpStatusList(all)}` });
+          }
+          case "error":
+            return c.json({ ok: true, text: sub.message });
+        }
+        return c.json({ ok: true, text: formatMcpStatusList(registry.status()) });
       }
 
       default:

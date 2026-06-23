@@ -99,6 +99,7 @@ import {
   defaultSubagentRegistry,
   globalBackgroundRegistry,
 } from "../core/subagent/index.js";
+import { getGlobalMcpRegistry } from "../core/mcp/registry.js";
 import {
   resolveProfile,
   readSettingsDefaultProfile,
@@ -792,6 +793,7 @@ export function defaultSessionFactory(
   workspace: string,
   approvalRegistry: ApprovalRegistry = sharedApprovalRegistry,
   profile?: ProfileEffects,
+  mcpRegistry?: { toolSpecs(): import("../core/chat/session.js").ToolSpec[] },
 ): ChatSessionFactory {
   return ({ model, scope, conversationId, autoRunGoal, autoRunPlan }) => {
     const config = loadConfig(configPathFor(workspace));
@@ -871,6 +873,7 @@ export function defaultSessionFactory(
       // denylistTools) fires BEFORE the broker is consulted — i.e. even a
       // user `allow` decision cannot override it.
       ...(profile ? { profile } : {}),
+      ...(mcpRegistry ? { mcpRegistry } : {}),
       // T1-D: thread workspace + scope into tools so lean_check (and future
       // wiki/effort tools) can resolve project-relative paths. BUG #7 fix.
       // v0.5 §2: workspace is now scope-narrowed so fs tools land inside the
@@ -2336,6 +2339,7 @@ function buildApp(
   workspace: string,
   factory: ChatSessionFactory,
   goalLlmFactory?: GoalLLMFactory,
+  mcpRegistry?: import("../core/mcp/registry.js").McpRegistry,
 ): Hono {
   const app = new Hono();
   // Adapt the test-friendly `ChatSessionFactory(opts)` to the store's
@@ -2472,6 +2476,25 @@ function buildApp(
 
   app.get("/api/health", async (c) => {
     return c.json({ ok: true, version: await readPackageVersion(), workspace });
+  });
+
+  // MCP (#4): server status for the SPA "MCP Servers" panel (minimal — list +
+  // status only, no config editing in v1). `POST …/reload` reconnects a server
+  // (or all when `:name` is `all`).
+  app.get("/api/mcp/servers", async (c) => {
+    const registry = mcpRegistry ?? getGlobalMcpRegistry();
+    return c.json({ servers: registry.status(), warnings: registry.getWarnings() });
+  });
+  app.post("/api/mcp/servers/:name/reload", async (c) => {
+    const registry = mcpRegistry ?? getGlobalMcpRegistry();
+    const name = c.req.param("name");
+    if (name === "all") {
+      const servers = await registry.reloadAll();
+      return c.json({ ok: true, servers });
+    }
+    const info = await registry.reload(name);
+    if (!info) return c.json({ error: `unknown mcp server "${name}"` }, 404);
+    return c.json({ ok: true, server: info });
   });
 
   // #3 Background Agents — cooperative cancel: set the abort flag on a running
@@ -4132,6 +4155,7 @@ function buildApp(
     store: sessions,
     computeUsageStats,
     subagentKinds: () => defaultSubagentRegistry().list(),
+    ...(mcpRegistry ? { mcpRegistry } : {}),
   });
 
   // ─── Static hosting / placeholder ──────────────────────────────────────────
@@ -4201,11 +4225,21 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
     }
   }
 
+  // MCP (#4): bring up the process-level registry before building the app so
+  // every SPA conversation's session inherits its tools. Best-effort.
+  const mcpRegistry = getGlobalMcpRegistry();
+  try {
+    await mcpRegistry.init({ workspace });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(`[mathran] MCP init failed: ${(err as Error)?.message ?? err}`);
+  }
+
   const factory =
     opts.chatSessionFactory ??
-    defaultSessionFactory(workspace, sharedApprovalRegistry, resolvedProfile);
+    defaultSessionFactory(workspace, sharedApprovalRegistry, resolvedProfile, mcpRegistry);
 
-  const app = buildApp(workspace, factory, opts.goalLlmFactory);
+  const app = buildApp(workspace, factory, opts.goalLlmFactory, mcpRegistry);
 
   const server = await new Promise<ReturnType<typeof serve>>((resolve) => {
     const s = serve({ fetch: app.fetch, hostname: host, port }, () => resolve(s));
@@ -4218,7 +4252,9 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
 
   const close = () =>
     new Promise<void>((resolve, reject) => {
-      server.close((err?: unknown) => (err ? reject(err) : resolve()));
+      void mcpRegistry.shutdown().finally(() => {
+        server.close((err?: unknown) => (err ? reject(err) : resolve()));
+      });
     });
 
   return {
