@@ -34,6 +34,60 @@ export function makeSpineLLM(llm: LLMProvider, model?: string): SpineLLM {
   };
 }
 
+/**
+ * Scan `text` for the first complete, balanced JSON object or array and
+ * return its `{ start, end }` byte offsets (end exclusive). Uses a brace/
+ * bracket counter with a quote+escape state machine so that:
+ *   - nested objects/arrays match their true closing delimiter, and
+ *   - braces/brackets inside string literals (and escaped quotes) are
+ *     ignored.
+ * Returns `null` if no balanced value is found. This replaces a greedy
+ * `indexOf('{') … lastIndexOf('}')` that mis-parses `{"ok":true} trailing }`.
+ */
+export function findJsonBoundary(text: string): { start: number; end: number } | null {
+  const firstObj = text.indexOf("{");
+  const firstArr = text.indexOf("[");
+  let start = -1;
+  let open = "";
+  let close = "";
+  if (firstArr !== -1 && (firstObj === -1 || firstArr < firstObj)) {
+    start = firstArr;
+    open = "[";
+    close = "]";
+  } else if (firstObj !== -1) {
+    start = firstObj;
+    open = "{";
+    close = "}";
+  }
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === open) {
+      depth++;
+    } else if (ch === close) {
+      depth--;
+      if (depth === 0) return { start, end: i + 1 };
+    }
+  }
+  return null;
+}
+
 /** Best-effort extraction of a JSON value (object or array) from an LLM reply. */
 export function extractSpineJSON<T = unknown>(text: string): T | null {
   if (!text) return null;
@@ -41,20 +95,10 @@ export function extractSpineJSON<T = unknown>(text: string): T | null {
   const fence = candidate.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fence?.[1]) candidate = fence[1].trim();
 
-  const firstObj = candidate.indexOf("{");
-  const firstArr = candidate.indexOf("[");
-  let start = -1;
-  let end = -1;
-  if (firstArr !== -1 && (firstObj === -1 || firstArr < firstObj)) {
-    start = firstArr;
-    end = candidate.lastIndexOf("]");
-  } else {
-    start = firstObj;
-    end = candidate.lastIndexOf("}");
-  }
-  if (start === -1 || end === -1 || end <= start) return null;
+  const bounds = findJsonBoundary(candidate);
+  if (!bounds) return null;
   try {
-    return JSON.parse(candidate.slice(start, end + 1)) as T;
+    return JSON.parse(candidate.slice(bounds.start, bounds.end)) as T;
   } catch {
     return null;
   }
