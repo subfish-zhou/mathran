@@ -307,6 +307,30 @@ export function renderGoalModeFragment(input: GoalPromptInput): string {
     `Do NOT announce completion in plain text — only the \`mark_done\` tool call counts.`,
   );
 
+  // ───── Hands-off mode (exp-1894 Bug D + F) ─────
+  // The point of goal mode is that no human is listening. The two
+  // worst failure modes we observed:
+  //   D. The model calls `ask_user`, which auto-resolves with a canned
+  //      reply, wasting a round + tokens on a non-answer.
+  //   F. The model calls `give_up` the first time a tool seems missing
+  //      or a fact unknown, instead of using its tools to find out.
+  lines.push(
+    "",
+    `# Hands-off`,
+    "",
+    `There is no human in this loop. \`ask_user\` is automatically resolved`,
+    `with a canned "proceed with your best assumption" reply — calling it`,
+    `just wastes a round. Instead: make an explicit assumption, document it`,
+    `in your output, and continue.`,
+    "",
+    `Before \`give_up\`: you have read/write/exec/search/edit_file tools.`,
+    `If something seems missing (a file, a paper, a library), use those`,
+    `tools to locate or create it. If a paper is referenced but absent,`,
+    `web_search / read_file the workspace / build a conditional version of`,
+    `the result. Only call \`give_up\` after you've genuinely exhausted the`,
+    `available tools — not because a single sub-goal failed.`,
+  );
+
   // ───── Anti-loop ─────
   lines.push(
     "",
