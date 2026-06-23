@@ -53,11 +53,22 @@ export type ChatEvent =
       /** v0.16 §11 — the model called `ask_user`. The serve stream emits
        *  this just before closing; the SPA renders an inline answer box
        *  on the matching tool bubble. Resume the round via
-       *  {@link streamAnswerAsk}. */
+       *  {@link streamAnswerAsk}.
+       *
+       *  v0.19 Codex parity — four optional structured fields the model
+       *  can supply via `ask_user({ options, default, timeoutSeconds,
+       *  allowCustom })`. When present, the SPA renders a button list,
+       *  a fallback hint, and/or a live countdown instead of the plain
+       *  textarea. All optional — a bare `ask_user({ question })` call
+       *  still emits the same shape it always did. */
       type: "ask_user";
       id: string;
       name: string;
       question: string;
+      options?: string[];
+      default?: string;
+      timeoutSeconds?: number;
+      allowCustom?: boolean;
     }
   | {
       /** v0.17 mathub parity W7 — emitted by the *goal* runner at the
@@ -422,6 +433,24 @@ export interface PendingAskAnnotation {
   callId: string;
   toolCallId: string;
   ts: number;
+  /**
+   * v0.19 Codex parity — mirrors the server-side PendingAskAnnotation.
+   * All optional; legacy sidecars (pre-v0.19) load with these undefined
+   * and the SPA falls back to the plain textarea-only render.
+   *   - options:     predefined choices (renders as button list)
+   *   - default:     fallback text used on timeout / shown as hint
+   *   - timeoutSeconds: total timeout window the model requested
+   *   - allowCustom: when options is set, whether free-form text is
+   *                  still accepted (defaults to true)
+   *   - timeoutAt:   epoch-ms deadline the server scheduled — used by
+   *                  the SPA to render a live countdown without
+   *                  needing to know when the question was posed.
+   */
+  options?: string[];
+  default?: string;
+  timeoutSeconds?: number;
+  allowCustom?: boolean;
+  timeoutAt?: number;
 }
 
 export async function fetchAnnotations(
