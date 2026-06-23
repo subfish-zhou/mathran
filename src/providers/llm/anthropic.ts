@@ -12,7 +12,10 @@ import type {
   LLMResponse,
   LLMStreamChunk,
   LLMMessage,
+  MessageContent,
+  ContentPart,
 } from "../../core/providers/llm.js";
+import { contentToString } from "../../core/providers/llm.js";
 import { buildAnthropicEffortPatch, isReasoningEffortLevel } from "../../core/reasoning-effort/index.js";
 import { createAnthropicTokenCounter, type TokenCounter } from "../../core/chat/token-counter.js";
 
@@ -41,6 +44,42 @@ function mapStopReason(reason: string | null | undefined): FinishReason {
 }
 
 /**
+ * Translate a Mathran `MessageContent` value into Anthropic content blocks
+ * for a `role: 'user'` or `role: 'assistant'` turn.
+ *
+ * - A plain string short-circuits to a single `{type: 'text', text}` block
+ *   (Anthropic actually accepts a bare string here; we keep the block-array
+ *   shape consistent so downstream serialization is uniform).
+ * - An array of `ContentPart` produces one Anthropic block per part:
+ *     * text  → `{type: 'text', text}`
+ *     * image → `{type: 'image', source: {type:'base64', media_type, data}}`
+ *
+ * Anthropic accepts image MIME types `image/jpeg | png | gif | webp`. We do
+ * NOT re-validate here — chat-attachments already filters; an unknown MIME
+ * is passed through and Anthropic will surface its own 400.
+ */
+export function toAnthropicContentBlocks(content: MessageContent): any {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const blocks: any[] = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      if (part.text.length > 0) blocks.push({ type: "text", text: part.text });
+    } else if (part.type === "image") {
+      blocks.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: part.mimeType,
+          data: part.dataBase64,
+        },
+      });
+    }
+  }
+  return blocks;
+}
+
+/**
  * Translate the kernel's neutral `LLMMessage[]` into Anthropic's protocol
  * shape (`{system, messages: [{role, content: text|blocks}]}`).
  *
@@ -54,14 +93,17 @@ export function toAnthropicMessages(messages: LLMMessage[]): {
   const out: any[] = [];
   for (const m of messages) {
     if (m.role === "system") {
-      systemParts.push(m.content);
+      // System turns are concatenated into Anthropic's top-level `system`
+      // string. Image parts in a system turn are dropped (Anthropic doesn't
+      // accept image blocks on the system slot).
+      systemParts.push(contentToString(m.content));
       continue;
     }
     if (m.role === "tool") {
       out.push({
         role: "user",
         content: [
-          { type: "tool_result", tool_use_id: m.toolCallId ?? "", content: m.content },
+          { type: "tool_result", tool_use_id: m.toolCallId ?? "", content: contentToString(m.content) },
         ],
       });
       continue;
@@ -71,8 +113,9 @@ export function toAnthropicMessages(messages: LLMMessage[]): {
       // text + tool_use blocks. Anthropic rejects assistant turns that have
       // a trailing tool_result without a matching tool_use.
       const blocks: any[] = [];
-      if (m.content && m.content.length > 0) {
-        blocks.push({ type: "text", text: m.content });
+      const assistantText = contentToString(m.content);
+      if (assistantText && assistantText.length > 0) {
+        blocks.push({ type: "text", text: assistantText });
       }
       for (const c of m.toolCalls) {
         let parsed: unknown = {};
@@ -88,7 +131,8 @@ export function toAnthropicMessages(messages: LLMMessage[]): {
       out.push({ role: "assistant", content: blocks });
       continue;
     }
-    out.push({ role: m.role, content: m.content });
+    // User / assistant turn with optional multimodal content.
+    out.push({ role: m.role, content: toAnthropicContentBlocks(m.content) });
   }
   return { system: systemParts.length ? systemParts.join("\n\n") : undefined, messages: out };
 }
@@ -97,6 +141,14 @@ export class AnthropicAdapter implements LLMProvider {
   protected client: Anthropic;
   protected defaultModel?: string;
   protected tokenCounter: TokenCounter;
+
+  /**
+   * Anthropic Messages API (Claude 3 / Sonnet 4 / Opus 4 family) supports
+   * `image` content blocks on user turns. Adapter declares vision capability
+   * statically so the host can decide to forward `ContentPart[]` rather than
+   * flattening images into text markers.
+   */
+  readonly supportsVision = true;
 
   constructor(opts: AnthropicAdapterOptions) {
     this.client = new Anthropic({ apiKey: opts.apiKey, baseURL: opts.baseUrl });

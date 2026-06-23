@@ -488,7 +488,7 @@ describe("runGoalRound persistence reuses ChatSessionStore (v0.2 §10)", () => {
     const history = await store.readHistory({ kind: "global" }, conversationId);
     expect(history).not.toBeNull();
     expect(history!.some((m) => m.role === "user" && m.content === "check store")).toBe(true);
-    expect(history!.some((m) => m.role === "assistant" && m.content.includes("persisted via store"))).toBe(true);
+    expect(history!.some((m) => m.role === "assistant" && typeof m.content === "string" && m.content.includes("persisted via store"))).toBe(true);
 
     // Transcript Markdown was written next to the jsonl (best-effort by spec
     // but it is the chat store's normal flush path).

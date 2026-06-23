@@ -15,6 +15,7 @@ import { encode as encodeO200k } from "gpt-tokenizer/encoding/o200k_base";
 import { encode as encodeCl100k } from "gpt-tokenizer/encoding/cl100k_base";
 
 import type { LLMMessage } from "../providers/llm.js";
+import { contentToString } from "../providers/llm.js";
 
 export interface TokenCounter {
   /** Best-effort token count for a single message (content + tool calls + envelope). */
@@ -28,7 +29,7 @@ const PER_REQUEST_OVERHEAD = 3; // priming tokens
 
 /** Stringify the message's content + name + tool_calls into one blob for counting. */
 function messageTextBlob(msg: LLMMessage): string {
-  let s = msg.content ?? "";
+  let s = contentToString(msg.content ?? "");
   if (msg.name) s += "\n" + msg.name;
   if (msg.toolCallId) s += "\n" + msg.toolCallId;
   if (msg.toolCalls && msg.toolCalls.length > 0) {

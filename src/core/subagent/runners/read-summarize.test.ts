@@ -195,7 +195,7 @@ describe("read_summarize runner — large file truncation", () => {
     // The body in the prompt is the first 1024 bytes of X's, NOT all 3072.
     // The fence between ``` and ``` should hold exactly 1024 X chars + the
     // marker; checking length is the cleanest assertion.
-    const xRun = (userMsg?.content ?? "").match(/X+/);
+    const xRun = ((userMsg?.content ?? "") as string).match(/X+/);
     expect(xRun?.[0].length).toBe(1024);
     // Artifact has exactly the read bytes (1024 X chars), not 3072.
     const artifactAbs = path.join(workspace, result.artifactPath!);

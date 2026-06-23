@@ -114,7 +114,7 @@ import {
   createFallbackTokenCounter,
   type TokenCounter,
 } from "../core/chat/token-counter.js";
-import type { LLMMessage } from "../core/providers/llm.js";
+import type { LLMMessage, MessageContent } from "../core/providers/llm.js";
 import {
   ScopedChatSessionStore,
   type ChatScope,
@@ -1171,19 +1171,14 @@ function registerChatScope(
     // stream: a bad-path attachment must surface as an HTTP 400, not as
     // a half-open SSE that emits an error event. Once the stream is
     // open we can't rewrite the status code.
-    let augmentedMessage: string;
-    try {
-      augmentedMessage = await buildUserMessageWithAttachments(
-        store.getWorkspace(),
-        message,
-        attachments,
-      );
-    } catch (err: unknown) {
-      if (err instanceof BadAttachmentError) {
-        return c.json({ error: err.message }, 400);
-      }
-      return c.json({ error: (err as Error)?.message ?? String(err) }, 500);
-    }
+    //
+    // C-round Commit 4: we resolve / construct the chat session FIRST so we
+    // can ask the provider whether it supports vision
+    // (`session.providerSupportsVision()`). If yes, attachments with
+    // `image/*` MIME render as inline base64 `ContentPart` blocks the
+    // provider adapter can emit as native image blocks. If no (Ollama,
+    // unknown route, etc.) we fall back to the legacy `[Image: ...]` text
+    // marker so the model still gets a notice.
     const model = typeof body?.model === "string" ? body.model : undefined;
     // sessionId / conversationId aliases for back-compat.
     const requested = typeof body?.conversationId === "string" && body.conversationId.length > 0
@@ -1198,6 +1193,21 @@ function registerChatScope(
       session = await store.getOrCreate(scope, conversationId, model);
     } catch (err: any) {
       return c.json({ error: err?.message ?? String(err) }, 500);
+    }
+
+    let augmentedMessage: MessageContent;
+    try {
+      augmentedMessage = await buildUserMessageWithAttachments(
+        store.getWorkspace(),
+        message,
+        attachments,
+        { enableVision: session.providerSupportsVision() },
+      );
+    } catch (err: unknown) {
+      if (err instanceof BadAttachmentError) {
+        return c.json({ error: err.message }, 400);
+      }
+      return c.json({ error: (err as Error)?.message ?? String(err) }, 500);
     }
 
     return streamSSE(c, async (stream) => {

@@ -330,7 +330,7 @@ describe("ChatSession", () => {
       // History message is capped well under 4.5KB and carries the breadcrumb.
       const toolMsg = session.history().find((m) => m.role === "tool")!;
       expect(toolMsg.content).toContain("[output truncated");
-      expect(Buffer.byteLength(toolMsg.content, "utf-8")).toBeLessThan(4500);
+      expect(Buffer.byteLength(toolMsg.content as string, "utf-8")).toBeLessThan(4500);
 
       // Full output dumped to disk.
       const dump = path.join(tmp, ".mathran", "tool-output", "sess-cap", "call_big.txt");
@@ -1038,7 +1038,7 @@ describe("ChatSession memoryFiles (v0.3 §14)", () => {
       // our (empty) tmp dir.
       const projHeader = `## Project (${path.join(tmp, "MATHRAN.md")})`;
       const sawProj = history.some(
-        (m) => m.role === "system" && (m.content ?? "").includes(projHeader),
+        (m) => m.role === "system" && typeof m.content === "string" && (m.content ?? "").includes(projHeader),
       );
       expect(sawProj).toBe(false);
     } finally {
@@ -1068,7 +1068,7 @@ describe("ChatSession memoryFiles (v0.3 §14)", () => {
       const remaining = session.history();
       expect(remaining.every((m) => m.role === "system")).toBe(true);
       // Memory should still be there.
-      expect(remaining.some((m) => (m.content ?? "").includes("MEM_BODY"))).toBe(true);
+      expect(remaining.some((m) => typeof m.content === "string" && (m.content ?? "").includes("MEM_BODY"))).toBe(true);
       expect(remaining.some((m) => m.content === "persona")).toBe(true);
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });

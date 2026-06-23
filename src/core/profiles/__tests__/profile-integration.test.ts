@@ -199,6 +199,6 @@ describe("ChatSession × permission profile (hard reject)", () => {
       profile: resolveProfileEffects(BUILTIN_PROFILES.ci),
     });
     const sys = session.history().filter((m) => m.role === "system");
-    expect(sys.some((m) => (m.content ?? "").includes("Active permission profile: ci"))).toBe(true);
+    expect(sys.some((m) => typeof m.content === "string" && (m.content ?? "").includes("Active permission profile: ci"))).toBe(true);
   });
 });

@@ -10,9 +10,70 @@
  * chunk with role=assistant + content=<full text>.
  */
 
+/**
+ * Multimodal content part (C-round vision).
+ *
+ * - `text`  — plain UTF-8 text fragment (the legacy default).
+ * - `image` — raw image bytes encoded as base64 plus the source MIME type
+ *   (image/jpeg | image/png | image/gif | image/webp). Vision-capable
+ *   provider adapters translate this into the provider-native image block
+ *   (Anthropic `image` source, OpenAI `image_url` data: URL, etc.); providers
+ *   without vision degrade-fallback to a `[Image: filename]` text marker.
+ */
+export type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image"; mimeType: string; dataBase64: string };
+
+/**
+ * Message content union. The plain `string` form remains the legacy default
+ * and every existing string-content code path keeps working unchanged.
+ * The `ContentPart[]` form is opt-in and only emitted when a vision-capable
+ * provider is in play (see `LLMProvider.supportsVision`).
+ */
+export type MessageContent = string | ContentPart[];
+
+/**
+ * Flatten a `MessageContent` value into a plain string for legacy code paths
+ * (transcript, history persistence, fallback providers, summarisation). Text
+ * parts are concatenated; image parts collapse to a `[Image: <mime>]` marker
+ * so the token count and the human-readable transcript remain meaningful.
+ */
+export function contentToString(content: MessageContent): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const p of content) {
+    if (p.type === "text") {
+      parts.push(p.text);
+    } else if (p.type === "image") {
+      parts.push(`[Image: ${p.mimeType}]`);
+    }
+  }
+  return parts.join("\n\n");
+}
+
+/**
+ * Extract just the image parts from a `MessageContent`. Returns an empty
+ * array when the content is a plain string or carries no `image` parts.
+ */
+export function extractImageParts(
+  content: MessageContent,
+): Array<Extract<ContentPart, { type: "image" }>> {
+  if (typeof content === "string" || !Array.isArray(content)) return [];
+  return content.filter(
+    (p): p is Extract<ContentPart, { type: "image" }> => p.type === "image",
+  );
+}
+
 export interface LLMMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string;
+  /**
+   * Message body. A plain `string` is the legacy default; `ContentPart[]`
+   * is opt-in for multimodal turns (Commit C-round). Providers that don't
+   * implement vision MUST degrade-fallback (flatten image parts into text
+   * markers) rather than throwing.
+   */
+  content: MessageContent;
   /** Tool-call metadata, when role === "tool" or role === "assistant" with tool calls. */
   toolCallId?: string;
   name?: string;
@@ -94,4 +155,16 @@ export interface LLMProvider {
    * gpt-tokenizer's `encode()` is sync.
    */
   countTokens?(messages: LLMMessage[]): number;
+
+  /**
+   * C-round vision capability flag. When `true`, the provider understands
+   * `LLMMessage.content` shaped as `ContentPart[]` with `image` parts; when
+   * absent or `false`, the host MUST flatten image parts into
+   * `[Image: filename]` text markers before calling `chat()`.
+   *
+   * Adapters declare this statically (Anthropic / OpenAI / Azure /
+   * Copilot = true; Ollama = false). The router aggregates per-route
+   * support — see `ModelRouter.supportsVision`.
+   */
+  supportsVision?: boolean;
 }

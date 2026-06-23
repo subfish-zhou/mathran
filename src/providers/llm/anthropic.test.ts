@@ -6,7 +6,7 @@
  * blocks, and the trailing tool result must reference the same id.
  */
 import { describe, it, expect } from "vitest";
-import { toAnthropicMessages } from "./anthropic.js";
+import { toAnthropicMessages, toAnthropicContentBlocks, AnthropicAdapter } from "./anthropic.js";
 
 describe("toAnthropicMessages", () => {
   it("collects all system messages into a single system string", () => {
@@ -76,5 +76,42 @@ describe("toAnthropicMessages", () => {
     const blocks = (out.messages[0] as { content: any[] }).content;
     const toolUse = blocks.find((b: any) => b.type === "tool_use");
     expect(toolUse.input).toEqual({});
+  });
+});
+
+describe("toAnthropicContentBlocks (C-round vision)", () => {
+  it("keeps plain strings as plain strings", () => {
+    expect(toAnthropicContentBlocks("hello")).toBe("hello");
+  });
+
+  it("emits {type:'image', source:{type:'base64', media_type, data}} for image parts", () => {
+    const blocks = toAnthropicContentBlocks([
+      { type: "text", text: "look at this" },
+      { type: "image", mimeType: "image/png", dataBase64: "aGVsbG8=" },
+    ]);
+    expect(blocks).toEqual([
+      { type: "text", text: "look at this" },
+      {
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+      },
+    ]);
+  });
+
+  it("drops zero-length text parts from the block list", () => {
+    const blocks = toAnthropicContentBlocks([
+      { type: "text", text: "" },
+      { type: "image", mimeType: "image/jpeg", dataBase64: "AAAA" },
+    ]);
+    expect(blocks).toEqual([
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "AAAA" } },
+    ]);
+  });
+});
+
+describe("AnthropicAdapter supportsVision", () => {
+  it("declares supportsVision = true so the host forwards ContentPart[]", () => {
+    const adapter = new AnthropicAdapter({ apiKey: "sk-fake" });
+    expect(adapter.supportsVision).toBe(true);
   });
 });

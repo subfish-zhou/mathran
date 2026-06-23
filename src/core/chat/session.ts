@@ -21,7 +21,10 @@ import type {
   LLMMessage,
   LLMRequest,
   LLMStreamChunk,
+  MessageContent,
+  ContentPart,
 } from "../providers/llm.js";
+import { contentToString } from "../providers/llm.js";
 import type { ReasoningEffortLevel } from "../reasoning-effort/index.js";
 import { capToolOutput } from "./tool-output-cap.js";
 import {
@@ -854,6 +857,7 @@ export class ChatSession {
     this.model = opts.model;
     this.tools = opts.tools ?? [];
     this.toolByName = new Map(this.tools.map((t) => [t.name, t]));
+
     // Tool-call round cap. Default raised from 8 → 50 (v0.12.x).
     //
     // Background: at 8 rounds, LLM doing legitimate multi-step exploration
@@ -999,6 +1003,28 @@ export class ChatSession {
   /** Current conversation history (read-only copy). */
   history(): LLMMessage[] {
     return this.messages.map((m) => ({ ...m }));
+  }
+
+  /**
+   * C-round Commit 4: ask the underlying LLM provider whether it understands
+   * `ContentPart[]` with image parts. The router aggregates per-route support
+   * (`ModelRouter.routeSupportsVision(modelString)`); a plain provider exposes
+   * the static `supportsVision` boolean. Returns false when neither is
+   * present so the host degrades to legacy `[Image: ...]` text markers.
+   */
+  providerSupportsVision(): boolean {
+    const provider = this.llm as LLMProvider & {
+      supportsVision?: boolean;
+      routeSupportsVision?: (modelString: string) => boolean;
+    };
+    if (typeof provider.routeSupportsVision === "function" && this.model) {
+      try {
+        return provider.routeSupportsVision(this.model) === true;
+      } catch {
+        return false;
+      }
+    }
+    return provider.supportsVision === true;
   }
 
   /**
@@ -1837,7 +1863,10 @@ export class ChatSession {
    * Run one user turn. Streams text/tool events; resolves the conversation by
    * looping through tool calls until the model stops requesting them.
    */
-  async *send(userText: string, opts: SendOpts = {}): AsyncIterable<ChatEvent> {
+  async *send(
+    userText: MessageContent,
+    opts: SendOpts = {},
+  ): AsyncIterable<ChatEvent> {
     const signal = opts.signal;
     // Abort before we touch history: leave `messages` untouched and bail.
     if (signal?.aborted) throw abortError();
@@ -1851,7 +1880,13 @@ export class ChatSession {
     // (removed after the turn so a long chat doesn't accumulate stale skill
     // fragments). Matched skills also register their `allowedTools` as
     // temporary approval rules for the rest of the session.
-    const skillMessage = this.activateTriggeredSkills(userText);
+    //
+    // Skill matching is text-based: when we receive a ContentPart[] (vision)
+    // we collapse to the leading text part for trigger matching only — the
+    // image parts pass through unchanged into the persisted message.
+    const triggerText =
+      typeof userText === "string" ? userText : contentToString(userText);
+    const skillMessage = this.activateTriggeredSkills(triggerText);
 
     this.messages.push(
       opts.attachments && opts.attachments.length > 0

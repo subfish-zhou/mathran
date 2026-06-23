@@ -24,7 +24,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import type { LLMStreamChunk } from "../../core/providers/llm.js";
+import type { LLMStreamChunk, MessageContent, ContentPart } from "../../core/providers/llm.js";
+import { contentToString } from "../../core/providers/llm.js";
 
 type FinishReason = Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
 
@@ -170,10 +171,16 @@ export interface CopilotToolDef {
  * A single conversation message. `tool` messages carry the result of a tool
  * invocation; `toolCallId`/`name` thread the call metadata so the GPT/Claude
  * builders can reconstruct the provider-native function_call / tool_use pairs.
+ *
+ * `content` mirrors the kernel's `MessageContent` union — a plain `string`
+ * (legacy default) or `ContentPart[]` for multimodal user turns. The GPT
+ * (Responses API) and Claude (Messages API) builders translate `image` parts
+ * into the provider-native image block; degrade fallbacks flatten them into
+ * `[Image: <mime>]` text markers.
  */
 export interface CopilotChatMessage {
   role: "user" | "assistant" | "tool";
-  content: string;
+  content: MessageContent;
   toolCallId?: string;
   name?: string;
   /**
@@ -285,6 +292,57 @@ function extractMessagesText(raw: any): { text: string; input: number; output: n
 
 // ─── GPT (Responses API) tool wiring ──────────────────────────────────────
 
+/**
+ * Translate Mathran `MessageContent` into the OpenAI Responses API content
+ * shape for a user/assistant turn. Plain strings stay as strings; arrays
+ * become a `parts[]` list with `input_text` and `input_image` entries.
+ */
+function toResponsesContent(content: MessageContent): any {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: any[] = [];
+  for (const p of content) {
+    if (p.type === "text") {
+      if (p.text.length > 0) parts.push({ type: "input_text", text: p.text });
+    } else if (p.type === "image") {
+      parts.push({
+        type: "input_image",
+        image_url: `data:${p.mimeType};base64,${p.dataBase64}`,
+      });
+    }
+  }
+  return parts;
+}
+
+/**
+ * Translate Mathran `MessageContent` into Anthropic Messages content blocks.
+ * Plain strings stay as strings; arrays become a list of `text` / `image`
+ * blocks (image as `{type:'image', source:{type:'base64', media_type, data}}`).
+ */
+function toAnthropicContent(content: MessageContent): any {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const blocks: any[] = [];
+  for (const p of content) {
+    if (p.type === "text") {
+      if (p.text.length > 0) blocks.push({ type: "text", text: p.text });
+    } else if (p.type === "image") {
+      blocks.push({
+        type: "image",
+        source: { type: "base64", media_type: p.mimeType, data: p.dataBase64 },
+      });
+    }
+  }
+  return blocks;
+}
+
+/** True if the content carries at least one non-empty text/image part. */
+function contentIsEmpty(content: MessageContent): boolean {
+  if (typeof content === "string") return content.length === 0;
+  if (!Array.isArray(content)) return true;
+  return content.length === 0;
+}
+
 /** Build the Responses `input[]` list, translating tool turns into the
  * function_call / function_call_output item pair the Responses API expects. */
 export function buildResponsesInput(req: CopilotChatRequest): unknown[] {
@@ -299,8 +357,9 @@ export function buildResponsesInput(req: CopilotChatRequest): unknown[] {
       // Preferred path: the kernel preserved the actual `tool_calls` from the
       // previous assistant turn. Replay each as a function_call item with the
       // exact arguments string the model emitted.
-      if (m.content.length > 0) {
-        input.push({ role: "assistant", content: m.content });
+      const assistantText = contentToString(m.content);
+      if (assistantText.length > 0) {
+        input.push({ role: "assistant", content: assistantText });
       }
       for (const c of m.toolCalls) {
         input.push({
@@ -331,14 +390,14 @@ export function buildResponsesInput(req: CopilotChatRequest): unknown[] {
       input.push({
         type: "function_call_output",
         call_id: callId,
-        output: m.content,
+        output: contentToString(m.content),
       });
       continue;
     }
     // Skip empty assistant turns (e.g. a turn that was only a tool call): the
     // Responses API rejects messages with empty content.
-    if (m.role === "assistant" && m.content.length === 0) continue;
-    input.push({ role: m.role, content: m.content });
+    if (m.role === "assistant" && contentIsEmpty(m.content)) continue;
+    input.push({ role: m.role, content: toResponsesContent(m.content) });
   }
   return input;
 }
@@ -378,7 +437,7 @@ export function buildMessagesInput(req: CopilotChatMessage[]): any[] {
   let lastAssistantIdx = -1;
   for (const m of req) {
     if (m.role === "assistant") {
-      out.push({ role: "assistant", content: m.content });
+      out.push({ role: "assistant", content: toAnthropicContent(m.content) });
       lastAssistantIdx = out.length - 1;
       continue;
     }
@@ -401,7 +460,7 @@ export function buildMessagesInput(req: CopilotChatMessage[]): any[] {
       // Batch the tool_result onto the user message immediately following the
       // assistant turn (so multiple tool calls share one user message).
       const last = out[out.length - 1];
-      const resultBlock = { type: "tool_result", tool_use_id: m.toolCallId ?? "", content: m.content };
+      const resultBlock = { type: "tool_result", tool_use_id: m.toolCallId ?? "", content: contentToString(m.content) };
       if (last && last !== a && last.role === "user" && Array.isArray(last.content)) {
         last.content.push(resultBlock);
       } else {
@@ -409,7 +468,7 @@ export function buildMessagesInput(req: CopilotChatMessage[]): any[] {
       }
       continue;
     }
-    out.push({ role: "user", content: m.content });
+    out.push({ role: "user", content: toAnthropicContent(m.content) });
   }
   return out;
 }
@@ -505,7 +564,7 @@ export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatR
   if (req.systemPrompt) messages.push({ role: "system", content: req.systemPrompt });
   for (const m of req.messages) {
     if (m.role === "user" || m.role === "assistant") {
-      messages.push({ role: m.role, content: m.content });
+      messages.push({ role: m.role, content: contentToString(m.content) });
     }
   }
   const raw = await postJson(

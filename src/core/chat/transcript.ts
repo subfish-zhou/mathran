@@ -14,6 +14,7 @@
  */
 
 import type { LLMMessage } from "../providers/llm.js";
+import { contentToString } from "../providers/llm.js";
 
 export interface TranscriptMeta {
   /** A human-readable scope label (e.g. "global", "project / x", "effort / x / y", "REPL"). */
@@ -44,7 +45,7 @@ export function renderTranscriptMarkdown(history: LLMMessage[], meta: Transcript
       out.push("<details><summary>system prompt</summary>");
       out.push("");
       out.push("```");
-      out.push(m.content ?? "");
+      out.push(contentToString(m.content ?? ""));
       out.push("```");
       out.push("");
       out.push("</details>");
@@ -53,9 +54,12 @@ export function renderTranscriptMarkdown(history: LLMMessage[], meta: Transcript
     }
     out.push(`## ${role}`);
     out.push("");
-    if (m.content && m.content.trim().length > 0) {
-      out.push(m.content);
-      out.push("");
+    if (m.content) {
+      const text = contentToString(m.content);
+      if (text.trim().length > 0) {
+        out.push(text);
+        out.push("");
+      }
     }
     if (Array.isArray(m.toolCalls) && m.toolCalls.length > 0) {
       for (const call of m.toolCalls) {

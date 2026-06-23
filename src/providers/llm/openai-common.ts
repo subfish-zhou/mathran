@@ -6,7 +6,8 @@
  */
 
 import type OpenAI from "openai";
-import type { LLMRequest, LLMStreamChunk } from "../../core/providers/llm.js";
+import type { LLMRequest, LLMStreamChunk, MessageContent, ContentPart } from "../../core/providers/llm.js";
+import { contentToString } from "../../core/providers/llm.js";
 
 type FinishReason = Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
 
@@ -26,21 +27,50 @@ function mapFinishReason(reason: string | null | undefined): FinishReason {
   }
 }
 
+/**
+ * Translate a Mathran `MessageContent` value into the OpenAI Chat Completions
+ * `messages[i].content` shape for a user turn.
+ *
+ * - A plain `string` short-circuits to itself — OpenAI accepts a bare string
+ *   on user/assistant turns.
+ * - A `ContentPart[]` is translated to the OpenAI multimodal `parts[]`:
+ *     * text  → `{type: 'text', text}`
+ *     * image → `{type: 'image_url', image_url: {url: 'data:<mime>;base64,<b64>'}}`
+ *   (GPT-4o / GPT-4-vision / Azure GPT-4o all use this exact shape.)
+ */
+export function toOpenAIContent(content: MessageContent): any {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: any[] = [];
+  for (const p of content) {
+    if (p.type === "text") {
+      if (p.text.length > 0) parts.push({ type: "text", text: p.text });
+    } else if (p.type === "image") {
+      parts.push({
+        type: "image_url",
+        image_url: { url: `data:${p.mimeType};base64,${p.dataBase64}` },
+      });
+    }
+  }
+  return parts;
+}
+
 /** Build the params object for client.chat.completions.create({ stream: true }). */
 export function buildOpenAIParams(req: LLMRequest, model: string): any {
   const messages = req.messages.map((m) => {
     if (m.role === "tool") {
-      return { role: "tool", content: m.content, tool_call_id: m.toolCallId ?? "" };
+      return { role: "tool", content: contentToString(m.content), tool_call_id: m.toolCallId ?? "" };
     }
     if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
       // Replay the assistant's tool_calls so the trailing tool messages have
       // a valid parent. OpenAI / Azure reject sequences where a tool message
       // appears without an immediately preceding assistant `tool_calls`.
+      const assistantText = contentToString(m.content);
       const out: any = {
         role: "assistant",
         // OpenAI accepts `null` content for pure tool-call turns; non-empty
         // text is still allowed and shown.
-        content: m.content && m.content.length > 0 ? m.content : null,
+        content: assistantText.length > 0 ? assistantText : null,
         tool_calls: m.toolCalls.map((c) => ({
           id: c.id,
           type: "function",
@@ -50,7 +80,11 @@ export function buildOpenAIParams(req: LLMRequest, model: string): any {
       if (m.name) out.name = m.name;
       return out;
     }
-    const base: any = { role: m.role, content: m.content };
+    // System turns are always coerced to plain text — OpenAI / Azure don't
+    // accept image parts in a system message slot.
+    const contentValue =
+      m.role === "system" ? contentToString(m.content) : toOpenAIContent(m.content);
+    const base: any = { role: m.role, content: contentValue };
     if (m.name) base.name = m.name;
     return base;
   });

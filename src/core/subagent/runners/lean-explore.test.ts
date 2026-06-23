@@ -337,7 +337,7 @@ describe("lean_explore — generateProof", () => {
 describe("lean_explore — runner: happy path (winner)", () => {
   it("first ok=true attempt becomes the winner; summary names it", async () => {
     const llm = new ScriptedLLM([], (req) => {
-      const user = req.messages.find((m) => m.role === "user")?.content ?? "";
+      const user = (req.messages.find((m) => m.role === "user")?.content ?? "") as string;
       const m = user.match(/STRATEGY:\n(\S+)/);
       const tag = m ? m[1] : "x";
       return "```lean\nproof_for_" + tag + "\n```";
@@ -434,7 +434,7 @@ describe("lean_explore — runner: brainstorm parse fallback", () => {
   it("uses FALLBACK_STRATEGIES when brainstorm reply is garbage", async () => {
     const seenSystems: string[] = [];
     const llm = new ScriptedLLM([], (req) => {
-      const sys = req.messages.find((m) => m.role === "system")?.content ?? "";
+      const sys = (req.messages.find((m) => m.role === "system")?.content ?? "") as string;
       seenSystems.push(sys);
       if (sys.includes("strategist")) return "totally not json";
       return "```lean\np\n```";
@@ -564,7 +564,7 @@ describe("lean_explore — runner: abort propagation", () => {
 describe("lean_explore — runner: anti-recursion invariant", () => {
   it("EVERY LLM request has tools: []", async () => {
     const llm = new ScriptedLLM([], (req) => {
-      const sys = req.messages.find((m) => m.role === "system")?.content ?? "";
+      const sys = (req.messages.find((m) => m.role === "system")?.content ?? "") as string;
       if (sys.includes("strategist")) return '["x","y","z"]';
       return "```lean\nproof\n```";
     });
