@@ -22,6 +22,11 @@ import type { ToolSpec } from "../session.js";
 import type { SubagentScheduler, SubagentTaskWithRuntime } from "../../subagent/scheduler.js";
 import type { SubagentTaskType } from "../../subagent/types.js";
 import { RECOMMENDED_MODELS } from "../../subagent/registry.js";
+import {
+  BackgroundConcurrencyError,
+  summarizeTask,
+  type BackgroundSubagentRegistry,
+} from "../../subagent/background.js";
 
 const KNOWN_TYPES: readonly SubagentTaskType[] = [
   "compact",
@@ -45,6 +50,20 @@ export interface DispatchSubagentToolOptions {
    * is validated (fail-open on provider existence).
    */
   knownProviders?: readonly string[];
+  /**
+   * Background mode wiring (#3). When supplied, `mode: "background"` becomes
+   * available: the tool registers the run in `registry`, kicks the dispatch
+   * off without awaiting, and returns `{ subagentId, status: "running" }`
+   * immediately. On completion it lands the result back in the registry (which
+   * broadcasts a `subagent-completed` event the host relays over SSE). When
+   * omitted, `mode: "background"` is rejected — the LLM must dispatch
+   * synchronously (the CLI / goal hosts have no SSE surface to notify).
+   */
+  background?: {
+    registry: BackgroundSubagentRegistry;
+    /** Conversation that owns the run — scopes the per-conversation cap + SSE. */
+    parentConversationId: string;
+  };
 }
 
 /** Render the recommended-model mapping for the tool description. */
@@ -111,6 +130,18 @@ const PARAMETERS = {
       description:
         "Optional. Default 'inline'. 'subprocess' isolates the runner in a " +
         "forked Node process (slower startup, safer for crashy LLM calls).",
+    },
+    mode: {
+      type: "string",
+      enum: ["sync", "background"],
+      description:
+        "Optional. Default 'sync' (block until the subagent finishes and " +
+        "return its summary). Use 'background' to fire-and-forget: the tool " +
+        "returns immediately with {subagentId, status:'running'} and you can " +
+        "keep working / call other tools. You'll be notified when it finishes " +
+        "(or poll with get_subagent_result). Max 3 background subagents per " +
+        "conversation. Only choose 'background' when you genuinely don't need " +
+        "the result before your next step.",
     },
     model: {
       type: "string",
@@ -228,6 +259,61 @@ export function createDispatchSubagentTool(
         ...(hardCapBytes !== undefined ? { hardCapBytes } : {}),
         ...(model !== undefined ? { model } : {}),
       };
+
+      // Mode arg (#3). Default "sync" keeps the historical blocking behaviour.
+      const rawMode = typeof args.mode === "string" ? args.mode : "sync";
+      if (rawMode !== "sync" && rawMode !== "background") {
+        return {
+          ok: false,
+          content: `dispatch_subagent: invalid mode "${rawMode}" (expected "sync" or "background")`,
+        };
+      }
+
+      if (rawMode === "background") {
+        if (!opts.background) {
+          return {
+            ok: false,
+            content:
+              'dispatch_subagent: background mode is not available in this context; use mode "sync"',
+          };
+        }
+        const { registry, parentConversationId } = opts.background;
+        let registration;
+        try {
+          registration = registry.register({
+            type,
+            parentConversationId,
+            taskSummary: summarizeTask(input),
+          });
+        } catch (err) {
+          if (err instanceof BackgroundConcurrencyError) {
+            return { ok: false, content: `dispatch_subagent: ${err.message}` };
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          return { ok: false, content: `dispatch_subagent: ${msg}` };
+        }
+        const { record, signal } = registration;
+        // Fire-and-forget: the dispatch keeps running on the event loop even
+        // after this HTTP request (and its SSE stream) closes. On settle we
+        // land the result back in the registry, which broadcasts a
+        // `subagent-completed` event for any open stream to relay.
+        void opts.scheduler
+          .dispatch(task, { signal })
+          .then((res) => registry.complete(record.id, res))
+          .catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            registry.fail(record.id, `scheduler threw: ${msg}`);
+          });
+        return {
+          ok: true,
+          content: JSON.stringify({
+            subagentId: record.id,
+            status: "running",
+            type,
+            mode: "background",
+          }),
+        };
+      }
 
       let result: Awaited<ReturnType<typeof opts.scheduler.dispatch>>;
       try {
