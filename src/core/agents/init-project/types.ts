@@ -32,6 +32,11 @@ export interface AiInitConfig {
   enableWiki: boolean;
   enableWorkspace: boolean;
   searchDepth: "quick" | "standard" | "deep";
+  /**
+   * Opt into the Spine-First pipeline (v1b). When false (default) the v1a
+   * 4-phase path runs unchanged.
+   */
+  useSpine?: boolean;
 }
 
 export interface InitAgentInput {
@@ -40,11 +45,23 @@ export interface InitAgentInput {
   aiInit: AiInitConfig;
 }
 
-/** v1a phases (review/verify/spine are v1b). */
+/**
+ * Agent phases. The v1a path uses seed_research → deep_crawl → build_wiki;
+ * the v1b Spine-First path (useSpine=true) uses explore_graph → build_spine →
+ * build_efforts → spine_wiki. Both converge on `completed`.
+ */
 export type InitPhase =
   | "seed_research"
   | "deep_crawl"
   | "build_wiki"
+  | "explore_graph"
+  | "build_spine"
+  | "build_efforts"
+  | "spine_wiki"
+  | "review_refine"
+  | "verify"
+  | "link_review"
+  | "completeness_check"
   | "completed"
   | "error";
 
@@ -68,11 +85,21 @@ export interface InitAgentResult {
   wikiPages: string[];
   crawledResources: number;
   seedPapers: number;
+  /** Set when the Spine-First pipeline ran (useSpine=true). */
+  mode?: "v1a" | "spine";
   summary: {
     conceptsExtracted: number;
     queriesRun: number;
     resourcesFound: number;
     wikiPagesGenerated: number;
     durationMs: number;
+    /** Spine-First only. */
+    spineNodes?: number;
+    effortsCreated?: number;
+    papersDiscovered?: number;
+    papersRelevant?: number;
+    pagesRefined?: number;
+    pagesFlagged?: number;
+    spineCoverage?: number;
   };
 }
