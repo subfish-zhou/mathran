@@ -65,7 +65,19 @@ export const DEFAULT_GOAL_AUTONOMY: GoalAutonomyConfig = {
   autonomyLevel: "balanced",
   summaryGranularity: "realtime",
   summaryIntervalMs: 30 * 60 * 1000,
-  defaultMaxRounds: 12,
+  // Bumped from 12 → 200 (goal-defaults-timer task, 2026-06-23):
+  // long-running autonomous goals (especially LRC / Lean / overnight
+  // proof searches) routinely chew through 50+ rounds, so a 12-round
+  // default was forcing every user to immediately override the cap
+  // in the create-goal modal. 200 is still bounded enough to catch a
+  // pathological infinite loop within a few hours of wall-clock time.
+  defaultMaxRounds: 200,
+  // Token cap moved from "absent" to 12.8M (goal-defaults-timer):
+  // ~12.8M total tokens across an entire goal corresponds to roughly
+  // a full long-running session against a 200k-context model with
+  // generous tool-output overhead. Same rationale as defaultMaxRounds —
+  // "effectively uncapped for normal use, but still a runaway brake".
+  defaultTokensCap: 12_800_000,
   updatedAt: 0,
 };
 
@@ -300,9 +312,15 @@ export function mergeGoalAutonomy(
   project: StoredGoalAutonomyLayer | null,
 ): GoalAutonomyConfig {
   const eff: GoalAutonomyConfig = { ...DEFAULT_GOAL_AUTONOMY };
-  // Strip the default's `defaultTokensCap` (it's absent in DEFAULT_GOAL_AUTONOMY,
-  // but we keep this delete defensive in case a future DEFAULT carries one).
-  delete (eff as Partial<GoalAutonomyConfig>).defaultTokensCap;
+  // NOTE (goal-defaults-timer 2026-06-23): the old behaviour here
+  // deleted `defaultTokensCap` from the merged result on the assumption
+  // that DEFAULT carried no cap. DEFAULT_GOAL_AUTONOMY now ships an
+  // explicit 12.8M cap, so we deliberately KEEP the field — layers
+  // (project, global) can still override it via `applyLayer` below,
+  // and a project that wants "truly uncapped" can write
+  // `defaultTokensCap: null` (which `parseStoredGoalAutonomy` drops as
+  // a clear signal, leaving the DEFAULT in place; explicit override
+  // requires writing a positive integer).
   applyLayer(eff, global);
   applyLayer(eff, project);
   eff.updatedAt = Math.max(
