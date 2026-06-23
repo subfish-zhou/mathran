@@ -167,6 +167,25 @@ export interface PendingAskAnnotation {
    *  a relative age ("asked 3 min ago") and lets ops alarms catch
    *  forgotten pending asks. */
   ts: number;
+  /**
+   * v0.19 Codex parity — the four structured fields the model can
+   * supply via `ask_user({ options, default, timeoutSeconds, allowCustom })`.
+   * Persisted on the sidecar so a tab reload after the original SSE
+   * stream closed can still render the button list + countdown + hint.
+   * All optional; legacy pending asks (pre-v0.19) load with these
+   * fields undefined and the SPA falls back to the plain textarea.
+   */
+  options?: string[];
+  default?: string;
+  timeoutSeconds?: number;
+  allowCustom?: boolean;
+  /**
+   * v0.19 — unix epoch ms by which the server's auto-resolve timeout
+   * fires. Recorded so the SPA can render a live countdown and so an
+   * answer arriving after this timestamp (race) can be detected.
+   * Only set when `timeoutSeconds` was supplied.
+   */
+  timeoutAt?: number;
 }
 
 export interface ConversationUiState {
@@ -219,7 +238,51 @@ export async function loadAnnotations(
           typeof pa.toolCallId === "string" &&
           typeof pa.ts === "number"
         ) {
-          out.pendingAsk = pa;
+          // v0.19 Codex parity — round-trip the new structured fields
+          // when present and well-typed. We rebuild the object
+          // explicitly so a corrupted extra key on disk never leaks
+          // back into save. Each field is also shape-checked
+          // individually: bogus types are silently dropped rather than
+          // tainting the in-memory model the SPA renders.
+          const restored: PendingAskAnnotation = {
+            question: pa.question,
+            callId: pa.callId,
+            toolCallId: pa.toolCallId,
+            ts: pa.ts,
+          };
+          if (
+            Array.isArray((pa as { options?: unknown }).options) &&
+            ((pa as { options: unknown[] }).options as unknown[]).every(
+              (x) => typeof x === "string",
+            )
+          ) {
+            restored.options = (pa as { options: string[] }).options;
+          }
+          if (typeof (pa as { default?: unknown }).default === "string") {
+            restored.default = (pa as { default: string }).default;
+          }
+          if (
+            typeof (pa as { timeoutSeconds?: unknown }).timeoutSeconds ===
+              "number" &&
+            Number.isFinite(
+              (pa as { timeoutSeconds: number }).timeoutSeconds,
+            ) &&
+            (pa as { timeoutSeconds: number }).timeoutSeconds > 0
+          ) {
+            restored.timeoutSeconds = (pa as {
+              timeoutSeconds: number;
+            }).timeoutSeconds;
+          }
+          if (typeof (pa as { allowCustom?: unknown }).allowCustom === "boolean") {
+            restored.allowCustom = (pa as { allowCustom: boolean }).allowCustom;
+          }
+          if (
+            typeof (pa as { timeoutAt?: unknown }).timeoutAt === "number" &&
+            Number.isFinite((pa as { timeoutAt: number }).timeoutAt)
+          ) {
+            restored.timeoutAt = (pa as { timeoutAt: number }).timeoutAt;
+          }
+          out.pendingAsk = restored;
         }
       }
       return out;
