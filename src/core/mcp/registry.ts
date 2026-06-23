@@ -89,8 +89,14 @@ export class McpRegistry {
    * Load config + connect every enabled server. Idempotent: a second call is a
    * no-op (use `reloadAll()` to re-read config). Never throws — connect
    * failures land in each server's status.
+   *
+   * By default only `scope: "global"` servers are connected; servers marked
+   * `scope: "per-conversation"` are owned by individual {@link ChatSession}s
+   * (see {@link createPerConversationRegistry}) and skipped here. Pass
+   * `scopeFilter` to override (e.g. a per-conversation registry asks for the
+   * complementary set).
    */
-  async init(opts: LoadMcpConfigOpts): Promise<void> {
+  async init(opts: LoadMcpConfigOpts & { scopeFilter?: (s: McpServerConfig) => boolean }): Promise<void> {
     if (this.initialized) return;
     this.initialized = true;
     const { servers, warnings } = loadMcpConfig(opts);
@@ -99,8 +105,9 @@ export class McpRegistry {
       // eslint-disable-next-line no-console
       console.warn(w);
     }
+    const scopeFilter = opts.scopeFilter ?? ((s) => s.scope === "global");
     await Promise.all(
-      servers.map(async (config) => {
+      servers.filter(scopeFilter).map(async (config) => {
         if (!config.enabled) {
           this.servers.set(config.name, {
             config,
@@ -483,11 +490,15 @@ export class McpRegistry {
    * tearing down unaffected servers (PLAN #4 hot reload). Returns the diff.
    * Even when the registry hasn't been `init()`ed this works (it just adds).
    */
-  async reloadFromConfig(opts: LoadMcpConfigOpts): Promise<ServerConfigDiff> {
+  async reloadFromConfig(
+    opts: LoadMcpConfigOpts & { scopeFilter?: (s: McpServerConfig) => boolean },
+  ): Promise<ServerConfigDiff> {
     const { servers, warnings } = loadMcpConfig(opts);
     this.warnings = warnings;
+    const scopeFilter = opts.scopeFilter ?? ((s) => s.scope === "global");
+    const scoped = servers.filter(scopeFilter);
     const current = [...this.servers.values()].map((m) => m.config);
-    const diff = diffServerConfigs(current, servers);
+    const diff = diffServerConfigs(current, scoped);
     for (const name of diff.removed) {
       await this.removeServer(name);
     }
