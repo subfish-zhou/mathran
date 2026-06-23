@@ -5,6 +5,13 @@ import * as os from "node:os";
 
 import { startServer, type RunningServer } from "./serve.js";
 import type { LLMProvider, LLMRequest, LLMResponse, LLMStreamChunk } from "../core/providers/llm.js";
+import {
+  createRun,
+  writeCheckpoint,
+  finishRun,
+} from "../core/agents/init-project/index.js";
+import { writeSpine } from "../core/agents/init-project/spine/builder.js";
+import type { NarrativeSpine } from "../core/agents/init-project/spine/types.js";
 
 function fakeLlm(): LLMProvider {
   return {
@@ -13,9 +20,16 @@ function fakeLlm(): LLMProvider {
     },
     async chat(req: LLMRequest): Promise<LLMResponse> {
       const prompt = req.messages.map((m) => m.content).join("\n");
-      const reply = prompt.includes("identifying key concepts")
-        ? JSON.stringify({ concepts: [{ name: "sieve" }], search_queries: ["sieve theory"] })
-        : "> [AI-GENERATED] generated.\n\n# Page\n\n## A\n\n## B\n\n## C\nbody";
+      let reply: string;
+      if (prompt.includes("identifying key concepts")) {
+        reply = JSON.stringify({ concepts: [{ name: "sieve" }], search_queries: ["sieve theory"] });
+      } else if (prompt.includes("reviewing a mathematical wiki page")) {
+        reply = JSON.stringify({ overallScore: 9, issues: [] });
+      } else if (prompt.includes("verifying the factual")) {
+        reply = JSON.stringify({ status: "verified", flaggedClaims: [] });
+      } else {
+        reply = "> [AI-GENERATED] generated.\n\n# Page\n\n## A\n\n## B\n\n## C\nbody";
+      }
       return {
         async *stream(): AsyncIterable<LLMStreamChunk> {
           yield { type: "text", delta: reply };
@@ -138,5 +152,236 @@ describe("GET /api/agent/init-project/:runId", () => {
   it("returns 404 for an unknown runId", async () => {
     const res = await fetch(`${base}/api/agent/init-project/run-deadbeefcafe`);
     expect(res.status).toBe(404);
+  });
+});
+
+// ── helpers for stream/resume suites ────────────────────────────────────────
+
+function agentRunDir(slug: string, runId: string): string {
+  return path.join(workspace, "projects", slug, ".mathran", "agent-runs", runId);
+}
+
+async function scaffoldProject(slug: string): Promise<void> {
+  await fs.mkdir(path.join(workspace, "projects", slug, "wiki"), { recursive: true });
+}
+
+/** Read an SSE response fully until the server closes the stream (or timeout). */
+async function readStreamUntilClose(url: string, timeoutMs = 5000): Promise<string> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let text = "";
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    const reader = res.body!.getReader();
+    const dec = new TextDecoder();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) text += dec.decode(value, { stream: true });
+    }
+  } catch {
+    /* aborted on timeout — return whatever we collected */
+  } finally {
+    clearTimeout(timer);
+  }
+  return text;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+describe("GET /api/agent/init-project/:runId/stream (SSE)", () => {
+  it("returns 400 for a malformed runId", async () => {
+    const res = await fetch(`${base}/api/agent/init-project/not-a-run/stream`);
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 404 for an unknown runId", async () => {
+    const res = await fetch(`${base}/api/agent/init-project/run-deadbeefcafe/stream`);
+    expect(res.status).toBe(404);
+  });
+
+  it("replays existing phases and closes immediately on a completed run", async () => {
+    const slug = "sse-replay";
+    const runId = "run-aaaa11112222";
+    await scaffoldProject(slug);
+    await fs.mkdir(agentRunDir(slug, runId), { recursive: true });
+    const phasesFile = path.join(agentRunDir(slug, runId), "phases.jsonl");
+    await fs.writeFile(
+      phasesFile,
+      [
+        JSON.stringify({ phase: "explore_graph", event: "start" }),
+        JSON.stringify({ phase: "build_spine", event: "end" }),
+        JSON.stringify({ phase: "completed", event: "end" }),
+      ].join("\n") + "\n",
+      "utf-8",
+    );
+
+    const text = await readStreamUntilClose(`${base}/api/agent/init-project/${runId}/stream`);
+    expect(text).toContain("event: phase");
+    expect(text).toContain("explore_graph");
+    expect(text).toContain("build_spine");
+    expect(text).toContain("completed");
+  });
+
+  it("tails newly appended phase lines and closes on a terminal phase", async () => {
+    const slug = "sse-tail";
+    const runId = "run-bbbb33334444";
+    await scaffoldProject(slug);
+    await fs.mkdir(agentRunDir(slug, runId), { recursive: true });
+    const phasesFile = path.join(agentRunDir(slug, runId), "phases.jsonl");
+    await fs.writeFile(
+      phasesFile,
+      JSON.stringify({ phase: "explore_graph", event: "start" }) + "\n",
+      "utf-8",
+    );
+
+    const streamP = readStreamUntilClose(`${base}/api/agent/init-project/${runId}/stream`, 6000);
+    await sleep(300);
+    await fs.appendFile(
+      phasesFile,
+      JSON.stringify({ phase: "build_spine", event: "end" }) + "\n" +
+        JSON.stringify({ phase: "completed", event: "end" }) + "\n",
+      "utf-8",
+    );
+    const text = await streamP;
+    expect(text).toContain("explore_graph");
+    expect(text).toContain("build_spine");
+    expect(text).toContain("completed");
+  });
+
+  it("emits each phase record as an `event: phase` SSE frame", async () => {
+    const slug = "sse-format";
+    const runId = "run-cccc55556666";
+    await scaffoldProject(slug);
+    await fs.mkdir(agentRunDir(slug, runId), { recursive: true });
+    await fs.writeFile(
+      path.join(agentRunDir(slug, runId), "phases.jsonl"),
+      JSON.stringify({ phase: "completed", event: "end", data: { ok: true } }) + "\n",
+      "utf-8",
+    );
+    const text = await readStreamUntilClose(`${base}/api/agent/init-project/${runId}/stream`);
+    expect(text).toMatch(/event: phase\ndata: \{/);
+    expect(text).toContain('"ok":true');
+  });
+});
+
+// ── resume ──────────────────────────────────────────────────────────────────
+
+function spineFixture(): NarrativeSpine {
+  return {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    globalThesis: "thesis",
+    eras: [],
+    nodes: [
+      {
+        id: "node-1",
+        type: "foundation",
+        title: "Foundational result",
+        statement: "stmt",
+        significance: "sig",
+        paperIds: ["arxiv-1"],
+        effortIds: ["e1"],
+        depth: "foundational",
+      },
+    ],
+    edges: [],
+    threads: [],
+    openQuestions: [],
+  } as NarrativeSpine;
+}
+
+/**
+ * Build an interrupted Spine-First run on disk: spine.json + a wiki page +
+ * a checkpoint at `spine_wiki` with status=error, ready to be resumed.
+ */
+async function makeInterruptedRun(slug: string, runId: string): Promise<string> {
+  const projectDir = path.join(workspace, "projects", slug);
+  await fs.mkdir(path.join(projectDir, "wiki"), { recursive: true });
+  await fs.mkdir(path.join(projectDir, "efforts", "e1"), { recursive: true });
+  await fs.writeFile(path.join(projectDir, "efforts", "e1", "document.md"), "# e1\n", "utf-8");
+  await writeSpine(projectDir, spineFixture());
+  await fs.writeFile(
+    path.join(projectDir, "wiki", "twin-primes.md"),
+    `---\ntitle: "Twin Primes"\nslug: twin-primes\ntags: ["x"]\n---\n# Twin Primes\n\nBody referencing @ws:e1.\n`,
+    "utf-8",
+  );
+  await createRun(projectDir, {
+    runId,
+    input: {
+      problem: { title: "Twin Prime Conjecture", tags: ["number-theory"] },
+      seedReferences: [],
+      aiInit: { enableWiki: true, enableWorkspace: true, searchDepth: "standard", useSpine: true },
+    },
+  });
+  await writeCheckpoint(projectDir, runId, "spine_wiki", { wikiPages: ["twin-primes"] });
+  await finishRun(projectDir, runId, "error", "interrupted");
+  return projectDir;
+}
+
+describe("POST /api/agent/init-project/:runId/resume", () => {
+  it("returns 400 for a malformed runId", async () => {
+    const res = await fetch(`${base}/api/agent/init-project/not-a-run/resume`, { method: "POST" });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 404 for an unknown runId", async () => {
+    const res = await fetch(`${base}/api/agent/init-project/run-deadbeefcafe/resume`, { method: "POST" });
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 404 when the run has no checkpoint", async () => {
+    const slug = "resume-no-ckpt";
+    const runId = "run-dddd77778888";
+    const projectDir = path.join(workspace, "projects", slug);
+    await fs.mkdir(path.join(projectDir, "wiki"), { recursive: true });
+    await createRun(projectDir, { runId, input: {} });
+    const res = await fetch(`${base}/api/agent/init-project/${runId}/resume`, { method: "POST" });
+    expect(res.status).toBe(404);
+  });
+
+  it("resumes from the spine_wiki checkpoint and runs through completion", async () => {
+    const slug = "resume-ok";
+    const runId = "run-eeee9999aaaa";
+    await makeInterruptedRun(slug, runId);
+
+    const res = await fetch(`${base}/api/agent/init-project/${runId}/resume`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body.runId).toBe(runId);
+    expect(body.resumedFrom).toBe("spine_wiki");
+
+    const ledger = await waitForStatus(runId, "completed", 6000);
+    expect(ledger.run.status).toBe("completed");
+    // the verify phase (after the checkpoint) re-ran and stamped the page
+    const page = await fs.readFile(
+      path.join(workspace, "projects", slug, "wiki", "twin-primes.md"),
+      "utf-8",
+    );
+    expect(page).toContain("verification: verified");
+  });
+
+  it("does not re-run phases at or before the checkpoint", async () => {
+    const slug = "resume-skip";
+    const runId = "run-ffff0000bbbb";
+    await makeInterruptedRun(slug, runId);
+
+    await fetch(`${base}/api/agent/init-project/${runId}/resume`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const ledger = await waitForStatus(runId, "completed", 6000);
+    const resumedPhases = ledger.phases
+      .filter((p: any) => p.data?.resumed)
+      .map((p: any) => p.phase);
+    // spine_wiki (and earlier) are skipped; only later phases carry resumed:true
+    expect(resumedPhases).not.toContain("spine_wiki");
+    expect(resumedPhases).not.toContain("build_efforts");
+    expect(resumedPhases).toContain("review_refine");
   });
 });

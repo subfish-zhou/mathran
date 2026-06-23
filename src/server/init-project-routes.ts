@@ -11,15 +11,21 @@
  */
 
 import type { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import * as path from "node:path";
+import * as fsp from "node:fs/promises";
+import { watchFile, unwatchFile } from "node:fs";
 
 import type { LLMProvider } from "../core/providers/llm.js";
 import { initProject } from "../cli/commands/project.js";
 import { slugify } from "../lib/slug.js";
 import {
   runInitAgent,
+  resumeInitAgent,
   createRun,
   readRunLedger,
+  readRun,
+  readCheckpoint,
   newRunId,
   type InitAgentInput,
   type FormalizedProblem,
@@ -136,7 +142,15 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
     const input: InitAgentInput = { problem, seedReferences, aiInit };
     const run = await createRun(projectDir, {
       runId: newRunId(),
-      input: { title: problem.title, seeds: seedReferences.length, searchDepth: aiInit.searchDepth },
+      input: {
+        title: problem.title,
+        seeds: seedReferences.length,
+        searchDepth: aiInit.searchDepth,
+        // Full input snapshot so a later /resume can reconstruct the run.
+        problem: problem as unknown as Record<string, unknown>,
+        seedReferences: seedReferences as unknown as Record<string, unknown>[],
+        aiInit: aiInit as unknown as Record<string, unknown>,
+      },
     });
 
     // Fire-and-forget: the fs runs ledger is the durable state. Errors are
@@ -166,6 +180,116 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
     const ledger = await readRunLedger(projectDir, runId);
     if (!ledger) return c.json({ error: "run not found" }, 404);
     return c.json(ledger);
+  });
+
+  // SSE: live phase stream. Replays existing phases.jsonl lines, then tails the
+  // file (watchFile on mtime) pushing each new phase record. Emits a `ping`
+  // heartbeat every 30s and closes once a `completed`/`error` phase is seen.
+  app.get("/api/agent/init-project/:runId/stream", async (c) => {
+    const runId = c.req.param("runId");
+    if (!/^run-[0-9a-f]{6,}$/.test(runId)) return c.json({ error: "invalid runId" }, 400);
+    const projectDir = await findRunProjectDir(workspace, runId);
+    if (!projectDir) return c.json({ error: "run not found" }, 404);
+    const phasesFile = path.join(projectDir, ".mathran", "agent-runs", runId, "phases.jsonl");
+
+    return streamSSE(c, async (stream) => {
+      let offset = 0;
+      let terminal = false;
+
+      // Emit every complete line past `offset`; flags terminal on completed/error.
+      const flush = async (): Promise<void> => {
+        let raw: string;
+        try {
+          raw = await fsp.readFile(phasesFile, "utf-8");
+        } catch {
+          return;
+        }
+        if (raw.length <= offset) return;
+        const chunk = raw.slice(offset);
+        offset = raw.length;
+        for (const line of chunk.split("\n")) {
+          const t = line.trim();
+          if (!t) continue;
+          let rec: { phase?: string };
+          try {
+            rec = JSON.parse(t);
+          } catch {
+            continue;
+          }
+          await stream.writeSSE({ event: "phase", data: JSON.stringify(rec) });
+          if (rec.phase === "completed" || rec.phase === "error") terminal = true;
+        }
+      };
+
+      await flush();
+      if (terminal) return;
+
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = (): void => {
+          if (settled) return;
+          settled = true;
+          clearInterval(heartbeat);
+          unwatchFile(phasesFile, onChange);
+          resolve();
+        };
+        const onChange = (): void => {
+          void flush().then(() => {
+            if (terminal) finish();
+          });
+        };
+        const heartbeat = setInterval(() => {
+          void stream.writeSSE({ event: "ping", data: "ping" });
+        }, 30_000);
+        stream.onAbort(finish);
+        watchFile(phasesFile, { interval: 200 }, onChange);
+        // Guard against a terminal line landing between the initial flush and
+        // the watcher being armed.
+        void flush().then(() => {
+          if (terminal) finish();
+        });
+      });
+    });
+  });
+
+  // Resume a run from its last checkpoint. Skips already-completed phases and
+  // continues the Spine-First pipeline from the next one.
+  app.post("/api/agent/init-project/:runId/resume", async (c) => {
+    const runId = c.req.param("runId");
+    if (!/^run-[0-9a-f]{6,}$/.test(runId)) return c.json({ error: "invalid runId" }, 400);
+    const projectDir = await findRunProjectDir(workspace, runId);
+    if (!projectDir) return c.json({ error: "run not found" }, 404);
+
+    const checkpoint = await readCheckpoint(projectDir, runId);
+    if (!checkpoint) return c.json({ error: "no checkpoint to resume from" }, 404);
+
+    const run = await readRun(projectDir, runId);
+    const stored = (run?.input ?? {}) as Record<string, unknown>;
+    let body: Record<string, unknown> = {};
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      /* empty/no body is fine */
+    }
+
+    const problem = coerceProblem(body.problem ?? stored.problem);
+    if (!problem) return c.json({ error: "problem.title is required to resume" }, 400);
+    const seedReferences = coerceReferences(body.seedReferences ?? stored.seedReferences);
+    const aiInit = coerceAiInit(body.aiInit ?? stored.aiInit);
+    const fromPhase = typeof body.checkpoint === "string" ? body.checkpoint : undefined;
+
+    const slug = path.basename(projectDir);
+    const input: InitAgentInput = { problem, seedReferences, aiInit };
+
+    void (async () => {
+      try {
+        await resumeInitAgent(input, { workspace, projectDir, slug, runId, llm: llmFor() }, { fromPhase });
+      } catch {
+        /* ledger already flipped to error */
+      }
+    })();
+
+    return c.json({ projectSlug: slug, runId, resumedFrom: fromPhase ?? checkpoint.phase }, 202);
   });
 }
 

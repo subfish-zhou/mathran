@@ -26,6 +26,7 @@ import {
   appendLog,
   writeCheckpoint,
   finishRun,
+  readCheckpoint,
 } from "./runs-ledger.js";
 import {
   searchArxiv as realSearchArxiv,
@@ -41,9 +42,9 @@ import type {
   ParsedReference,
 } from "./types.js";
 import { makeSpineLLM } from "./spine/llm.js";
-import { buildSpine } from "./spine/builder.js";
+import { buildSpine, readSpine } from "./spine/builder.js";
 import { generateEffortsFromSpine } from "./spine/effort-from-spine.js";
-import { generateWikiFromSpine } from "./spine/wiki-from-spine.js";
+import { generateWikiFromSpine, wikiDir, extractWorkspaceRefs } from "./spine/wiki-from-spine.js";
 import { explorePaperGraph } from "./spine/explore-pipeline.js";
 import { CITATION_MAX_DEPTH, CITATION_MAX_NODES, type NeighborPaper } from "./citation-explorer.js";
 import {
@@ -52,7 +53,7 @@ import {
   reviewLinks,
   checkCompleteness,
 } from "./review-verify.js";
-import type { SpinePipelineEvent } from "./spine/types.js";
+import type { SpinePipelineEvent, WikiPageOutput, WorkspaceEffortOutput } from "./spine/types.js";
 import type { PaperNode } from "../../paper-graph/index.js";
 
 export interface InitAgentContext {
@@ -584,6 +585,263 @@ async function runInitAgentSpine(
       wikiPages,
       crawledResources: explore.discoveredPaperIds.length,
       seedPapers: seedResult.ingested.length,
+      mode: "spine",
+      summary,
+    };
+  } catch (err) {
+    await appendPhase(projectDir, runId, "error", "end", { error: errMsg(err) });
+    await finishRun(projectDir, runId, "error", errMsg(err));
+    throw err;
+  }
+}
+
+// ============================================================
+//  Resume (Spine-First pipeline)
+// ============================================================
+
+/**
+ * Ordered Spine-First phases. `resumeInitAgent` uses this to decide which
+ * phases are already complete (skip + reload artifacts) vs. still pending.
+ */
+const SPINE_PHASE_ORDER = [
+  "explore_graph",
+  "build_spine",
+  "build_efforts",
+  "spine_wiki",
+  "review_refine",
+  "verify",
+  "link_review",
+  "completeness_check",
+] as const;
+
+export interface ResumeOptions {
+  /** Explicit phase to treat as the last *completed* one (default: checkpoint). */
+  fromPhase?: string;
+}
+
+export class ResumeError extends Error {}
+
+/** Reconstruct minimal efforts (id-only) from the persisted efforts/ dir. */
+async function reloadEfforts(projectDir: string): Promise<WorkspaceEffortOutput[]> {
+  const effortsRoot = path.join(projectDir, "efforts");
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(effortsRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((d) => d.isDirectory())
+    .map((d) => ({
+      id: d.name,
+      type: "REFERENCE",
+      title: d.name,
+      description: "",
+      status: "DRAFT",
+      subject: "",
+      sources: [],
+      document: "",
+      tags: [],
+      difficultyEstimate: "MODERATE",
+    })) as WorkspaceEffortOutput[];
+}
+
+/** Reconstruct wiki pages from persisted wiki/*.md (frontmatter-aware). */
+async function reloadPages(projectDir: string): Promise<WikiPageOutput[]> {
+  const dir = wikiDir(projectDir);
+  let files: string[];
+  try {
+    files = (await fs.readdir(dir)).filter((f) => f.endsWith(".md"));
+  } catch {
+    return [];
+  }
+  const pages: WikiPageOutput[] = [];
+  for (const file of files) {
+    try {
+      const raw = await fs.readFile(path.join(dir, file), "utf-8");
+      const { slug, title, content } = parseWikiMarkdown(raw, file.replace(/\.md$/, ""));
+      pages.push({ slug, title, content, workspaceRefs: extractWorkspaceRefs(content) });
+    } catch {
+      /* skip unreadable page */
+    }
+  }
+  return pages;
+}
+
+function parseWikiMarkdown(raw: string, fallbackSlug: string): { slug: string; title: string; content: string } {
+  let slug = fallbackSlug;
+  let title = fallbackSlug;
+  let content = raw;
+  if (raw.startsWith("---")) {
+    const end = raw.indexOf("\n---", 3);
+    if (end !== -1) {
+      const fm = raw.slice(3, end);
+      const bodyStart = raw.indexOf("\n", end + 1);
+      content = bodyStart === -1 ? "" : raw.slice(bodyStart + 1);
+      const slugMatch = fm.match(/^slug:\s*(.+)$/m);
+      if (slugMatch) slug = slugMatch[1]!.trim();
+      const titleMatch = fm.match(/^title:\s*(.+)$/m);
+      if (titleMatch) {
+        const t = titleMatch[1]!.trim();
+        try {
+          title = JSON.parse(t) as string;
+        } catch {
+          title = t.replace(/^"|"$/g, "");
+        }
+      }
+    }
+  }
+  return { slug, title, content: content.trim() };
+}
+
+/**
+ * Resume a Spine-First run from its last checkpoint. Phases at or before the
+ * checkpoint are skipped (their fs artifacts are reloaded); pending phases run
+ * normally. If the spine itself was never built (checkpoint earlier than
+ * `build_spine`), the whole pipeline is re-run from scratch.
+ *
+ * Throws `ResumeError` when there is no checkpoint to resume from.
+ */
+export async function resumeInitAgent(
+  input: InitAgentInput,
+  ctx: InitAgentContext,
+  opts: ResumeOptions = {},
+): Promise<InitAgentResult> {
+  const started = Date.now();
+  const { projectDir, slug, runId } = ctx;
+
+  const checkpoint = await readCheckpoint(projectDir, runId);
+  const fromPhase = opts.fromPhase ?? checkpoint?.phase;
+  if (!fromPhase) {
+    throw new ResumeError(`no checkpoint to resume run ${runId}`);
+  }
+
+  const fromIdx = SPINE_PHASE_ORDER.indexOf(fromPhase as (typeof SPINE_PHASE_ORDER)[number]);
+  const spine = await readSpine(projectDir);
+
+  // Can't do a partial resume without a built spine — restart the full pipeline.
+  if (!spine || fromIdx < SPINE_PHASE_ORDER.indexOf("build_spine")) {
+    return runInitAgent(input, ctx);
+  }
+
+  const spineLLM = makeSpineLLM(ctx.llm, ctx.model);
+  const emit = (e: SpinePipelineEvent): void => {
+    const msg = e.type === "log" ? e.message : e.type;
+    void appendLog(projectDir, runId, "spine", msg, e as unknown as Record<string, unknown>);
+  };
+  const problem = {
+    title: input.problem.title,
+    formalStatement: input.problem.formalStatement ?? "",
+    description: input.problem.description ?? "",
+    tags: input.problem.tags ?? [],
+  };
+  /** `true` when `phase` already completed (≤ checkpoint) → skip + reload. */
+  const done = (phase: (typeof SPINE_PHASE_ORDER)[number]): boolean =>
+    fromIdx >= SPINE_PHASE_ORDER.indexOf(phase);
+
+  const summary: NonNullable<InitAgentResult["summary"]> = {
+    conceptsExtracted: spine.nodes.length,
+    queriesRun: 0,
+    resourcesFound: 0,
+    wikiPagesGenerated: 0,
+    durationMs: 0,
+    spineNodes: spine.nodes.length,
+    effortsCreated: 0,
+    papersDiscovered: 0,
+    papersRelevant: 0,
+  };
+
+  await appendLog(projectDir, runId, "resume", `resuming run ${runId} from phase ${fromPhase}`);
+
+  try {
+    // ── build_efforts ─────────────────────────────────────────────────────
+    let efforts: WorkspaceEffortOutput[];
+    if (done("build_efforts")) {
+      efforts = await reloadEfforts(projectDir);
+    } else if (input.aiInit.enableWorkspace) {
+      await appendPhase(projectDir, runId, "build_efforts", "start", { resumed: true });
+      const effortResult = await generateEffortsFromSpine(
+        { spine, projectDir, workspace: ctx.workspace, problemTitle: problem.title },
+        spineLLM,
+        emit,
+      );
+      efforts = effortResult.efforts;
+      await writeCheckpoint(projectDir, runId, "build_efforts", { efforts: efforts.length });
+      await appendPhase(projectDir, runId, "build_efforts", "end", { efforts: efforts.length });
+    } else {
+      efforts = [];
+    }
+    summary.effortsCreated = efforts.length;
+
+    // ── spine_wiki ────────────────────────────────────────────────────────
+    let pages: WikiPageOutput[];
+    if (done("spine_wiki")) {
+      pages = await reloadPages(projectDir);
+    } else if (input.aiInit.enableWiki) {
+      await appendPhase(projectDir, runId, "spine_wiki", "start", { resumed: true });
+      pages = await generateWikiFromSpine(
+        {
+          spine,
+          projectDir,
+          problem: { ...problem, mathStatus: input.problem.mathStatus },
+          paperIds: spine.nodes.flatMap((n) => n.paperIds),
+          workspaceEfforts: efforts,
+        },
+        spineLLM,
+        emit,
+      );
+      await writeCheckpoint(projectDir, runId, "spine_wiki", { wikiPages: pages.map((p) => p.slug) });
+      await appendPhase(projectDir, runId, "spine_wiki", "end", { wikiPages: pages.length });
+    } else {
+      pages = [];
+    }
+    summary.wikiPagesGenerated = pages.length;
+
+    // ── review / verify / link / completeness ─────────────────────────────
+    if (input.aiInit.enableWiki && pages.length > 0) {
+      const rvConfig = { projectDir, pages, problem, efforts, spine, tags: problem.tags };
+
+      if (!done("review_refine")) {
+        await appendPhase(projectDir, runId, "review_refine", "start", { resumed: true });
+        const review = await reviewAndRefinePages(rvConfig, spineLLM, emit);
+        await writeCheckpoint(projectDir, runId, "review_refine", { refined: review.refinedCount });
+        await appendPhase(projectDir, runId, "review_refine", "end", { refined: review.refinedCount });
+      }
+      if (!done("verify")) {
+        await appendPhase(projectDir, runId, "verify", "start", { resumed: true });
+        const verify = await verifyPages(rvConfig, spineLLM, emit);
+        await writeCheckpoint(projectDir, runId, "verify", { flagged: verify.flaggedCount });
+        await appendPhase(projectDir, runId, "verify", "end", { flagged: verify.flaggedCount });
+      }
+      if (!done("link_review")) {
+        await appendPhase(projectDir, runId, "link_review", "start", { resumed: true });
+        const links = reviewLinks(rvConfig, emit);
+        await writeCheckpoint(projectDir, runId, "link_review", {
+          brokenWsRefs: links.brokenWsRefs.length,
+          brokenWikiLinks: links.brokenWikiLinks.length,
+        });
+        await appendPhase(projectDir, runId, "link_review", "end", {
+          brokenWsRefs: links.brokenWsRefs.length,
+          brokenWikiLinks: links.brokenWikiLinks.length,
+        });
+      }
+      if (!done("completeness_check")) {
+        await appendPhase(projectDir, runId, "completeness_check", "start", { resumed: true });
+        const completeness = checkCompleteness(rvConfig, emit);
+        await writeCheckpoint(projectDir, runId, "completeness_check", { coverage: completeness.coverage });
+        await appendPhase(projectDir, runId, "completeness_check", "end", { coverage: completeness.coverage });
+      }
+    }
+
+    summary.durationMs = Date.now() - started;
+    await appendPhase(projectDir, runId, "completed", "end", { summary, resumed: true });
+    await finishRun(projectDir, runId, "completed");
+
+    return {
+      projectSlug: slug,
+      wikiPages: pages.map((p) => p.slug),
+      crawledResources: 0,
+      seedPapers: 0,
       mode: "spine",
       summary,
     };
