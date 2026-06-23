@@ -2555,13 +2555,24 @@ describe("POST /api/chat + /:id/answer-ask (v0.16 §11)", () => {
     }
   });
 
-  it("404s when there is no pendingAsk slot", async () => {
+  it("200 ignored when there is no pendingAsk slot (stale sidecar tolerance)", async () => {
+    // v0.17 W14: goal-mode auto-resolves ask_user; a 404 here is
+    // almost always a stale sidecar from a pre-goal chat round, so
+    // /answer-ask now 200s with `ignored: true` instead of erroring.
     const res = await fetch(`${base}/api/chat/never-asked/answer-ask`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ answer: "hi" }),
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      ignored: boolean;
+      reason: string;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.ignored).toBe(true);
+    expect(body.reason).toMatch(/no pending ask_user/);
   });
 
   it("400s on an empty answer", async () => {
