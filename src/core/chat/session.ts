@@ -67,6 +67,13 @@ import {
 } from "./tools/ask-user.js";
 import { createProposeGoalTool } from "./tools/propose-goal.js";
 import { createProposePlanTool } from "./tools/propose-plan.js";
+import { createMemoryListTool } from "./tools/memory-list.js";
+import { createMemoryReadTool } from "./tools/memory-read.js";
+import { createMemoryWriteTool } from "./tools/memory-write.js";
+import { createMemoryAppendTool } from "./tools/memory-append.js";
+import { createMemorySearchTool } from "./tools/memory-search.js";
+import { createScratchpadReadTool } from "./tools/scratchpad-read.js";
+import { createScratchpadWriteTool } from "./tools/scratchpad-write.js";
 import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
@@ -383,6 +390,23 @@ export interface ChatSessionOptions {
       model: string;
       autoRunner?: (planId: string, objective: string) => void;
     };
+    /**
+     * gap #3 — long-term, topic-based memory tools. Each persists under
+     * `<workspace>/.mathran/memory/<topic>.md` and survives across sessions.
+     */
+    memory_list?: boolean;
+    memory_read?: boolean;
+    memory_write?: boolean;
+    memory_append?: boolean;
+    memory_search?: boolean;
+    /**
+     * gap #3 — per-conversation scratchpad tools. They persist under
+     * `<workspace>/.mathran/scratchpad/<convId>/<name>.md`. The conversation id
+     * is taken from the explicit `conversationId` here, else falls back to
+     * `checkpoints.conversationId`; without one the tool errors at call time.
+     */
+    scratchpad_read?: boolean | { conversationId?: string };
+    scratchpad_write?: boolean | { conversationId?: string };
   };
   /**
    * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
@@ -1024,6 +1048,51 @@ export class ChatSession {
           model: cfg.propose_plan.model,
           autoRunner: cfg.propose_plan.autoRunner,
         }),
+      );
+    }
+    // gap #3 — long-term memory tools (workspace-scoped, fs-only).
+    const memWorkspace = this.workspace ? { workspace: this.workspace } : {};
+    if (cfg.memory_list) {
+      out.push(createMemoryListTool(memWorkspace));
+    }
+    if (cfg.memory_read) {
+      out.push(createMemoryReadTool(memWorkspace));
+    }
+    if (cfg.memory_write) {
+      out.push(this.maybeCheckpoint(createMemoryWriteTool(memWorkspace)));
+    }
+    if (cfg.memory_append) {
+      out.push(this.maybeCheckpoint(createMemoryAppendTool(memWorkspace)));
+    }
+    if (cfg.memory_search) {
+      out.push(createMemorySearchTool(memWorkspace));
+    }
+    // gap #3 — per-conversation scratchpad tools. The conversation id comes
+    // from an explicit override, else the checkpoints conversation id.
+    if (cfg.scratchpad_read) {
+      const convId =
+        (typeof cfg.scratchpad_read === "object"
+          ? cfg.scratchpad_read.conversationId
+          : undefined) ?? this.checkpointsCfg?.conversationId;
+      out.push(
+        createScratchpadReadTool({
+          ...(this.workspace ? { workspace: this.workspace } : {}),
+          ...(convId ? { conversationId: convId } : {}),
+        }),
+      );
+    }
+    if (cfg.scratchpad_write) {
+      const convId =
+        (typeof cfg.scratchpad_write === "object"
+          ? cfg.scratchpad_write.conversationId
+          : undefined) ?? this.checkpointsCfg?.conversationId;
+      out.push(
+        this.maybeCheckpoint(
+          createScratchpadWriteTool({
+            ...(this.workspace ? { workspace: this.workspace } : {}),
+            ...(convId ? { conversationId: convId } : {}),
+          }),
+        ),
       );
     }
     return out;
