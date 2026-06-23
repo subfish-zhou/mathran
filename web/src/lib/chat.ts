@@ -135,8 +135,30 @@ export type ChatEvent =
       id: string;
       decision: ApprovalDecision;
     }
+  | {
+      /** outcomes 收尾 C-2 — emitted by the host SSE layer when a background
+       *  self-grade round lands an Outcome on disk while this stream is open.
+       *  Self-grade is fire-and-forget (it runs after the goal's own stream
+       *  closes), so whichever chat stream is active relays it. The SPA filters
+       *  on `goalId`, toasts `📊 Goal graded: X/5`, and refreshes its outcomes
+       *  list. Multiple tabs with an open stream each receive their own copy. */
+      type: "goal-graded";
+      goalId: string;
+      outcome: OutcomeSummary;
+    }
   | { type: "done"; finishReason: string }
   | { type: "error"; message: string };
+
+/** Minimal Outcome shape the SPA renders from a `goal-graded` frame. */
+export interface OutcomeSummary {
+  goalId: string;
+  goalText: string;
+  resolution: "complete" | "abandoned" | "blocked";
+  averageScore: number;
+  contextTags: string[];
+  lessons: string;
+  endedAt: number;
+}
 
 /**
  * Stream a single user message through one of the three chat scopes.

@@ -199,6 +199,8 @@ export interface ServerSlashResult {
   prompt?: string;
   effort?: string;
   message?: string;
+  /** outcomes 收尾 C-2 — pre-formatted text body (e.g. `/outcomes` listing). */
+  text?: string;
   stats?: unknown;
   error?: string;
 }

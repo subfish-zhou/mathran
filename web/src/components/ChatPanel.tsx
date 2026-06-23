@@ -271,6 +271,9 @@ export default function ChatPanel({
   const [approvalSubmitting, setApprovalSubmitting] = useState(false);
   const [approvalError, setApprovalError] = useState<string | null>(null);
   const [planSavedToast, setPlanSavedToast] = useState<string | null>(null);
+  // outcomes 收尾 C-2 — transient toast surfaced when a background self-grade
+  // round lands a `goal-graded` SSE frame ("📊 Goal graded: X/5").
+  const [goalGradedToast, setGoalGradedToast] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   // W4 (v0.17 mathub parity): composer is a multi-line <textarea> that
   // auto-grows from 1 to 8 rows. We keep a ref so the IME composition
@@ -788,9 +791,23 @@ export default function ChatPanel({
             }, 800);
           }
         }
+        // outcomes 收尾 C-2 — a background self-grade round finished and wrote
+        // an Outcome. Surface a transient toast and bump the reload tick so any
+        // outcomes-backed panel (and the history view) re-reads from disk. The
+        // frame can arrive on ANY open stream, so we don't gate on goalId here
+        // beyond display — every tab with a live stream shows its own toast.
+        if (ev.type === "goal-graded") {
+          const score = ev.outcome.averageScore.toFixed(1);
+          const shortId = ev.goalId.slice(0, 8);
+          setGoalGradedToast(`📊 Goal graded: ${score}/5 (${shortId})`);
+          window.setTimeout(() => {
+            setGoalGradedToast((cur) =>
+              cur && cur.includes(shortId) ? null : cur,
+            );
+          }, 6000);
+        }
         // v0.17 P2 sibling — plan-proposed banner + optional auto-navigate.
-        if (ev.type === "plan-proposed") {
-          setPlanProposed({
+        if (ev.type === "plan-proposed") {          setPlanProposed({
             planId: ev.planId,
             objective: ev.objective,
             autoRun: ev.autoRun,
@@ -1213,8 +1230,21 @@ export default function ChatPanel({
           return { handled: true };
         }
 
+        case "outcomes": {
+          // outcomes 收尾 C-2 — server-rendered list/detail/delete. Mirrors
+          // the CLI REPL `/outcomes` output; the SPA just renders the text the
+          // server formats so both surfaces stay byte-identical.
+          setInput("");
+          try {
+            const res = await postChatSlash(conversationId ?? "global", "outcomes", args);
+            pushInfoBubble("```\n" + (res.text ?? "(no output)") + "\n```");
+          } catch (err) {
+            pushInfoBubble(`**/outcomes** — ${(err as Error).message}`);
+          }
+          return { handled: true };
+        }
+
         default:
-          // Recognised builtin with no client handler (e.g. /help, /reset,
           // /memory, /system, /model live in the CLI). Show a hint rather
           // than silently sending to the LLM.
           setInput("");
@@ -3268,6 +3298,18 @@ export default function ChatPanel({
         >
           {planSavedToast}
         </div>
+      )}
+      {/* outcomes 收尾 C-2 — goal-graded toast. Stacked above the steer toasts
+          (bottom-28) so a grade landing mid-steer doesn't clobber either. */}
+      {goalGradedToast && (
+        <button
+          type="button"
+          onClick={() => setGoalGradedToast(null)}
+          className="fixed bottom-28 right-4 z-50 max-w-sm rounded-md border border-sky-300 bg-sky-50 px-3 py-2 text-left text-xs text-sky-900 shadow hover:bg-sky-100"
+          title="Click to dismiss"
+        >
+          {goalGradedToast}
+        </button>
       )}
       {/* v0.17 mathub parity W9 — Live Steering toasts.
           - `steerToast`: "⏳ Steer queued… «…first 80 chars»". Visible

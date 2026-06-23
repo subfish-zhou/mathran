@@ -162,6 +162,10 @@ import {
   markStreamActive,
   setPendingSteer,
 } from "./steer-registry.js";
+import {
+  subscribeOutcomeGraded,
+  type OutcomeGradedEvent,
+} from "../core/outcomes/events.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 7878;
@@ -170,6 +174,36 @@ const DEFAULT_MODEL = "copilot/gpt-5.5";
 import { buildBaseSystemPrompt } from "../core/prompts/index.js";
 
 const SYSTEM_PROMPT = buildBaseSystemPrompt();
+
+/**
+ * outcomes 收尾 C-2 — subscribe an active SSE stream to background `goal-graded`
+ * notifications and multicast each as a `goal-graded` frame. Self-grade runs
+ * fire-and-forget after the goal's own stream closes, so this lets whatever
+ * stream is open when grading lands relay the result. The SPA filters on
+ * `goalId`. Returns the unsubscribe fn the caller MUST call in its `finally`.
+ *
+ * Writes are fire-and-forget: the sync emitter callback can't await, and a
+ * dead/closing stream's rejected write is swallowed so it can't crash the
+ * publisher or leak an unhandled rejection.
+ */
+function pipeGoalGradedFrames(stream: {
+  writeSSE: (m: { event: string; data: string }) => Promise<void>;
+}): () => void {
+  return subscribeOutcomeGraded((ev: OutcomeGradedEvent) => {
+    void stream
+      .writeSSE({
+        event: "goal-graded",
+        data: JSON.stringify({
+          type: "goal-graded",
+          goalId: ev.goalId,
+          outcome: ev.outcome,
+        }),
+      })
+      .catch(() => {
+        /* stream already closed — nothing to do */
+      });
+  });
+}
 
 /**
  * Factory the chat endpoints use to build a session.
@@ -1105,6 +1139,7 @@ function registerChatScope(
       // concurrent rerun on the same conversationId still releases
       // cleanly when one of them ends.
       const releaseSteerSlot = markStreamActive(conversationId);
+      const releaseGoalGraded = pipeGoalGradedFrames(stream);
       try {
         await stream.writeSSE({
           event: "session",
@@ -1243,6 +1278,9 @@ function registerChatScope(
         // gone). Also clears any unread steer on the way out so a fresh
         // stream on the same conversationId doesn't pick up a stale one.
         releaseSteerSlot();
+        // outcomes 收尾 C-2 — stop relaying background goal-graded frames once
+        // this stream is done.
+        releaseGoalGraded();
         // Approval Policy 矩阵 — fail-safe: settle any prompt still awaiting a
         // decision (browser closed mid-approval) as a deny so the session never
         // hangs on a dead Promise.
@@ -1425,6 +1463,7 @@ function registerChatScope(
       // v0.17 mathub parity W9 — same active-stream tracking as POST <base>
       // so the user can steer a rerun mid-flight.
       const releaseSteerSlot = markStreamActive(id);
+      const releaseGoalGraded = pipeGoalGradedFrames(stream);
       try {
         // Mirror the POST <base> envelope exactly so the SPA's existing SSE
         // reader handles re-run identically to a fresh send.
@@ -1541,6 +1580,7 @@ function registerChatScope(
         });
       } finally {
         releaseSteerSlot();
+        releaseGoalGraded();
         approvalRegistry.rejectPending(id);
       }
     });
@@ -1791,6 +1831,7 @@ function registerChatScope(
       // round mid-flight too. Track active stream + pipe the probe into
       // `resume`, which forwards it straight into `runRounds`.
       const releaseSteerSlot = markStreamActive(id);
+      const releaseGoalGraded = pipeGoalGradedFrames(stream);
       try {
         await stream.writeSSE({
           event: "session",
@@ -1909,6 +1950,7 @@ function registerChatScope(
         });
       } finally {
         releaseSteerSlot();
+        releaseGoalGraded();
         // Approval Policy 矩阵 — fail-safe: a resumed round can raise a fresh
         // approval prompt too; settle any still pending if the stream dies.
         approvalRegistry.rejectPending(id);

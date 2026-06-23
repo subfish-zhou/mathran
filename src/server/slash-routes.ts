@@ -29,11 +29,19 @@ import {
   setSessionReasoningEffort,
   skillsToSummaries,
   REVIEW_STUB_PROMPT,
+  parseOutcomesSubcommand,
+  formatOutcomesList,
+  formatOutcomeDetail,
 } from "../core/chat/slash-builtin.js";
 import { resolveCustomCommands } from "../core/chat/slash-custom.js";
 import { loadLayeredCommands } from "../core/commands/loader.js";
 import { loadLayeredSkills } from "../core/skills/loader.js";
 import { defaultSubagentRegistry } from "../core/subagent/index.js";
+import {
+  readIndex as readOutcomeIndex,
+  readOutcome,
+  deleteOutcome,
+} from "../core/outcomes/store.js";
 
 /** Shape of `computeUsageStats` (defined in serve.ts), injected to avoid cycles. */
 export interface UsageStatsLike {
@@ -182,6 +190,41 @@ export function registerSlashRoutes(app: Hono, deps: SlashRoutesDeps): void {
         // MVP stub (PLAN decision #2): no reviewer agent yet. Hand the SPA a
         // preset prompt to send through the normal chat stream.
         return c.json({ ok: true, action: "send", prompt: REVIEW_STUB_PROMPT });
+      }
+
+      case "outcomes": {
+        // outcomes 收尾 C-2 — mirror the CLI `/outcomes` REPL handler so the
+        // SPA renders the identical text. Reads from the workspace outcome
+        // store (host-scoped, like the CLI's memoryWorkspace path).
+        const sub = parseOutcomesSubcommand(args);
+        switch (sub.kind) {
+          case "list": {
+            const index = await readOutcomeIndex(workspace);
+            return c.json({ ok: true, text: formatOutcomesList(index) });
+          }
+          case "show": {
+            const outcome = await readOutcome(workspace, sub.goalId);
+            if (!outcome) {
+              return c.json({
+                ok: true,
+                text: `no outcome found for goal '${sub.goalId}' (try /outcomes to list)`,
+              });
+            }
+            return c.json({ ok: true, text: formatOutcomeDetail(outcome) });
+          }
+          case "delete": {
+            const removed = await deleteOutcome(workspace, sub.goalId);
+            return c.json({
+              ok: true,
+              text: removed
+                ? `deleted outcome for goal '${sub.goalId}'.`
+                : `no outcome found for goal '${sub.goalId}'.`,
+            });
+          }
+          case "error":
+            return c.json({ ok: true, text: sub.message });
+        }
+        return c.json({ ok: true, text: formatOutcomesList(await readOutcomeIndex(workspace)) });
       }
 
       default:
