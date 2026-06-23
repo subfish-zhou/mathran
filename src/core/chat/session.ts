@@ -99,6 +99,9 @@ import { createMemoryAppendTool } from "./tools/memory-append.js";
 import { createMemorySearchTool } from "./tools/memory-search.js";
 import { createScratchpadReadTool } from "./tools/scratchpad-read.js";
 import { createScratchpadWriteTool } from "./tools/scratchpad-write.js";
+import { createRunPythonTool } from "./tools/run-python.js";
+import { createRunLatexTool } from "./tools/run-latex.js";
+import { createInstallPythonPackageTool } from "./tools/install-python-package.js";
 import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
@@ -455,6 +458,16 @@ export interface ChatSessionOptions {
      */
     scratchpad_read?: boolean | { conversationId?: string };
     scratchpad_write?: boolean | { conversationId?: string };
+    /**
+     * gap #4 — per-conversation scientific-computing tools. They operate inside
+     * a per-conversation virtualenv / latex tmpdir under
+     * `<workspace>/.mathran/`. The conversation id is taken from the explicit
+     * `conversationId` here, else falls back to `checkpoints.conversationId`;
+     * without one the tool errors at call time.
+     */
+    run_python?: boolean | { conversationId?: string };
+    run_latex?: boolean | { conversationId?: string };
+    install_python_package?: boolean | { conversationId?: string };
   };
   /**
    * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
@@ -1172,6 +1185,52 @@ export class ChatSession {
       out.push(
         this.maybeCheckpoint(
           createScratchpadWriteTool({
+            ...(this.workspace ? { workspace: this.workspace } : {}),
+            ...(convId ? { conversationId: convId } : {}),
+          }),
+        ),
+      );
+    }
+    // gap #4 — per-conversation Python / LaTeX execution tools. Same convId
+    // resolution as the scratchpad tools. All execute arbitrary code, so they
+    // carry riskClass "exec" and (being write operations under .mathran) run
+    // through maybeCheckpoint like bash.
+    if (cfg.run_python) {
+      const convId =
+        (typeof cfg.run_python === "object"
+          ? cfg.run_python.conversationId
+          : undefined) ?? this.checkpointsCfg?.conversationId;
+      out.push(
+        this.maybeCheckpoint(
+          createRunPythonTool({
+            ...(this.workspace ? { workspace: this.workspace } : {}),
+            ...(convId ? { conversationId: convId } : {}),
+          }),
+        ),
+      );
+    }
+    if (cfg.run_latex) {
+      const convId =
+        (typeof cfg.run_latex === "object"
+          ? cfg.run_latex.conversationId
+          : undefined) ?? this.checkpointsCfg?.conversationId;
+      out.push(
+        this.maybeCheckpoint(
+          createRunLatexTool({
+            ...(this.workspace ? { workspace: this.workspace } : {}),
+            ...(convId ? { conversationId: convId } : {}),
+          }),
+        ),
+      );
+    }
+    if (cfg.install_python_package) {
+      const convId =
+        (typeof cfg.install_python_package === "object"
+          ? cfg.install_python_package.conversationId
+          : undefined) ?? this.checkpointsCfg?.conversationId;
+      out.push(
+        this.maybeCheckpoint(
+          createInstallPythonPackageTool({
             ...(this.workspace ? { workspace: this.workspace } : {}),
             ...(convId ? { conversationId: convId } : {}),
           }),
