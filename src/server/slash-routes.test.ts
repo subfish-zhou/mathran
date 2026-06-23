@@ -10,6 +10,8 @@ import * as os from "node:os";
 
 import { startServer, type RunningServer } from "./serve.js";
 import { ChatSession } from "../core/chat/index.js";
+import { writeOutcome } from "../core/outcomes/store.js";
+import type { Outcome } from "../core/outcomes/schema.js";
 import type { LLMProvider, LLMRequest, LLMResponse, LLMStreamChunk } from "../core/providers/llm.js";
 
 function fakeLlm(reply: string): LLMProvider {
@@ -180,5 +182,82 @@ describe("POST /api/chat/:cid/slash", () => {
       body: JSON.stringify({}),
     });
     expect(res.status).toBe(400);
+  });
+});
+
+describe("POST /api/chat/:cid/slash — /outcomes (C-2)", () => {
+  const sampleOutcome: Outcome = {
+    goalId: "goal-abc12345",
+    goalText: "refactor the parser for clarity",
+    startedAt: 1000,
+    endedAt: 2000,
+    resolution: "complete",
+    rubric: { correctness: 5, completeness: 4, efficiency: 4 },
+    averageScore: 4.3,
+    lessons: "Used TDD; ran tests each round.",
+    contextTags: ["typescript", "refactor"],
+  };
+
+  beforeAll(async () => {
+    await writeOutcome(workspace, sampleOutcome);
+  });
+
+  it("lists recorded outcomes (bare /outcomes)", async () => {
+    const res = await fetch(`${base}/api/chat/conv-outcomes/slash`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "outcomes" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.text).toContain("Recent outcomes");
+    expect(body.text).toContain("goal-abc"); // short id
+    expect(body.text).toContain("refactor the parser");
+  });
+
+  it("shows a single outcome's detail (/outcomes <id>)", async () => {
+    const res = await fetch(`${base}/api/chat/conv-outcomes/slash`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "outcomes", args: "goal-abc12345" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.text).toContain("Outcome for goal goal-abc12345");
+    expect(body.text).toContain("correctness=5");
+    expect(body.text).toContain("Used TDD");
+  });
+
+  it("reports a missing outcome on /outcomes <unknown>", async () => {
+    const res = await fetch(`${base}/api/chat/conv-outcomes/slash`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "outcomes", args: "nope-99999999" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.text).toContain("no outcome found for goal 'nope-99999999'");
+  });
+
+  it("deletes an outcome (/outcomes delete <id>) and then lists empty", async () => {
+    const del = await fetch(`${base}/api/chat/conv-outcomes/slash`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "outcomes", args: "delete goal-abc12345" }),
+    });
+    expect(del.status).toBe(200);
+    const delBody = await del.json();
+    expect(delBody.text).toContain("deleted outcome for goal 'goal-abc12345'");
+
+    const list = await fetch(`${base}/api/chat/conv-outcomes/slash`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "outcomes" }),
+    });
+    const listBody = await list.json();
+    expect(listBody.text).toContain("no self-graded outcomes yet");
   });
 });
