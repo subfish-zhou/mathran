@@ -1,0 +1,281 @@
+/**
+ * Spine-First Architecture — Core Type Definitions (fs port of mathub's
+ * `spine/types.ts`).
+ *
+ * The Narrative Spine is the structural backbone of a research problem:
+ *   - Nodes represent milestones, techniques, barriers, open directions
+ *   - Edges represent how ideas build on each other
+ *   - Threads trace narrative lines through the research landscape
+ *   - Eras group nodes into historical periods
+ *
+ * In mathran (DB-free) the spine is persisted as JSON under
+ * `<project>/.mathran/spine/spine.json` (see builder.ts).
+ */
+
+// ============================================================
+//  Spine Node Types
+// ============================================================
+
+export type SpineNodeType =
+  | "foundation"
+  | "milestone"
+  | "technique_origin"
+  | "refinement"
+  | "barrier"
+  | "bridge"
+  | "dead_end"
+  | "open_direction";
+
+export type SpineEdgeType =
+  | "enables"
+  | "improves"
+  | "generalizes"
+  | "applies_technique"
+  | "contradicts"
+  | "reveals_barrier";
+
+export type SpineThreadStatus = "active" | "stalled" | "converged" | "dead_end";
+
+export type SpineNodeDepth = "foundational" | "major" | "incremental";
+
+// ============================================================
+//  Spine Data Structures
+// ============================================================
+
+export interface SpineNode {
+  id: string;
+  type: SpineNodeType;
+  title: string;
+  year?: number;
+  authors?: string[];
+  /** Precise mathematical statement in LaTeX */
+  statement: string;
+  /** Why this result matters for the problem (2-3 sentences) */
+  significance: string;
+  /** Core proof idea (1-2 sentences, optional) */
+  proofIdea?: string;
+  /** Paper node IDs this spine node is derived from */
+  paperIds: string[];
+  /** Workspace effort IDs linked to this node */
+  effortIds: string[];
+  depth: SpineNodeDepth;
+}
+
+export interface SpineEdge {
+  from: string;
+  to: string;
+  type: SpineEdgeType;
+  context: string;
+}
+
+export interface SpineThread {
+  id: string;
+  name: string;
+  description: string;
+  nodeIds: string[];
+  status: SpineThreadStatus;
+  currentFrontier?: string;
+  barrier?: string;
+}
+
+export interface SpineEra {
+  name: string;
+  startYear?: number;
+  endYear?: number;
+  summary: string;
+  nodeIds: string[];
+}
+
+export interface SpineOpenQuestion {
+  title: string;
+  statement: string;
+  relatedNodeIds: string[];
+  barrier: string;
+  partialProgress: string;
+}
+
+export interface NarrativeSpine {
+  version: number;
+  updatedAt: string;
+  /** One-sentence summary of the problem's core tension */
+  globalThesis: string;
+  eras: SpineEra[];
+  nodes: SpineNode[];
+  edges: SpineEdge[];
+  threads: SpineThread[];
+  openQuestions: SpineOpenQuestion[];
+}
+
+// ============================================================
+//  Pipeline Events
+// ============================================================
+
+export type SpinePipelineEvent =
+  | { type: "log"; message: string }
+  | { type: "phase_change"; phase: SpinePipelinePhase; message: string }
+  | { type: "progress"; percent: number; message?: string }
+  | { type: "paper_discovered"; title: string; arxivId?: string; depth: number }
+  | { type: "paper_scored"; title: string; score: number }
+  | { type: "spine_node_extracted"; nodeId: string; nodeType: SpineNodeType; title: string }
+  | { type: "spine_assembled"; nodeCount: number; edgeCount: number; threadCount: number }
+  | { type: "effort_created"; effortId: string; title: string; fromSpineNode?: string }
+  | { type: "wiki_page_start"; slug: string; title: string }
+  | { type: "wiki_page_complete"; slug: string }
+  | { type: "checkpoint"; phase: string; data: Record<string, unknown> }
+  | { type: "error"; message: string };
+
+export type SpinePipelinePhase =
+  | "explore"
+  | "build_spine"
+  | "build_efforts"
+  | "generate_wiki"
+  | "review_verify"
+  | "completed"
+  | "error";
+
+/** Diff between two spine versions (for patrol incremental updates) */
+export interface SpineDiff {
+  newNodes: SpineNode[];
+  removedNodeIds: string[];
+  updatedNodes: Array<{ id: string; changes: Partial<SpineNode> }>;
+  newEdges: SpineEdge[];
+  removedEdgeKeys: string[];
+  updatedThreads: SpineThread[];
+  newThreads: SpineThread[];
+  newOpenQuestions: SpineOpenQuestion[];
+  affectedWikiSlugs: string[];
+}
+
+// ============================================================
+//  Explore Pipeline Types
+// ============================================================
+
+export interface ExploreConfig {
+  projectDir: string;
+  workspace: string;
+  /** Seed paper node IDs to start exploration from */
+  seeds: string[];
+  /** Keywords for arXiv search (supplements citation-graph BFS) */
+  keywords: string[];
+  mode: "deep" | "incremental";
+  /** Max BFS depth from seeds */
+  maxDepth: number;
+  /** Max total papers to explore */
+  maxPapers: number;
+  /** Papers already known (skip during dedup) */
+  knownPaperIds?: Set<string>;
+}
+
+export interface ExploreResult {
+  discoveredPaperIds: string[];
+  relevantPaperIds: string[];
+  totalRounds: number;
+}
+
+// ============================================================
+//  Spine Builder Types
+// ============================================================
+
+export interface SpineNodeCandidate {
+  node: Omit<SpineNode, "effortIds">;
+  sourcePaperIds: string[];
+  suggestedEdges: Array<{
+    targetNodeId: string;
+    edgeType: SpineEdgeType;
+    context: string;
+  }>;
+}
+
+export interface SpineBuilderConfig {
+  projectDir: string;
+  workspace: string;
+  /** Paper IDs to build spine from */
+  paperIds: string[];
+  mode: "full" | "incremental";
+  existingSpine?: NarrativeSpine;
+  problem: {
+    title: string;
+    formalStatement: string;
+    description: string;
+    tags: string[];
+  };
+}
+
+// ============================================================
+//  Effort / Wiki output shapes (fs port — trimmed from init-types.ts)
+// ============================================================
+
+export type EffortType =
+  | "REFERENCE"
+  | "PROOF_ATTEMPT"
+  | "CONSTRUCTION"
+  | "ESTIMATE"
+  | "REDUCTION"
+  | "AUXILIARY";
+
+export type EffortStatus = "REFERENCE" | "DEAD_END" | "DRAFT" | "VERIFIED";
+
+export type EffortDifficulty = "MODERATE" | "HARD" | "VERY_HARD";
+
+export type EffortNarrativeRole =
+  | "background"
+  | "core_technique"
+  | "application"
+  | "open_direction"
+  | "generalization"
+  | "dead_end";
+
+/** A workspace effort generated from a spine node/thread. */
+export interface WorkspaceEffortOutput {
+  id: string;
+  type: EffortType;
+  title: string;
+  description: string;
+  status: EffortStatus;
+  subject: string;
+  sources: SpineCrawledResource[];
+  document: string;
+  tags: string[];
+  difficultyEstimate: EffortDifficulty;
+  year?: number;
+  era?: string;
+  spineNodeId?: string;
+  spineThreadId?: string;
+  abstract?: string;
+  formalStatement?: string;
+  narrativeRole?: EffortNarrativeRole;
+  referenceKind?: string;
+  deadEndReason?: string;
+  includedPaperIds?: string[];
+  includedSpineNodeIds?: string[];
+}
+
+export interface DependencyEdgeOutput {
+  fromId: string;
+  toId: string;
+  relation: "depends_on" | "extends" | "uses" | "contradicts" | "related";
+  description: string;
+  confidence: number;
+  source: string;
+}
+
+export interface WikiPageOutput {
+  slug: string;
+  title: string;
+  content: string;
+  workspaceRefs: string[];
+  parentSlug?: string;
+}
+
+/** Lightweight crawled-resource shape used by effort sources. */
+export interface SpineCrawledResource {
+  id: string;
+  title: string;
+  authors: string[];
+  year?: number;
+  sourceType: "arxiv" | "journal" | "webpage";
+  arxivId?: string;
+  doi?: string;
+  url: string;
+  abstract?: string;
+}
