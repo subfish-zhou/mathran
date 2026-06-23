@@ -25,6 +25,7 @@ import * as fsSync from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { loadConfig } from "../../core/config.js";
 import {
   ChatSession,
@@ -77,6 +78,8 @@ import {
   readOutcome,
   deleteOutcome,
 } from "../../core/outcomes/store.js";
+import { runDiff } from "../../core/checkpoints/diff-run.js";
+import { runRewind } from "../../core/checkpoints/rewind.js";
 import { createOpenAITokenCounter, createFallbackTokenCounter } from "../../core/chat/token-counter.js";
 import { MATHRAN_DIR, SETTINGS_FILE } from "../../core/config/mathran-root.js";
 import { atomicWriteFile } from "../../core/chat/atomic-write.js";
@@ -107,6 +110,12 @@ export interface BuildSessionOptions {
   model?: string;
   configPath?: string;
   systemPrompt?: string;
+  /**
+   * Conversation id used to namespace auto-checkpoints (/diff + rewind). When
+   * omitted, a fresh UUID is generated per built session so each REPL run has
+   * an isolated checkpoint bucket.
+   */
+  conversationId?: string;
   /**
    * v0.3 §14: project workspace root for MATHRAN.md auto-load. When set, the
    * built ChatSession is constructed with `memoryFiles: { enabled, workspace }`
@@ -331,6 +340,8 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
   model: string;
   providerKey: string;
   hookInvoker: HookInvoker;
+  /** Conversation id namespacing this session's checkpoints (/diff + rewind). */
+  conversationId: string;
   /** Resolved active profile (#2), or undefined when no profile is active. */
   profile?: ProfileEffects;
 } {
@@ -347,6 +358,7 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
   const lean = new LocalLeanProvider();
   const workspace =
     opts.memoryWorkspace ?? process.env.MATHRAN_WORKSPACE ?? process.cwd();
+  const conversationId = opts.conversationId ?? randomUUID();
   // C 方案 wire-up: discover the layered `.mathran/` config (skills + the
   // settings-driven disabled list) for this workspace. Best-effort — a
   // workspace with no `.mathran/` yields an empty skill list.
@@ -458,6 +470,10 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     scheduler,
     approvalBroker,
     hooks: hookInvoker,
+    // /diff + checkpoint/rewind: snapshot write_file / edit_file mutations to
+    // <workspace>/.mathran/cache/checkpoints/<conversationId>/ so `/diff` and
+    // `/rewind` can inspect / roll them back.
+    checkpoints: { conversationId, workspace },
     // v0.4 §1: enable the full builtin toolkit for `mathran chat`. Users
     // run chat at a workspace root with full access; treat it like a local
     // shell session.
@@ -486,7 +502,7 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     ...(profile ? { profile } : {}),
   });
 
-  return { session, model, providerKey, hookInvoker, ...(profile ? { profile } : {}) };
+  return { session, model, providerKey, hookInvoker, conversationId, ...(profile ? { profile } : {}) };
 }
 
 /**
@@ -682,6 +698,16 @@ export interface SlashContext {
    * report the current profile. Undefined when no profile is active.
    */
   profileName?: string;
+  /**
+   * Conversation id namespacing this REPL's auto-checkpoints (/diff +
+   * rewind). Defaults to the session's id when unset.
+   */
+  checkpointConversationId?: string;
+  /**
+   * Workspace root holding the checkpoint cache. Defaults to
+   * {@link SlashContext.memoryWorkspace} then `process.cwd()`.
+   */
+  checkpointWorkspace?: string;
 }
 
 const HELP_TEXT = `commands:
@@ -700,6 +726,8 @@ const HELP_TEXT = `commands:
   /profile <name>          switch to a permission profile (dev|ci|review|custom; session-only)
   /hooks                   list layered hooks (use /hooks log|bypass|disable <name>)
   /outcomes                list self-graded goal outcomes (use /outcomes <id> | delete <id>)
+  /diff                    list file checkpoints (use /diff <id> | /diff last to view a diff)
+  /rewind                  list checkpoints (use /rewind <N> | /rewind <id> to roll back)
   /agents                  list available sub-agent kinds (+ active)
   /review                  print the preset review prompt (MVP stub)
   /memory                  show MATHRAN.md memory (use /memory help for sub-commands)
@@ -950,6 +978,25 @@ export async function handleSlashCommand(
           return { kind: "continue", output: sub.message };
       }
       return { kind: "continue", output: formatOutcomesList(await readOutcomeIndex(workspace)) };
+    }
+
+    case "/diff": {
+      const workspace =
+        ctx.checkpointWorkspace ?? ctx.memoryWorkspace ?? process.cwd();
+      const convId = ctx.checkpointConversationId ?? ctx.session.sessionId;
+      const text = await runDiff(workspace, convId, arg);
+      return { kind: "continue", output: text };
+    }
+
+    case "/rewind": {
+      const workspace =
+        ctx.checkpointWorkspace ?? ctx.memoryWorkspace ?? process.cwd();
+      const convId = ctx.checkpointConversationId ?? ctx.session.sessionId;
+      const outcome = await runRewind(workspace, convId, arg);
+      if (outcome.kind === "done") {
+        ctx.session.appendSystemNote(outcome.historyNote);
+      }
+      return { kind: "continue", output: outcome.text };
     }
 
     case "/agents": {
@@ -1228,15 +1275,16 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
   const approvalResolver = createReadlineApprovalResolver(rl);
   const ruleProposalResolver = createReadlineRuleProposalResolver(rl);
 
-  let { session, model, providerKey, hookInvoker, profile } = buildChatSession({
-    model: opts.model,
-    configPath: opts.configPath,
-    ...(opts.effort !== undefined ? { effort: opts.effort } : {}),
-    askUserResolver,
-    approvalResolver,
-    ruleProposalResolver,
-    ...(opts.profile ? { profile: opts.profile } : {}),
-  });
+  let { session, model, providerKey, hookInvoker, profile, conversationId } =
+    buildChatSession({
+      model: opts.model,
+      configPath: opts.configPath,
+      ...(opts.effort !== undefined ? { effort: opts.effort } : {}),
+      askUserResolver,
+      approvalResolver,
+      ruleProposalResolver,
+      ...(opts.profile ? { profile: opts.profile } : {}),
+    });
 
   console.log(`mathran chat — model: ${model}  (provider: ${providerKey})`);
   if (profile) {
@@ -1287,6 +1335,8 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           memoryWorkspace: workspace,
           hookInvoker,
           promptReload,
+          checkpointConversationId: conversationId,
+          checkpointWorkspace: workspace,
           ...(profile ? { profileName: profile.name } : {}),
         });
         if (result.output) console.log(result.output);
@@ -1303,6 +1353,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           providerKey = built.providerKey;
           hookInvoker = built.hookInvoker;
           profile = built.profile;
+          conversationId = built.conversationId;
         }
       } catch (err: any) {
         console.error(`mathran: ${err?.message ?? err}`);

@@ -66,6 +66,7 @@ import {
 } from "./tools/ask-user.js";
 import { createProposeGoalTool } from "./tools/propose-goal.js";
 import { createProposePlanTool } from "./tools/propose-plan.js";
+import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
 import type { RiskClass, ApprovalRequest, ApprovalDecision, ApprovalResolver } from "../approval/types.js";
@@ -426,6 +427,20 @@ export interface ChatSessionOptions {
    * its own system message. Empty / undefined → nothing injected.
    */
   layeredSkills?: ReadonlyArray<LoadedSkill>;
+  /**
+   * Auto-checkpoint config (/diff + checkpoint/rewind). When set, the built-in
+   * `write_file` / `edit_file` tools are wrapped so a {@link Checkpoint} is
+   * recorded (before + after snapshot of the touched path) into
+   * `<workspace>/.mathran/cache/checkpoints/<conversationId>/` before each
+   * successful mutate. `/diff` and `/rewind` read that store. Requires
+   * `workspace` (or `checkpoints.workspace`) so snapshots can be resolved.
+   * Unset → no checkpoints (backward-compatible).
+   */
+  checkpoints?: {
+    conversationId: string;
+    /** Defaults to {@link ChatSessionOptions.workspace}. */
+    workspace?: string;
+  };
 }
 
 interface PendingToolCall {
@@ -576,6 +591,7 @@ export class ChatSession {
   /** v0.5 §7 — absolute paths read this session (read-before-write gate). */
   private readonly readPaths = new Set<string>();
   private readonly builtinToolsCfg?: ChatSessionOptions["builtinTools"];
+  private readonly checkpointsCfg?: ChatSessionOptions["checkpoints"];
   /** Approval broker (Approval Policy 矩阵). Optional; gates high-risk tools. */
   private readonly approvalBroker?: ApprovalBroker;
   /** Hooks runner (PreEdit/PostEdit/PreCommit/PreBash/PostTool/OnGoalComplete). */
@@ -625,6 +641,7 @@ export class ChatSession {
     // pass the latter (for compact) automatically get dispatch too.
     this.dispatchScheduler = opts.scheduler ?? opts.subagentScheduler;
     this.builtinToolsCfg = opts.builtinTools;
+    this.checkpointsCfg = opts.checkpoints;
     this.approvalBroker = opts.approvalBroker;
     this.approvalResolver = opts.approvalResolver;
     this.hookInvoker = opts.hooks;
@@ -755,6 +772,17 @@ export class ChatSession {
   }
 
   /**
+   * Append a `system` note to history (/rewind 物理恢复 marker). Used by the
+   * `/rewind` slash command to record `[Rewound to before checkpoint …]` so
+   * the model sees the workspace was rolled back. Also invalidates the
+   * read-before-write tracking, since files on disk changed underneath it.
+   */
+  appendSystemNote(text: string): void {
+    this.readPaths.clear();
+    this.messages.push({ role: "system", content: text });
+  }
+
+  /**
    * Replace the in-memory history with a hydrated copy (used by the disk-
    * backed `ScopedChatSessionStore` during session re-hydration on first
    * access after a process restart).
@@ -806,6 +834,21 @@ export class ChatSession {
    * back as `{ ok: false, content: <human msg> }` instead of throwing, so the
    * model can see the error in a tool result and try a different path.
    */
+  /**
+   * Wrap a mutate tool (`write_file` / `edit_file`) with the checkpoint
+   * middleware when {@link ChatSessionOptions.checkpoints} is configured and a
+   * workspace is known; otherwise return it unchanged.
+   */
+  private maybeCheckpoint(tool: ToolSpec): ToolSpec {
+    const cfg = this.checkpointsCfg;
+    const workspace = cfg?.workspace ?? this.workspace;
+    if (!cfg || !workspace) return tool;
+    return wrapMutateTool(tool, {
+      workspace,
+      conversationId: cfg.conversationId,
+    });
+  }
+
   private buildBuiltinTools(): ToolSpec[] {
     const cfg = this.builtinToolsCfg;
     if (!cfg) return [];
@@ -832,12 +875,16 @@ export class ChatSession {
     }
     if (cfg.write_file) {
       out.push(
-        createWriteFileTool(this.workspace ? { workspace: this.workspace } : {}),
+        this.maybeCheckpoint(
+          createWriteFileTool(this.workspace ? { workspace: this.workspace } : {}),
+        ),
       );
     }
     if (cfg.edit_file) {
       out.push(
-        createEditFileTool(this.workspace ? { workspace: this.workspace } : {}),
+        this.maybeCheckpoint(
+          createEditFileTool(this.workspace ? { workspace: this.workspace } : {}),
+        ),
       );
     }
     // v0.5 wire-up Gap #4 + #5: generic dispatch tool. Requires a scheduler

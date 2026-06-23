@@ -32,6 +32,7 @@ import { ChatSession } from "./session.js";
 import type { LLMMessage } from "../providers/llm.js";
 import { renderTranscriptMarkdown } from "./transcript.js";
 import { atomicWriteFile } from "./atomic-write.js";
+import { deleteConversationCheckpoints } from "../checkpoints/store.js";
 
 export type ChatScopeKind = "global" | "project" | "effort";
 
@@ -617,6 +618,13 @@ export class ScopedChatSessionStore {
     if (hadIndex) {
       delete idx.conversations[conversationId];
       await writeIndex(dir, idx);
+    }
+    // /diff + rewind: best-effort cleanup of this conversation's checkpoint
+    // bucket so deleting a thread doesn't leak its snapshot cache.
+    try {
+      await deleteConversationCheckpoints(this.workspace, conversationId);
+    } catch {
+      /* advisory cache — never block a delete on it */
     }
     return hadCache || hadFile || hadIndex;
   }
