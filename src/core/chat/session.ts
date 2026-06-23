@@ -104,6 +104,7 @@ import { createRunLatexTool } from "./tools/run-latex.js";
 import { createInstallPythonPackageTool } from "./tools/install-python-package.js";
 import { createSearchWebTool } from "./tools/search-web.js";
 import { createVerifyPageTool } from "./tools/verify-page.js";
+import { createSearchArxivTool } from "./tools/search-arxiv.js";
 import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
@@ -484,6 +485,12 @@ export interface ChatSessionOptions {
      * session LLM by default; pass an object to override the `model`.
      */
     verify_page?: boolean | { model?: string };
+    /**
+     * gap #2 — stateless arXiv search. Unlike the python/latex tools this is a
+     * read-only network query with no per-conversation state, so it takes a
+     * plain boolean.
+     */
+    search_arxiv?: boolean;
   };
   /**
    * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
@@ -1273,6 +1280,10 @@ export class ChatSession {
           }),
         ),
       );
+    }
+    // gap #2 — stateless read-only arXiv search; no checkpoint wrapping needed.
+    if (cfg.search_arxiv) {
+      out.push(createSearchArxivTool());
     }
     return out;
   }
