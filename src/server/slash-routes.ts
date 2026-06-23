@@ -42,6 +42,8 @@ import {
   readOutcome,
   deleteOutcome,
 } from "../core/outcomes/store.js";
+import { runDiff } from "../core/checkpoints/diff-run.js";
+import { runRewind } from "../core/checkpoints/rewind.js";
 
 /** Shape of `computeUsageStats` (defined in serve.ts), injected to avoid cycles. */
 export interface UsageStatsLike {
@@ -225,6 +227,30 @@ export function registerSlashRoutes(app: Hono, deps: SlashRoutesDeps): void {
             return c.json({ ok: true, text: sub.message });
         }
         return c.json({ ok: true, text: formatOutcomesList(await readOutcomeIndex(workspace)) });
+      }
+
+      case "diff": {
+        // /diff — list checkpoints or render one checkpoint's diff. Reads the
+        // per-conversation checkpoint cache under the workspace.
+        const text = await runDiff(workspace, id, args);
+        return c.json({ ok: true, text });
+      }
+
+      case "rewind": {
+        // /rewind — roll the workspace back to before a checkpoint (or the
+        // newest N). On success, append a `[Rewound …]` system note to the
+        // conversation so the model sees the workspace changed underneath it.
+        const outcome = await runRewind(workspace, id, args);
+        if (outcome.kind === "done") {
+          try {
+            const session = await store.getOrCreate(GLOBAL_SCOPE, id, undefined);
+            session.appendSystemNote(outcome.historyNote);
+            await store.flush(GLOBAL_SCOPE, id);
+          } catch {
+            // Best-effort history note — the disk rollback already happened.
+          }
+        }
+        return c.json({ ok: true, text: outcome.text });
       }
 
       default:

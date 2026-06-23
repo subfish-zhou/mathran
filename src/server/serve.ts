@@ -832,6 +832,12 @@ export function defaultSessionFactory(
       // project / effort dir, not at workspace root.
       workspace: scopedWorkspace,
       toolContext: { workspace: scopedWorkspace, scope },
+      // /diff + checkpoint/rewind: snapshot write_file / edit_file mutations
+      // under the scoped workspace so the SPA `/diff` + `/rewind` endpoints can
+      // inspect / roll them back. Keyed by the SPA conversation id.
+      ...(conversationId
+        ? { checkpoints: { conversationId, workspace: scopedWorkspace } }
+        : {}),
       systemPrompt: buildScopedSystemPrompt(scope, scopedWorkspace),
       // v0.17 W12 — wire `todo_write` per-conversation so each thread has
       // its own persisted plan file. The factory closes over the scope +

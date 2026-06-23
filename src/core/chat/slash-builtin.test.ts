@@ -27,10 +27,10 @@ import { HookHistory } from "../hooks/history.js";
 import type { LoadedHook } from "../hooks/loader.js";
 
 describe("builtin command metadata", () => {
-  it("includes all eleven new commands", () => {
+  it("includes all twelve new commands", () => {
     const names = NEW_BUILTIN_SLASH_COMMANDS.map((c) => c.name).sort();
     expect(names).toEqual(
-      ["agents", "cd", "compact", "context", "diff", "effort", "hooks", "outcomes", "plan", "review", "skills"].sort(),
+      ["agents", "cd", "compact", "context", "diff", "effort", "hooks", "outcomes", "plan", "review", "rewind", "skills"].sort(),
     );
   });
 

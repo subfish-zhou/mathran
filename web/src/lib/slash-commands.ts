@@ -46,11 +46,12 @@ export const FALLBACK_BUILTINS: BuiltinSlashCommand[] = [
   { name: "cd", description: "Switch workspace scope to projects/<slug>" },
   { name: "compact", description: "Compact conversation history (keep last k rounds)" },
   { name: "context", description: "Show token usage and context-window percentage" },
-  { name: "diff", description: "Open the diff view for the current effort (coming soon)" },
+  { name: "diff", description: "Show file checkpoints / a checkpoint diff (use /diff <id> | last)" },
   { name: "effort", description: "Set reasoning effort: low | medium | high | max" },
   { name: "help", description: "Show the command list" },
   { name: "plan", description: "Open the plan runner for the current objective" },
   { name: "review", description: "Ask the reviewer to look at the latest exchange (MVP stub)" },
+  { name: "rewind", description: "Restore files to before a checkpoint (use /rewind <N> | <id>)" },
   { name: "skills", description: "List layered skills (project / workspace / user)" },
 ];
 

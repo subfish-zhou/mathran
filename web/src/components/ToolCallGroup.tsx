@@ -34,6 +34,12 @@ interface ToolCallGroupProps {
   /** v0.16 §11: passed through to each {@link ToolCallDisplay} so an
    *  `ask_user` card inside the cluster can render its answer box. */
   onAnswerAsk?: (callId: string, answer: string) => void | Promise<void>;
+  /** /diff + checkpoint/rewind: forwarded to each {@link ToolCallDisplay}
+   *  so write_file / edit_file cards can offer view-diff / rewind. */
+  onCheckpointAction?: (
+    action: "diff" | "rewind",
+    toolCallId: string,
+  ) => void | Promise<void>;
 }
 
 export default function ToolCallGroup({
@@ -41,6 +47,7 @@ export default function ToolCallGroup({
   subGoalIdByToolId,
   onOpenThread,
   onAnswerAsk,
+  onCheckpointAction,
 }: ToolCallGroupProps) {
   const [collapsed, setCollapsed] = useState(false);
 
@@ -51,6 +58,7 @@ export default function ToolCallGroup({
       subGoalIdForThisCall={subGoalIdByToolId?.[t.id] ?? null}
       onOpenThread={onOpenThread}
       onAnswerAsk={onAnswerAsk}
+      onCheckpointAction={onCheckpointAction}
     />
   );
 
