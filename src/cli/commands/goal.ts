@@ -211,6 +211,8 @@ async function driveOneRound(
       tools,
       toolContext,
       chatWorkspace: scopeRoot,
+      // #5: grade top-level goal outcomes on completion (background).
+      selfGrade: true,
       // v0.5 wire-up Gap #4 + #5: pass scheduler so `dispatch_subagent`
       // builtin tool can dispatch into the registered runners.
       scheduler: new SubagentScheduler({

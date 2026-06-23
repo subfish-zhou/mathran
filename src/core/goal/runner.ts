@@ -68,6 +68,10 @@ import {
   type Goal,
 } from "./store.js";
 import { buildGoalTools, createGoalToolHandler } from "./tools.js";
+import {
+  resolutionFromCompletion,
+  triggerSelfGrade,
+} from "../outcomes/self-grade.js";
 import { buildSpawnSubGoalTool, DEFAULT_SUB_GOAL_MAX_ROUNDS } from "./sub-goal-tool.js";
 import {
   formatPlanFragment,
@@ -262,6 +266,18 @@ export interface RunRoundOptions {
    * (see `src/server/steer-registry.ts`); plain JSON callers omit it.
    */
   steerProbe?: () => string | null | undefined;
+  /**
+   * #5 (outcomes / self-grade): when true, completing this round (the
+   * assistant calling `mark_done` / `give_up`) kicks off a background,
+   * fire-and-forget LLM grading round that writes an `Outcome` record to
+   * `.mathran/cache/outcomes/`. Only ever fires for TOP-LEVEL goals
+   * (`depth === 0`) — sub-goals are bounded side-quests not worth grading.
+   *
+   * Default `false` so the plain runner path (and its unit tests) does NOT
+   * pay for an extra inference. Production callers (serve / CLI goal run)
+   * opt in explicitly.
+   */
+  selfGrade?: boolean;
 }
 
 export interface RunRoundResult {
@@ -882,6 +898,23 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
       systemPrompt,
       history: session.history(),
     });
+    // #5: fire-and-forget self-grade. The goal is already terminal; grading
+    // runs in the background on a separate inference and never throws. Only
+    // top-level goals are graded, and only when the caller opted in.
+    if (opts.selfGrade && depth === 0) {
+      triggerSelfGrade({
+        workspace,
+        goalId,
+        objective: finalGoal.objective,
+        resolution: resolutionFromCompletion("done"),
+        endReason: reason,
+        startedAt: Date.parse(finalGoal.createdAt) || Date.now(),
+        endedAt: finalGoal.endedAt ? Date.parse(finalGoal.endedAt) || Date.now() : Date.now(),
+        history: session.history(),
+        llm,
+        model: finalGoal.model,
+      });
+    }
     return { goal: finalGoal, text: textBuf, completed: true, exhausted: false, failed: false, aborted: false, endReason: reason };
   }
   if (handler.completion?.outcome === "give_up") {
@@ -896,6 +929,21 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
       systemPrompt,
       history: session.history(),
     });
+    // #5: fire-and-forget self-grade for abandoned goals too (top-level + opt-in).
+    if (opts.selfGrade && depth === 0) {
+      triggerSelfGrade({
+        workspace,
+        goalId,
+        objective: finalGoal.objective,
+        resolution: resolutionFromCompletion("give_up"),
+        endReason: reason,
+        startedAt: Date.parse(finalGoal.createdAt) || Date.now(),
+        endedAt: finalGoal.endedAt ? Date.parse(finalGoal.endedAt) || Date.now() : Date.now(),
+        history: session.history(),
+        llm,
+        model: finalGoal.model,
+      });
+    }
     return { goal: finalGoal, text: textBuf, completed: false, exhausted: false, failed: true, aborted: false, endReason: reason };
   }
 

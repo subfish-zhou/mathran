@@ -66,8 +66,16 @@ import {
   formatHooksList,
   formatHooksLog,
   parseHooksSubcommand,
+  parseOutcomesSubcommand,
+  formatOutcomesList,
+  formatOutcomeDetail,
   REVIEW_STUB_PROMPT,
 } from "../../core/chat/slash-builtin.js";
+import {
+  readIndex as readOutcomeIndex,
+  readOutcome,
+  deleteOutcome,
+} from "../../core/outcomes/store.js";
 import { createOpenAITokenCounter, createFallbackTokenCounter } from "../../core/chat/token-counter.js";
 import { MATHRAN_DIR, SETTINGS_FILE } from "../../core/config/mathran-root.js";
 import { atomicWriteFile } from "../../core/chat/atomic-write.js";
@@ -599,6 +607,7 @@ const HELP_TEXT = `commands:
   /skills disable <name>   add <name> to settings.json#skills.disabled
   /skills enable <name>    remove <name> from settings.json#skills.disabled
   /hooks                   list layered hooks (use /hooks log|bypass|disable <name>)
+  /outcomes                list self-graded goal outcomes (use /outcomes <id> | delete <id>)
   /agents                  list available sub-agent kinds (+ active)
   /review                  print the preset review prompt (MVP stub)
   /memory                  show MATHRAN.md memory (use /memory help for sub-commands)
@@ -816,6 +825,39 @@ export async function handleSlashCommand(
           return { kind: "continue", output: sub.message };
       }
       return { kind: "continue", output: formatHooksList(invoker) };
+    }
+
+    case "/outcomes": {
+      const workspace = ctx.memoryWorkspace ?? process.cwd();
+      const sub = parseOutcomesSubcommand(arg);
+      switch (sub.kind) {
+        case "list": {
+          const index = await readOutcomeIndex(workspace);
+          return { kind: "continue", output: formatOutcomesList(index) };
+        }
+        case "show": {
+          const outcome = await readOutcome(workspace, sub.goalId);
+          if (!outcome) {
+            return {
+              kind: "continue",
+              output: `mathran: no outcome found for goal '${sub.goalId}' (try /outcomes to list)`,
+            };
+          }
+          return { kind: "continue", output: formatOutcomeDetail(outcome) };
+        }
+        case "delete": {
+          const removed = await deleteOutcome(workspace, sub.goalId);
+          return {
+            kind: "continue",
+            output: removed
+              ? `deleted outcome for goal '${sub.goalId}'.`
+              : `mathran: no outcome found for goal '${sub.goalId}'.`,
+          };
+        }
+        case "error":
+          return { kind: "continue", output: sub.message };
+      }
+      return { kind: "continue", output: formatOutcomesList(await readOutcomeIndex(workspace)) };
     }
 
     case "/agents": {

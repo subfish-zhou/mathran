@@ -355,4 +355,40 @@ describe("createProposeGoalTool — end-to-end", () => {
     const r2 = await tWith.execute({ objective: "x", reasoning: "y" });
     expect(JSON.parse(r2.content).hint).toMatch(/kicked off in the background/i);
   });
+  it("injects retrieved past outcomes (#5 few-shot) into the result", async () => {
+    const calls: string[] = [];
+    const tool = createProposeGoalTool({
+      resolver: async () => "confirm",
+      workspace,
+      scope,
+      model: "copilot/gpt-5.5",
+      retrieveFewShot: async (objective: string) => {
+        calls.push(objective);
+        return "Past outcomes for similar goals (for reference):\n- goal: prior refactor / score: 4.0 / resolution: complete";
+      },
+    });
+    const res = await tool.execute({
+      objective: "refactor module Z end-to-end",
+      reasoning: "spans dependent modules",
+    });
+    expect(calls).toEqual(["refactor module Z end-to-end"]);
+    const payload = JSON.parse(res.content);
+    expect(payload.pastOutcomes).toContain("Past outcomes for similar goals");
+  });
+
+  it("swallows retrieval errors and omits pastOutcomes", async () => {
+    const tool = createProposeGoalTool({
+      resolver: async () => "confirm",
+      workspace,
+      scope,
+      model: "copilot/gpt-5.5",
+      retrieveFewShot: async () => {
+        throw new Error("retrieval boom");
+      },
+    });
+    const res = await tool.execute({ objective: "x", reasoning: "y" });
+    expect(res.ok).toBe(true);
+    expect(JSON.parse(res.content).pastOutcomes).toBeUndefined();
+  });
+
 });
