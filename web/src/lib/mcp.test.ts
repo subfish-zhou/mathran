@@ -4,6 +4,9 @@ import {
   MCP_STATUS_DOT,
   getMcpServers,
   reloadMcpServer,
+  getMcpConfig,
+  putMcpConfig,
+  testMcpConnection,
   type McpServerRow,
 } from "./mcp.ts";
 
@@ -76,5 +79,84 @@ describe("reloadMcpServer", () => {
   it("returns false when the request throws", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network")));
     await expect(reloadMcpServer("filesystem")).resolves.toBe(false);
+  });
+});
+
+describe("getMcpConfig", () => {
+  it("returns servers from the config endpoint", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ servers: [{ name: "fs", command: "node" }], path: "/x" }),
+      }),
+    );
+    const res = await getMcpConfig();
+    expect(res.servers).toEqual([{ name: "fs", command: "node" }]);
+    expect(res.path).toBe("/x");
+  });
+
+  it("defaults missing servers to empty", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }));
+    const res = await getMcpConfig();
+    expect(res.servers).toEqual([]);
+  });
+
+  it("throws on a non-ok response", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404, json: async () => ({}) }));
+    await expect(getMcpConfig()).rejects.toThrow(/404/);
+  });
+});
+
+describe("putMcpConfig", () => {
+  it("PUTs the servers array and returns ok", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const res = await putMcpConfig([{ name: "fs", command: "node" }]);
+    expect(res.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/mcp/config",
+      expect.objectContaining({ method: "PUT" }),
+    );
+  });
+
+  it("surfaces validation details on a 400", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        json: async () => ({ error: "validation failed", details: ["fs: bad"] }),
+      }),
+    );
+    const res = await putMcpConfig([{ name: "fs" }]);
+    expect(res.ok).toBe(false);
+    expect(res.details).toEqual(["fs: bad"]);
+  });
+
+  it("returns ok:false when the request throws", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network")));
+    const res = await putMcpConfig([]);
+    expect(res.ok).toBe(false);
+  });
+});
+
+describe("testMcpConnection", () => {
+  it("returns the host's connection result", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ ok: true, toolCount: 2, promptCount: 1, resourceCount: 0 }),
+      }),
+    );
+    const res = await testMcpConnection({ name: "fs", command: "node" });
+    expect(res.ok).toBe(true);
+    expect(res.toolCount).toBe(2);
+  });
+
+  it("returns ok:false when the request throws", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network")));
+    const res = await testMcpConnection({ name: "fs" });
+    expect(res.ok).toBe(false);
   });
 });
