@@ -212,8 +212,14 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
           return;
         }
         if (raw.length <= offset) return;
-        const chunk = raw.slice(offset);
-        offset = raw.length;
+        // Only consume up to the last complete line. If appendFile is mid-write
+        // the tail of `raw` may be a partial record with no trailing newline;
+        // advancing offset past it would drop that line forever. Leave the
+        // partial bytes for the next flush by stopping at the final '\n'.
+        const lastNewline = raw.lastIndexOf("\n");
+        if (lastNewline < offset) return;
+        const chunk = raw.slice(offset, lastNewline + 1);
+        offset = lastNewline + 1;
         for (const line of chunk.split("\n")) {
           const t = line.trim();
           if (!t) continue;

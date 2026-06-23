@@ -287,6 +287,64 @@ describe("GET /api/agent/init-project/:runId/stream (SSE)", () => {
     expect(text).toMatch(/event: phase\ndata: \{/);
     expect(text).toContain('"ok":true');
   });
+
+  it("does not lose a phase line that was only partially written at flush time", async () => {
+    const slug = "sse-partial";
+    const runId = "run-dddd77778888";
+    await scaffoldProject(slug);
+    await fs.mkdir(agentRunDir(slug, runId), { recursive: true });
+    const phasesFile = path.join(agentRunDir(slug, runId), "phases.jsonl");
+    // First record complete; second record is mid-write (no trailing newline)
+    // — exactly what a reader sees if it races an in-progress appendFile.
+    await fs.writeFile(
+      phasesFile,
+      JSON.stringify({ phase: "explore_graph", event: "start" }) + "\n" +
+        JSON.stringify({ phase: "build_spine", event: "end" }),
+      "utf-8",
+    );
+
+    const streamP = readStreamUntilClose(`${base}/api/agent/init-project/${runId}/stream`, 6000);
+    await sleep(300);
+    // Complete the partial line, then add a terminal phase to close the stream.
+    await fs.appendFile(
+      phasesFile,
+      "\n" + JSON.stringify({ phase: "completed", event: "end" }) + "\n",
+      "utf-8",
+    );
+    const text = await streamP;
+    expect(text).toContain("explore_graph");
+    // The partial line must survive — it is delivered once its newline lands.
+    expect(text).toContain("build_spine");
+    expect(text).toContain("completed");
+    // And it must arrive exactly once (no duplicate from the partial buffer).
+    expect(text.match(/build_spine/g)?.length).toBe(1);
+  });
+
+  it("delivers a completed line on the next flush after a partial write", async () => {
+    const slug = "sse-partial-then-complete";
+    const runId = "run-eeee99990000";
+    await scaffoldProject(slug);
+    await fs.mkdir(agentRunDir(slug, runId), { recursive: true });
+    const phasesFile = path.join(agentRunDir(slug, runId), "phases.jsonl");
+    // Start with only a partial first line — nothing should be emitted yet.
+    await fs.writeFile(
+      phasesFile,
+      JSON.stringify({ phase: "explore_graph", event: "start" }),
+      "utf-8",
+    );
+
+    const streamP = readStreamUntilClose(`${base}/api/agent/init-project/${runId}/stream`, 6000);
+    await sleep(300);
+    await fs.appendFile(
+      phasesFile,
+      "\n" + JSON.stringify({ phase: "completed", event: "end" }) + "\n",
+      "utf-8",
+    );
+    const text = await streamP;
+    expect(text).toContain("explore_graph");
+    expect(text).toContain("completed");
+    expect(text.match(/explore_graph/g)?.length).toBe(1);
+  });
 });
 
 // ── resume ──────────────────────────────────────────────────────────────────
