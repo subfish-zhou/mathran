@@ -58,6 +58,10 @@ export type InitPhase =
   | "build_spine"
   | "build_efforts"
   | "spine_wiki"
+  | "review_refine"
+  | "verify"
+  | "link_review"
+  | "completeness_check"
   | "completed"
   | "error";
 
@@ -94,5 +98,8 @@ export interface InitAgentResult {
     effortsCreated?: number;
     papersDiscovered?: number;
     papersRelevant?: number;
+    pagesRefined?: number;
+    pagesFlagged?: number;
+    spineCoverage?: number;
   };
 }

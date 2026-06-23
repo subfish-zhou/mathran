@@ -46,6 +46,12 @@ import { generateEffortsFromSpine } from "./spine/effort-from-spine.js";
 import { generateWikiFromSpine } from "./spine/wiki-from-spine.js";
 import { explorePaperGraph } from "./spine/explore-pipeline.js";
 import { CITATION_MAX_DEPTH, CITATION_MAX_NODES, type NeighborPaper } from "./citation-explorer.js";
+import {
+  reviewAndRefinePages,
+  verifyPages,
+  reviewLinks,
+  checkCompleteness,
+} from "./review-verify.js";
 import type { SpinePipelineEvent } from "./spine/types.js";
 import type { PaperNode } from "../../paper-graph/index.js";
 
@@ -388,7 +394,11 @@ async function runInitAgentSpine(
     tags: input.problem.tags ?? [],
   };
 
-  const summary = {
+  const summary: NonNullable<InitAgentResult["summary"]> & {
+    pagesRefined?: number;
+    pagesFlagged?: number;
+    spineCoverage?: number;
+  } = {
     conceptsExtracted: 0,
     queriesRun: 0,
     resourcesFound: 0,
@@ -507,6 +517,62 @@ async function runInitAgentSpine(
     summary.wikiPagesGenerated = wikiPages.length;
     await writeCheckpoint(projectDir, runId, "spine_wiki", { wikiPages });
     await appendPhase(projectDir, runId, "spine_wiki", "end", { wikiPages: wikiPages.length });
+
+    // ── Phase 5-8: review / verify / link / completeness (only with wiki) ──
+    if (input.aiInit.enableWiki && pages.length > 0) {
+      const rvConfig = {
+        projectDir,
+        pages,
+        problem,
+        efforts: effortResult.efforts,
+        spine,
+        tags: problem.tags,
+      };
+
+      // Phase 5: review_refine
+      await appendPhase(projectDir, runId, "review_refine", "start");
+      const review = await reviewAndRefinePages(rvConfig, spineLLM, emit);
+      summary.pagesRefined = review.refinedCount;
+      await writeCheckpoint(projectDir, runId, "review_refine", {
+        refined: review.refinedCount,
+        scores: review.scores,
+      });
+      await appendPhase(projectDir, runId, "review_refine", "end", { refined: review.refinedCount });
+
+      // Phase 6: verify
+      await appendPhase(projectDir, runId, "verify", "start");
+      const verify = await verifyPages(rvConfig, spineLLM, emit);
+      summary.pagesFlagged = verify.flaggedCount;
+      await writeCheckpoint(projectDir, runId, "verify", {
+        flagged: verify.flaggedCount,
+        results: verify.results,
+      });
+      await appendPhase(projectDir, runId, "verify", "end", { flagged: verify.flaggedCount });
+
+      // Phase 7: link_review (pure)
+      await appendPhase(projectDir, runId, "link_review", "start");
+      const links = reviewLinks(rvConfig, emit);
+      await writeCheckpoint(projectDir, runId, "link_review", {
+        brokenWsRefs: links.brokenWsRefs.length,
+        brokenWikiLinks: links.brokenWikiLinks.length,
+      });
+      await appendPhase(projectDir, runId, "link_review", "end", {
+        brokenWsRefs: links.brokenWsRefs.length,
+        brokenWikiLinks: links.brokenWikiLinks.length,
+      });
+
+      // Phase 8: completeness_check (pure)
+      await appendPhase(projectDir, runId, "completeness_check", "start");
+      const completeness = checkCompleteness(rvConfig, emit);
+      summary.spineCoverage = completeness.coverage;
+      await writeCheckpoint(projectDir, runId, "completeness_check", {
+        coverage: completeness.coverage,
+        uncovered: completeness.uncoveredNodeIds,
+      });
+      await appendPhase(projectDir, runId, "completeness_check", "end", {
+        coverage: completeness.coverage,
+      });
+    }
 
     // ── completed ─────────────────────────────────────────────────────────
     summary.durationMs = Date.now() - started;
