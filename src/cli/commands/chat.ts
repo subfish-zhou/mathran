@@ -83,6 +83,7 @@ import { atomicWriteFile } from "../../core/chat/atomic-write.js";
 import {
   resolveProfile,
   listAvailableProfiles,
+  readSettingsDefaultProfile,
   UnknownProfileError,
 } from "../../core/profiles/index.js";
 import type { ProfileEffects } from "../../core/profiles/index.js";
@@ -371,7 +372,7 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
   //   --profile flag (opts.profile) > settings.json#profile default > none.
   // A profile forces the approval policy and adds dispatch-level hard rejects;
   // it never weakens the denylist (always additive).
-  const profileName = opts.profile ?? readSettingsDefaultProfile(workspace);
+  const profileName = opts.profile ?? readSettingsDefaultProfileFromChat(workspace);
   let profile: ProfileEffects | undefined;
   if (profileName) {
     try {
@@ -385,11 +386,14 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     }
   }
   // The profile's policy overrides the settings policy; its denylistTools are
-  // merged on TOP of the settings denylist (never replacing it).
+  // merged on TOP of the settings denylist (never replacing it). The profile's
+  // autoApprovePatterns (C-1) are passed to the broker as a pre-prompt allow
+  // signal — they cannot override denylist or readOnlyMode/hardRejectMutations.
   const effectivePolicy = profile?.policy ?? approvalCfg.policy;
   const effectiveDenylist = profile
     ? [...approvalCfg.denylist, ...profile.denylistTools.map((t) => `${t}:*`)]
     : approvalCfg.denylist;
+  const effectiveAutoApprovePatterns = profile?.autoApprovePatterns ?? [];
 
   const approvalBroker = new ApprovalBroker({
     policy: effectivePolicy,
@@ -400,6 +404,7 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     denylist: effectiveDenylist,
     rulesFiles: approvalCfg.rulesFiles,
     persistentRuleFile: approvalCfg.persistentRuleFile,
+    autoApprovePatterns: effectiveAutoApprovePatterns,
     history: historyFor(approvalCfg),
     ...(opts.approvalResolver ? { resolver: opts.approvalResolver } : {}),
     ...(opts.ruleProposalResolver
@@ -489,17 +494,12 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
  * `settings.json#profile` field, if present. Best-effort — a missing or
  * malformed file yields `undefined`.
  */
-function readSettingsDefaultProfile(workspace: string): string | undefined {
-  const file = path.join(workspace, MATHRAN_DIR, SETTINGS_FILE);
-  try {
-    const parsed = JSON.parse(fsSync.readFileSync(file, "utf-8"));
-    if (parsed && typeof parsed === "object" && typeof parsed.profile === "string") {
-      return parsed.profile;
-    }
-  } catch {
-    /* no settings / malformed → no default profile */
-  }
-  return undefined;
+function readSettingsDefaultProfileFromChat(workspace: string): string | undefined {
+  // Thin wrapper preserved as `readSettingsDefaultProfile` for the existing
+  // call sites; the actual implementation now lives in the profiles module so
+  // `mathran serve` can share the same fallback chain. The local re-export
+  // keeps git diff small and avoids touching every existing caller.
+  return readSettingsDefaultProfile(workspace);
 }
 
 /** Read all of stdin (used for piped one-shot prompts). */

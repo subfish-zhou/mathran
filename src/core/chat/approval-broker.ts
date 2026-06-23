@@ -33,6 +33,7 @@ import {
 } from "../approval/rules.js";
 import type { Rule, DenylistEntry } from "../approval/rules.js";
 import { derivePrefix, ApprovalHistory } from "../approval/history.js";
+import { matchAutoApprovePattern } from "../profiles/profile-resolver.js";
 import type {
   ApprovalPolicy,
   ApprovalRequest,
@@ -106,6 +107,16 @@ export interface ApprovalBrokerOptions {
    * rules only.
    */
   persistentRuleFile?: string;
+  /**
+   * Permission Profiles (#2 / C-1): glob patterns the active profile declares
+   * as auto-approve. Applied as a pre-prompt allow signal AFTER the denylist
+   * and standing rules but BEFORE the policy matrix prompt. Only matched
+   * against the `path` argument of write-style tools — never against `bash`
+   * commands (see {@link matchAutoApprovePattern}). The dispatch-level hard
+   * reject (`readOnlyMode` / `hardRejectMutations`) still wins because it runs
+   * BEFORE the broker is consulted.
+   */
+  autoApprovePatterns?: readonly string[];
 }
 
 export class ApprovalBroker {
@@ -120,6 +131,7 @@ export class ApprovalBroker {
   private readonly resolver?: ApprovalResolver;
   private readonly proposalResolver?: RuleProposalResolver;
   private readonly persistentRuleFile?: string;
+  private readonly autoApprovePatterns: readonly string[];
   /** Session-scoped rules accumulated from allow_session / allow_prefix. */
   private readonly sessionRules: Rule[] = [];
 
@@ -135,6 +147,7 @@ export class ApprovalBroker {
     this.resolver = opts.resolver;
     this.proposalResolver = opts.proposalResolver;
     this.persistentRuleFile = opts.persistentRuleFile;
+    this.autoApprovePatterns = opts.autoApprovePatterns ?? [];
   }
 
   /** The active policy (read-only accessor for hosts / tests). */
@@ -264,7 +277,19 @@ export class ApprovalBroker {
       return { kind: "allow" };
     }
 
-    // 3. Policy matrix.
+    // 3. Permission-profile autoApprovePatterns (C-1). Only matched against the
+    //    `path` arg of write-style tools — bash/lean_check are NEVER auto-
+    //    approved by a pattern. The dispatch-level hard reject (readOnlyMode /
+    //    hardRejectMutations) has already run BEFORE the broker is invoked, so
+    //    a match here cannot bypass ci / review. Priority restated:
+    //        denylist > hardReject > autoApprovePattern > policy prompt.
+    if (
+      matchAutoApprovePattern(tool, args, this.autoApprovePatterns) !== null
+    ) {
+      return { kind: "allow" };
+    }
+
+    // 4. Policy matrix.
     const context = this.buildPolicyContext(tool, args);
     const outcome = evaluatePolicy(this.policy, riskClass, context);
     if (outcome === "pass") return { kind: "allow" };
