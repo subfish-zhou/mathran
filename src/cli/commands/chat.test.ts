@@ -135,6 +135,35 @@ describe("handleSlashCommand: state-mutating commands", () => {
   });
 });
 
+describe("handleSlashCommand: /profile", () => {
+  it("/profile alone lists the builtins + active profile", async () => {
+    const res = await handleSlashCommand("/profile", { ...ctx, memoryWorkspace: tmpDir, profileName: "ci" });
+    expect(res.kind).toBe("continue");
+    expect(res.output).toContain("active profile: ci");
+    expect(res.output).toContain("dev");
+    expect(res.output).toContain("ci");
+    expect(res.output).toContain("review");
+  });
+
+  it("/profile with no active profile shows (none)", async () => {
+    const res = await handleSlashCommand("/profile", { ...ctx, memoryWorkspace: tmpDir });
+    expect(res.output).toContain("active profile: (none)");
+  });
+
+  it("/profile <name> requests a rebuild with the profile", async () => {
+    const res = await handleSlashCommand("/profile review", { ...ctx, memoryWorkspace: tmpDir });
+    expect(res.kind).toBe("rebuild");
+    if (res.kind !== "rebuild") throw new Error("expected rebuild");
+    expect(res.nextBuild.profile).toBe("review");
+  });
+
+  it("/profile <unknown> reports an error and does not rebuild", async () => {
+    const res = await handleSlashCommand("/profile nope", { ...ctx, memoryWorkspace: tmpDir });
+    expect(res.kind).toBe("continue");
+    expect(res.output).toContain("unknown profile");
+  });
+});
+
 describe("handleSlashCommand: /model", () => {
   it("/model alone prints the current model + provider", async () => {
     const res = await handleSlashCommand("/model", ctx);

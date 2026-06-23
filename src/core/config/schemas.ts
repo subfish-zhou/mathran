@@ -143,6 +143,12 @@ export const MathranSettingsSchema = z
       .optional(),
     /** Approval Policy 矩阵 — see {@link ApprovalSettingsSchema}. */
     approval: ApprovalSettingsSchema.optional(),
+    /**
+     * Permission Profiles (#2) — default profile name applied when no
+     * `--profile` flag is given (dev | ci | review | custom). The CLI `--profile`
+     * flag overrides this.
+     */
+    profile: z.string().optional(),
   })
   .passthrough();
 
