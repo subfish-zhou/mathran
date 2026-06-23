@@ -20,6 +20,7 @@ export function createListDocPagesTool(
   return {
     name: "list_doc_pages",
     riskClass: "read",
+    readOnly: true,
     description:
       "List `docs/*.md` files in a project. Docs are a free-form notebook (no frontmatter required) " +
       "separate from `wiki/` (which is structured + versioned). " +

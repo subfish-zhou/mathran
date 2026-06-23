@@ -39,6 +39,7 @@ export function createLeanCheckTool(
   return {
     name: "lean_check",
     riskClass: "exec",
+    readOnly: false,
     description:
       "Type-check a complete Lean 4 source snippet with the local Lean toolchain. " +
       "Returns whether it compiles plus any error/warning messages.",

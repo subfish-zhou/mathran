@@ -14,6 +14,7 @@ export function createMemoryListTool(opts: MemoryListToolOptions = {}): ToolSpec
   return {
     name: "memory_list",
     riskClass: "read",
+    readOnly: true,
     description:
       "List all long-term memory topics persisted under the workspace. " +
       "Returns one topic name per line. Memory survives across chat sessions.",

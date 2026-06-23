@@ -19,6 +19,7 @@ export function createScratchpadReadTool(
   return {
     name: "scratchpad_read",
     riskClass: "read",
+    readOnly: true,
     description:
       "Read a named scratchpad scoped to the current conversation. " +
       "Scratchpads are temporary working notes that persist across turns within a conversation.",

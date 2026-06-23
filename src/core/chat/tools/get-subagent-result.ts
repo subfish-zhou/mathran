@@ -46,6 +46,7 @@ export function createGetSubagentResultTool(
   return {
     name: "get_subagent_result",
     riskClass: "read",
+    readOnly: true,
     description:
       "Poll a background subagent (dispatched via dispatch_subagent mode: " +
       "'background') by its id. Returns its current status and, once it has " +

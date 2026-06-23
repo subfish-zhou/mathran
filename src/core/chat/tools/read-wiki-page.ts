@@ -24,6 +24,7 @@ export function createReadWikiPageTool(
   return {
     name: "read_wiki_page",
     riskClass: "read",
+    readOnly: true,
     description:
       "Read a wiki page from a mathran project. Returns the page body (markdown without the YAML frontmatter) " +
       "along with title, version, parent, and tags. " +

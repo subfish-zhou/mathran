@@ -25,6 +25,7 @@ export function createListEffortRelationsTool(
   return {
     name: "list_effort_relations",
     riskClass: "read",
+    readOnly: true,
     description:
       "List effort relations. When `effort` is given, returns `{ outgoing, incoming }` — outgoing " +
       "are edges from this effort; incoming are edges pointing at it (its dependents). When " +

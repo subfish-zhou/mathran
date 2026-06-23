@@ -19,6 +19,7 @@ export function createUpdateDocPageTool(
   return {
     name: "update_doc_page",
     riskClass: "write",
+    readOnly: false,
     description:
       "Overwrite an existing `docs/<page>.md` in a project. Fails (ok=false) if the file does not " +
       "exist — use `create_doc_page` first. Body is written verbatim. Output: `{ page, bytes }`.",

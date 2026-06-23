@@ -16,6 +16,7 @@ export function createMemoryWriteTool(
   return {
     name: "memory_write",
     riskClass: "write",
+    readOnly: false,
     description:
       "Overwrite (or create) a long-term memory topic with the given content. " +
       "Replaces the whole topic — use memory_append to add a single line.",

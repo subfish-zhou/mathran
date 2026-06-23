@@ -143,6 +143,7 @@ export function createProposePlanTool(opts: ProposePlanToolOptions): ToolSpec {
   return {
     name: "propose_plan",
     riskClass: "read",
+    readOnly: false,
     description: DESCRIPTION,
     parameters: {
       type: "object",

@@ -138,6 +138,7 @@ export function createAskUserTool(opts: AskUserToolOptions): ToolSpec {
   return {
     name: "ask_user",
     riskClass: "read",
+    readOnly: true,
     description: DEFAULT_ASK_USER_DESCRIPTION,
     parameters: {
       type: "object",

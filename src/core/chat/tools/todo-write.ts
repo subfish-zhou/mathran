@@ -305,6 +305,7 @@ export function createTodoWriteTool(opts: CreateTodoWriteToolOptions): ToolSpec 
   return {
     name: "todo_write",
     riskClass: "write",
+    readOnly: false,
     description: DEFAULT_DESCRIPTION,
     parameters: {
       type: "object",

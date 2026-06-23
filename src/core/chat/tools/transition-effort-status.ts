@@ -22,6 +22,7 @@ export function createTransitionEffortStatusTool(
   return {
     name: "transition_effort_status",
     riskClass: "write",
+    readOnly: false,
     description:
       "Apply a guarded status transition to a workspace effort. Enforces VALID_TRANSITIONS — " +
       "DEAD_END / ERRATUM require `reason`, SUPERSEDED requires `supersededBy` (target slug in " +

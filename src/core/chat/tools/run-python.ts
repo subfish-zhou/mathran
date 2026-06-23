@@ -41,6 +41,7 @@ export function createRunPythonTool(
   return {
     name: "run_python",
     riskClass: "exec",
+    readOnly: false,
     description:
       "Run a Python snippet inside this conversation's isolated virtualenv " +
       "(created lazily on first use and reused across turns). Optionally declare " +

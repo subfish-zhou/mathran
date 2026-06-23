@@ -70,6 +70,7 @@ export function createSearchArxivTool(
   return {
     name: "search_arxiv",
     riskClass: "read",
+    readOnly: true,
     description:
       "Search arXiv for papers matching a query. Returns up to `limit` results " +
       "(default 10, max 50), each `{ arxivId, title, authors, abstract, year, url, categories }`. " +

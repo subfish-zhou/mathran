@@ -18,6 +18,7 @@ export function createListProjectsTool(
   return {
     name: "list_projects",
     riskClass: "read",
+    readOnly: true,
     description:
       "List every project in this mathran workspace (each is a directory under `projects/<slug>/` " +
       "with a `project.toml`). " +

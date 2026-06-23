@@ -105,6 +105,11 @@ import { createInstallPythonPackageTool } from "./tools/install-python-package.j
 import { createSearchWebTool } from "./tools/search-web.js";
 import { createVerifyPageTool } from "./tools/verify-page.js";
 import { createSearchArxivTool } from "./tools/search-arxiv.js";
+import {
+  createCompletePlanTool,
+  createEnterPlanModeTool,
+} from "./tools/plan-mode-tools.js";
+import { createGitTools } from "./tools/git-tools.js";
 import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
@@ -167,6 +172,29 @@ export interface ToolSpec {
    */
   riskClass?: RiskClass;
   /**
+   * Plan-mode ACL flag (Part B1).
+   *
+   * When the chat session is in **plan mode** (a read-only "thinking"
+   * phase opted into via `enter_plan_mode`), the dispatcher only allows
+   * tools with `readOnly === true` to execute. All other tools (write,
+   * exec, mutating semantics, side-effecting external calls) are blocked
+   * with `PlanModeBlockedError`, surfaced back to the model as an
+   * `ok: false` tool result so the loop can keep reasoning without
+   * mutating state.
+   *
+   * Optional / defaults to `false`. Backward-compat: any tool that does
+   * not opt in to `readOnly: true` is treated as mutating and therefore
+   * blocked in plan mode. This conservative default mirrors Claude Code's
+   * Plan Mode — unknown / un-classified tools are never silently allowed.
+   *
+   * Note: this is independent of `riskClass`. A tool may have
+   * `riskClass: "read"` and still be `readOnly: false` (e.g.
+   * `propose_goal` / `propose_plan` carry a read risk class but write
+   * goal / plan records to disk on user confirmation). Always classify
+   * `readOnly` by *side effects*, not by the approval risk bucket.
+   */
+  readOnly?: boolean;
+  /**
    * Execute the tool. `args` is the parsed JSON arguments object (or `{}` if
    * the model emitted no/invalid JSON). `ctx` carries optional workspace/scope
    * hints — tools should treat it as advisory and fall back to safe defaults
@@ -174,6 +202,21 @@ export interface ToolSpec {
    * model plus an `ok` flag for callers/loggers.
    */
   execute(args: Record<string, unknown>, ctx?: ToolExecuteContext): Promise<{ ok: boolean; content: string }>;
+}
+
+/**
+ * Part B1 — thrown by the dispatcher when a tool call is rejected because
+ * the chat session is in plan mode and the tool is not `readOnly`. Callers
+ * (the chat loop) catch this and surface it as a regular `ok: false` tool
+ * result so the model can keep reasoning without mutating state.
+ */
+export class PlanModeBlockedError extends Error {
+  readonly toolName: string;
+  constructor(toolName: string) {
+    super(`tool '${toolName}' blocked in plan mode (not read-only)`);
+    this.name = "PlanModeBlockedError";
+    this.toolName = toolName;
+  }
 }
 
 /**
@@ -491,6 +534,28 @@ export interface ChatSessionOptions {
      * plain boolean.
      */
     search_arxiv?: boolean;
+    /**
+     * Part B1 — chat-level plan mode tools (`enter_plan_mode` /
+     * `complete_plan`). Default ON when the host explicitly enables them.
+     * The flag itself is a plain boolean; the tools take no host wiring
+     * beyond a pair of callbacks pointing at
+     * {@link ChatSession.enablePlanMode} /
+     * {@link ChatSession.disablePlanMode}, which the builder wires up.
+     *
+     * Plan mode is an in-memory session flag; it does NOT persist across
+     * session restarts.
+     */
+    plan_mode?: boolean;
+    /**
+     * Part B2 — git inspect/commit chat tools. Registers 4 read-only
+     * tools by default: `git_status`, `git_diff`, `git_log`, `git_branch`.
+     * Pass an object with `allowCommit: true` to additionally register
+     * `git_commit` (riskClass: write, gated by the approval broker).
+     *
+     * cwd is the session workspace; the tools refuse to run outside it
+     * by virtue of being workspace-scoped.
+     */
+    git?: boolean | { allowCommit?: boolean };
   };
   /**
    * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
@@ -759,6 +824,20 @@ export class ChatSession {
   private readonly approvalResolver?: ApprovalResolver;
   /** Permission Profile (#2) — drives the dispatch-level hard reject. */
   private readonly profile?: ProfileEffects;
+  /**
+   * Part B1 — plan mode flag.
+   *
+   * When `true`, the dispatcher (executeWithApproval) only allows tools
+   * with `ToolSpec.readOnly === true` to execute; everything else is
+   * blocked with PlanModeBlockedError, returned to the model as an
+   * `ok: false` tool result. Toggled via {@link enablePlanMode} /
+   * {@link disablePlanMode}.
+   *
+   * Not persisted: every fresh ChatSession starts with `planMode = false`.
+   * The chat-level `enter_plan_mode` / `complete_plan` tools (commit 3)
+   * are the user-visible affordance for toggling it.
+   */
+  private planMode: boolean = false;
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
   private messages: LLMMessage[] = [];
@@ -936,6 +1015,31 @@ export class ChatSession {
    */
   setEffort(level: ReasoningEffortLevel | undefined): void {
     this.currentEffort = level;
+  }
+
+  /**
+   * Part B1 — enter plan mode.
+   *
+   * After this call, every tool invocation in this session is gated by
+   * the dispatcher: only tools with `ToolSpec.readOnly === true` are
+   * allowed; everything else surfaces as an `ok: false` tool result.
+   * Idempotent. Not persisted across session restarts.
+   */
+  enablePlanMode(): void {
+    this.planMode = true;
+  }
+
+  /**
+   * Part B1 — exit plan mode and resume normal tool dispatch.
+   * Idempotent.
+   */
+  disablePlanMode(): void {
+    this.planMode = false;
+  }
+
+  /** Part B1 — inspect the current plan-mode flag (host / test affordance). */
+  isPlanMode(): boolean {
+    return this.planMode;
   }
 
   /** Clear history, keeping any leading system prompt(s). */
@@ -1285,6 +1389,30 @@ export class ChatSession {
     if (cfg.search_arxiv) {
       out.push(createSearchArxivTool());
     }
+    // Part B1 — chat-level plan mode tools. Both tools are readOnly so the
+    // model can always *exit* plan mode after entering it. We bind to
+    // arrow callbacks (NOT bound methods) so the closures keep working
+    // even if the host swaps the session reference later in tests.
+    if (cfg.plan_mode) {
+      const planOpts = {
+        enablePlanMode: () => this.enablePlanMode(),
+        disablePlanMode: () => this.disablePlanMode(),
+      };
+      out.push(createEnterPlanModeTool(planOpts));
+      out.push(createCompletePlanTool(planOpts));
+    }
+    // Part B2 — git inspect / commit tools. Always workspace-scoped; the
+    // commit tool is opt-in via `cfg.git.allowCommit`. `cfg.git === true`
+    // is treated as `{ allowCommit: false }` (inspect-only).
+    if (cfg.git) {
+      const gitCfg = typeof cfg.git === "object" ? cfg.git : {};
+      out.push(
+        ...createGitTools({
+          ...(this.workspace ? { workspace: this.workspace } : {}),
+          ...(gitCfg.allowCommit ? { allowCommit: true } : {}),
+        }),
+      );
+    }
     return out;
   }
 
@@ -1306,6 +1434,19 @@ export class ChatSession {
     parsed: Record<string, unknown>,
     callCtx: ToolExecuteContext,
   ): AsyncGenerator<ChatEvent, { ok: boolean; content: string }, void> {
+    // Part B1 — Plan mode HARD gate. Runs BEFORE permission profiles +
+    // approval broker so even an approved tool cannot run while the
+    // session is in plan mode. Caught by `runRounds` / loop and surfaced
+    // back to the model as an `ok: false` tool result. Tools opt in via
+    // `ToolSpec.readOnly = true`; anything else is blocked.
+    //
+    // Plan-mode toggle tools (`enter_plan_mode` / `complete_plan`) are
+    // themselves classified `readOnly: true` so the model can always
+    // *exit* plan mode — commit 3 ships them.
+    if (this.planMode && tool.readOnly !== true) {
+      throw new PlanModeBlockedError(call.name);
+    }
+
     // Permission Profiles (#2): HARD reject at the dispatch entry — before the
     // approval broker, so the user can never override it. Applies to:
     //   - any tool the active profile explicitly denies (denylistTools), and
@@ -2047,7 +2188,17 @@ export class ChatSession {
                 };
                 throw err;
               }
-              result = { ok: false, content: `error: ${err?.message ?? String(err)}` };
+              if (err instanceof PlanModeBlockedError) {
+                // Part B1 — plan-mode hard gate. Surface a uniform `ok: false`
+                // tool result so the model keeps reasoning in plan mode
+                // without thinking the tool actually ran.
+                result = {
+                  ok: false,
+                  content: `⛔ tool '${err.toolName}' blocked in plan mode (not read-only)`,
+                };
+              } else {
+                result = { ok: false, content: `error: ${err?.message ?? String(err)}` };
+              }
             }
           } else {
             result = result!;

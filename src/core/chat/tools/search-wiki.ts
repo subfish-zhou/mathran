@@ -19,6 +19,7 @@ export function createSearchWikiTool(
   return {
     name: "search_wiki",
     riskClass: "read",
+    readOnly: true,
     description:
       "Search the wiki of a project for a case-insensitive substring. Returns up to `limit` hits " +
       "(default 20, max 100), one per matching page (first line that contains the query). " +

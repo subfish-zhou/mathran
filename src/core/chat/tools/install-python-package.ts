@@ -36,6 +36,7 @@ export function createInstallPythonPackageTool(
   return {
     name: "install_python_package",
     riskClass: "exec",
+    readOnly: false,
     description:
       "Install a pip package into this conversation's isolated virtualenv " +
       "(created lazily if needed). Subsequent run_python calls can import it. " +

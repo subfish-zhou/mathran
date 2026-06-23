@@ -20,6 +20,7 @@ export function createAppendEffortDocumentTool(
   return {
     name: "append_effort_document",
     riskClass: "write",
+    readOnly: false,
     description:
       "Append a markdown chunk to the end of `document.md` (with one leading newline if the file " +
       "is already non-empty). Use this for streaming notes; for full rewrites use " +

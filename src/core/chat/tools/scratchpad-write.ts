@@ -19,6 +19,7 @@ export function createScratchpadWriteTool(
   return {
     name: "scratchpad_write",
     riskClass: "write",
+    readOnly: false,
     description:
       "Write (or overwrite) a named scratchpad scoped to the current conversation. " +
       "Use this to persist working notes across turns within the conversation.",

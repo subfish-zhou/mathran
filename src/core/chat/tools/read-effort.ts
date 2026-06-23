@@ -21,6 +21,7 @@ export function createReadEffortTool(
   return {
     name: "read_effort",
     riskClass: "read",
+    readOnly: true,
     description:
       "Read a workspace effort: returns `effort.toml` metadata (id, type, status, statusHistory, ...) " +
       "and the full `document.md` body. " +

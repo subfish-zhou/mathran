@@ -20,6 +20,7 @@ export function createAddEffortRelationTool(
   return {
     name: "add_effort_relation",
     riskClass: "write",
+    readOnly: false,
     description:
       "Add a typed relationship edge between two efforts in the same project. " +
       `Valid types: ${VALID_RELATION_TYPES.join(", ")}. ` +
