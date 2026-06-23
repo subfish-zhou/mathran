@@ -200,6 +200,21 @@ export interface ToolSpec {
 }
 
 /**
+ * Part B1 — thrown by the dispatcher when a tool call is rejected because
+ * the chat session is in plan mode and the tool is not `readOnly`. Callers
+ * (the chat loop) catch this and surface it as a regular `ok: false` tool
+ * result so the model can keep reasoning without mutating state.
+ */
+export class PlanModeBlockedError extends Error {
+  readonly toolName: string;
+  constructor(toolName: string) {
+    super(`tool '${toolName}' blocked in plan mode (not read-only)`);
+    this.name = "PlanModeBlockedError";
+    this.toolName = toolName;
+  }
+}
+
+/**
  * Minimal subagent-result shape carried on the `subagent-completed` ChatEvent
  * (#3). A trimmed projection of `SubagentResult` so the host SSE layer can ship
  * the essentials without the SPA depending on the full kernel type.
@@ -782,6 +797,20 @@ export class ChatSession {
   private readonly approvalResolver?: ApprovalResolver;
   /** Permission Profile (#2) — drives the dispatch-level hard reject. */
   private readonly profile?: ProfileEffects;
+  /**
+   * Part B1 — plan mode flag.
+   *
+   * When `true`, the dispatcher (executeWithApproval) only allows tools
+   * with `ToolSpec.readOnly === true` to execute; everything else is
+   * blocked with PlanModeBlockedError, returned to the model as an
+   * `ok: false` tool result. Toggled via {@link enablePlanMode} /
+   * {@link disablePlanMode}.
+   *
+   * Not persisted: every fresh ChatSession starts with `planMode = false`.
+   * The chat-level `enter_plan_mode` / `complete_plan` tools (commit 3)
+   * are the user-visible affordance for toggling it.
+   */
+  private planMode: boolean = false;
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
   private messages: LLMMessage[] = [];
@@ -959,6 +988,31 @@ export class ChatSession {
    */
   setEffort(level: ReasoningEffortLevel | undefined): void {
     this.currentEffort = level;
+  }
+
+  /**
+   * Part B1 — enter plan mode.
+   *
+   * After this call, every tool invocation in this session is gated by
+   * the dispatcher: only tools with `ToolSpec.readOnly === true` are
+   * allowed; everything else surfaces as an `ok: false` tool result.
+   * Idempotent. Not persisted across session restarts.
+   */
+  enablePlanMode(): void {
+    this.planMode = true;
+  }
+
+  /**
+   * Part B1 — exit plan mode and resume normal tool dispatch.
+   * Idempotent.
+   */
+  disablePlanMode(): void {
+    this.planMode = false;
+  }
+
+  /** Part B1 — inspect the current plan-mode flag (host / test affordance). */
+  isPlanMode(): boolean {
+    return this.planMode;
   }
 
   /** Clear history, keeping any leading system prompt(s). */
@@ -1329,6 +1383,19 @@ export class ChatSession {
     parsed: Record<string, unknown>,
     callCtx: ToolExecuteContext,
   ): AsyncGenerator<ChatEvent, { ok: boolean; content: string }, void> {
+    // Part B1 — Plan mode HARD gate. Runs BEFORE permission profiles +
+    // approval broker so even an approved tool cannot run while the
+    // session is in plan mode. Caught by `runRounds` / loop and surfaced
+    // back to the model as an `ok: false` tool result. Tools opt in via
+    // `ToolSpec.readOnly = true`; anything else is blocked.
+    //
+    // Plan-mode toggle tools (`enter_plan_mode` / `complete_plan`) are
+    // themselves classified `readOnly: true` so the model can always
+    // *exit* plan mode — commit 3 ships them.
+    if (this.planMode && tool.readOnly !== true) {
+      throw new PlanModeBlockedError(call.name);
+    }
+
     // Permission Profiles (#2): HARD reject at the dispatch entry — before the
     // approval broker, so the user can never override it. Applies to:
     //   - any tool the active profile explicitly denies (denylistTools), and
@@ -2070,7 +2137,17 @@ export class ChatSession {
                 };
                 throw err;
               }
-              result = { ok: false, content: `error: ${err?.message ?? String(err)}` };
+              if (err instanceof PlanModeBlockedError) {
+                // Part B1 — plan-mode hard gate. Surface a uniform `ok: false`
+                // tool result so the model keeps reasoning in plan mode
+                // without thinking the tool actually ran.
+                result = {
+                  ok: false,
+                  content: `⛔ tool '${err.toolName}' blocked in plan mode (not read-only)`,
+                };
+              } else {
+                result = { ok: false, content: `error: ${err?.message ?? String(err)}` };
+              }
             }
           } else {
             result = result!;
