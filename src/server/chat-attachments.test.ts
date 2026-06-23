@@ -52,6 +52,33 @@ function nullLlm(): LLMProvider {
   };
 }
 
+/**
+ * Vision-aware fake LLM that also records the most recent `messages`
+ * payload so the test can assert image parts survived the round-trip from
+ * the SPA → chat-attachments → ChatSession.send() pipeline.
+ *
+ * `supportsVision = true` flips the server's `providerSupportsVision()`
+ * probe in `serve.ts` so attachments render as `ContentPart[]`.
+ */
+function visionLlm(): LLMProvider & { lastMessages: LLMRequest["messages"] | null } {
+  const adapter = {
+    lastMessages: null as LLMRequest["messages"] | null,
+    supportsVision: true as const,
+    async describe() {
+      return { name: "vision-fake" };
+    },
+    async chat(req: LLMRequest): Promise<LLMResponse> {
+      adapter.lastMessages = req.messages;
+      return {
+        async *stream(): AsyncIterable<LLMStreamChunk> {
+          yield { type: "done", finishReason: "stop" };
+        },
+      };
+    },
+  };
+  return adapter;
+}
+
 let workspace: string;
 let server: RunningServer;
 let base: string;
@@ -201,6 +228,70 @@ describe("buildUserMessageWithAttachments (unit)", () => {
       ]),
     ).rejects.toBeInstanceOf(BadAttachmentError);
   });
+
+  // ---- C-round Commit 3 vision tests ----------------------------------
+  it("enableVision=true: image attachment returns ContentPart[] with base64 image part", async () => {
+    // Write a tiny image directly under uploads (skip the upload route).
+    const uploadsDir = path.join(workspace, ".mathran", "uploads");
+    await fs.mkdir(uploadsDir, { recursive: true });
+    const imgPath = path.join(uploadsDir, "vision-test.png");
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    await fs.writeFile(imgPath, pngBytes);
+
+    const result = await buildUserMessageWithAttachments(
+      workspace,
+      "what is this?",
+      [{ path: imgPath, filename: "vision-test.png", mimeType: "image/png" }],
+      { enableVision: true },
+    );
+    expect(Array.isArray(result)).toBe(true);
+    const parts = result as Array<
+      | { type: "text"; text: string }
+      | { type: "image"; mimeType: string; dataBase64: string }
+    >;
+    // [text-with-body, image-part]
+    expect(parts).toHaveLength(2);
+    expect(parts[0]).toEqual({ type: "text", text: "what is this?" });
+    expect(parts[1].type).toBe("image");
+    expect((parts[1] as any).mimeType).toBe("image/png");
+    expect((parts[1] as any).dataBase64).toBe(pngBytes.toString("base64"));
+  });
+
+  it("enableVision=true but oversize image: degrades to text marker with size hint", async () => {
+    // 5 MB > MAX_INLINE_IMAGE_BYTES (4 MB) — the renderer must NOT inline.
+    const uploadsDir = path.join(workspace, ".mathran", "uploads");
+    await fs.mkdir(uploadsDir, { recursive: true });
+    const imgPath = path.join(uploadsDir, "huge.png");
+    const big = Buffer.alloc(5 * 1024 * 1024, 0xaa);
+    await fs.writeFile(imgPath, big);
+
+    const result = await buildUserMessageWithAttachments(
+      workspace,
+      "check",
+      [{ path: imgPath, filename: "huge.png", mimeType: "image/png" }],
+      { enableVision: true },
+    );
+    // Falls back to a string — not ContentPart[].
+    expect(typeof result).toBe("string");
+    expect(result as string).toContain("too-large-for-inline-vision");
+    expect(result as string).toContain("[Image: huge.png");
+  });
+
+  it("enableVision=false: image attachment stays a `[Image: ...]` text marker (legacy)", async () => {
+    const uploadsDir = path.join(workspace, ".mathran", "uploads");
+    await fs.mkdir(uploadsDir, { recursive: true });
+    const imgPath = path.join(uploadsDir, "legacy.png");
+    await fs.writeFile(imgPath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+
+    const result = await buildUserMessageWithAttachments(
+      workspace,
+      "hi",
+      [{ path: imgPath, filename: "legacy.png", mimeType: "image/png" }],
+      { enableVision: false },
+    );
+    expect(typeof result).toBe("string");
+    expect(result as string).toMatch(/^hi\n\n\[Image: legacy\.png @ /);
+  });
 });
 
 describe("POST /api/global-chat with attachments", () => {
@@ -311,5 +402,127 @@ describe("POST /api/global-chat with attachments", () => {
     // attachment block (no leading blank line).
     expect(userMsg!.content.startsWith("[Attachment: notes.txt]\n")).toBe(true);
     expect(userMsg!.content).toContain("just a note");
+  });
+});
+
+describe("POST /api/global-chat with attachments (C-round vision)", () => {
+  let visionWorkspace: string;
+  let visionServer: RunningServer;
+  let visionBase: string;
+  let lastVisionLlm: ReturnType<typeof visionLlm>;
+
+  beforeAll(async () => {
+    visionWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-vision-attach-"));
+    visionServer = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace: visionWorkspace,
+      chatSessionFactory: ({ model }) => {
+        lastVisionLlm = visionLlm();
+        return new ChatSession({ llm: lastVisionLlm, model });
+      },
+    });
+    visionBase = visionServer.url;
+  });
+
+  afterAll(async () => {
+    await visionServer.close();
+    await fs.rm(visionWorkspace, { recursive: true, force: true });
+  });
+
+  async function uploadVision(
+    filename: string,
+    mimeType: string,
+    bytes: Uint8Array,
+  ): Promise<{ path: string; filename: string; mimeType: string; size: number }> {
+    const form = new FormData();
+    form.set(
+      "file",
+      new Blob([bytes as unknown as BlobPart], { type: mimeType }),
+      filename,
+    );
+    const res = await fetch(`${visionBase}/api/uploads`, { method: "POST", body: form });
+    expect(res.status).toBe(200);
+    return (await res.json()) as any;
+  }
+
+  async function postChatVision(
+    message: string,
+    attachments: Array<{ path: string; filename: string; mimeType: string; size?: number }>,
+  ): Promise<{ status: number; conversationId: string | null }> {
+    const res = await fetch(`${visionBase}/api/global-chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message, attachments }),
+    });
+    if (res.status !== 200) {
+      return { status: res.status, conversationId: null };
+    }
+    let conversationId: string | null = null;
+    // Drain the SSE stream so the kernel actually runs the round.
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value);
+      const sessIdx = buf.indexOf("event: session");
+      if (conversationId === null && sessIdx >= 0) {
+        const m = buf.slice(sessIdx).match(/"conversationId":"([^"]+)"/);
+        if (m) conversationId = m[1];
+      }
+    }
+    return { status: res.status, conversationId };
+  }
+
+  it("vision-enabled provider: image attachment reaches LLM as ContentPart[] image part", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const up = await uploadVision("see-me.png", "image/png", png);
+    const { status, conversationId } = await postChatVision("describe this please", [up]);
+    expect(status).toBe(200);
+    expect(conversationId).not.toBeNull();
+
+    // The fake LLM captured `req.messages`; the LAST user turn should
+    // carry a ContentPart[] with one image part.
+    const captured = lastVisionLlm.lastMessages;
+    expect(captured).not.toBeNull();
+    const userTurn = captured!.find((m) => m.role === "user")!;
+    expect(Array.isArray(userTurn.content)).toBe(true);
+    const parts = userTurn.content as Array<{ type: string; mimeType?: string }>;
+    const imgPart = parts.find((p) => p.type === "image");
+    expect(imgPart).toBeDefined();
+    expect(imgPart!.mimeType).toBe("image/png");
+
+    // History persistence: .jsonl flattens the ContentPart[] to a text
+    // marker so disk usage stays bounded.
+    const file = path.join(
+      visionWorkspace,
+      ".mathran",
+      "global-chat",
+      `${conversationId}.jsonl`,
+    );
+    const raw = await fs.readFile(file, "utf-8");
+    const lines = raw.trim().split("\n").map((l) => JSON.parse(l));
+    const userLine = lines.find((l: any) => l.role === "user")!;
+    expect(typeof userLine.content).toBe("string");
+    expect(userLine.content).toContain("[Image: image/png]");
+    expect(userLine.content).toContain("describe this please");
+  });
+
+  it("vision-enabled provider: textual attachment still collapses to a plain string user turn", async () => {
+    // No image → enableVision doesn't matter; the legacy string path runs.
+    const up = await uploadVision(
+      "plain.txt",
+      "text/plain",
+      new TextEncoder().encode("hello world"),
+    );
+    const { status } = await postChatVision("summarize", [up]);
+    expect(status).toBe(200);
+    const userTurn = lastVisionLlm.lastMessages!.find((m) => m.role === "user")!;
+    expect(typeof userTurn.content).toBe("string");
+    expect(userTurn.content as string).toContain("summarize");
+    expect(userTurn.content as string).toContain("[Attachment: plain.txt]");
+    expect(userTurn.content as string).toContain("hello world");
   });
 });

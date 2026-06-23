@@ -6,7 +6,7 @@
  * trailing `role:"tool"` message must include `tool_call_id`.
  */
 import { describe, it, expect } from "vitest";
-import { buildOpenAIParams } from "./openai-common.js";
+import { buildOpenAIParams, toOpenAIContent } from "./openai-common.js";
 import type { LLMRequest } from "../../core/providers/llm.js";
 
 describe("buildOpenAIParams", () => {
@@ -100,5 +100,51 @@ describe("buildOpenAIParams", () => {
     const params = buildOpenAIParams(req, "gpt-test");
     expect(params.messages[0].content).toBe("Let me check that.");
     expect(params.messages[0].tool_calls).toHaveLength(1);
+  });
+});
+
+describe("toOpenAIContent (C-round vision)", () => {
+  it("keeps plain strings as plain strings", () => {
+    expect(toOpenAIContent("text-only")).toBe("text-only");
+  });
+
+  it("emits {type:'image_url', image_url:{url:'data:<mime>;base64,<b64>'}} for image parts", () => {
+    const parts = toOpenAIContent([
+      { type: "text", text: "caption" },
+      { type: "image", mimeType: "image/png", dataBase64: "AAAA" },
+    ]);
+    expect(parts).toEqual([
+      { type: "text", text: "caption" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+    ]);
+  });
+});
+
+describe("buildOpenAIParams (C-round vision)", () => {
+  it("forwards ContentPart[] image parts onto the user turn as image_url blocks", () => {
+    const req: LLMRequest = {
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: "S" },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            { type: "image", mimeType: "image/jpeg", dataBase64: "////" },
+          ],
+        },
+      ],
+    };
+    const params = buildOpenAIParams(req, "gpt-4o");
+    // system turn stays a plain string (OpenAI rejects image_url on system)
+    expect(params.messages[0]).toEqual({ role: "system", content: "S" });
+    // user turn promotes to multimodal parts[]
+    expect(params.messages[1]).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "what is this?" },
+        { type: "image_url", image_url: { url: "data:image/jpeg;base64,////" } },
+      ],
+    });
   });
 });
