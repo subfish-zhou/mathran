@@ -12,6 +12,11 @@
  *      the `/profile` listing.
  *   4. {@link isMutatingCall} — the single source of truth for "does this tool
  *      call mutate?", used by the dispatch hard-reject (ci / review).
+ *   5. {@link matchAutoApprovePattern} — checks whether a tool call's `path`
+ *      argument matches a profile-declared autoApprovePattern. The broker uses
+ *      this as a pre-prompt allow signal — but the denylist + dispatch-level
+ *      hard reject still win (denylist > hardReject > autoApprovePattern >
+ *      user prompt).
  *
  * Profiles never weaken the denylist (重要约束): {@link ProfileEffects.denylistTools}
  * is always merged *on top of* the settings denylist by the caller.
@@ -20,7 +25,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { MATHRAN_DIR } from "../config/mathran-root.js";
+import { MATHRAN_DIR, SETTINGS_FILE } from "../config/mathran-root.js";
 import { DEFAULT_APPROVAL_POLICY } from "../approval/types.js";
 import type { RiskClass } from "../approval/types.js";
 import { BUILTIN_PROFILES, BUILTIN_PROFILE_NAMES } from "./builtin-profiles.js";
@@ -126,6 +131,25 @@ export function resolveProfile(
   opts: ProfileResolveOpts = {},
 ): ProfileEffects {
   return resolveProfileEffects(loadProfileDefinition(name, opts));
+}
+
+/**
+ * Read `settings.json#profile` from a workspace root, returning the default
+ * profile name (or undefined when settings.json is absent / malformed / lacks
+ * a `profile` field). Used by `mathran chat` and `mathran serve` so both CLIs
+ * share the same `--flag > settings > none` fallback chain.
+ */
+export function readSettingsDefaultProfile(workspace: string): string | undefined {
+  const file = path.join(workspace, MATHRAN_DIR, SETTINGS_FILE);
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf-8"));
+    if (parsed && typeof parsed === "object" && typeof parsed.profile === "string") {
+      return parsed.profile;
+    }
+  } catch {
+    /* no settings / malformed → no default profile */
+  }
+  return undefined;
 }
 
 export interface AvailableProfile {
@@ -270,4 +294,88 @@ export function isMutatingCall(
   }
   // Generic: writes / network / arbitrary execution mutate; reads do not.
   return riskClass === "write" || riskClass === "net" || riskClass === "exec";
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// autoApprovePatterns — pre-prompt allow signal for the approval broker
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Tools whose `path` argument is a workspace file path that may be matched
+ * against an autoApprovePattern glob (i.e. write-style tools where the path
+ * is the meaningful subject of approval).
+ *
+ * NOTE (intentional restriction — see PLAN.md §1 "安全保留"):
+ *   - `bash` / `lean_check` (command-driven tools) are NOT in this list. An
+ *     autoApprovePattern containing `*` must NEVER auto-approve `bash` — the
+ *     denylist + suspicious-command checks are the only gates for shell.
+ *   - Read tools never reach the broker (pass-through in the policy matrix),
+ *     so there is no need to consider them here.
+ */
+const PATH_PATTERNABLE_TOOLS: ReadonlySet<string> = new Set([
+  "write_file",
+  "edit_file",
+]);
+
+/**
+ * Convert a glob (supporting `*` and `**`) to a RegExp. `**` matches across
+ * path separators; `*` matches within a single segment.
+ *
+ * (Local copy — duplicating the approval/rules.ts version keeps the profile
+ * module free of cross-imports from the approval module, mirroring how
+ * `isReadOnlyShellCommand` lives here rather than in approval/.)
+ */
+function globToRegExp(glob: string): RegExp {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        re += ".*";
+        i++;
+        // Swallow a trailing slash after `**` so `src/**` matches `src/a`.
+        if (glob[i + 1] === "/") i++;
+      } else {
+        re += "[^/]*";
+      }
+    } else if ("\\^$.|?+()[]{}".includes(c)) {
+      re += "\\" + c;
+    } else {
+      re += c;
+    }
+  }
+  return new RegExp(`^${re}$`);
+}
+
+/**
+ * True when the tool call's `path` argument matches any of the supplied
+ * autoApprovePatterns. Returns the matched pattern, or `null` when:
+ *   - the tool is not a path-pattern-able tool (PATH_PATTERNABLE_TOOLS),
+ *   - the call carries no `path` arg,
+ *   - or no pattern matches.
+ *
+ * This is a *pre-prompt allow signal*. The caller (broker) must still apply
+ * the denylist + dispatch-level hard reject BEFORE consulting this — so a
+ * match here can never override a denylist veto or a `readOnlyMode` /
+ * `hardRejectMutations` profile.
+ */
+export function matchAutoApprovePattern(
+  tool: string,
+  args: Record<string, unknown>,
+  patterns: readonly string[],
+): string | null {
+  if (!PATH_PATTERNABLE_TOOLS.has(tool)) return null;
+  if (!patterns.length) return null;
+  const pathArg = typeof args.path === "string" ? args.path : "";
+  if (!pathArg) return null;
+  for (const pattern of patterns) {
+    if (!pattern) continue;
+    try {
+      if (globToRegExp(pattern).test(pathArg)) return pattern;
+    } catch {
+      // Malformed pattern → skip (warn-and-ignore, never crash a round).
+      continue;
+    }
+  }
+  return null;
 }

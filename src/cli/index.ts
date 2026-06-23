@@ -625,9 +625,17 @@ program
   .option("--port <port>", "Port to listen on (default 7878)")
   .option("--host <host>", "Host/address to bind (default 127.0.0.1; do not expose publicly)")
   .option("--workspace <dir>", "Workspace root (overrides MATHRAN_WORKSPACE and the default)")
-  .action(async (opts: { port?: string; host?: string; workspace?: string }) => {
+  .option("--profile <name>", "Permission profile to apply (dev|ci|review or a custom .mathran/profiles/<name>.json)")
+  .action(async (opts: { port?: string; host?: string; workspace?: string; profile?: string }) => {
     const { runServe } = await import("./commands/serve.js");
-    process.exit(await runServe({ port: opts.port, host: opts.host, workspace: opts.workspace }));
+    process.exit(
+      await runServe({
+        port: opts.port,
+        host: opts.host,
+        workspace: opts.workspace,
+        ...(opts.profile ? { profile: opts.profile } : {}),
+      }),
+    );
   });
 
 program

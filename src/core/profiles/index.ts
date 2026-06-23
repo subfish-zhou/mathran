@@ -19,9 +19,11 @@ export {
   loadProfileDefinition,
   resolveProfileEffects,
   resolveProfile,
+  readSettingsDefaultProfile,
   listAvailableProfiles,
   isMutatingCall,
   isReadOnlyShellCommand,
+  matchAutoApprovePattern,
   type ProfileResolveOpts,
   type AvailableProfile,
 } from "./profile-resolver.js";

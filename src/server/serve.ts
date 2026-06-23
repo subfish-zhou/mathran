@@ -99,6 +99,12 @@ import {
   defaultSubagentRegistry,
 } from "../core/subagent/index.js";
 import {
+  resolveProfile,
+  readSettingsDefaultProfile,
+  UnknownProfileError,
+  type ProfileEffects,
+} from "../core/profiles/index.js";
+import {
   createOpenAITokenCounter,
   createAnthropicTokenCounter,
   createFallbackTokenCounter,
@@ -218,6 +224,13 @@ export interface StartServerOptions {
    * omitted the server wires a `ModelRouter` from `<workspace>/config.toml`.
    */
   goalLlmFactory?: GoalLLMFactory;
+  /**
+   * Permission profile name applied to EVERY chat session this server creates
+   * (C-1). Falls back to `settings.json#profile` when omitted. Unknown profile
+   * names are logged and ignored (no profile applied), matching
+   * `mathran chat --profile` behaviour.
+   */
+  profile?: string;
 }
 
 export interface RunningServer {
@@ -226,6 +239,8 @@ export interface RunningServer {
   host: string;
   port: number;
   workspace: string;
+  /** Active permission profile name (when one resolved successfully). */
+  profile?: string;
 }
 
 // ─── Small fs / parsing helpers ──────────────────────────────────────────────
@@ -697,6 +712,7 @@ async function writeProviders(workspace: string, payload: any): Promise<Record<s
 export function defaultSessionFactory(
   workspace: string,
   approvalRegistry: ApprovalRegistry = sharedApprovalRegistry,
+  profile?: ProfileEffects,
 ): ChatSessionFactory {
   return ({ model, scope, conversationId, autoRunGoal, autoRunPlan }) => {
     const config = loadConfig(configPathFor(workspace));
@@ -737,15 +753,29 @@ export function defaultSessionFactory(
       // eslint-disable-next-line no-console
       console.warn(`[mathran] ${w}`);
     }
+    // Permission profile (C-1): when supplied by `startServer`, the profile
+    // overrides the settings policy, adds denylistTools on top of the settings
+    // denylist, and supplies autoApprovePatterns to the broker. The profile
+    // ALSO threads into ChatSession so the dispatch-level hard reject
+    // (readOnlyMode / hardRejectMutations) fires BEFORE the broker is asked.
+    const effectivePolicy = profile?.policy ?? approvalCfg.policy;
+    const effectiveDenylist = profile
+      ? [
+          ...approvalCfg.denylist,
+          ...profile.denylistTools.map((t) => `${t}:*`),
+        ]
+      : approvalCfg.denylist;
+    const effectiveAutoApprovePatterns = profile?.autoApprovePatterns ?? [];
     const approvalBroker = new ApprovalBroker({
-      policy: approvalCfg.policy,
+      policy: effectivePolicy,
       workspace: scopedWorkspace,
       learning: approvalCfg.learning,
       proposeAfter: approvalCfg.proposeAfter,
       inlineRules: approvalCfg.inlineRules,
-      denylist: approvalCfg.denylist,
+      denylist: effectiveDenylist,
       rulesFiles: approvalCfg.rulesFiles,
       persistentRuleFile: approvalCfg.persistentRuleFile,
+      autoApprovePatterns: effectiveAutoApprovePatterns,
       history: historyFor(approvalCfg),
     });
     const approvalResolver = conversationId
@@ -757,6 +787,11 @@ export function defaultSessionFactory(
       model: resolvedModel,
       approvalBroker,
       ...(approvalResolver ? { approvalResolver } : {}),
+      // C-1: when a profile is active, thread it into the session so the
+      // dispatch-level hard reject (readOnlyMode / hardRejectMutations /
+      // denylistTools) fires BEFORE the broker is consulted — i.e. even a
+      // user `allow` decision cannot override it.
+      ...(profile ? { profile } : {}),
       // T1-D: thread workspace + scope into tools so lean_check (and future
       // wiki/effort tools) can resolve project-relative paths. BUG #7 fix.
       // v0.5 §2: workspace is now scope-narrowed so fs tools land inside the
@@ -4012,7 +4047,30 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
   const host = opts.host ?? DEFAULT_HOST;
   const port = opts.port ?? DEFAULT_PORT;
   const workspace = resolveWorkspaceRoot(opts.workspace);
-  const factory = opts.chatSessionFactory ?? defaultSessionFactory(workspace);
+
+  // Permission profile (C-1): `--profile <name>` flag > `settings.json#profile`
+  // > none. Unknown profile names are warned to stderr and ignored (matches
+  // `mathran chat` behaviour). The resolved profile is threaded into the
+  // session factory so every SPA conversation inherits its effects.
+  const profileName =
+    opts.profile ?? (await readSettingsDefaultProfileLazy(workspace));
+  let resolvedProfile: ProfileEffects | undefined;
+  if (profileName) {
+    try {
+      resolvedProfile = resolveProfile(profileName, { workspace });
+    } catch (err) {
+      if (err instanceof UnknownProfileError) {
+        // eslint-disable-next-line no-console
+        console.error(`[mathran] ${err.message}`);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  const factory =
+    opts.chatSessionFactory ??
+    defaultSessionFactory(workspace, sharedApprovalRegistry, resolvedProfile);
 
   const app = buildApp(workspace, factory, opts.goalLlmFactory);
 
@@ -4030,5 +4088,24 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
       server.close((err?: unknown) => (err ? reject(err) : resolve()));
     });
 
-  return { close, url, host, port: boundPort, workspace };
+  return {
+    close,
+    url,
+    host,
+    port: boundPort,
+    workspace,
+    ...(resolvedProfile ? { profile: resolvedProfile.name } : {}),
+  };
+}
+
+/**
+ * Wrap the synchronous `readSettingsDefaultProfile` in a Promise so `startServer`
+ * can `await` it. The underlying I/O is `fs.readFileSync` — fine for a one-shot
+ * read during process startup, but the Promise wrap keeps the call site uniform
+ * with the rest of the async server boot.
+ */
+async function readSettingsDefaultProfileLazy(
+  workspace: string,
+): Promise<string | undefined> {
+  return readSettingsDefaultProfile(workspace);
 }
