@@ -66,6 +66,7 @@ export const NEW_BUILTIN_SLASH_COMMANDS: readonly BuiltinSlashCommandSpec[] = [
   { name: "diff", description: "Show file checkpoints / a checkpoint diff (use /diff <id> | last)" },
   { name: "rewind", description: "Restore files to before a checkpoint (use /rewind <N> | <id>)" },
   { name: "agents", description: "List available and active sub-agents" },
+  { name: "mcp", description: "List MCP servers / tools (use /mcp <name> status|tools|reload)" },
   { name: "skills", description: "List layered skills (project / workspace / user)" },
   { name: "hooks", description: "List/log/bypass layered hooks (post-edit / pre-commit / …)" },
   { name: "outcomes", description: "List self-graded goal outcomes (use /outcomes <id> | delete <id>)" },

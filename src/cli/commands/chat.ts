@@ -28,6 +28,16 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { loadConfig } from "../../core/config.js";
 import {
+  getGlobalMcpRegistry,
+  type McpRegistry,
+} from "../../core/mcp/index.js";
+import {
+  formatMcpStatusList,
+  formatMcpServerDetail,
+  formatMcpToolsList,
+  parseMcpSubcommand,
+} from "../../core/mcp/format.js";
+import {
   ChatSession,
   createLeanCheckTool,
   renderTranscriptMarkdown,
@@ -156,6 +166,13 @@ export interface BuildSessionOptions {
    * `medium`. An invalid string is ignored (falls through the cascade).
    */
   effort?: string;
+  /**
+   * MCP client registry (#4). When provided, its connected servers' tools are
+   * injected into the built session's toolset (namespaced `mcp__<server>__…`).
+   * The REPL passes the process-level singleton after `init()`; one-shot / test
+   * callers omit it (no MCP tools).
+   */
+  mcpRegistry?: McpRegistry;
 }
 
 /**
@@ -500,6 +517,7 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
       : { layeredMemory: { workspace } }),
     ...(layeredSkills.length > 0 ? { layeredSkills } : {}),
     ...(profile ? { profile } : {}),
+    ...(opts.mcpRegistry ? { mcpRegistry: opts.mcpRegistry } : {}),
   });
 
   return { session, model, providerKey, hookInvoker, conversationId, ...(profile ? { profile } : {}) };
@@ -701,13 +719,14 @@ export interface SlashContext {
   /**
    * Conversation id namespacing this REPL's auto-checkpoints (/diff +
    * rewind). Defaults to the session's id when unset.
-   */
-  checkpointConversationId?: string;
+   */  checkpointConversationId?: string;
   /**
    * Workspace root holding the checkpoint cache. Defaults to
    * {@link SlashContext.memoryWorkspace} then `process.cwd()`.
    */
   checkpointWorkspace?: string;
+  /** MCP registry (#4) for the `/mcp` slash command. */
+  mcpRegistry?: McpRegistry;
 }
 
 const HELP_TEXT = `commands:
@@ -729,6 +748,7 @@ const HELP_TEXT = `commands:
   /diff                    list file checkpoints (use /diff <id> | /diff last to view a diff)
   /rewind                  list checkpoints (use /rewind <N> | /rewind <id> to roll back)
   /agents                  list available sub-agent kinds (+ active)
+  /mcp                     list MCP servers (use /mcp <name> [status|tools|reload], /mcp reload-all)
   /review                  print the preset review prompt (MVP stub)
   /memory                  show MATHRAN.md memory (use /memory help for sub-commands)
   /system [text]           show or replace the system prompt (resets history)
@@ -1014,6 +1034,52 @@ export async function handleSlashCommand(
       };
     }
 
+    case "/mcp": {
+      const registry = ctx.mcpRegistry;
+      if (!registry) {
+        return { kind: "continue", output: "MCP is not available in this session." };
+      }
+      const sub = parseMcpSubcommand(arg);
+      switch (sub.kind) {
+        case "list":
+          return { kind: "continue", output: formatMcpStatusList(registry.status()) };
+        case "status":
+          return {
+            kind: "continue",
+            output: formatMcpServerDetail(registry.statusFor(sub.server), sub.server),
+          };
+        case "tools":
+          return {
+            kind: "continue",
+            output: formatMcpToolsList(sub.server, registry.toolsFor(sub.server)),
+          };
+        case "reload": {
+          const info = await registry.reload(sub.server);
+          if (!info) {
+            return {
+              kind: "continue",
+              output: `no MCP server named "${sub.server}" (try /mcp for the list).`,
+            };
+          }
+          return {
+            kind: "continue",
+            output: `reloaded "${sub.server}" → ${info.status} (tools: ${info.toolCount}).` +
+              (info.lastError ? `\n  lastError: ${info.lastError}` : ""),
+          };
+        }
+        case "reload-all": {
+          const all = await registry.reloadAll();
+          return {
+            kind: "continue",
+            output: `reloaded ${all.length} server(s).\n${formatMcpStatusList(all)}`,
+          };
+        }
+        case "error":
+          return { kind: "continue", output: `mathran: ${sub.message}` };
+      }
+      return { kind: "continue" };
+    }
+
     case "/effort": {
       if (!arg) {
         const current = getSessionReasoningEffort(ctx.session);
@@ -1260,6 +1326,23 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
   const workspace = process.env.MATHRAN_WORKSPACE ?? process.cwd();
   const memInfo = detectMemoryFiles(workspace);
 
+  // MCP (#4): bring up the process-level registry before the session so its
+  // tools are available from the first turn. Best-effort — a failed server
+  // lands in its own status and never blocks the REPL.
+  const mcpRegistry = getGlobalMcpRegistry();
+  try {
+    await mcpRegistry.init({ workspace });
+    const connected = mcpRegistry.status().filter((s) => s.status === "connected");
+    if (connected.length > 0) {
+      const toolCount = connected.reduce((n, s) => n + s.toolCount, 0);
+      console.log(
+        `MCP: ${connected.length} server(s) connected, ${toolCount} tool(s). /mcp for details.`,
+      );
+    }
+  } catch (err) {
+    console.error(`mathran: MCP init failed: ${(err as Error)?.message ?? err}`);
+  }
+
   // v0.16 §11: create the readline interface BEFORE the ChatSession so
   // we can hand the session an `ask_user` resolver bound to this rl. We
   // pause the prompt while the resolver awaits input so the user's reply
@@ -1283,6 +1366,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
       askUserResolver,
       approvalResolver,
       ruleProposalResolver,
+      mcpRegistry,
       ...(opts.profile ? { profile: opts.profile } : {}),
     });
 
@@ -1337,6 +1421,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           promptReload,
           checkpointConversationId: conversationId,
           checkpointWorkspace: workspace,
+          mcpRegistry,
           ...(profile ? { profileName: profile.name } : {}),
         });
         if (result.output) console.log(result.output);
@@ -1347,6 +1432,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
             askUserResolver,
             approvalResolver,
             ruleProposalResolver,
+            mcpRegistry,
           });
           session = built.session;
           model = built.model;
@@ -1374,6 +1460,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
   }
 
   rl.close();
+  await mcpRegistry.shutdown().catch(() => {});
   console.log("bye.");
   return 0;
 }
