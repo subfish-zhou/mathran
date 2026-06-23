@@ -86,6 +86,11 @@ function coerceReferences(raw: unknown): ParsedReference[] {
   return out;
 }
 
+function coerceSeedPdfs(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((p): p is string => typeof p === "string" && p.length > 0);
+}
+
 function coerceAiInit(raw: unknown): AiInitConfig {
   const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const depth = r.searchDepth;
@@ -122,6 +127,7 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
     const problem = coerceProblem(b.problem);
     if (!problem) return c.json({ error: "problem.title is required" }, 400);
     const seedReferences = coerceReferences(b.seedReferences);
+    const seedPdfs = coerceSeedPdfs(b.seedPdfs);
     const aiInit = coerceAiInit(b.aiInit);
 
     // Scaffold the project (fs). Returns the slug.
@@ -139,7 +145,7 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
       return c.json({ projectSlug: slug, runId: null, aiAssisted: false }, 201);
     }
 
-    const input: InitAgentInput = { problem, seedReferences, aiInit };
+    const input: InitAgentInput = { problem, seedReferences, aiInit, seedPdfs };
     const run = await createRun(projectDir, {
       runId: newRunId(),
       input: {
@@ -150,6 +156,7 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
         problem: problem as unknown as Record<string, unknown>,
         seedReferences: seedReferences as unknown as Record<string, unknown>[],
         aiInit: aiInit as unknown as Record<string, unknown>,
+        seedPdfs,
       },
     });
 
@@ -275,11 +282,12 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
     const problem = coerceProblem(body.problem ?? stored.problem);
     if (!problem) return c.json({ error: "problem.title is required to resume" }, 400);
     const seedReferences = coerceReferences(body.seedReferences ?? stored.seedReferences);
+    const seedPdfs = coerceSeedPdfs(body.seedPdfs ?? stored.seedPdfs);
     const aiInit = coerceAiInit(body.aiInit ?? stored.aiInit);
     const fromPhase = typeof body.checkpoint === "string" ? body.checkpoint : undefined;
 
     const slug = path.basename(projectDir);
-    const input: InitAgentInput = { problem, seedReferences, aiInit };
+    const input: InitAgentInput = { problem, seedReferences, aiInit, seedPdfs };
 
     void (async () => {
       try {

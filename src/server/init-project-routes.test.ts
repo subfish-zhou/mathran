@@ -123,8 +123,32 @@ describe("POST /api/agent/init-project", () => {
     expect(runJson.status).toBe("completed");
   });
 
-  it("Skip AI degrades to plain scaffold (runId null)", async () => {
+  it("persists seedPdfs to the run input snapshot", async () => {
     const res = await fetch(`${base}/api/agent/init-project`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        problem: { title: "Seed Pdfs Project" },
+        seedReferences: [],
+        seedPdfs: ["/tmp/uploads/a-paper.pdf", "/tmp/uploads/b-notes.tex", 42, ""],
+        aiInit: { enableWiki: true, enableWorkspace: true, searchDepth: "quick" },
+      }),
+    });
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body.runId).toMatch(/^run-/);
+
+    const runJson = JSON.parse(
+      await fs.readFile(
+        path.join(workspace, "projects", "seed-pdfs-project", ".mathran", "agent-runs", body.runId, "run.json"),
+        "utf-8",
+      ),
+    );
+    // Non-string / empty entries are dropped by coerceSeedPdfs.
+    expect(runJson.input.seedPdfs).toEqual(["/tmp/uploads/a-paper.pdf", "/tmp/uploads/b-notes.tex"]);
+  });
+
+  it("Skip AI degrades to plain scaffold (runId null)", async () => {    const res = await fetch(`${base}/api/agent/init-project`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
