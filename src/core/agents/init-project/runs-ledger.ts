@@ -195,7 +195,27 @@ export async function listRuns(projectDir: string): Promise<RunRecord[]> {
 }
 
 async function writeJson(file: string, value: unknown): Promise<void> {
-  await fs.writeFile(file, JSON.stringify(value, null, 2) + "\n", "utf-8");
+  await writeJsonAtomic(file, value);
+}
+
+/**
+ * Atomically write a JSON file: serialise to a uniquely-named temp file in
+ * the same directory, then `rename` it over the destination. POSIX `rename`
+ * within a filesystem is atomic, so a reader (readRun/readCheckpoint) ever
+ * sees either the complete old file or the complete new one — never a
+ * half-written truncation. If the process crashes mid-write the destination
+ * keeps its prior good contents and only a stale `.tmp` file is left behind.
+ */
+async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
+  const tmp = `${file}.tmp.${randomBytes(6).toString("hex")}`;
+  const json = JSON.stringify(value, null, 2) + "\n";
+  await fs.writeFile(tmp, json, "utf-8");
+  try {
+    await fs.rename(tmp, file);
+  } catch (err) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
 }
 
 async function readJsonl<T>(file: string): Promise<T[]> {

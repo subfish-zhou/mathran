@@ -106,4 +106,30 @@ describe("runs ledger", () => {
     expect(snap?.checkpoint?.phase).toBe("build_wiki");
     expect(snap?.logs.length).toBe(1);
   });
+
+  it("writeJsonAtomic: round-trips run.json correctly after an update", async () => {
+    const run = await createRun(projectDir, { input: { title: "Atomic" } });
+    // finishRun overwrites run.json via the atomic writer.
+    await finishRun(projectDir, run.runId, "completed");
+    const r = await readRun(projectDir, run.runId);
+    expect(r?.status).toBe("completed");
+    expect(r?.input?.title).toBe("Atomic");
+    // No leftover temp files pollute the run dir after a clean write.
+    const entries = await fs.readdir(runDir(projectDir, run.runId));
+    expect(entries.some((e) => e.includes(".tmp."))).toBe(false);
+  });
+
+  it("writeJsonAtomic: a stale .tmp sibling never corrupts the live file", async () => {
+    const run = await createRun(projectDir);
+    const dir = runDir(projectDir, run.runId);
+    // Simulate a crash mid-write: a half-written temp file is left behind.
+    await fs.writeFile(path.join(dir, "run.json.tmp.deadbe"), "{ truncated", "utf-8");
+    // The live run.json must still parse to the last good value, and a
+    // subsequent atomic write must succeed regardless of the stale tmp.
+    const before = await readRun(projectDir, run.runId);
+    expect(before?.status).toBe("running");
+    await finishRun(projectDir, run.runId, "completed");
+    const after = await readRun(projectDir, run.runId);
+    expect(after?.status).toBe("completed");
+  });
 });
