@@ -100,6 +100,7 @@ import {
   globalBackgroundRegistry,
 } from "../core/subagent/index.js";
 import { getGlobalMcpRegistry } from "../core/mcp/registry.js";
+import { registerMcpConfigRoutes } from "./mcp-config-routes.js";
 import {
   resolveProfile,
   readSettingsDefaultProfile,
@@ -2495,6 +2496,12 @@ function buildApp(
     const info = await registry.reload(name);
     if (!info) return c.json({ error: `unknown mcp server "${name}"` }, 404);
     return c.json({ ok: true, server: info });
+  });
+
+  // v1.5 #5: MCP config editor — GET/PUT .mathran/mcp.json + POST test-connection.
+  registerMcpConfigRoutes(app, {
+    workspace,
+    ...(mcpRegistry ? { mcpRegistry } : {}),
   });
 
   // #3 Background Agents — cooperative cancel: set the abort flag on a running
