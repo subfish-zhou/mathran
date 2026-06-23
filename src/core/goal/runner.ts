@@ -773,7 +773,26 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     builtinTools: {
       ...(opts.builtinTools ?? {}),
       ask_user: {
-        resolver: async () => ASK_USER_GOAL_AUTO_REPLY,
+        // v0.17 W14 observability: emit an audit step so the goal
+        // detail view can show what the model asked even though the
+        // resolver short-circuits the round with the canned reply.
+        // Best-effort: a write failure must not abort the round, so we
+        // swallow + log instead of letting the exception bubble into
+        // the LLM loop (where it would surface as a tool error).
+        resolver: async (question: string) => {
+          try {
+            await appendStep(workspace, goalId, {
+              kind: "ask-user-auto-resolved",
+              payload: { question },
+            });
+          } catch (err) {
+            console.warn(
+              `[mathran] failed to audit ask-user-auto-resolved for goal ${goalId}:`,
+              err,
+            );
+          }
+          return ASK_USER_GOAL_AUTO_REPLY;
+        },
       },
     },
     ...(opts.scheduler ? { subagentScheduler: opts.scheduler, scheduler: opts.scheduler } : {}),
