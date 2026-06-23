@@ -87,6 +87,7 @@ function coerceAiInit(raw: unknown): AiInitConfig {
     enableWiki: r.enableWiki !== false,
     enableWorkspace: r.enableWorkspace !== false,
     searchDepth: depth === "quick" || depth === "deep" ? depth : "standard",
+    useSpine: r.useSpine === true,
   };
 }
 

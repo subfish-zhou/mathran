@@ -40,6 +40,14 @@ import type {
   CrawledResource,
   ParsedReference,
 } from "./types.js";
+import { makeSpineLLM } from "./spine/llm.js";
+import { buildSpine } from "./spine/builder.js";
+import { generateEffortsFromSpine } from "./spine/effort-from-spine.js";
+import { generateWikiFromSpine } from "./spine/wiki-from-spine.js";
+import { explorePaperGraph } from "./spine/explore-pipeline.js";
+import { CITATION_MAX_DEPTH, CITATION_MAX_NODES, type NeighborPaper } from "./citation-explorer.js";
+import type { SpinePipelineEvent } from "./spine/types.js";
+import type { PaperNode } from "../../paper-graph/index.js";
 
 export interface InitAgentContext {
   workspace: string;
@@ -53,6 +61,12 @@ export interface InitAgentContext {
   fetchWikipediaSummary?: (topic: string) => Promise<string | null>;
   /** Override the arXiv rate-limit delay (tests pass 0). */
   rateDelayMs?: number;
+  /**
+   * Citation-neighbor discovery seam for the Spine-First pipeline. mathran
+   * ships no network citation source, so the host wires this (arXiv / S2);
+   * tests inject a fake. Default: graph-only BFS.
+   */
+  fetchNeighbors?: (paper: PaperNode) => Promise<NeighborPaper[]>;
 }
 
 const DEPTH_PARAMS: Record<string, { maxQueries: number; perQuery: number }> = {
@@ -172,6 +186,9 @@ export async function runInitAgent(
   input: InitAgentInput,
   ctx: InitAgentContext,
 ): Promise<InitAgentResult> {
+  if (input.aiInit.useSpine) {
+    return runInitAgentSpine(input, ctx);
+  }
   const started = Date.now();
   const { workspace, projectDir, slug, runId, llm, model } = ctx;
   const searchArxiv = ctx.searchArxiv ?? ((q, n) => realSearchArxiv(q, n));
@@ -329,6 +346,179 @@ export async function runInitAgent(
       wikiPages,
       crawledResources: allResources.length,
       seedPapers: seedResult.ingested.length,
+      summary,
+    };
+  } catch (err) {
+    await appendPhase(projectDir, runId, "error", "end", { error: errMsg(err) });
+    await finishRun(projectDir, runId, "error", errMsg(err));
+    throw err;
+  }
+}
+
+/**
+ * Spine-First pipeline (v1b, useSpine=true). Four phases:
+ *   explore_graph → build_spine → build_efforts → spine_wiki → completed
+ *
+ * Never throws on the happy path beyond the v1a contract: failures inside a
+ * phase are isolated by the underlying spine modules (console.warn + fallback);
+ * a hard failure flips the run to `error` and rethrows, exactly like v1a.
+ */
+async function runInitAgentSpine(
+  input: InitAgentInput,
+  ctx: InitAgentContext,
+): Promise<InitAgentResult> {
+  const started = Date.now();
+  const { workspace, projectDir, slug, runId, llm, model } = ctx;
+  const searchArxiv = ctx.searchArxiv ?? ((q, n) => realSearchArxiv(q, n));
+  const rateDelay = ctx.rateDelayMs ?? ARXIV_RATE_DELAY;
+  const depth = DEPTH_PARAMS[input.aiInit.searchDepth] ?? DEPTH_PARAMS.standard!;
+  const spineLLM = makeSpineLLM(llm, model);
+
+  // Forward spine pipeline events into the runs ledger as logs (fire-and-forget;
+  // appendLog is failure-isolated and never throws).
+  const emit = (e: SpinePipelineEvent): void => {
+    const msg = e.type === "log" ? e.message : e.type;
+    void appendLog(projectDir, runId, "spine", msg, e as unknown as Record<string, unknown>);
+  };
+
+  const problem = {
+    title: input.problem.title,
+    formalStatement: input.problem.formalStatement ?? "",
+    description: input.problem.description ?? "",
+    tags: input.problem.tags ?? [],
+  };
+
+  const summary = {
+    conceptsExtracted: 0,
+    queriesRun: 0,
+    resourcesFound: 0,
+    wikiPagesGenerated: 0,
+    durationMs: 0,
+    spineNodes: 0,
+    effortsCreated: 0,
+    papersDiscovered: 0,
+    papersRelevant: 0,
+  };
+
+  try {
+    // ── Phase 1: explore_graph ────────────────────────────────────────────
+    await appendPhase(projectDir, runId, "explore_graph", "start");
+    const seeds: CrawledResource[] = [];
+    for (const ref of input.seedReferences) {
+      const res = refToResource(ref);
+      if (res) seeds.push(res);
+    }
+    const seedResult = await ingestSeedPapersForProject(
+      workspace,
+      projectDir,
+      seeds.map(resourceToNodeInput),
+      { discoveredBy: "seed", relevanceScore: 1.0, depth: 0 },
+    );
+    await appendLog(projectDir, runId, "seed_ingest", `ingested ${seedResult.ingested.length} seeds (${seedResult.failed} failed)`);
+
+    const keywords = [input.problem.title, ...(input.problem.tags ?? [])]
+      .filter((k): k is string => typeof k === "string" && k.trim().length > 0)
+      .slice(0, Math.max(1, Math.min(5, depth.maxQueries)));
+
+    const explore = await explorePaperGraph(
+      {
+        projectDir,
+        workspace,
+        seeds: seedResult.ingested,
+        keywords,
+        mode: "deep",
+        maxDepth: CITATION_MAX_DEPTH,
+        maxPapers: CITATION_MAX_NODES,
+        problem: { title: problem.title, formalStatement: problem.formalStatement, tags: problem.tags },
+      },
+      { llm: spineLLM, searchArxiv, fetchNeighbors: ctx.fetchNeighbors, rateDelayMs: rateDelay, emit },
+    );
+    summary.papersDiscovered = explore.discoveredPaperIds.length;
+    summary.papersRelevant = explore.relevantPaperIds.length;
+    summary.resourcesFound = explore.discoveredPaperIds.length;
+
+    const spinePaperIds =
+      explore.relevantPaperIds.length > 0 ? explore.relevantPaperIds : explore.discoveredPaperIds;
+
+    await writeCheckpoint(projectDir, runId, "explore_graph", {
+      seedPapers: seedResult.ingested.length,
+      discovered: explore.discoveredPaperIds.length,
+      relevant: explore.relevantPaperIds.length,
+    });
+    await appendPhase(projectDir, runId, "explore_graph", "end", {
+      discovered: explore.discoveredPaperIds.length,
+      relevant: explore.relevantPaperIds.length,
+    });
+
+    // ── Phase 2: build_spine ──────────────────────────────────────────────
+    await appendPhase(projectDir, runId, "build_spine", "start", { papers: spinePaperIds.length });
+    const spine = await buildSpine(
+      { projectDir, workspace, paperIds: spinePaperIds, mode: "full", problem },
+      spineLLM,
+      emit,
+    );
+    summary.spineNodes = spine.nodes.length;
+    summary.conceptsExtracted = spine.nodes.length;
+    await writeCheckpoint(projectDir, runId, "build_spine", {
+      nodes: spine.nodes.length,
+      edges: spine.edges.length,
+      threads: spine.threads.length,
+    });
+    await appendPhase(projectDir, runId, "build_spine", "end", {
+      nodes: spine.nodes.length,
+      threads: spine.threads.length,
+    });
+
+    // ── Phase 3: build_efforts ────────────────────────────────────────────
+    await appendPhase(projectDir, runId, "build_efforts", "start");
+    const effortResult = input.aiInit.enableWorkspace
+      ? await generateEffortsFromSpine(
+          { spine, projectDir, workspace, problemTitle: problem.title },
+          spineLLM,
+          emit,
+        )
+      : { efforts: [], edges: [] };
+    summary.effortsCreated = effortResult.efforts.length;
+    await writeCheckpoint(projectDir, runId, "build_efforts", {
+      efforts: effortResult.efforts.length,
+      edges: effortResult.edges.length,
+    });
+    await appendPhase(projectDir, runId, "build_efforts", "end", {
+      efforts: effortResult.efforts.length,
+    });
+
+    // ── Phase 4: spine_wiki ───────────────────────────────────────────────
+    await appendPhase(projectDir, runId, "spine_wiki", "start");
+    const wikiProblem = { ...problem, mathStatus: input.problem.mathStatus };
+    const pages = input.aiInit.enableWiki
+      ? await generateWikiFromSpine(
+          {
+            spine,
+            projectDir,
+            problem: wikiProblem,
+            paperIds: spinePaperIds,
+            workspaceEfforts: effortResult.efforts,
+          },
+          spineLLM,
+          emit,
+        )
+      : [];
+    const wikiPages = pages.map((p) => p.slug);
+    summary.wikiPagesGenerated = wikiPages.length;
+    await writeCheckpoint(projectDir, runId, "spine_wiki", { wikiPages });
+    await appendPhase(projectDir, runId, "spine_wiki", "end", { wikiPages: wikiPages.length });
+
+    // ── completed ─────────────────────────────────────────────────────────
+    summary.durationMs = Date.now() - started;
+    await appendPhase(projectDir, runId, "completed", "end", { summary });
+    await finishRun(projectDir, runId, "completed");
+
+    return {
+      projectSlug: slug,
+      wikiPages,
+      crawledResources: explore.discoveredPaperIds.length,
+      seedPapers: seedResult.ingested.length,
+      mode: "spine",
       summary,
     };
   } catch (err) {
