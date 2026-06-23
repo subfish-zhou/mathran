@@ -79,6 +79,38 @@ describe("api.initProjectAi", () => {
     const body = JSON.parse(calls[0]![1].body as string);
     expect("useSpine" in body.aiInit).toBe(false);
   });
+
+  it("passes seedPdfs through to the request body", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 202,
+      async text() {
+        return JSON.stringify({ projectSlug: "p", runId: "run-333333333333", aiAssisted: true });
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    await api.initProjectAi("P", { seedPdfs: ["/ws/.mathran/uploads/a.pdf", "/ws/.mathran/uploads/b.tex"] });
+    const calls = fetchMock.mock.calls as unknown as Array<[string, RequestInit]>;
+    const body = JSON.parse(calls[0]![1].body as string);
+    expect(body.seedPdfs).toEqual(["/ws/.mathran/uploads/a.pdf", "/ws/.mathran/uploads/b.tex"]);
+  });
+
+  it("defaults seedPdfs to an empty array when omitted", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 202,
+      async text() {
+        return JSON.stringify({ projectSlug: "q", runId: "run-444444444444", aiAssisted: true });
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    await api.initProjectAi("Q");
+    const calls = fetchMock.mock.calls as unknown as Array<[string, RequestInit]>;
+    const body = JSON.parse(calls[0]![1].body as string);
+    expect(body.seedPdfs).toEqual([]);
+  });
 });
 
 describe("api.getInitRun", () => {

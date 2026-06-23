@@ -87,6 +87,7 @@ export default function ProjectsPanel() {
         searchDepth: payload.searchDepth,
         useSpine: payload.useSpine,
         seedReferences: payload.seedReferences,
+        seedPdfs: payload.seedPdfs,
       });
       setName("");
       setPendingSlug(projectSlug);

@@ -1,20 +1,24 @@
 /**
  * AiInitConfig — single-page form for configuring an AI-assisted project init.
  *
- * Collects the title, search depth, pipeline toggles (Spine-First / wiki) and a
- * list of seed references (arXiv ids or URLs). Pure validation/parsing helpers
- * (`validateTitle`, `parseSeedReferences`) live here so they can be unit-tested
+ * Collects the title, search depth, pipeline toggles (Spine-First / wiki), a
+ * chip list of seed references (arXiv ids / DOIs / URLs via ReferenceLinksInput)
+ * and uploaded seed files (FileUploadArea). Pure helpers (`validateTitle`,
+ * `buildAiInitPayload`) live in `ai-init-helpers.ts` so they can be unit-tested
  * without rendering the component.
  */
 import { useState } from "react";
 
 import {
   type AiInitPayload,
+  buildAiInitPayload,
   parseSeedReferences,
   validateTitle,
 } from "./ai-init-helpers.ts";
+import ReferenceLinksInput from "./ReferenceLinksInput.tsx";
+import FileUploadArea, { type UploadedFile } from "./FileUploadArea.tsx";
 
-export { parseSeedReferences, validateTitle };
+export { parseSeedReferences, validateTitle, buildAiInitPayload };
 export type { AiInitPayload };
 
 export interface AiInitConfigProps {
@@ -28,10 +32,9 @@ export default function AiInitConfig({ onSubmit, onCancel, loading }: AiInitConf
   const [searchDepth, setSearchDepth] = useState<"quick" | "standard" | "deep">("standard");
   const [useSpine, setUseSpine] = useState(true);
   const [enableWiki, setEnableWiki] = useState(true);
-  const [seedText, setSeedText] = useState("");
+  const [seedReferences, setSeedReferences] = useState<string[]>([]);
+  const [files, setFiles] = useState<UploadedFile[]>([]);
   const [error, setError] = useState<string | null>(null);
-
-  const { invalid } = parseSeedReferences(seedText);
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -40,13 +43,17 @@ export default function AiInitConfig({ onSubmit, onCancel, loading }: AiInitConf
       setError(titleError);
       return;
     }
-    const { valid, invalid: bad } = parseSeedReferences(seedText);
-    if (bad.length > 0) {
-      setError(`Invalid seed reference(s): ${bad.join(", ")}`);
-      return;
-    }
     setError(null);
-    onSubmit({ title: title.trim(), searchDepth, useSpine, enableWiki, seedReferences: valid });
+    onSubmit(
+      buildAiInitPayload({
+        title,
+        searchDepth,
+        useSpine,
+        enableWiki,
+        seedReferences,
+        seedPdfs: files.map((f) => f.path),
+      }),
+    );
   }
 
   return (
@@ -101,22 +108,17 @@ export default function AiInitConfig({ onSubmit, onCancel, loading }: AiInitConf
         <span className="font-medium">Generate wiki</span>
       </label>
 
-      <label className="flex flex-col gap-1 text-sm">
-        <span className="font-medium text-slate-700">Seed references</span>
-        <span className="text-xs text-slate-400">
-          One per line — arXiv id (e.g. arXiv:1234.5678) or http(s) URL.
-        </span>
-        <textarea
-          value={seedText}
-          onChange={(e) => setSeedText(e.target.value)}
-          rows={4}
-          placeholder={"arXiv:1234.5678\nhttps://example.com/paper"}
-          className="rounded-md border border-slate-300 px-3 py-2 font-mono text-xs outline-none focus:border-slate-500"
-        />
-        {invalid.length > 0 && (
-          <span className="text-xs text-amber-600">Unrecognized: {invalid.join(", ")}</span>
-        )}
-      </label>
+      <ReferenceLinksInput
+        links={seedReferences}
+        onAdd={(link) => setSeedReferences((prev) => [...prev, link])}
+        onRemove={(index) => setSeedReferences((prev) => prev.filter((_, i) => i !== index))}
+      />
+
+      <FileUploadArea
+        files={files}
+        onAdd={(file) => setFiles((prev) => [...prev, file])}
+        onRemove={(index) => setFiles((prev) => prev.filter((_, i) => i !== index))}
+      />
 
       {error && (
         <div className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>

@@ -208,6 +208,7 @@ export const api = {
     opts: {
       searchDepth?: "quick" | "standard" | "deep";
       seedReferences?: string[];
+      seedPdfs?: string[];
       useSpine?: boolean;
     } = {},
   ): Promise<{ projectSlug: string; runId: string | null; aiAssisted: boolean }> {
@@ -218,6 +219,7 @@ export const api = {
         body: JSON.stringify({
           problem: { title: name },
           seedReferences: opts.seedReferences ?? [],
+          seedPdfs: opts.seedPdfs ?? [],
           aiInit: {
             enableWiki: true,
             enableWorkspace: true,

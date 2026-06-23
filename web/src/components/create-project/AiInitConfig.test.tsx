@@ -5,7 +5,7 @@
  */
 import { describe, it, expect } from "vitest";
 
-import { parseSeedReferences, validateTitle } from "./ai-init-helpers.ts";
+import { buildAiInitPayload, parseSeedReferences, validateTitle } from "./ai-init-helpers.ts";
 
 describe("parseSeedReferences", () => {
   it("returns empty buckets for empty/blank input", () => {
@@ -42,5 +42,35 @@ describe("validateTitle", () => {
 
   it("returns null for a non-empty title", () => {
     expect(validateTitle("Twin Primes")).toBeNull();
+  });
+});
+
+describe("buildAiInitPayload", () => {
+  it("trims the title and includes seedPdfs paths", () => {
+    const payload = buildAiInitPayload({
+      title: "  Twin Primes  ",
+      searchDepth: "deep",
+      useSpine: true,
+      enableWiki: true,
+      seedReferences: ["2301.10828"],
+      seedPdfs: ["/ws/.mathran/uploads/abc-paper.pdf"],
+    });
+    expect(payload.title).toBe("Twin Primes");
+    expect(payload.searchDepth).toBe("deep");
+    expect(payload.seedReferences).toEqual(["2301.10828"]);
+    expect(payload.seedPdfs).toEqual(["/ws/.mathran/uploads/abc-paper.pdf"]);
+  });
+
+  it("defaults to empty seedPdfs when none are uploaded", () => {
+    const payload = buildAiInitPayload({
+      title: "X",
+      searchDepth: "standard",
+      useSpine: false,
+      enableWiki: true,
+      seedReferences: [],
+      seedPdfs: [],
+    });
+    expect(payload.seedPdfs).toEqual([]);
+    expect(payload.useSpine).toBe(false);
   });
 });
