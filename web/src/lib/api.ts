@@ -89,6 +89,70 @@ export interface ConversationSummary {
   messageCount: number;
 }
 
+/**
+ * Result of a completed init-project agent run. Mirrors
+ * `src/core/agents/init-project/types.ts:InitAgentResult`.
+ */
+export interface InitAgentResult {
+  projectSlug: string;
+  wikiPages: string[];
+  crawledResources: number;
+  seedPapers: number;
+  mode?: "v1a" | "spine";
+  summary: {
+    conceptsExtracted: number;
+    queriesRun: number;
+    resourcesFound: number;
+    wikiPagesGenerated: number;
+    durationMs: number;
+    spineNodes?: number;
+    effortsCreated?: number;
+    papersDiscovered?: number;
+    papersRelevant?: number;
+    pagesRefined?: number;
+    pagesFlagged?: number;
+    spineCoverage?: number;
+  };
+}
+
+export interface RunRecord {
+  runId: string;
+  agentType: string;
+  status: "running" | "completed" | "error";
+  startedAt: string;
+  finishedAt?: string;
+  error?: string;
+  input?: Record<string, unknown>;
+}
+
+export interface PhaseRecord {
+  phase: string;
+  event: "start" | "end";
+  at: string;
+  data?: Record<string, unknown>;
+}
+
+export interface CheckpointRecord {
+  phase: string;
+  at: string;
+  data: Record<string, unknown>;
+}
+
+export interface LogRecord {
+  at: string;
+  kind: string;
+  message?: string;
+  data?: Record<string, unknown>;
+}
+
+/** Snapshot of an init-project run ledger (mirrors `runs-ledger.ts`). */
+export interface RunLedgerSnapshot {
+  run: RunRecord;
+  phases: PhaseRecord[];
+  checkpoint: CheckpointRecord | null;
+  logs: LogRecord[];
+}
+
 /** Response shape of `GET <chat-base>/:id/usage` (v0.3 §19). */
 export interface UsageStats {
   tokens: number;
@@ -141,7 +205,11 @@ export const api = {
    */
   async initProjectAi(
     name: string,
-    opts: { searchDepth?: "quick" | "standard" | "deep"; seedReferences?: string[] } = {},
+    opts: {
+      searchDepth?: "quick" | "standard" | "deep";
+      seedReferences?: string[];
+      useSpine?: boolean;
+    } = {},
   ): Promise<{ projectSlug: string; runId: string | null; aiAssisted: boolean }> {
     return jsonOrThrow(
       await fetch("/api/agent/init-project", {
@@ -154,8 +222,26 @@ export const api = {
             enableWiki: true,
             enableWorkspace: true,
             searchDepth: opts.searchDepth ?? "standard",
+            ...(opts.useSpine !== undefined ? { useSpine: opts.useSpine } : {}),
           },
         }),
+      }),
+    );
+  },
+  /** Read an init-project run ledger (status, phases, checkpoint, logs). */
+  async getInitRun(runId: string): Promise<RunLedgerSnapshot> {
+    return jsonOrThrow(await fetch(`/api/agent/init-project/${enc(runId)}`));
+  },
+  /** Resume an init-project run from its last (or a given) checkpoint. */
+  async resumeInitRun(
+    runId: string,
+    opts: { checkpoint?: string } = {},
+  ): Promise<{ ok: boolean }> {
+    return jsonOrThrow(
+      await fetch(`/api/agent/init-project/${enc(runId)}/resume`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(opts.checkpoint ? { checkpoint: opts.checkpoint } : {}),
       }),
     );
   },
