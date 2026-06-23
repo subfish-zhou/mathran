@@ -36,7 +36,7 @@ import {
 import { resolveCustomCommands } from "../core/chat/slash-custom.js";
 import { loadLayeredCommands } from "../core/commands/loader.js";
 import { loadLayeredSkills } from "../core/skills/loader.js";
-import { defaultSubagentRegistry } from "../core/subagent/index.js";
+import { defaultSubagentRegistry, globalBackgroundRegistry } from "../core/subagent/index.js";
 import {
   readIndex as readOutcomeIndex,
   readOutcome,
@@ -109,15 +109,28 @@ export function registerSlashRoutes(app: Hono, deps: SlashRoutesDeps): void {
 
   // ── GET /api/subagents/active ─────────────────────────────────────────
   //
-  // MVP: `kinds` comes from the subagent registry; `active` is best-effort
-  // empty — there's no global cross-conversation scheduler tracker yet
-  // (full live-tree wiring is a follow-up; the SubagentTreePanel uses the
-  // goal-tree surface instead). Documented in PLAN "部分已存在".
+  // `kinds` comes from the subagent registry. `active` lists the live (and
+  // recently-finished) *background* subagents tracked process-wide by the
+  // BackgroundSubagentRegistry (#3) — the SPA's BackgroundAgentsPanel polls
+  // this. Records age out a few seconds after reaching a terminal state.
   app.get("/api/subagents/active", (c) => {
     const kinds = deps.subagentKinds
       ? deps.subagentKinds()
       : defaultSubagentRegistry().list();
-    return c.json({ kinds, active: [] as Array<{ id: string; type: string; status?: string }> });
+    const active = globalBackgroundRegistry()
+      .getActiveSubagents()
+      .map((r) => ({
+        id: r.id,
+        type: r.type,
+        mode: r.mode,
+        status: r.status,
+        startedAt: r.startedAt,
+        parentConversationId: r.parentConversationId,
+        taskSummary: r.taskSummary,
+        ...(r.durationMs !== undefined ? { durationMs: r.durationMs } : {}),
+        ...(r.errorMessage !== undefined ? { errorMessage: r.errorMessage } : {}),
+      }));
+    return c.json({ kinds, active });
   });
 
   // ── GET /api/chat/:cid/context ────────────────────────────────────────

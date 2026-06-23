@@ -57,6 +57,7 @@ import { createReadFileTool } from "./tools/read-file.js";
 import { createWriteFileTool } from "./tools/write-file.js";
 import { createEditFileTool } from "./tools/edit-file.js";
 import { createDispatchSubagentTool } from "./tools/dispatch-subagent.js";
+import { createGetSubagentResultTool } from "./tools/get-subagent-result.js";
 import {
   AskUserPending,
   ASK_USER_PENDING_PLACEHOLDER,
@@ -71,6 +72,7 @@ import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
 import type { RiskClass, ApprovalRequest, ApprovalDecision, ApprovalResolver } from "../approval/types.js";
 import type { Outcome } from "../outcomes/schema.js";
+import type { BackgroundSubagentRegistry } from "../subagent/background.js";
 import type { ProfileEffects } from "../profiles/types.js";
 import { isMutatingCall } from "../profiles/profile-resolver.js";
 import { buildProfileBanner } from "../profiles/profile-message.js";
@@ -134,6 +136,18 @@ export interface ToolSpec {
    * model plus an `ok` flag for callers/loggers.
    */
   execute(args: Record<string, unknown>, ctx?: ToolExecuteContext): Promise<{ ok: boolean; content: string }>;
+}
+
+/**
+ * Minimal subagent-result shape carried on the `subagent-completed` ChatEvent
+ * (#3). A trimmed projection of `SubagentResult` so the host SSE layer can ship
+ * the essentials without the SPA depending on the full kernel type.
+ */
+export interface SubagentResultLite {
+  status: string;
+  summary: string;
+  artifactPath: string | null;
+  durationMs?: number;
 }
 
 /**
@@ -205,6 +219,20 @@ export type ChatEvent =
       type: "goal-graded";
       goalId: string;
       outcome: Outcome;
+    }
+  | {
+      /** Background Agents (#3) — emitted by the *host* SSE layer (NOT the
+       *  kernel) when a background subagent dispatched from this conversation
+       *  reaches a terminal state. Lives in the union so `serve.ts` can write
+       *  it through the same typed `writeSSE` envelope. The SPA filters on
+       *  `subagentId`, toasts completion, and flips the panel row to its
+       *  terminal colour. `result` is the bounded scheduler summary (omitted
+       *  for pure cancels that never produced one). */
+      type: "subagent-completed";
+      subagentId: string;
+      status: "done" | "failed" | "cancelled";
+      durationMs: number;
+      result?: SubagentResultLite;
     }
   | {
       type: "done";
@@ -302,7 +330,21 @@ export interface ChatSessionOptions {
     read_file?: boolean;
     write_file?: boolean;
     edit_file?: boolean;
-    dispatch_subagent?: boolean;
+    /**
+     * `dispatch_subagent` (v0.5 wire-up Gap #4 + #5; #3 background). `true`
+     * enables sync-only dispatch. Pass an object with `background` to also
+     * allow `mode: "background"` — the run is tracked in the supplied registry
+     * (scoped to `parentConversationId`) and a companion `get_subagent_result`
+     * tool is exposed so the LLM can poll it. Requires `opts.scheduler`.
+     */
+    dispatch_subagent?:
+      | boolean
+      | {
+          background?: {
+            registry: BackgroundSubagentRegistry;
+            parentConversationId: string;
+          };
+        };
     /**
      * v0.16 §11 — host-specific `ask_user` resolver. Pass the readline
      * resolver from CLI, the `throw new AskUserPending` resolver from
@@ -892,9 +934,24 @@ export class ChatSession {
     // warning + silent skip, never a crash).
     if (cfg.dispatch_subagent) {
       if (this.dispatchScheduler) {
+        const dsCfg =
+          typeof cfg.dispatch_subagent === "object"
+            ? cfg.dispatch_subagent
+            : undefined;
+        const background = dsCfg?.background;
         out.push(
-          createDispatchSubagentTool({ scheduler: this.dispatchScheduler }),
+          createDispatchSubagentTool({
+            scheduler: this.dispatchScheduler,
+            ...(background ? { background } : {}),
+          }),
         );
+        // Background mode pairs with a poll tool so the LLM can check a
+        // detached run without blocking. Only useful when background is wired.
+        if (background) {
+          out.push(
+            createGetSubagentResultTool({ registry: background.registry }),
+          );
+        }
       } else {
         // eslint-disable-next-line no-console
         console.warn(
