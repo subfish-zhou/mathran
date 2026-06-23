@@ -427,4 +427,307 @@ describe("ask_user tool", () => {
       expect(llm.requests[0].tools ?? []).toEqual([]);
     });
   });
+
+  // v0.19 Codex parity — Zod schema validates the structured fields.
+  describe("v0.19 schema validation (Codex parity)", () => {
+    it("rejects timeoutSeconds=0 with a clear error tool-result", async () => {
+      const resolver: AskUserResolver = async () => "never called";
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "bad_1",
+            name: "ask_user",
+            argsDelta: '{"question":"q?","timeoutSeconds":0}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        // Round 2: model sees the error and gives up.
+        [{ type: "text", delta: "ok" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        tools: [],
+        builtinTools: { ask_user: { resolver } },
+      });
+      const events = await collect(session.send("go"));
+      const tr = events.find((e) => e.type === "tool-result") as Extract<
+        ChatEvent,
+        { type: "tool-result" }
+      >;
+      expect(tr.ok).toBe(false);
+      expect(tr.content).toMatch(/timeoutSeconds/);
+      expect(tr.content).toMatch(/>=\s*1/);
+    });
+
+    it("rejects options=[] (empty array) with a clear error", async () => {
+      const resolver: AskUserResolver = async () => "never called";
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "bad_2",
+            name: "ask_user",
+            argsDelta: '{"question":"q?","options":[]}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [{ type: "text", delta: "ok" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        tools: [],
+        builtinTools: { ask_user: { resolver } },
+      });
+      const events = await collect(session.send("go"));
+      const tr = events.find((e) => e.type === "tool-result") as Extract<
+        ChatEvent,
+        { type: "tool-result" }
+      >;
+      expect(tr.ok).toBe(false);
+      expect(tr.content).toMatch(/options/);
+    });
+
+    it("forwards options/default/timeoutSeconds/allowCustom into resolver ctx", async () => {
+      let seenCtx: {
+        callId: string;
+        options?: string[];
+        default?: string;
+        timeoutSeconds?: number;
+        allowCustom?: boolean;
+      } | null = null;
+      const resolver: AskUserResolver = async (_q, ctx) => {
+        seenCtx = ctx;
+        return "yes";
+      };
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "ok_1",
+            name: "ask_user",
+            argsDelta:
+              '{"question":"yes or no?","options":["yes","no"],"default":"yes","timeoutSeconds":30,"allowCustom":false}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [{ type: "text", delta: "done" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        tools: [],
+        builtinTools: { ask_user: { resolver } },
+      });
+      await collect(session.send("choose"));
+      expect(seenCtx).not.toBeNull();
+      expect(seenCtx!.callId).toBe("ok_1");
+      expect(seenCtx!.options).toEqual(["yes", "no"]);
+      expect(seenCtx!.default).toBe("yes");
+      expect(seenCtx!.timeoutSeconds).toBe(30);
+      expect(seenCtx!.allowCustom).toBe(false);
+    });
+
+    it("bare ask_user({question}) still works — ctx has no extra fields", async () => {
+      let seenCtx: {
+        callId: string;
+        options?: string[];
+        default?: string;
+        timeoutSeconds?: number;
+        allowCustom?: boolean;
+      } | null = null;
+      const resolver: AskUserResolver = async (_q, ctx) => {
+        seenCtx = ctx;
+        return "sure";
+      };
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "bare_1",
+            name: "ask_user",
+            argsDelta: '{"question":"hi?"}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [{ type: "text", delta: "done" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        tools: [],
+        builtinTools: { ask_user: { resolver } },
+      });
+      await collect(session.send("q"));
+      expect(seenCtx).not.toBeNull();
+      expect(seenCtx!.options).toBeUndefined();
+      expect(seenCtx!.default).toBeUndefined();
+      expect(seenCtx!.timeoutSeconds).toBeUndefined();
+      expect(seenCtx!.allowCustom).toBeUndefined();
+    });
+
+    it("AskUserPending carries the structured payload when the resolver throws", async () => {
+      // Serve-style resolver: throw AskUserPending mirroring serve.ts.
+      const resolver: AskUserResolver = async (q, ctx) => {
+        throw new AskUserPending({
+          question: q,
+          callId: ctx.callId,
+          ...(ctx.options !== undefined ? { options: ctx.options } : {}),
+          ...(ctx.default !== undefined ? { default: ctx.default } : {}),
+          ...(ctx.timeoutSeconds !== undefined
+            ? { timeoutSeconds: ctx.timeoutSeconds }
+            : {}),
+          ...(ctx.allowCustom !== undefined
+            ? { allowCustom: ctx.allowCustom }
+            : {}),
+        });
+      };
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "throw_1",
+            name: "ask_user",
+            argsDelta:
+              '{"question":"file?","options":["a.ts","b.ts"],"default":"a.ts","timeoutSeconds":60,"allowCustom":true}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        tools: [],
+        builtinTools: { ask_user: { resolver } },
+      });
+      let thrown: unknown = null;
+      const askUserEvents: Array<Extract<ChatEvent, { type: "ask_user" }>> = [];
+      try {
+        for await (const ev of session.send("which")) {
+          if (ev.type === "ask_user") {
+            askUserEvents.push(ev);
+          }
+        }
+      } catch (e) {
+        thrown = e;
+      }
+      expect(isAskUserPending(thrown)).toBe(true);
+      const err = thrown as AskUserPending;
+      expect(err.question).toBe("file?");
+      expect(err.callId).toBe("throw_1");
+      expect(err.options).toEqual(["a.ts", "b.ts"]);
+      expect(err.default).toBe("a.ts");
+      expect(err.timeoutSeconds).toBe(60);
+      expect(err.allowCustom).toBe(true);
+      // The ChatEvent the session yielded just before re-throwing carries
+      // the same structured payload so SSE consumers see it.
+      expect(askUserEvents.length).toBe(1);
+      const ev = askUserEvents[0];
+      expect(ev.question).toBe("file?");
+      expect(ev.options).toEqual(["a.ts", "b.ts"]);
+      expect(ev.default).toBe("a.ts");
+      expect(ev.timeoutSeconds).toBe(60);
+      expect(ev.allowCustom).toBe(true);
+    });
+
+    it("rejects unknown extra keys (strict) so model typos don't slip through", async () => {
+      const resolver: AskUserResolver = async () => "never";
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "bad_3",
+            name: "ask_user",
+            argsDelta: '{"question":"q?","priority":"high"}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [{ type: "text", delta: "ok" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        tools: [],
+        builtinTools: { ask_user: { resolver } },
+      });
+      const events = await collect(session.send("go"));
+      const tr = events.find((e) => e.type === "tool-result") as Extract<
+        ChatEvent,
+        { type: "tool-result" }
+      >;
+      expect(tr.ok).toBe(false);
+      // Zod 'unrecognized_keys' issue — the message mentions the key.
+      expect(tr.content.toLowerCase()).toMatch(/priority|unrecognized/);
+    });
+  });
+
+  // v0.19 Codex parity — goal-mode resolver honors `default` over the canned
+  // auto-reply. Two tests here so the file covers the runner-side behavior
+  // even though the runner has its own dedicated test file.
+  describe("v0.19 goal-mode default fallback (Codex parity)", () => {
+    it("uses default when supplied (not the canned auto-reply)", async () => {
+      // Simulate goal-mode resolver inline — same logic as runner.ts.
+      const resolver: AskUserResolver = async (_q, ctx) =>
+        ctx.default !== undefined ? ctx.default : ASK_USER_GOAL_AUTO_REPLY;
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "goal_1",
+            name: "ask_user",
+            argsDelta: '{"question":"pick file","default":"foo.ts"}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [{ type: "text", delta: "done" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        tools: [],
+        builtinTools: { ask_user: { resolver } },
+      });
+      const events = await collect(session.send("go"));
+      const tr = events.find((e) => e.type === "tool-result") as Extract<
+        ChatEvent,
+        { type: "tool-result" }
+      >;
+      expect(tr.ok).toBe(true);
+      expect(tr.content).toBe("foo.ts");
+      // NOT the canned reply.
+      expect(tr.content).not.toBe(ASK_USER_GOAL_AUTO_REPLY);
+    });
+
+    it("falls back to ASK_USER_GOAL_AUTO_REPLY when no default supplied", async () => {
+      const resolver: AskUserResolver = async (_q, ctx) =>
+        ctx.default !== undefined ? ctx.default : ASK_USER_GOAL_AUTO_REPLY;
+      const llm = new ScriptedLLM([
+        [
+          {
+            type: "tool-call",
+            id: "goal_2",
+            name: "ask_user",
+            argsDelta: '{"question":"vague"}',
+          },
+          { type: "done", finishReason: "tool_calls" },
+        ],
+        [{ type: "text", delta: "done" }, { type: "done", finishReason: "stop" }],
+      ]);
+      const session = new ChatSession({
+        llm,
+        model: "m",
+        tools: [],
+        builtinTools: { ask_user: { resolver } },
+      });
+      const events = await collect(session.send("go"));
+      const tr = events.find((e) => e.type === "tool-result") as Extract<
+        ChatEvent,
+        { type: "tool-result" }
+      >;
+      expect(tr.ok).toBe(true);
+      expect(tr.content).toBe(ASK_USER_GOAL_AUTO_REPLY);
+    });
+  });
 });

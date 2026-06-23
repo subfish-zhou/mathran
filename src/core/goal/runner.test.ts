@@ -1458,6 +1458,92 @@ describe("runGoalRound ask_user goal-mode auto-reply (v0.16 §11)", () => {
     // surface it to.
     expect(round?.stats.toolCallCount).toBe(1);
   });
+
+  // v0.19 Codex parity — the resolver honors the model's `default`
+  // over the canned auto-reply when one is supplied. Hands-off goal
+  // runs should respect the model's own fallback intent.
+  it("v0.19: uses the model-supplied `default` instead of the canned auto-reply", async () => {
+    const g = await createGoal(workspace, {
+      objective: "prove y",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const llm = fakeLLM([
+      [
+        {
+          type: "tool-call",
+          id: "ask_g_default",
+          name: "ask_user",
+          argsDelta:
+            '{"question":"which target?","default":"target-foo"}',
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "acked" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const result = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+    });
+    expect(result.failed).toBe(false);
+    const round = await readGoal(workspace, g.id);
+    const toolStep = round?.steps.find(
+      (s) => s.kind === "tool-result" && (s.payload as any).name === "ask_user",
+    ) as any;
+    expect(toolStep).toBeDefined();
+    expect(toolStep.payload.ok).toBe(true);
+    // The model's structured default wins.
+    expect(toolStep.payload.content).toBe("target-foo");
+    // And specifically NOT the canned fallback.
+    expect(toolStep.payload.content).not.toContain("no human");
+  });
+
+  it("v0.19: still uses the canned auto-reply when the model supplies options without a default", async () => {
+    // options/timeoutSeconds/allowCustom are irrelevant in goal mode —
+    // there's no UI to render them on. Only `default` changes behavior.
+    const g = await createGoal(workspace, {
+      objective: "prove z",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const llm = fakeLLM([
+      [
+        {
+          type: "tool-call",
+          id: "ask_g_nodefault",
+          name: "ask_user",
+          argsDelta:
+            '{"question":"pick one","options":["a","b"],"timeoutSeconds":30}',
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "acked" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const result = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+    });
+    expect(result.failed).toBe(false);
+    const round = await readGoal(workspace, g.id);
+    const toolStep = round?.steps.find(
+      (s) => s.kind === "tool-result" && (s.payload as any).name === "ask_user",
+    ) as any;
+    expect(toolStep).toBeDefined();
+    // Falls back to the canned reply because no default was supplied.
+    expect(toolStep.payload.content).toContain("no human");
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────────

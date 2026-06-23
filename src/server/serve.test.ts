@@ -2629,3 +2629,335 @@ describe("POST /api/chat + /:id/answer-ask (v0.16 §11)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.19 Codex parity — server-side ask_user timeout auto-resolve.
+//
+// When the model emits `ask_user({ timeoutSeconds })`, the server persists
+// pendingAsk with `timeoutSeconds`/`timeoutAt` AND schedules a
+// `setTimeout(ms)` that auto-resolves the pending ask by patching the
+// placeholder tool message and driving session.resume(). If the user
+// POSTs /answer-ask before the timer fires, the timer is cancelled.
+// ---------------------------------------------------------------------------
+describe("POST /api/chat ask_user (v0.19 Codex parity — timeout auto-resolve)", () => {
+  // Same two-turn LLM pattern as the v0.16 §11 e2e test above, but the
+  // model emits all four structured fields. Round 2 echoes back the
+  // reply it saw so we can assert what the server fed into the resume.
+  function structuredAskingLlm(opts: {
+    options?: string[];
+    default?: string;
+    timeoutSeconds?: number;
+    allowCustom?: boolean;
+  }): LLMProvider {
+    let turn = 0;
+    return {
+      async describe() {
+        return { name: "structured-asking" };
+      },
+      async chat(req: LLMRequest): Promise<LLMResponse> {
+        const t = turn++;
+        return {
+          async *stream(): AsyncIterable<LLMStreamChunk> {
+            if (t === 0) {
+              const argv: Record<string, unknown> = { question: "Which file?" };
+              if (opts.options !== undefined) argv.options = opts.options;
+              if (opts.default !== undefined) argv.default = opts.default;
+              if (opts.timeoutSeconds !== undefined) argv.timeoutSeconds = opts.timeoutSeconds;
+              if (opts.allowCustom !== undefined) argv.allowCustom = opts.allowCustom;
+              yield {
+                type: "tool-call",
+                id: "ask_t_1",
+                name: "ask_user",
+                argsDelta: JSON.stringify(argv),
+              };
+              yield { type: "done", finishReason: "tool_calls" };
+              return;
+            }
+            const toolMsg = req.messages.find(
+              (m) => m.role === "tool" && m.toolCallId === "ask_t_1",
+            );
+            yield {
+              type: "text",
+              delta: `resumed-with: ${toolMsg?.content ?? "<none>"}`,
+            };
+            yield { type: "done", finishReason: "stop" };
+          },
+        };
+      },
+    };
+  }
+
+  function parseSSE(raw: string): Array<{ event?: string; data: any }> {
+    const out: Array<{ event?: string; data: any }> = [];
+    for (const block of raw.split(/\n\n+/)) {
+      const lines = block.split("\n");
+      let event: string | undefined;
+      let dataLine: string | undefined;
+      for (const l of lines) {
+        if (l.startsWith("event:")) event = l.slice("event:".length).trim();
+        else if (l.startsWith("data:")) dataLine = l.slice("data:".length).trim();
+      }
+      if (dataLine === undefined) continue;
+      try {
+        out.push({ event, data: JSON.parse(dataLine) });
+      } catch {
+        out.push({ event, data: dataLine });
+      }
+    }
+    return out;
+  }
+
+  // Spin up a fresh server with the structured asking LLM + the same
+  // serve-style AskUserPending throw the prod resolver does. Returns
+  // the running server and a cleanup fn the test must call in a finally.
+  async function spinStructured(opts: {
+    options?: string[];
+    default?: string;
+    timeoutSeconds?: number;
+    allowCustom?: boolean;
+  }) {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-serve-askt-"));
+    await fs.writeFile(
+      path.join(ws, "config.toml"),
+      'defaultModel = "openai/gpt-4o"\n',
+      "utf-8",
+    );
+    const local = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      workspace: ws,
+      chatSessionFactory: ({ model }) =>
+        new ChatSession({
+          llm: structuredAskingLlm(opts),
+          model,
+          builtinTools: {
+            ask_user: {
+              // Mirror serve.ts's serve resolver: forward every structured
+              // field from the resolver ctx into AskUserPending so the
+              // catch block can persist them on the sidecar.
+              resolver: async (question, ctx) => {
+                throw new AskUserPending({
+                  question,
+                  callId: ctx.callId,
+                  ...(ctx.options !== undefined ? { options: ctx.options } : {}),
+                  ...(ctx.default !== undefined ? { default: ctx.default } : {}),
+                  ...(ctx.timeoutSeconds !== undefined
+                    ? { timeoutSeconds: ctx.timeoutSeconds }
+                    : {}),
+                  ...(ctx.allowCustom !== undefined
+                    ? { allowCustom: ctx.allowCustom }
+                    : {}),
+                });
+              },
+            },
+          },
+        }),
+    });
+    return {
+      local,
+      cleanup: async () => {
+        await local.close();
+        await fs.rm(ws, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it("ask_user SSE event + sidecar carry the v0.19 structured fields", async () => {
+    const { local, cleanup } = await spinStructured({
+      options: ["a.ts", "b.ts"],
+      default: "a.ts",
+      timeoutSeconds: 60,
+      allowCustom: false,
+    });
+    try {
+      const conversationId = "ask-v19-1";
+      const r1 = await fetch(`${local.url}/api/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "go", sessionId: conversationId }),
+      });
+      expect(r1.status).toBe(200);
+      const evts = parseSSE(await r1.text());
+      const askEv = evts.find((e) => e.event === "ask_user");
+      expect(askEv).toBeDefined();
+      expect(askEv!.data.question).toBe("Which file?");
+      expect(askEv!.data.options).toEqual(["a.ts", "b.ts"]);
+      expect(askEv!.data.default).toBe("a.ts");
+      expect(askEv!.data.timeoutSeconds).toBe(60);
+      expect(askEv!.data.allowCustom).toBe(false);
+
+      const ann = (await (
+        await fetch(`${local.url}/api/chat/${conversationId}/annotations`)
+      ).json()) as any;
+      expect(ann.pendingAsk).toBeDefined();
+      expect(ann.pendingAsk.options).toEqual(["a.ts", "b.ts"]);
+      expect(ann.pendingAsk.default).toBe("a.ts");
+      expect(ann.pendingAsk.timeoutSeconds).toBe(60);
+      expect(ann.pendingAsk.allowCustom).toBe(false);
+      expect(typeof ann.pendingAsk.timeoutAt).toBe("number");
+      expect(ann.pendingAsk.timeoutAt).toBeGreaterThan(ann.pendingAsk.ts);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("server-side timeout auto-resolves pending ask with `default` after timeoutSeconds*1000 ms", async () => {
+    // Use timeoutSeconds=1 so the test stays fast. With the fire-and-
+    // forget timer, we poll the sidecar + history until the pending
+    // slot clears + the tool message gets patched.
+    const { local, cleanup } = await spinStructured({
+      default: "auto-foo.ts",
+      timeoutSeconds: 1,
+    });
+    try {
+      const conversationId = "ask-v19-timeout-default";
+      const r1 = await fetch(`${local.url}/api/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "go", sessionId: conversationId }),
+      });
+      expect(r1.status).toBe(200);
+      await r1.text(); // drain
+
+      // Sanity: pendingAsk is present right after.
+      const annPre = (await (
+        await fetch(`${local.url}/api/chat/${conversationId}/annotations`)
+      ).json()) as any;
+      expect(annPre.pendingAsk).toBeDefined();
+
+      // Wait for the timer to fire + clear the slot. Bound the wait so a
+      // broken timer fails fast rather than hanging the suite.
+      const deadline = Date.now() + 8000;
+      let cleared = false;
+      while (Date.now() < deadline) {
+        const ann = (await (
+          await fetch(`${local.url}/api/chat/${conversationId}/annotations`)
+        ).json()) as any;
+        if (!ann.pendingAsk) {
+          cleared = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(cleared).toBe(true);
+
+      // History should now show the patched tool message AND the round-2
+      // text echoing the default back ("resumed-with: auto-foo.ts").
+      const hist = (await (
+        await fetch(`${local.url}/api/chat/${conversationId}`)
+      ).json()) as { history: Array<{ role: string; content: string; toolCallId?: string }> };
+      const patched = hist.history.find(
+        (m) => m.role === "tool" && m.toolCallId === "ask_t_1",
+      );
+      expect(patched).toBeDefined();
+      expect(patched!.content).toBe("auto-foo.ts");
+      // The model's round-2 echo lands as an assistant text message.
+      const echoed = hist.history.find(
+        (m) => m.role === "assistant" && m.content.includes("resumed-with: auto-foo.ts"),
+      );
+      expect(echoed).toBeDefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("server-side timeout falls back to canned reply when `default` is absent", async () => {
+    const { local, cleanup } = await spinStructured({
+      // No default — server-side timer should patch with the canned
+      // ASK_USER_GOAL_AUTO_REPLY constant.
+      timeoutSeconds: 1,
+    });
+    try {
+      const conversationId = "ask-v19-timeout-canned";
+      const r1 = await fetch(`${local.url}/api/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "go", sessionId: conversationId }),
+      });
+      expect(r1.status).toBe(200);
+      await r1.text();
+
+      const deadline = Date.now() + 8000;
+      let cleared = false;
+      while (Date.now() < deadline) {
+        const ann = (await (
+          await fetch(`${local.url}/api/chat/${conversationId}/annotations`)
+        ).json()) as any;
+        if (!ann.pendingAsk) {
+          cleared = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(cleared).toBe(true);
+
+      const hist = (await (
+        await fetch(`${local.url}/api/chat/${conversationId}`)
+      ).json()) as { history: Array<{ role: string; content: string; toolCallId?: string }> };
+      const patched = hist.history.find(
+        (m) => m.role === "tool" && m.toolCallId === "ask_t_1",
+      );
+      expect(patched).toBeDefined();
+      // The canned reply lives in ASK_USER_GOAL_AUTO_REPLY — match the
+      // distinctive "no human available" phrase rather than importing
+      // the constant just for the assertion.
+      expect(patched!.content.toLowerCase()).toContain("no human available");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("user POST /answer-ask wins the race: timer is cancelled, reply is used", async () => {
+    // Wider timeout window so the user's reply lands well before the
+    // timer would fire. After resume completes, we check that the
+    // history reflects the user's reply, NOT the canned fallback /
+    // default. Then we wait past the would-be deadline to confirm the
+    // timer didn't re-resolve a second time.
+    const { local, cleanup } = await spinStructured({
+      default: "TIMER-FALLBACK",
+      timeoutSeconds: 2,
+    });
+    try {
+      const conversationId = "ask-v19-race";
+      const r1 = await fetch(`${local.url}/api/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "go", sessionId: conversationId }),
+      });
+      expect(r1.status).toBe(200);
+      await r1.text();
+
+      // User replies promptly.
+      const r2 = await fetch(
+        `${local.url}/api/chat/${conversationId}/answer-ask`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ answer: "USER-WINS.ts", callId: "ask_t_1" }),
+        },
+      );
+      expect(r2.status).toBe(200);
+      const evts2 = parseSSE(await r2.text());
+      const text = evts2
+        .filter((e) => e.event === "text")
+        .map((e) => e.data.delta)
+        .join("");
+      expect(text).toContain("USER-WINS.ts");
+      expect(text).not.toContain("TIMER-FALLBACK");
+
+      // Wait past the original deadline. A cancelled timer must NOT
+      // double-patch the now-resolved message (which would corrupt history).
+      await new Promise((r) => setTimeout(r, 2500));
+      const hist = (await (
+        await fetch(`${local.url}/api/chat/${conversationId}`)
+      ).json()) as { history: Array<{ role: string; content: string; toolCallId?: string }> };
+      const patched = hist.history.find(
+        (m) => m.role === "tool" && m.toolCallId === "ask_t_1",
+      );
+      expect(patched).toBeDefined();
+      expect(patched!.content).toBe("USER-WINS.ts");
+    } finally {
+      await cleanup();
+    }
+  });
+});
