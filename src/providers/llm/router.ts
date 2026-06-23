@@ -94,6 +94,36 @@ export class ModelRouter implements LLMProvider {
     return { name: "model-router", defaultModel: this.cfg.defaultModel };
   }
 
+  /**
+   * Aggregate vision capability per route. Returns true when the adapter
+   * the router would dispatch to (resolved from `modelString` like
+   * `provider/model`) declares `supportsVision = true`. The host calls this
+   * BEFORE issuing the chat request so it can decide whether to forward
+   * `ContentPart[]` (image parts) or degrade-fallback to a `[Image: ...]`
+   * text marker injected by chat-attachments.
+   *
+   * Returns false when:
+   *   - the routing string can't be resolved (no providers configured),
+   *   - the resolved provider lazily-constructed adapter would throw
+   *     (e.g. missing API key for an unused provider — we don't want a
+   *     vision probe to crash the unrelated route),
+   *   - the adapter exists but doesn't set `supportsVision`.
+   *
+   * Named `routeSupportsVision` (not `supportsVision`) to avoid colliding
+   * with the boolean field on the `LLMProvider` interface — the router
+   * itself is per-route-aware so a single static boolean wouldn't make
+   * sense.
+   */
+  routeSupportsVision(modelString: string): boolean {
+    try {
+      const { providerKey } = this.resolve(modelString);
+      const adapter = this.getAdapter(providerKey);
+      return adapter.supportsVision === true;
+    } catch {
+      return false;
+    }
+  }
+
   async chat(req: LLMRequest): Promise<LLMResponse> {
     const { providerKey, model } = this.resolve(req.model);
     this.assertModelAllowed(providerKey, model);

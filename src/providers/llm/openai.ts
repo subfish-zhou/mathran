@@ -20,6 +20,14 @@ export class OpenAIAdapter implements LLMProvider {
   protected defaultModel?: string;
   protected tokenCounter: TokenCounter;
 
+  /**
+   * OpenAI Chat Completions API supports `image_url` parts on user turns
+   * (GPT-4o, GPT-4-vision, GPT-4.1, etc.). Declared statically because every
+   * production-grade OpenAI model since GPT-4o is multimodal; older
+   * text-only models still accept text parts so the flag is safe.
+   */
+  readonly supportsVision = true;
+
   constructor(opts: OpenAIAdapterOptions) {
     this.client = new OpenAI({ apiKey: opts.apiKey, baseURL: opts.baseUrl });
     this.defaultModel = opts.defaultModel;

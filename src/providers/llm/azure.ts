@@ -24,6 +24,14 @@ export class AzureOpenAIAdapter implements LLMProvider {
   protected defaultModel?: string;
   protected tokenCounter: TokenCounter;
 
+  /**
+   * Azure GPT-4o / GPT-5 deployments accept the same OpenAI `image_url`
+   * shape. We declare vision capability statically; deployments without
+   * a vision-capable underlying model will surface a 400 from Azure itself,
+   * which is the same behaviour as a text-only model receiving an image.
+   */
+  readonly supportsVision = true;
+
   constructor(opts: AzureOpenAIAdapterOptions) {
     this.client = new AzureOpenAI({
       apiKey: opts.apiKey,

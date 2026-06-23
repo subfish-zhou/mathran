@@ -35,16 +35,30 @@ export class CopilotAdapter implements LLMProvider {
     return this.tokenCounter.countMessages(messages);
   }
 
+  /**
+   * Copilot is a model proxy; underlying GPT (Responses API) and Claude
+   * (Messages API) routes both support image content blocks. The adapter
+   * forwards `ContentPart[]` into the appropriate provider-native shape
+   * inside `copilotChat` (see toResponsesContent / toAnthropicContent). For
+   * the fallback chat-completions route (Gemini and friends) image parts
+   * collapse to `[Image: <mime>]` text via contentToString.
+   */
+  readonly supportsVision = true;
+
   async chat(req: LLMRequest): Promise<LLMResponse> {
     const systemParts: string[] = [];
     const messages: CopilotChatRequest["messages"] = [];
     for (const m of req.messages) {
       if (m.role === "system") {
+        // System turns: always flatten to text (no vision provider accepts
+        // image blocks in the system slot).
         systemParts.push(contentToString(m.content));
       } else if (m.role === "user" || m.role === "assistant") {
         const out: CopilotChatRequest["messages"][number] = {
           role: m.role,
-          content: contentToString(m.content),
+          // Forward MessageContent unchanged so vision-capable routes can
+          // emit native image blocks.
+          content: m.content,
         };
         if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
           out.toolCalls = m.toolCalls.map((c) => ({
