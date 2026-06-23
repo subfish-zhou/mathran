@@ -6,3 +6,5 @@ export * from "./naming.js";
 export * from "./schema.js";
 export * from "./client.js";
 export * from "./registry.js";
+export * from "./watcher.js";
+export * from "./server-exposure.js";

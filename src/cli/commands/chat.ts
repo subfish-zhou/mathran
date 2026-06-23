@@ -29,6 +29,8 @@ import { randomUUID } from "node:crypto";
 import { loadConfig } from "../../core/config.js";
 import {
   getGlobalMcpRegistry,
+  McpConfigWatcher,
+  formatConfigDiff,
   type McpRegistry,
 } from "../../core/mcp/index.js";
 import {
@@ -729,6 +731,8 @@ export interface SlashContext {
   checkpointWorkspace?: string;
   /** MCP registry (#4) for the `/mcp` slash command. */
   mcpRegistry?: McpRegistry;
+  /** MCP config hot-reload watcher (#4, v1.5) for `/mcp watch` + `/mcp reload-config`. */
+  mcpWatcher?: McpConfigWatcher;
 }
 
 const HELP_TEXT = `commands:
@@ -1086,6 +1090,26 @@ export async function handleSlashCommand(
             output: `reloaded ${all.length} server(s).\n${formatMcpStatusList(all)}`,
           };
         }
+        case "reload-config": {
+          const ws = ctx.memoryWorkspace ?? process.cwd();
+          const diff = await registry.reloadFromConfig({ workspace: ws });
+          return {
+            kind: "continue",
+            output: `${formatConfigDiff(diff)}\n${formatMcpStatusList(registry.status())}`,
+          };
+        }
+        case "watch": {
+          const w = ctx.mcpWatcher;
+          if (!w) {
+            return { kind: "continue", output: "MCP config watching is not available in this session." };
+          }
+          if (sub.on) {
+            w.start();
+            return { kind: "continue", output: "MCP config watching: on (changes to .mathran/mcp.json reload live)." };
+          }
+          w.stop();
+          return { kind: "continue", output: "MCP config watching: off." };
+        }
         case "error":
           return { kind: "continue", output: `mathran: ${sub.message}` };
       }
@@ -1355,6 +1379,20 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
     console.error(`mathran: MCP init failed: ${(err as Error)?.message ?? err}`);
   }
 
+  // v1.5 #4: hot-reload watcher — edits to .mathran/mcp.json reconnect servers
+  // live without restarting the REPL. Started on by default; `/mcp watch off`
+  // disables it. Diffs are logged so the user sees what changed.
+  const mcpWatcher = new McpConfigWatcher({
+    workspace,
+    home: os.homedir(),
+    registry: mcpRegistry,
+    onReload: (diff) => {
+      const summary = formatConfigDiff(diff);
+      if (summary !== "no MCP config changes") console.log(`\n[mcp] ${summary}`);
+    },
+  });
+  mcpWatcher.start();
+
   // v0.16 §11: create the readline interface BEFORE the ChatSession so
   // we can hand the session an `ask_user` resolver bound to this rl. We
   // pause the prompt while the resolver awaits input so the user's reply
@@ -1434,6 +1472,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           checkpointConversationId: conversationId,
           checkpointWorkspace: workspace,
           mcpRegistry,
+          mcpWatcher,
           ...(profile ? { profileName: profile.name } : {}),
         });
         if (result.output) console.log(result.output);
@@ -1472,6 +1511,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
   }
 
   rl.close();
+  mcpWatcher.stop();
   await mcpRegistry.shutdown().catch(() => {});
   console.log("bye.");
   return 0;

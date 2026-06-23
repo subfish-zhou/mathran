@@ -10,6 +10,8 @@ import type { McpServerStatusInfo } from "./registry.js";
 export type McpSubcommand =
   | { kind: "list" }
   | { kind: "reload-all" }
+  | { kind: "reload-config" }
+  | { kind: "watch"; on: boolean }
   | { kind: "status"; server: string }
   | { kind: "tools"; server: string }
   | { kind: "prompts"; server: string }
@@ -28,6 +30,9 @@ export function parseMcpSubcommand(arg: string): McpSubcommand {
   const trimmed = arg.trim();
   if (!trimmed || trimmed === "list") return { kind: "list" };
   if (trimmed === "reload-all") return { kind: "reload-all" };
+  if (trimmed === "reload-config") return { kind: "reload-config" };
+  if (trimmed === "watch" || trimmed === "watch on") return { kind: "watch", on: true };
+  if (trimmed === "watch off") return { kind: "watch", on: false };
   const parts = trimmed.split(/\s+/);
   const [first, second] = parts;
   if (!second) {

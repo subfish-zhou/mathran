@@ -53,6 +53,7 @@ import {
   formatMcpPromptsList,
   formatMcpResourcesList,
 } from "../core/mcp/format.js";
+import { formatConfigDiff } from "../core/mcp/watcher.js";
 
 /** Shape of `computeUsageStats` (defined in serve.ts), injected to avoid cycles. */
 export interface UsageStatsLike {
@@ -319,6 +320,18 @@ export function registerSlashRoutes(app: Hono, deps: SlashRoutesDeps): void {
             const all = await registry.reloadAll();
             return c.json({ ok: true, text: `reloaded ${all.length} server(s).\n${formatMcpStatusList(all)}` });
           }
+          case "reload-config": {
+            const diff = await registry.reloadFromConfig({ workspace });
+            return c.json({
+              ok: true,
+              text: `${formatConfigDiff(diff)}\n${formatMcpStatusList(registry.status())}`,
+            });
+          }
+          case "watch":
+            return c.json({
+              ok: true,
+              text: "MCP config is auto-watched by the serve host; use `/mcp reload-config` to force a reload.",
+            });
           case "error":
             return c.json({ ok: true, text: sub.message });
         }

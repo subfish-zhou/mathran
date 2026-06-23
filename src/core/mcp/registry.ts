@@ -25,6 +25,7 @@ import type { ToolSpec } from "../chat/session.js";
 import { McpClient, type McpClientState, type McpClientFactory } from "./client.js";
 import { loadMcpConfig, type LoadMcpConfigOpts, type McpServerConfig } from "./schema.js";
 import { namespaceToolName, parseMcpToolName } from "./naming.js";
+import { diffServerConfigs, type ServerConfigDiff } from "./watcher.js";
 
 export type McpServerStatus = "connected" | "disconnected" | "disabled";
 
@@ -442,6 +443,65 @@ export class McpRegistry {
   async reloadAll(): Promise<McpServerStatusInfo[]> {
     await Promise.all([...this.servers.keys()].map((n) => this.reload(n)));
     return this.status();
+  }
+
+  /**
+   * Add a server config at runtime (hot reload `added`). Connects it when
+   * enabled. A name collision replaces the existing entry (use `reload` to keep
+   * the same config). Never throws.
+   */
+  async addServer(config: McpServerConfig): Promise<McpServerStatusInfo | null> {
+    const existing = this.servers.get(config.name);
+    if (existing) await existing.client.disconnect();
+    const managed: ManagedServer = {
+      config,
+      client: this.makeClient(config),
+      status: config.enabled ? "disconnected" : "disabled",
+      retries: 0,
+    };
+    this.servers.set(config.name, managed);
+    if (config.enabled) await this.connectServer(managed);
+    return this.statusFor(config.name);
+  }
+
+  /** Remove + disconnect a server at runtime (hot reload `removed`). */
+  async removeServer(name: string): Promise<boolean> {
+    const managed = this.servers.get(name);
+    if (!managed) return false;
+    await managed.client.disconnect();
+    this.servers.delete(name);
+    return true;
+  }
+
+  /** Names of all currently-managed servers (any status). */
+  serverNames(): string[] {
+    return [...this.servers.keys()];
+  }
+
+  /**
+   * Re-read the on-disk config and apply the delta to the live set without
+   * tearing down unaffected servers (PLAN #4 hot reload). Returns the diff.
+   * Even when the registry hasn't been `init()`ed this works (it just adds).
+   */
+  async reloadFromConfig(opts: LoadMcpConfigOpts): Promise<ServerConfigDiff> {
+    const { servers, warnings } = loadMcpConfig(opts);
+    this.warnings = warnings;
+    const current = [...this.servers.values()].map((m) => m.config);
+    const diff = diffServerConfigs(current, servers);
+    for (const name of diff.removed) {
+      await this.removeServer(name);
+    }
+    for (const cfg of diff.added) {
+      await this.addServer(cfg);
+    }
+    for (const cfg of diff.changed) {
+      // Replace config then reload so the new command/url/transport takes effect.
+      const managed = this.servers.get(cfg.name);
+      if (managed) managed.config = cfg;
+      await this.addServer(cfg);
+    }
+    this.initialized = true;
+    return diff;
   }
 
   /** Tear down every server. Safe to call multiple times. */
