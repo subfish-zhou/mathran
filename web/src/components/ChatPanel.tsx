@@ -68,6 +68,8 @@ import ContextMeter from "./ContextMeter.tsx";
 import ToolCallGroup from "./ToolCallGroup.tsx";
 import { ThreadDrawer } from "./ThreadDrawer.tsx";
 import { SubagentTreePanel } from "./SubagentTreePanel.tsx";
+import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel.tsx";
+import type { SubagentCompletedFrame } from "../lib/subagents.ts";
 import SlashSuggester from "./SlashSuggester.tsx";
 import {
   parseSlashInput,
@@ -232,6 +234,11 @@ export default function ChatPanel({
   // in by clicking the "🌳 Sub-agent tree (N)" button when they want
   // the bird's-eye view across the whole forest.
   const [subagentTreeOpen, setSubagentTreeOpen] = useState(false);
+  // #3 Background Agents — latest `subagent-completed` SSE frame, fed to the
+  // BackgroundAgentsPanel so a finishing detached run flips to its terminal
+  // colour ahead of the panel's next poll.
+  const [bgCompletedFrame, setBgCompletedFrame] =
+    useState<SubagentCompletedFrame | null>(null);
   // v0.17 mathub parity W12: in-conversation TODO tracker maintained by
   // the `todo_write` built-in tool. Seeded by `fetchTodos` whenever the
   // active conversation changes, then live-updated by `todos` SSE frames
@@ -274,6 +281,8 @@ export default function ChatPanel({
   // outcomes 收尾 C-2 — transient toast surfaced when a background self-grade
   // round lands a `goal-graded` SSE frame ("📊 Goal graded: X/5").
   const [goalGradedToast, setGoalGradedToast] = useState<string | null>(null);
+  // #3 — transient toast when a background subagent finishes.
+  const [bgSubagentToast, setBgSubagentToast] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   // W4 (v0.17 mathub parity): composer is a multi-line <textarea> that
   // auto-grows from 1 to 8 rows. We keep a ref so the IME composition
@@ -802,6 +811,26 @@ export default function ChatPanel({
           setGoalGradedToast(`📊 Goal graded: ${score}/5 (${shortId})`);
           window.setTimeout(() => {
             setGoalGradedToast((cur) =>
+              cur && cur.includes(shortId) ? null : cur,
+            );
+          }, 6000);
+        }
+        // #3 Background Agents — a detached background subagent finished.
+        // Feed the panel (terminal-state reconcile) + toast briefly.
+        if (ev.type === "subagent-completed") {
+          setBgCompletedFrame({
+            type: "subagent-completed",
+            subagentId: ev.subagentId,
+            status: ev.status,
+            durationMs: ev.durationMs,
+            ...(ev.result ? { result: ev.result } : {}),
+          });
+          const shortId = ev.subagentId.slice(0, 10);
+          const emoji =
+            ev.status === "done" ? "🟢" : ev.status === "failed" ? "🔴" : "⚪";
+          setBgSubagentToast(`${emoji} Subagent ${ev.status} (${shortId})`);
+          window.setTimeout(() => {
+            setBgSubagentToast((cur) =>
               cur && cur.includes(shortId) ? null : cur,
             );
           }, 6000);
@@ -2276,6 +2305,12 @@ export default function ChatPanel({
           </div>
         )}
 
+        {/* #3 Background Agents — flat list of detached background subagents
+            running across the workspace. Self-hides when none are active. */}
+        <div className="border-b border-slate-200 bg-slate-50 px-6 py-2 empty:hidden">
+          <BackgroundAgentsPanel completedFrame={bgCompletedFrame} />
+        </div>
+
         {/* v0.17 W11: per-scope goal-autonomy defaults card. Collapsed
             by default; expands inline so the user can pin autonomy /
             budget defaults without leaving the chat surface. */}
@@ -3309,6 +3344,17 @@ export default function ChatPanel({
           title="Click to dismiss"
         >
           {goalGradedToast}
+        </button>
+      )}
+      {/* #3 Background Agents — subagent-completed toast. */}
+      {bgSubagentToast && (
+        <button
+          type="button"
+          onClick={() => setBgSubagentToast(null)}
+          className="fixed bottom-36 right-4 z-50 max-w-sm rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2 text-left text-xs text-emerald-900 shadow hover:bg-emerald-100"
+          title="Click to dismiss"
+        >
+          {bgSubagentToast}
         </button>
       )}
       {/* v0.17 mathub parity W9 — Live Steering toasts.

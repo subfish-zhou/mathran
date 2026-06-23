@@ -146,6 +146,22 @@ export type ChatEvent =
       goalId: string;
       outcome: OutcomeSummary;
     }
+  | {
+      /** Background Agents (#3) — emitted by the host SSE layer when a
+       *  background subagent dispatched from this conversation reaches a
+       *  terminal state. The SPA filters on `subagentId`, toasts completion,
+       *  and reconciles its BackgroundAgentsPanel row ahead of the next poll. */
+      type: "subagent-completed";
+      subagentId: string;
+      status: "done" | "failed" | "cancelled";
+      durationMs: number;
+      result?: {
+        status: string;
+        summary: string;
+        artifactPath: string | null;
+        durationMs?: number;
+      };
+    }
   | { type: "done"; finishReason: string }
   | { type: "error"; message: string };
 
