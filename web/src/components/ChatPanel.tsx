@@ -55,6 +55,7 @@ import {
   type Bubble,
   type ToolBubble,
 } from "../lib/history-to-bubbles.ts";
+import { shouldRenderAskPending } from "../lib/ask-pending-guard.ts";
 import {
   buildConversationLatex,
   buildConversationMarkdown,
@@ -512,13 +513,21 @@ export default function ChatPanel({
         // was consumed by a since-closed stream).
         const initialBubbles = historyToBubbles(data.history);
         const pending = ann.pendingAsk;
-        if (pending) {
+        // v0.17 W14 fix: goal-mode rounds auto-resolve `ask_user` (see
+        // src/core/goal/runner.ts builtinTools.ask_user), so the server
+        // will never have pending state to satisfy a /answer-ask POST.
+        // Guard against re-stamping a stale sidecar slot left over from a
+        // pre-goal chat round to avoid the "no pending ask_user" toast.
+        const owningGoalFromLookup = !!(goalLookup && goalLookup.goal);
+        if (
+          shouldRenderAskPending({ pending, owningGoal: owningGoalFromLookup })
+        ) {
           for (let i = 0; i < initialBubbles.length; i++) {
             const b = initialBubbles[i];
-            if (b.kind === "tool" && b.id === pending.callId) {
+            if (b.kind === "tool" && b.id === pending!.callId) {
               initialBubbles[i] = {
                 ...b,
-                askPending: { question: pending.question },
+                askPending: { question: pending!.question },
               };
               break;
             }
