@@ -1491,11 +1491,11 @@ describe("runGoalRound ask_user goal-mode auto-reply (v0.16 §11)", () => {
     expect(round?.stats.toolCallCount).toBe(1);
   });
 
+  // v0.17 W14 observability: even though the resolver short-circuits
+  // the round with the canned reply, operators should still be able
+  // to see what the model would have asked. We assert the dedicated
+  // step kind + payload shape so a future SPA panel can render it.
   it("emits an ask-user-auto-resolved audit step carrying the original question", async () => {
-    // v0.17 W14 observability: even though the resolver short-circuits
-    // the round with the canned reply, operators should still be able
-    // to see what the model would have asked. We assert the dedicated
-    // step kind + payload shape so a future SPA panel can render it.
     const g = await createGoal(workspace, {
       objective: "build it",
       scope: { kind: "global" },
@@ -1533,9 +1533,6 @@ describe("runGoalRound ask_user goal-mode auto-reply (v0.16 §11)", () => {
     expect((audit!.payload as { question: string }).question).toBe(
       "Which dataset should I use?",
     );
-    // The audit step should land BEFORE the tool-result step that
-    // carries the canned reply — otherwise a viewer could see the
-    // "resolved" marker without ever seeing what was asked.
     const stepIdxAudit = round!.steps.findIndex(
       (s) => s.kind === "ask-user-auto-resolved",
     );
@@ -1546,6 +1543,87 @@ describe("runGoalRound ask_user goal-mode auto-reply (v0.16 §11)", () => {
     expect(stepIdxToolResult).toBeGreaterThanOrEqual(0);
     expect(stepIdxAudit).toBeLessThan(stepIdxToolResult);
   });
+
+  // v0.19 Codex parity — the resolver honors the model's `default`
+  // over the canned auto-reply when one is supplied.
+  it("v0.19: uses the model-supplied `default` instead of the canned auto-reply", async () => {
+    const g = await createGoal(workspace, {
+      objective: "prove y",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const llm = fakeLLM([
+      [
+        {
+          type: "tool-call",
+          id: "ask_g_default",
+          name: "ask_user",
+          argsDelta:
+            '{"question":"which target?","default":"target-foo"}',
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "acked" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const result = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+    });
+    expect(result.failed).toBe(false);
+    const round = await readGoal(workspace, g.id);
+    const toolStep = round?.steps.find(
+      (s) => s.kind === "tool-result" && (s.payload as any).name === "ask_user",
+    ) as any;
+    expect(toolStep).toBeDefined();
+    expect(toolStep.payload.ok).toBe(true);
+    expect(toolStep.payload.content).toBe("target-foo");
+    expect(toolStep.payload.content).not.toContain("no human");
+  });
+
+  it("v0.19: still uses the canned auto-reply when the model supplies options without a default", async () => {
+    const g = await createGoal(workspace, {
+      objective: "prove z",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const llm = fakeLLM([
+      [
+        {
+          type: "tool-call",
+          id: "ask_g_nodefault",
+          name: "ask_user",
+          argsDelta:
+            '{"question":"pick one","options":["a","b"],"timeoutSeconds":30}',
+        },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "acked" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const result = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+    });
+    expect(result.failed).toBe(false);
+    const round = await readGoal(workspace, g.id);
+    const toolStep = round?.steps.find(
+      (s) => s.kind === "tool-result" && (s.payload as any).name === "ask_user",
+    ) as any;
+    expect(toolStep).toBeDefined();
+    expect(toolStep.payload.content).toContain("no human");
+  });
+
 });
 
 // ───────────────────────────────────────────────────────────────────────────

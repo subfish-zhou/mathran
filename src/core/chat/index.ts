@@ -35,6 +35,8 @@ export {
   isAskUserPending,
   ASK_USER_PENDING_PLACEHOLDER,
   ASK_USER_GOAL_AUTO_REPLY,
+  askUserArgsSchema,
+  type AskUserArgs,
   type AskUserResolver,
   type AskUserToolOptions,
 } from "./tools/ask-user.js";

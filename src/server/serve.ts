@@ -81,6 +81,7 @@ import {
   AskUserPending,
   isAskUserPending,
   ASK_USER_PENDING_PLACEHOLDER,
+  ASK_USER_GOAL_AUTO_REPLY,
   createTodoWriteTool,
   loadTodos,
   ApprovalBroker,
@@ -126,6 +127,7 @@ import {
   type MessageAnnotation,
   type ConversationUiState,
   type ConversationAnnotations,
+  type PendingAskAnnotation,
 } from "../core/chat/store.js";
 import {
   clearGoalAbortRequest,
@@ -178,6 +180,227 @@ const DEFAULT_MODEL = "copilot/gpt-5.5";
 import { buildBaseSystemPrompt } from "../core/prompts/index.js";
 
 const SYSTEM_PROMPT = buildBaseSystemPrompt();
+
+// ---------------------------------------------------------------------------
+// v0.19 Codex parity — ask_user server-side timeout registry.
+//
+// When the model emits `ask_user({ timeoutSeconds })`, the chat round
+// handler persists a `pendingAsk` annotation with a `timeoutAt` deadline
+// and schedules a setTimeout via `scheduleAskTimeout`. If the user POSTs
+// /answer-ask before the timer fires, `cancelAskTimeout(callId)` clears
+// the pending timer so we don't double-resolve.
+//
+// On fire, the timer (registered via `scheduleAskTimeout`) reloads the
+// sidecar, confirms the slot still points at the same callId (race
+// guard: the user may have answered between fire and tick), patches the
+// placeholder tool message to `default` (or the canned fallback when
+// `default` was omitted), clears the slot, and drains a `session.resume()`
+// so the next round runs. No SSE stream exists at this point — the next
+// time the SPA refetches the conversation it sees the new tail; live
+// tabs subscribed to a SSE notifier (out of scope here) would need a
+// separate notification path.
+//
+// Keyed by callId since it's globally unique per pending ask. Storing
+// the NodeJS.Timeout lets us clear it cleanly; the resolver itself is
+// closure-bound to (scope, conversationId, callId, default).
+const askTimeoutRegistry = new Map<string, NodeJS.Timeout>();
+
+function cancelAskTimeout(callId: string): void {
+  const t = askTimeoutRegistry.get(callId);
+  if (t !== undefined) {
+    clearTimeout(t);
+    askTimeoutRegistry.delete(callId);
+  }
+}
+
+function scheduleAskTimeout(
+  callId: string,
+  delayMs: number,
+  onFire: () => Promise<void>,
+): void {
+  // Reschedule wipes any prior timer for the same callId so a resume
+  // that immediately re-pauses on the same id can't leak handles.
+  cancelAskTimeout(callId);
+  const timer = setTimeout(() => {
+    askTimeoutRegistry.delete(callId);
+    // Run the resolver in its own microtask so an exception inside it
+    // can't take down the libuv timer thread; we log + swallow.
+    Promise.resolve(onFire()).catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[mathran] ask_user timeout resolver failed for ${callId}:`,
+        err,
+      );
+    });
+  }, delayMs);
+  // Keep the registry from holding the process alive past natural exit —
+  // a forgotten pending ask shouldn't pin the server up.
+  if (typeof timer.unref === "function") timer.unref();
+  askTimeoutRegistry.set(callId, timer);
+}
+
+/**
+ * Build the auto-resolver fn the timer fires. Exposed (closure factory)
+ * so the call sites that persist `pendingAsk` can wire scope + store +
+ * conversationId without us importing the chat scope type here.
+ */
+function makeAskTimeoutResolver(args: {
+  store: ScopedChatSessionStore;
+  scope: ChatScope;
+  conversationId: string;
+  callId: string;
+  fallback: string;
+}): () => Promise<void> {
+  const { store, scope, conversationId, callId, fallback } = args;
+  return async () => {
+    // Reload the sidecar fresh — the user may have answered in the
+    // interim (we clear the timer in that path but a microtask race is
+    // theoretically possible).
+    let sidecar: ConversationAnnotations;
+    try {
+      sidecar = await loadAnnotations(store.getWorkspace(), scope, conversationId);
+    } catch {
+      return;
+    }
+    const pending = sidecar.pendingAsk;
+    if (!pending || pending.callId !== callId) {
+      // Already answered, truncated, or replaced. Nothing to do.
+      return;
+    }
+    // Patch the placeholder — same logic as the /answer-ask handler.
+    let session: ChatSession;
+    try {
+      session = await store.getOrCreate(scope, conversationId, undefined);
+    } catch {
+      return;
+    }
+    const history = session.history();
+    let patched = false;
+    for (let i = history.length - 1; i >= 0; i--) {
+      const msg = history[i];
+      if (
+        msg.role === "tool" &&
+        msg.toolCallId === pending.callId &&
+        msg.content === ASK_USER_PENDING_PLACEHOLDER
+      ) {
+        history[i] = { ...msg, content: fallback };
+        patched = true;
+        break;
+      }
+    }
+    if (!patched) {
+      // History rewound under us — drop the slot and bail.
+      const cleared: ConversationAnnotations = { ...sidecar };
+      delete (cleared as { pendingAsk?: unknown }).pendingAsk;
+      try {
+        await saveAnnotations(store.getWorkspace(), scope, conversationId, cleared);
+      } catch {
+        /* best-effort */
+      }
+      return;
+    }
+    session.replaceHistory(history);
+    // Clear the slot BEFORE resuming so a fresh ask_user inside the
+    // resumed round can persist its own pendingAsk on top.
+    const cleared: ConversationAnnotations = { ...sidecar };
+    delete (cleared as { pendingAsk?: unknown }).pendingAsk;
+    try {
+      await saveAnnotations(store.getWorkspace(), scope, conversationId, cleared);
+    } catch {
+      /* best-effort */
+    }
+    // Drain the resume — no SSE consumer; we just want the model to
+    // continue. If it pauses on another ask_user, the catch in resume's
+    // own handler chain isn't wired here; we just let the error bubble
+    // and let the next /answer-ask or refetch see the new history tail.
+    try {
+      for await (const _ev of session.resume() as AsyncIterable<ChatEvent>) {
+        void _ev;
+      }
+      await store.flush(scope, conversationId);
+    } catch (err) {
+      // If resume itself paused on a new ask_user, the inner session.send
+      // already pushed the placeholder + sidecar fields we need. Just
+      // flush and exit — the new pendingAsk will already have been
+      // persisted by ChatSession.send's own catch path (after this
+      // commit's serve catch wiring — see the makePendingAskRecord
+      // call sites). We DO check whether it was AskUserPending so an
+      // unrelated thrown error gets logged.
+      if (!isAskUserPending(err)) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[mathran] resume after ask_user timeout failed for ${conversationId}:`,
+          err,
+        );
+      } else {
+        // Persist the nested pendingAsk — normally serve's catch chain
+        // handles this, but timer-driven resume runs outside any HTTP
+        // request so we do it here ourselves.
+        try {
+          const next = await loadAnnotations(
+            store.getWorkspace(),
+            scope,
+            conversationId,
+          );
+          await saveAnnotations(store.getWorkspace(), scope, conversationId, {
+            ...next,
+            pendingAsk: makePendingAskRecord(err as AskUserPending),
+          });
+          const nestedTimeout = (err as AskUserPending).timeoutSeconds;
+          if (typeof nestedTimeout === "number" && nestedTimeout >= 1) {
+            scheduleAskTimeout(
+              (err as AskUserPending).callId,
+              nestedTimeout * 1000,
+              makeAskTimeoutResolver({
+                store,
+                scope,
+                conversationId,
+                callId: (err as AskUserPending).callId,
+                fallback:
+                  (err as AskUserPending).default ?? fallback,
+              }),
+            );
+          }
+        } catch {
+          /* best-effort */
+        }
+      }
+      try {
+        await store.flush(scope, conversationId);
+      } catch {
+        /* best-effort */
+      }
+    }
+  };
+}
+
+/**
+ * Build the serializable `pendingAsk` record we persist on the
+ * conversation sidecar, copying every structured Codex-parity field
+ * that's actually set on the AskUserPending. Single source of truth for
+ * the three call sites that need to record a fresh pending ask
+ * (initial POST chat, rerun, nested resume).
+ */
+function makePendingAskRecord(err: AskUserPending): PendingAskAnnotation {
+  const record: PendingAskAnnotation = {
+    question: err.question,
+    callId: err.callId,
+    toolCallId: err.callId,
+    ts: Date.now(),
+  };
+  if (err.options !== undefined) record.options = err.options;
+  if (err.default !== undefined) record.default = err.default;
+  if (err.timeoutSeconds !== undefined) {
+    record.timeoutSeconds = err.timeoutSeconds;
+    // Record the absolute deadline so the SPA can render a countdown
+    // without knowing when the question was posed; the SPA receives
+    // both `ts` and `timeoutAt` and uses whichever it prefers.
+    record.timeoutAt = record.ts + err.timeoutSeconds * 1000;
+  }
+  if (err.allowCustom !== undefined) record.allowCustom = err.allowCustom;
+  return record;
+}
+
 
 /**
  * outcomes 收尾 C-2 — subscribe an active SSE stream to background `goal-graded`
@@ -932,8 +1155,23 @@ export function defaultSessionFactory(
         // answer box. `POST <chatBase>/:id/answer-ask` patches the
         // placeholder tool message with the reply and resumes the round.
         ask_user: {
-          resolver: async (question, { callId }) => {
-            throw new AskUserPending({ question, callId });
+          resolver: async (question, ctx) => {
+            // v0.19 Codex parity — forward the structured fields from the
+            // tool's parsed args into the pending payload so the SSE
+            // event + sidecar + SPA UI all see the same options/default/
+            // timeoutSeconds/allowCustom the model emitted.
+            throw new AskUserPending({
+              question,
+              callId: ctx.callId,
+              ...(ctx.options !== undefined ? { options: ctx.options } : {}),
+              ...(ctx.default !== undefined ? { default: ctx.default } : {}),
+              ...(ctx.timeoutSeconds !== undefined
+                ? { timeoutSeconds: ctx.timeoutSeconds }
+                : {}),
+              ...(ctx.allowCustom !== undefined
+                ? { allowCustom: ctx.allowCustom }
+                : {}),
+            });
           },
         },
         // v0.17 follow-up — chat-mode goal proposal. Same `AskUserPending`
@@ -1327,15 +1565,30 @@ function registerChatScope(
               scope,
               conversationId,
             );
+            const pendingAsk = makePendingAskRecord(err as AskUserPending);
             await saveAnnotations(store.getWorkspace(), scope, conversationId, {
               ...sidecar,
-              pendingAsk: {
-                question: (err as AskUserPending).question,
-                callId: (err as AskUserPending).callId,
-                toolCallId: (err as AskUserPending).callId,
-                ts: Date.now(),
-              },
+              pendingAsk,
             });
+            // v0.19 Codex parity — schedule the server-side timeout if the
+            // model supplied one. The timer is cancelled by the
+            // /answer-ask handler when the user replies first.
+            if (
+              typeof pendingAsk.timeoutSeconds === "number" &&
+              pendingAsk.timeoutSeconds >= 1
+            ) {
+              scheduleAskTimeout(
+                pendingAsk.callId,
+                pendingAsk.timeoutSeconds * 1000,
+                makeAskTimeoutResolver({
+                  store,
+                  scope,
+                  conversationId,
+                  callId: pendingAsk.callId,
+                  fallback: pendingAsk.default ?? ASK_USER_GOAL_AUTO_REPLY,
+                }),
+              );
+            }
           } catch (annotErr) {
             // Annotation failure is non-fatal; the SPA already has the
             // question via the live `ask_user` SSE event. Logging is
@@ -1640,15 +1893,27 @@ function registerChatScope(
               scope,
               id,
             );
+            const pendingAsk = makePendingAskRecord(err as AskUserPending);
             await saveAnnotations(store.getWorkspace(), scope, id, {
               ...sidecar,
-              pendingAsk: {
-                question: (err as AskUserPending).question,
-                callId: (err as AskUserPending).callId,
-                toolCallId: (err as AskUserPending).callId,
-                ts: Date.now(),
-              },
+              pendingAsk,
             });
+            if (
+              typeof pendingAsk.timeoutSeconds === "number" &&
+              pendingAsk.timeoutSeconds >= 1
+            ) {
+              scheduleAskTimeout(
+                pendingAsk.callId,
+                pendingAsk.timeoutSeconds * 1000,
+                makeAskTimeoutResolver({
+                  store,
+                  scope,
+                  conversationId: id,
+                  callId: pendingAsk.callId,
+                  fallback: pendingAsk.default ?? ASK_USER_GOAL_AUTO_REPLY,
+                }),
+              );
+            }
           } catch (annotErr) {
             // eslint-disable-next-line no-console
             console.warn(
@@ -1919,6 +2184,10 @@ function registerChatScope(
     const cleared: ConversationAnnotations = { ...sidecar };
     delete (cleared as { pendingAsk?: unknown }).pendingAsk;
     await saveAnnotations(store.getWorkspace(), scope, id, cleared);
+    // v0.19 Codex parity — cancel any server-side timeout that was scheduled
+    // for this pending ask so the user's reply wins the race against a
+    // delayed auto-resolve. Idempotent: harmless when no timer was set.
+    cancelAskTimeout(pending.callId);
 
     return streamSSE(c, async (stream) => {
       // v0.17 mathub parity W9 — the user can steer a resumed-from-ask
@@ -2020,15 +2289,27 @@ function registerChatScope(
               scope,
               id,
             );
+            const pendingAsk = makePendingAskRecord(err as AskUserPending);
             await saveAnnotations(store.getWorkspace(), scope, id, {
               ...next,
-              pendingAsk: {
-                question: (err as AskUserPending).question,
-                callId: (err as AskUserPending).callId,
-                toolCallId: (err as AskUserPending).callId,
-                ts: Date.now(),
-              },
+              pendingAsk,
             });
+            if (
+              typeof pendingAsk.timeoutSeconds === "number" &&
+              pendingAsk.timeoutSeconds >= 1
+            ) {
+              scheduleAskTimeout(
+                pendingAsk.callId,
+                pendingAsk.timeoutSeconds * 1000,
+                makeAskTimeoutResolver({
+                  store,
+                  scope,
+                  conversationId: id,
+                  callId: pendingAsk.callId,
+                  fallback: pendingAsk.default ?? ASK_USER_GOAL_AUTO_REPLY,
+                }),
+              );
+            }
           } catch (annotErr) {
             // eslint-disable-next-line no-console
             console.warn(

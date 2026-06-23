@@ -786,16 +786,28 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     // no human at the keyboard — so the resolver returns the canned
     // "proceed with assumption" reply, which trains the model to make a
     // documented assumption rather than block on missing info.
+    //
+    // v0.19 Codex parity — if the model supplied a structured `default`
+    // via `ask_user({ default })`, honor it instead of the canned
+    // auto-reply: a hands-off goal run should respect the model's own
+    // fallback intent. options/timeoutSeconds/allowCustom are ignored
+    // in goal mode because there's no UI to render them on — the
+    // resolver just returns synchronously, so the round continues
+    // immediately whether a timeout was requested or not.
     builtinTools: {
       ...(opts.builtinTools ?? {}),
       ask_user: {
-        // v0.17 W14 observability: emit an audit step so the goal
-        // detail view can show what the model asked even though the
-        // resolver short-circuits the round with the canned reply.
-        // Best-effort: a write failure must not abort the round, so we
-        // swallow + log instead of letting the exception bubble into
-        // the LLM loop (where it would surface as a tool error).
-        resolver: async (question: string) => {
+        // v0.17 W14 observability + v0.19 Codex parity:
+        // 1) emit an audit step so the goal detail view can show what
+        //    the model asked even though the resolver short-circuits
+        //    the round.
+        // 2) if the model supplied a structured `default` via
+        //    `ask_user({ default })`, honor it instead of the canned
+        //    auto-reply (Codex parity).
+        // Audit write is best-effort: a write failure must not abort
+        // the round, so we swallow + log instead of letting the
+        // exception bubble into the LLM loop.
+        resolver: async (question: string, ctx) => {
           try {
             await appendStep(workspace, goalId, {
               kind: "ask-user-auto-resolved",
@@ -807,7 +819,7 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
               err,
             );
           }
-          return ASK_USER_GOAL_AUTO_REPLY;
+          return ctx.default !== undefined ? ctx.default : ASK_USER_GOAL_AUTO_REPLY;
         },
       },
     },
