@@ -145,7 +145,7 @@ export function registerSlashRoutes(app: Hono, deps: SlashRoutesDeps): void {
       case "effort": {
         const level = parseReasoningEffort(args);
         if (!level) {
-          return c.json({ error: "usage: /effort <low|med|high>" }, 400);
+          return c.json({ error: "usage: /effort <low|medium|high|max>" }, 400);
         }
         let session: ChatSession;
         try {
@@ -157,7 +157,7 @@ export function registerSlashRoutes(app: Hono, deps: SlashRoutesDeps): void {
         return c.json({
           ok: true,
           effort: level,
-          message: `reasoning effort set to "${level}" (MVP: stored only; model router unchanged)`,
+          message: `reasoning effort set to "${level}" (applies to the next message)`,
         });
       }
 

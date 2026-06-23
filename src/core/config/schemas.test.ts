@@ -63,6 +63,28 @@ describe("MathranSettingsSchema", () => {
     expect(MathranSettingsSchema.parse(s)).toMatchObject(s);
   });
 
+  it("accepts the chat reasoning-effort block (#6)", () => {
+    const s = {
+      chat: {
+        defaultEffort: "high",
+        modelEffort: { "openai/gpt-5": "max", "anthropic/claude": "low" },
+      },
+    };
+    expect(MathranSettingsSchema.parse(s)).toMatchObject(s);
+  });
+
+  it("rejects an invalid chat.defaultEffort level", () => {
+    expect(() =>
+      MathranSettingsSchema.parse({ chat: { defaultEffort: "turbo" } }),
+    ).toThrow();
+  });
+
+  it("rejects an invalid chat.modelEffort value", () => {
+    expect(() =>
+      MathranSettingsSchema.parse({ chat: { modelEffort: { "m": "med" } } }),
+    ).toThrow();
+  });
+
   it("rejects a non-positive hooks timeout", () => {
     expect(() => MathranSettingsSchema.parse({ hooks: { timeoutMs: 0 } })).toThrow();
   });

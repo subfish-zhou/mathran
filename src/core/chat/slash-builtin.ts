@@ -20,10 +20,18 @@ import type { ChatSession } from "./session.js";
 import type { HookInvoker } from "../hooks/executor.js";
 import { outcomeTag, relativeAge } from "../hooks/executor.js";
 import { isBlockingHookType, type LoadedHook } from "../hooks/loader.js";
+import {
+  parseEffortLevel,
+  type ReasoningEffortLevel,
+} from "../reasoning-effort/index.js";
 import * as nodePath from "node:path";
 
-/** Canonical effort levels accepted by `/effort`. */
-export type ReasoningEffortLevel = "low" | "med" | "high";
+/**
+ * Canonical effort levels accepted by `/effort` (#6): `low | medium | high |
+ * max`. Re-exported from the reasoning-effort module so the slash surface and
+ * the budget mappings can never drift.
+ */
+export type { ReasoningEffortLevel };
 
 /** Metadata describing a builtin slash command (drives the suggester list). */
 export interface BuiltinSlashCommandSpec {
@@ -53,7 +61,7 @@ export const NEW_BUILTIN_SLASH_COMMANDS: readonly BuiltinSlashCommandSpec[] = [
   { name: "compact", description: "Compact conversation history (keep last k rounds)" },
   { name: "context", description: "Show token usage and context-window percentage" },
   { name: "review", description: "Ask the reviewer to look at the latest exchange (MVP stub)" },
-  { name: "effort", description: "Set reasoning effort: low | med | high" },
+  { name: "effort", description: "Set reasoning effort: low | medium | high | max" },
   { name: "cd", description: "Switch workspace scope to projects/<slug>" },
   { name: "diff", description: "Open the diff view for the current effort (coming soon)" },
   { name: "agents", description: "List available and active sub-agents" },
@@ -78,42 +86,46 @@ export const BUILTIN_SLASH_COMMAND_NAMES: ReadonlySet<string> = new Set(
 // ── /effort ──────────────────────────────────────────────────────────────
 
 /**
- * Normalise an `/effort` argument to a canonical level. Accepts the three
- * canonical tokens plus the common `medium` long-form. Returns `null` for
- * anything else so callers can surface a usage error.
+ * Normalise an `/effort` argument to a canonical level. Accepts the four
+ * canonical tokens (`low | medium | high | max`) plus the legacy `med`
+ * short-form. Returns `null` for anything else so callers can surface a usage
+ * error. (#6 — was an MVP `low|med|high` stub before passthrough landed.)
  */
 export function parseReasoningEffort(arg: string): ReasoningEffortLevel | null {
-  const a = arg.trim().toLowerCase();
-  switch (a) {
-    case "low":
-      return "low";
-    case "med":
-    case "medium":
-      return "med";
-    case "high":
-      return "high";
-    default:
-      return null;
-  }
+  return parseEffortLevel(arg);
 }
 
 /**
- * MVP persistence for `/effort` (PLAN decision #2): stash the level on the
- * session instance. The model router does not read this yet — that's a
- * follow-up PR. Kept as a tiny helper so `session.ts` stays untouched.
+ * Set the reasoning-effort level on a session. Prefers the real {@link
+ * ChatSession.setEffort} method (so the level is threaded into the next
+ * `LLMRequest` and passed through to the provider — #6); falls back to a
+ * stashed field for session-like test doubles that lack the method.
  */
 export function setSessionReasoningEffort(
   session: ChatSession,
   level: ReasoningEffortLevel,
 ): void {
-  (session as unknown as { reasoningEffort?: ReasoningEffortLevel }).reasoningEffort = level;
+  const s = session as unknown as {
+    setEffort?: (l: ReasoningEffortLevel) => void;
+    reasoningEffort?: ReasoningEffortLevel;
+  };
+  if (typeof s.setEffort === "function") {
+    s.setEffort(level);
+    return;
+  }
+  s.reasoningEffort = level;
 }
 
-/** Read back the effort level stashed by {@link setSessionReasoningEffort}. */
+/** Read back the effort level (real {@link ChatSession.getEffort} or stash). */
 export function getSessionReasoningEffort(
   session: ChatSession,
 ): ReasoningEffortLevel | undefined {
-  return (session as unknown as { reasoningEffort?: ReasoningEffortLevel }).reasoningEffort;
+  const s = session as unknown as {
+    getEffort?: () => ReasoningEffortLevel | undefined;
+    reasoningEffort?: ReasoningEffortLevel;
+  };
+  if (typeof s.getEffort === "function") return s.getEffort();
+  return s.reasoningEffort;
 }
 
 // ── /review (MVP stub) ────────────────────────────────────────────────────

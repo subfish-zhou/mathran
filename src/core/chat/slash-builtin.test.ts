@@ -54,12 +54,15 @@ describe("builtin command metadata", () => {
 describe("parseReasoningEffort", () => {
   it("accepts canonical tokens", () => {
     expect(parseReasoningEffort("low")).toBe("low");
-    expect(parseReasoningEffort("med")).toBe("med");
+    expect(parseReasoningEffort("medium")).toBe("medium");
     expect(parseReasoningEffort("high")).toBe("high");
+    expect(parseReasoningEffort("max")).toBe("max");
   });
-  it("accepts medium long-form and is case/space insensitive", () => {
-    expect(parseReasoningEffort("  MEDIUM ")).toBe("med");
+  it("accepts the legacy med short-form and is case/space insensitive", () => {
+    expect(parseReasoningEffort("  MED ")).toBe("medium");
+    expect(parseReasoningEffort("Medium")).toBe("medium");
     expect(parseReasoningEffort("High")).toBe("high");
+    expect(parseReasoningEffort("MAX")).toBe("max");
   });
   it("rejects unknown levels", () => {
     expect(parseReasoningEffort("turbo")).toBeNull();
@@ -67,12 +70,24 @@ describe("parseReasoningEffort", () => {
   });
 });
 
-describe("session effort persistence (MVP stub)", () => {
+describe("session effort persistence", () => {
   it("round-trips the level on a session-like object", () => {
     const fake = {} as ChatSession;
     expect(getSessionReasoningEffort(fake)).toBeUndefined();
     setSessionReasoningEffort(fake, "high");
     expect(getSessionReasoningEffort(fake)).toBe("high");
+  });
+  it("prefers the real setEffort/getEffort methods when present", () => {
+    let stored: string | undefined;
+    const real = {
+      setEffort: (l: string) => {
+        stored = l;
+      },
+      getEffort: () => stored,
+    } as unknown as ChatSession;
+    setSessionReasoningEffort(real, "max");
+    expect(stored).toBe("max");
+    expect(getSessionReasoningEffort(real)).toBe("max");
   });
 });
 

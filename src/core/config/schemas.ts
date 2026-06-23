@@ -55,6 +55,24 @@ export const ModelPreferenceSchema = z
 
 export type ModelPreference = z.infer<typeof ModelPreferenceSchema>;
 
+/** Canonical reasoning-effort levels (#6). */
+export const ReasoningEffortLevelSchema = z.enum(["low", "medium", "high", "max"]);
+
+/**
+ * `settings.json#chat` — chat-session defaults. Currently carries the
+ * reasoning-effort budget defaults (#6):
+ *   - `defaultEffort`  workspace/project default effort level.
+ *   - `modelEffort`    per-model override, keyed by routing model string.
+ */
+export const ChatSettingsSchema = z
+  .object({
+    defaultEffort: ReasoningEffortLevelSchema.optional(),
+    modelEffort: z.record(z.string(), ReasoningEffortLevelSchema).optional(),
+  })
+  .passthrough();
+
+export type ChatSettings = z.infer<typeof ChatSettingsSchema>;
+
 // ──────────────────────────────────────────────────────────────────────
 // approval (Approval Policy 矩阵)
 // ──────────────────────────────────────────────────────────────────────
@@ -113,6 +131,8 @@ export const MathranSettingsSchema = z
       .optional(),
     editor: z.string().optional(),
     modelPreference: ModelPreferenceSchema.optional(),
+    /** Chat-session defaults — reasoning-effort budget (#6). */
+    chat: ChatSettingsSchema.optional(),
     skills: z
       .object({
         disabled: z.array(z.string()).optional(),

@@ -47,6 +47,7 @@ import {
 import { loadLayeredSkills } from "../../core/skills/loader.js";
 import type { LoadedSkill } from "../../core/skills/loader.js";
 import { loadLayeredSettings } from "../../core/config/layered-settings.js";
+import { resolveEffort, type ChatEffortSettings } from "../../core/reasoning-effort/index.js";
 import { loadLayeredHooks } from "../../core/hooks/loader.js";
 import { HookInvoker } from "../../core/hooks/executor.js";
 import { ApprovalBroker } from "../../core/chat/approval-broker.js";
@@ -116,6 +117,13 @@ export interface BuildSessionOptions {
   approvalResolver?: import("../../core/approval/index.js").ApprovalResolver;
   /** Learning-mode rule-proposal resolver (readline). REPL-only. */
   ruleProposalResolver?: import("../../core/approval/index.js").RuleProposalResolver;
+  /**
+   * Reasoning-effort budget (#6): `low | medium | high | max`. The `--effort`
+   * flag value (highest precedence). When omitted, the level falls back to
+   * `settings.chat.modelEffort[<model>]` → `settings.chat.defaultEffort` →
+   * `medium`. An invalid string is ignored (falls through the cascade).
+   */
+  effort?: string;
 }
 
 /**
@@ -375,9 +383,20 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     denylist: approvalCfg.denylist,
   });
 
+  // Reasoning-effort budget (#6): resolve the effective level from the
+  // `--effort` flag (highest precedence) cascading down through
+  // settings.chat.modelEffort[model] → settings.chat.defaultEffort → medium.
+  // Pure passthrough — never touches routing/model selection.
+  const effort = resolveEffort({
+    ...(opts.effort !== undefined ? { flag: opts.effort } : {}),
+    model,
+    settings: (layeredSettings.chat ?? {}) as ChatEffortSettings,
+  });
+
   const session = new ChatSession({
     llm: router,
     model,
+    effort,
     systemPrompt: opts.systemPrompt ?? SYSTEM_PROMPT,
     tools: [createLeanCheckTool(lean)],
     workspace,
@@ -470,6 +489,8 @@ export interface OneShotOptions {
   prompt: string;
   model?: string;
   configPath?: string;
+  /** `--effort` budget level (#6). */
+  effort?: string;
 }
 
 /**
@@ -514,6 +535,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   const { session, hookInvoker } = buildChatSession({
     model: opts.model,
     configPath: opts.configPath,
+    ...(opts.effort !== undefined ? { effort: opts.effort } : {}),
   });
   if (memInfo.anyPresent) {
     // Match REPL behaviour: a one-line stderr breadcrumb so users know
@@ -593,7 +615,7 @@ const HELP_TEXT = `commands:
   /history                 print a summary of the current history
   /compact [k]             compact history via subagent (keep last k user rounds, default 5)
   /context                 show message count + approximate token usage
-  /effort [low|med|high]   show or set the reasoning-effort level (MVP: stored only)
+  /effort [low|medium|high|max]  show or set the reasoning-effort budget (passed through to the provider)
   /skills                  list layered skills (builtin / user / workspace / project)
   /skills <name>           show one skill's full SKILL.md (trigger + tools + body)
   /skills disable <name>   add <name> to settings.json#skills.disabled
@@ -840,17 +862,17 @@ export async function handleSlashCommand(
           kind: "continue",
           output: current
             ? `reasoning effort: ${current}`
-            : "usage: /effort <low|med|high>",
+            : "usage: /effort <low|medium|high|max>",
         };
       }
       const level = parseReasoningEffort(arg);
       if (!level) {
-        return { kind: "continue", output: "usage: /effort <low|med|high>" };
+        return { kind: "continue", output: "usage: /effort <low|medium|high|max>" };
       }
       setSessionReasoningEffort(ctx.session, level);
       return {
         kind: "continue",
-        output: `reasoning effort set to "${level}" (MVP: stored only; model router unchanged).`,
+        output: `reasoning effort set to "${level}" (applies to your next message).`,
       };
     }
 
@@ -1036,6 +1058,8 @@ async function reloadMemoryIntoSession(
 export interface ReplOptions {
   model?: string;
   configPath?: string;
+  /** `--effort` budget level (#6). */
+  effort?: string;
 }
 
 /** Run the interactive REPL. Returns a process exit code. */
@@ -1061,6 +1085,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
   let { session, model, providerKey, hookInvoker } = buildChatSession({
     model: opts.model,
     configPath: opts.configPath,
+    ...(opts.effort !== undefined ? { effort: opts.effort } : {}),
     askUserResolver,
     approvalResolver,
     ruleProposalResolver,
