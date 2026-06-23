@@ -69,6 +69,7 @@ import { createProposePlanTool } from "./tools/propose-plan.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
 import type { RiskClass, ApprovalRequest, ApprovalDecision, ApprovalResolver } from "../approval/types.js";
+import type { Outcome } from "../outcomes/schema.js";
 import type { ProfileEffects } from "../profiles/types.js";
 import { isMutatingCall } from "../profiles/profile-resolver.js";
 import { buildProfileBanner } from "../profiles/profile-message.js";
@@ -192,6 +193,17 @@ export type ChatEvent =
        *  reloads see what the user actually steered with. */
       type: "steer-received";
       text: string;
+    }
+  | {
+      /** outcomes 收尾 C-2 — emitted by the *host* SSE layer (NOT the kernel)
+       *  when a background self-grade round lands an Outcome on disk while a
+       *  stream is open. The kernel never yields this itself; it lives in the
+       *  union so `serve.ts` can write it through the same typed `writeSSE`
+       *  envelope and the SPA can switch on it. The SPA filters on `goalId`,
+       *  toasts `📊 Goal graded: X/5`, and refreshes its outcomes list. */
+      type: "goal-graded";
+      goalId: string;
+      outcome: Outcome;
     }
   | {
       type: "done";

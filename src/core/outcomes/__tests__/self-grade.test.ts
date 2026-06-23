@@ -10,6 +10,7 @@ import {
   buildTraceFromHistory,
 } from "../self-grade.js";
 import { readOutcome, readIndex } from "../store.js";
+import { subscribeOutcomeGraded } from "../events.js";
 import type { LLMMessage, LLMProvider, LLMRequest } from "../../providers/llm.js";
 
 let workspace: string;
@@ -144,6 +145,55 @@ describe("selfGradeGoal", () => {
     });
     expect(result).toBeNull();
     expect(await readOutcome(workspace, "g-bad")).toBeNull();
+  });
+
+  it("publishes a goal-graded event after persisting (C-2)", async () => {
+    const seen: Array<{ goalId: string; workspace: string; avg: number }> = [];
+    const unsub = subscribeOutcomeGraded((e) =>
+      seen.push({ goalId: e.goalId, workspace: e.workspace, avg: e.outcome.averageScore }),
+    );
+    try {
+      const outcome = await selfGradeGoal({
+        workspace,
+        goalId: "g-emit",
+        objective: "refactor",
+        resolution: "complete",
+        startedAt: 1,
+        endedAt: 2,
+        history: [{ role: "assistant", content: "did it" }],
+        llm: textLLM(GOOD_REPLY),
+        model: "test",
+      });
+      expect(outcome).not.toBeNull();
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ goalId: "g-emit", workspace });
+      expect(seen[0].avg).toBeCloseTo(4.3, 5);
+    } finally {
+      unsub();
+    }
+  });
+
+  it("does NOT publish when grading fails (C-2 failure path)", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const seen: string[] = [];
+    const unsub = subscribeOutcomeGraded((e) => seen.push(e.goalId));
+    try {
+      const result = await selfGradeGoal({
+        workspace,
+        goalId: "g-noemit",
+        objective: "x",
+        resolution: "complete",
+        startedAt: 1,
+        endedAt: 2,
+        history: [{ role: "assistant", content: "hi" }],
+        llm: errorLLM(),
+        model: "test",
+      });
+      expect(result).toBeNull();
+      expect(seen).toEqual([]);
+    } finally {
+      unsub();
+    }
   });
 });
 

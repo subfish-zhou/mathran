@@ -23,6 +23,7 @@ import {
 } from "./schema.js";
 import { buildRubricMessages, parseRubricReply } from "./rubric-prompt.js";
 import { writeOutcome } from "./store.js";
+import { publishOutcomeGraded } from "./events.js";
 import type { LLMMessage, LLMProvider } from "../providers/llm.js";
 
 /** Map the runner's completion outcome to an outcome resolution. */
@@ -127,6 +128,18 @@ export async function selfGradeGoal(
     };
 
     await writeOutcome(input.workspace, outcome);
+    // Notify any active SSE stream so the SPA can toast + refresh. Best-effort:
+    // a publish with no subscribers is a no-op (the outcome is on disk either
+    // way). Guarded so a misbehaving listener can't break the grade flow.
+    try {
+      publishOutcomeGraded({
+        workspace: input.workspace,
+        goalId: outcome.goalId,
+        outcome,
+      });
+    } catch {
+      /* a throwing subscriber must not turn a successful grade into a failure */
+    }
     return outcome;
   } catch (err) {
     // Fire-and-forget contract: log + swallow. A failed grade must never
