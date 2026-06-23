@@ -134,6 +134,31 @@ export const api = {
       }),
     );
   },
+  /**
+   * AI-assisted project init (v1a). Scaffolds the project then kicks off the
+   * init-project agent (fs-only, runs in the background). Returns the new slug
+   * plus the runId you can poll via the run ledger.
+   */
+  async initProjectAi(
+    name: string,
+    opts: { searchDepth?: "quick" | "standard" | "deep"; seedReferences?: string[] } = {},
+  ): Promise<{ projectSlug: string; runId: string | null; aiAssisted: boolean }> {
+    return jsonOrThrow(
+      await fetch("/api/agent/init-project", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          problem: { title: name },
+          seedReferences: opts.seedReferences ?? [],
+          aiInit: {
+            enableWiki: true,
+            enableWorkspace: true,
+            searchDepth: opts.searchDepth ?? "standard",
+          },
+        }),
+      }),
+    );
+  },
   async getProject(slug: string): Promise<ProjectDetail> {
     return jsonOrThrow(await fetch(`/api/projects/${enc(slug)}`));
   },
