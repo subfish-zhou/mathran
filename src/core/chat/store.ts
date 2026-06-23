@@ -297,10 +297,46 @@ export function conversationFilePath(
   return conversationFile(scopeDir(workspace, scope), conversationId);
 }
 
+/**
+ * Flatten a single message's ContentPart[] (vision payload) down to a plain
+ * string for disk persistence. We DO NOT persist base64 image bytes:
+ *
+ *   - the upload itself is already saved under `<workspace>/.mathran/uploads/`
+ *     and the renderer marker can point back to it,
+ *   - inlining the same image bytes in every persisted message would
+ *     quadruple disk usage on a long thread,
+ *   - on reload we don't need the bytes — the SPA shows the prior user
+ *     turn from history and any re-send goes through chat-attachments again.
+ *
+ * The flattened form mirrors the legacy `[Image: <mime>]` text marker so a
+ * future model that re-reads the persisted thread still sees "image happened
+ * here" instead of nothing. Text parts are joined with `\n\n`.
+ */
+function flattenContentForPersist(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const out: string[] = [];
+  for (const p of content) {
+    if (p && typeof p === "object") {
+      if ((p as any).type === "text" && typeof (p as any).text === "string") {
+        out.push((p as any).text);
+      } else if ((p as any).type === "image") {
+        const mime = typeof (p as any).mimeType === "string" ? (p as any).mimeType : "unknown";
+        out.push(`[Image: ${mime}]`);
+      }
+    }
+  }
+  return out.join("\n\n");
+}
+
 /** Persist the full message history of a session as one `.jsonl` file. */
 async function flushSession(dir: string, conversationId: string, history: LLMMessage[]): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
-  const lines = history.map((m) => JSON.stringify(m)).join("\n");
+  // C-round Commit 4 vision: ContentPart[] (image base64) is flattened to a
+  // text marker before serialization — we never persist base64 image bytes
+  // (the uploads dir already has the file).
+  const flattened = history.map((m) => ({ ...m, content: flattenContentForPersist(m.content) }));
+  const lines = flattened.map((m) => JSON.stringify(m)).join("\n");
   await atomicWriteFile(conversationFile(dir, conversationId), lines + (lines.length > 0 ? "\n" : ""));
 }
 
