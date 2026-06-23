@@ -273,6 +273,12 @@ function CreateGoalModal({
   const [model, setModel] = useState(defaultModel ?? "");
   const [budgetTokens, setBudgetTokens] = useState("");
   const [maxRounds, setMaxRounds] = useState("");
+  // goal-defaults-timer (commit 5/7): "额外指令" / additional context.
+  // Free-form text that ends up appended to every round's system
+  // prompt as a labelled tail block (see runner.buildGoalSystemPrompt).
+  // Server trims empty/whitespace to undefined, so leaving this blank
+  // is the no-op default.
+  const [extraInstructions, setExtraInstructions] = useState("");
 
   const canSubmit = objective.trim().length > 0 && !pending;
 
@@ -338,6 +344,24 @@ function CreateGoalModal({
           />
         </label>
 
+        {/* goal-defaults-timer (commit 5/7): the 3rd field. Optional
+            standing instructions for the whole goal — anything the
+            user wants the assistant to keep in mind across every round
+            (output language, project conventions, "don't touch X",
+            stylistic notes). Spliced into the system prompt as the
+            tail-most block, so it sits closest to the assistant's next
+            response and wins recency bias against ephemeral steers. */}
+        <label className="mt-2 block text-xs font-medium text-slate-700">
+          额外指令 / Additional context (optional)
+          <textarea
+            value={extraInstructions}
+            onChange={(e) => setExtraInstructions(e.target.value)}
+            rows={3}
+            placeholder={"e.g. 中文回复。 / Always respond in Lean 4 syntax. / Don't modify files under vendored/."}
+            className="mt-1 w-full rounded border border-slate-300 px-2 py-1 text-sm focus:border-amber-500 focus:outline-none"
+          />
+        </label>
+
         {error && (
           <div className="mt-3 rounded border border-red-300 bg-red-50 px-2 py-1 text-xs text-red-800">
             {error}
@@ -363,6 +387,7 @@ function CreateGoalModal({
                 model: model.trim() || undefined,
                 budgetTokens: budgetTokens ? Number(budgetTokens) : null,
                 maxRounds: maxRounds ? Number(maxRounds) : null,
+                extraInstructions: extraInstructions.trim() || undefined,
               })
             }
             className="rounded border border-amber-500 bg-amber-100 px-3 py-1 text-sm text-amber-900 hover:bg-amber-200 disabled:cursor-not-allowed disabled:opacity-50"
