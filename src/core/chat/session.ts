@@ -483,6 +483,15 @@ export interface ChatSessionOptions {
     /** Defaults to {@link ChatSessionOptions.workspace}. */
     workspace?: string;
   };
+  /**
+   * MCP client registry (#4). When set, the connected MCP servers' tools are
+   * projected into mathran {@link ToolSpec}s (namespaced `mcp__<server>__<tool>`,
+   * `riskClass: "exec"` so they flow through the approval policy) and appended
+   * to the tool list AFTER the builtins. Structural type so the session doesn't
+   * depend on the concrete `McpRegistry` class. Unset → no MCP tools (purely
+   * additive, backward-compatible).
+   */
+  mcpRegistry?: { toolSpecs(): ToolSpec[] };
 }
 
 interface PendingToolCall {
@@ -695,6 +704,20 @@ export class ChatSession {
     if (builtins.length > 0) {
       this.tools = [...builtins, ...this.tools];
       this.toolByName = new Map(this.tools.map((t) => [t.name, t]));
+    }
+    // MCP tools (#4): pull every connected server's namespaced tools from the
+    // registry and append them AFTER builtins + caller tools. Best-effort — a
+    // throwing registry must never abort session construction.
+    if (opts.mcpRegistry) {
+      try {
+        const mcpTools = opts.mcpRegistry.toolSpecs();
+        if (mcpTools.length > 0) {
+          this.tools = [...this.tools, ...mcpTools];
+          this.toolByName = new Map(this.tools.map((t) => [t.name, t]));
+        }
+      } catch {
+        // constructors must NEVER throw.
+      }
     }
     // v0.3 §14: prepend MATHRAN.md memory (global → project) BEFORE the
     // persona system prompt. Reads are sync (tiny files) and never throw —
