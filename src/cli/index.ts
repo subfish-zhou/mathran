@@ -47,6 +47,7 @@ function readMathranVersion(): string {
 interface TopLevelOpts {
   prompt?: string;
   model?: string;
+  profile?: string;
 }
 
 /**
@@ -79,8 +80,8 @@ async function runChatEntry(opts: TopLevelOpts): Promise<never> {
   const prompt = await resolvePrompt(opts);
   const code =
     prompt !== null
-      ? await runOneShot({ prompt, model: opts.model })
-      : await runRepl({ model: opts.model });
+      ? await runOneShot({ prompt, model: opts.model, ...(opts.profile ? { profile: opts.profile } : {}) })
+      : await runRepl({ model: opts.model, ...(opts.profile ? { profile: opts.profile } : {}) });
   process.exit(code);
 }
 
@@ -92,6 +93,7 @@ program
   .version(readMathranVersion(), "-v, --version", "Print version and exit")
   .option("-p, --prompt <text>", 'One-shot prompt (use "-" or pipe stdin to read from stdin), then exit')
   .option("-m, --model <model>", "LLM model to use (e.g. copilot/gpt-5.5); defaults to config.defaultModel")
+  .option("--profile <name>", "Permission profile to apply (dev|ci|review or a custom .mathran/profiles/<name>.json)")
   .action(async (opts: TopLevelOpts) => {
     await runChatEntry(opts);
   });
@@ -101,6 +103,7 @@ program
   .description("Start the conversational REPL (or one-shot with -p)")
   .option("-p, --prompt <text>", 'One-shot prompt (use "-" or pipe stdin to read from stdin), then exit')
   .option("-m, --model <model>", "LLM model to use (e.g. copilot/gpt-5.5); defaults to config.defaultModel")
+  .option("--profile <name>", "Permission profile to apply (dev|ci|review or a custom .mathran/profiles/<name>.json)")
   .action(async (opts: TopLevelOpts) => {
     await runChatEntry(opts);
   });

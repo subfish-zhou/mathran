@@ -71,6 +71,12 @@ import {
 import { createOpenAITokenCounter, createFallbackTokenCounter } from "../../core/chat/token-counter.js";
 import { MATHRAN_DIR, SETTINGS_FILE } from "../../core/config/mathran-root.js";
 import { atomicWriteFile } from "../../core/chat/atomic-write.js";
+import {
+  resolveProfile,
+  listAvailableProfiles,
+  UnknownProfileError,
+} from "../../core/profiles/index.js";
+import type { ProfileEffects } from "../../core/profiles/index.js";
 
 const DEFAULT_MODEL = "copilot/gpt-5.5";
 
@@ -116,6 +122,14 @@ export interface BuildSessionOptions {
   approvalResolver?: import("../../core/approval/index.js").ApprovalResolver;
   /** Learning-mode rule-proposal resolver (readline). REPL-only. */
   ruleProposalResolver?: import("../../core/approval/index.js").RuleProposalResolver;
+  /**
+   * Permission Profile (#2). The profile NAME selected via `mathran chat
+   * --profile <name>` or `/profile <name>`. Resolved against the builtins
+   * (dev / ci / review) plus any user/workspace `.mathran/profiles/<name>.json`.
+   * When omitted, `settings.json#profile` is consulted; absent that, no profile
+   * is active (legacy behaviour).
+   */
+  profile?: string;
 }
 
 /**
@@ -300,6 +314,8 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
   model: string;
   providerKey: string;
   hookInvoker: HookInvoker;
+  /** Resolved active profile (#2), or undefined when no profile is active. */
+  profile?: ProfileEffects;
 } {
   const config = loadConfig(opts.configPath);
   const model = opts.model ?? config.defaultModel ?? DEFAULT_MODEL;
@@ -334,13 +350,38 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
   for (const w of approvalCfg.warnings) {
     process.stderr.write(`\x1b[33m[mathran] ${w}\x1b[0m\n`);
   }
+
+  // Permission Profiles (#2): resolve the active profile. Precedence:
+  //   --profile flag (opts.profile) > settings.json#profile default > none.
+  // A profile forces the approval policy and adds dispatch-level hard rejects;
+  // it never weakens the denylist (always additive).
+  const profileName = opts.profile ?? readSettingsDefaultProfile(workspace);
+  let profile: ProfileEffects | undefined;
+  if (profileName) {
+    try {
+      profile = resolveProfile(profileName, { workspace });
+    } catch (err) {
+      if (err instanceof UnknownProfileError) {
+        process.stderr.write(`\x1b[31m[mathran] ${err.message}\x1b[0m\n`);
+      } else {
+        throw err;
+      }
+    }
+  }
+  // The profile's policy overrides the settings policy; its denylistTools are
+  // merged on TOP of the settings denylist (never replacing it).
+  const effectivePolicy = profile?.policy ?? approvalCfg.policy;
+  const effectiveDenylist = profile
+    ? [...approvalCfg.denylist, ...profile.denylistTools.map((t) => `${t}:*`)]
+    : approvalCfg.denylist;
+
   const approvalBroker = new ApprovalBroker({
-    policy: approvalCfg.policy,
+    policy: effectivePolicy,
     workspace,
     learning: approvalCfg.learning,
     proposeAfter: approvalCfg.proposeAfter,
     inlineRules: approvalCfg.inlineRules,
-    denylist: approvalCfg.denylist,
+    denylist: effectiveDenylist,
     rulesFiles: approvalCfg.rulesFiles,
     persistentRuleFile: approvalCfg.persistentRuleFile,
     history: historyFor(approvalCfg),
@@ -410,9 +451,28 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
       ? { memoryFiles: { enabled: true, workspace: opts.memoryWorkspace } }
       : { layeredMemory: { workspace } }),
     ...(layeredSkills.length > 0 ? { layeredSkills } : {}),
+    ...(profile ? { profile } : {}),
   });
 
-  return { session, model, providerKey, hookInvoker };
+  return { session, model, providerKey, hookInvoker, ...(profile ? { profile } : {}) };
+}
+
+/**
+ * Permission Profiles (#2): read the default profile name from the workspace
+ * `settings.json#profile` field, if present. Best-effort — a missing or
+ * malformed file yields `undefined`.
+ */
+function readSettingsDefaultProfile(workspace: string): string | undefined {
+  const file = path.join(workspace, MATHRAN_DIR, SETTINGS_FILE);
+  try {
+    const parsed = JSON.parse(fsSync.readFileSync(file, "utf-8"));
+    if (parsed && typeof parsed === "object" && typeof parsed.profile === "string") {
+      return parsed.profile;
+    }
+  } catch {
+    /* no settings / malformed → no default profile */
+  }
+  return undefined;
 }
 
 /** Read all of stdin (used for piped one-shot prompts). */
@@ -470,6 +530,8 @@ export interface OneShotOptions {
   prompt: string;
   model?: string;
   configPath?: string;
+  /** Permission Profile (#2) name (dev / ci / review / custom). */
+  profile?: string;
 }
 
 /**
@@ -514,6 +576,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   const { session, hookInvoker } = buildChatSession({
     model: opts.model,
     configPath: opts.configPath,
+    ...(opts.profile ? { profile: opts.profile } : {}),
   });
   if (memInfo.anyPresent) {
     // Match REPL behaviour: a one-line stderr breadcrumb so users know
@@ -584,6 +647,11 @@ export interface SlashContext {
    * `/memory edit` skips the reload prompt (used by tests).
    */
   promptReload?: () => Promise<boolean>;
+  /**
+   * Permission Profiles (#2): the active profile name, used by `/profile` to
+   * report the current profile. Undefined when no profile is active.
+   */
+  profileName?: string;
 }
 
 const HELP_TEXT = `commands:
@@ -598,6 +666,8 @@ const HELP_TEXT = `commands:
   /skills <name>           show one skill's full SKILL.md (trigger + tools + body)
   /skills disable <name>   add <name> to settings.json#skills.disabled
   /skills enable <name>    remove <name> from settings.json#skills.disabled
+  /profile                 show the active profile + list available profiles
+  /profile <name>          switch to a permission profile (dev|ci|review|custom; session-only)
   /hooks                   list layered hooks (use /hooks log|bypass|disable <name>)
   /agents                  list available sub-agent kinds (+ active)
   /review                  print the preset review prompt (MVP stub)
@@ -881,6 +951,38 @@ export async function handleSlashCommand(
       };
     }
 
+    case "/profile": {
+      const workspace = ctx.memoryWorkspace ?? process.cwd();
+      const available = listAvailableProfiles({ workspace });
+      if (!arg) {
+        const current = ctx.profileName ?? "(none)";
+        const lines = available.map((p) => {
+          const marker = p.name === ctx.profileName ? "* " : "  ";
+          const desc = p.description ? ` — ${p.description}` : "";
+          return `${marker}${p.name} [${p.source}]${desc}`;
+        });
+        return {
+          kind: "continue",
+          output: `active profile: ${current}\navailable profiles:\n${lines.join("\n")}`,
+        };
+      }
+      // Switch profile: validate, then rebuild the session (the broker policy
+      // is immutable, so a switch rebuilds — same pattern as /model).
+      try {
+        resolveProfile(arg, { workspace });
+      } catch (err: any) {
+        if (err instanceof UnknownProfileError) {
+          return { kind: "continue", output: `mathran: ${err.message}` };
+        }
+        throw err;
+      }
+      return {
+        kind: "rebuild",
+        output: `switched to profile '${arg}' (history reset).`,
+        nextBuild: { model: ctx.model, configPath: ctx.configPath, profile: arg },
+      };
+    }
+
     default:
       return {
         kind: "continue",
@@ -1036,6 +1138,8 @@ async function reloadMemoryIntoSession(
 export interface ReplOptions {
   model?: string;
   configPath?: string;
+  /** Permission Profile (#2) name (dev / ci / review / custom). */
+  profile?: string;
 }
 
 /** Run the interactive REPL. Returns a process exit code. */
@@ -1058,15 +1162,19 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
   const approvalResolver = createReadlineApprovalResolver(rl);
   const ruleProposalResolver = createReadlineRuleProposalResolver(rl);
 
-  let { session, model, providerKey, hookInvoker } = buildChatSession({
+  let { session, model, providerKey, hookInvoker, profile } = buildChatSession({
     model: opts.model,
     configPath: opts.configPath,
     askUserResolver,
     approvalResolver,
     ruleProposalResolver,
+    ...(opts.profile ? { profile: opts.profile } : {}),
   });
 
   console.log(`mathran chat — model: ${model}  (provider: ${providerKey})`);
+  if (profile) {
+    console.log(`Active profile: ${profile.name}${profile.description ? ` — ${profile.description}` : ""}`);
+  }
   if (memInfo.anyPresent) {
     console.log(
       `Loaded memory: global=${memInfo.globalSize}B project=${memInfo.projectSize}B`,
@@ -1112,6 +1220,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           memoryWorkspace: workspace,
           hookInvoker,
           promptReload,
+          ...(profile ? { profileName: profile.name } : {}),
         });
         if (result.output) console.log(result.output);
         if (result.kind === "exit") break;
@@ -1126,6 +1235,7 @@ export async function runRepl(opts: ReplOptions = {}): Promise<number> {
           model = built.model;
           providerKey = built.providerKey;
           hookInvoker = built.hookInvoker;
+          profile = built.profile;
         }
       } catch (err: any) {
         console.error(`mathran: ${err?.message ?? err}`);

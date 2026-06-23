@@ -68,6 +68,9 @@ import { createProposePlanTool } from "./tools/propose-plan.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
 import type { RiskClass, ApprovalRequest, ApprovalDecision, ApprovalResolver } from "../approval/types.js";
+import type { ProfileEffects } from "../profiles/types.js";
+import { isMutatingCall } from "../profiles/profile-resolver.js";
+import { buildProfileBanner } from "../profiles/profile-message.js";
 import * as path from "node:path";
 
 /**
@@ -354,6 +357,17 @@ export interface ChatSessionOptions {
    */
   approvalResolver?: ApprovalResolver;
   /**
+   * Permission Profile (#2). When set, a HARD reject is applied at the tool
+   * dispatch entry point (before the approval broker, so the user cannot
+   * override it) for mutating tool calls under a read-only / review profile,
+   * and for any tool listed in {@link ProfileEffects.denylistTools}. A banner
+   * describing the active profile is also injected as a leading system message.
+   * The broker's policy is expected to already reflect `profile.policy` (the
+   * CLI wires that up); this field only drives the dispatch-level enforcement
+   * and the banner.
+   */
+  profile?: ProfileEffects;
+  /**
    * MATHRAN.md memory injection (v0.3 §14). When `enabled: true`, the
    * constructor synchronously reads `~/.mathran/MATHRAN.md` (global) and
    * `<workspace>/MATHRAN.md` (project) and prepends a single system message
@@ -545,6 +559,8 @@ export class ChatSession {
   private readonly hookInvoker?: HookInvoker;
   /** Session-level approval resolver (yield-based prompt driver). */
   private readonly approvalResolver?: ApprovalResolver;
+  /** Permission Profile (#2) — drives the dispatch-level hard reject. */
+  private readonly profile?: ProfileEffects;
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
   private messages: LLMMessage[] = [];
@@ -588,6 +604,7 @@ export class ChatSession {
     this.approvalBroker = opts.approvalBroker;
     this.approvalResolver = opts.approvalResolver;
     this.hookInvoker = opts.hooks;
+    this.profile = opts.profile;
     // Mix in built-in tools (v0.2 §9+). Order: built-ins first, then caller's
     // tools (so a caller-supplied tool with the same name wins via the
     // `toolByName` map's last-write).
@@ -671,6 +688,17 @@ export class ChatSession {
 
     if (opts.systemPrompt && opts.systemPrompt.trim().length > 0) {
       this.messages.push({ role: "system", content: opts.systemPrompt });
+    }
+
+    // Permission Profiles (#2): inject the active-profile banner as the LAST
+    // leading system message so the model is reminded of the current profile's
+    // constraints on every turn (it survives /reset, which keeps leading
+    // system messages).
+    if (this.profile) {
+      const banner = buildProfileBanner(this.profile);
+      if (banner.trim().length > 0) {
+        this.messages.push({ role: "system", content: banner });
+      }
     }
 
   }
@@ -840,6 +868,30 @@ export class ChatSession {
     parsed: Record<string, unknown>,
     callCtx: ToolExecuteContext,
   ): AsyncGenerator<ChatEvent, { ok: boolean; content: string }, void> {
+    // Permission Profiles (#2): HARD reject at the dispatch entry — before the
+    // approval broker, so the user can never override it. Applies to:
+    //   - any tool the active profile explicitly denies (denylistTools), and
+    //   - mutating tool calls under a read-only (ci) or hard-reject (review)
+    //     profile.
+    const profile = this.profile;
+    if (profile) {
+      if (profile.denylistTools.includes(call.name)) {
+        return {
+          ok: false,
+          content: `⛔ tool '${call.name}' is blocked by permission profile '${profile.name}'`,
+        };
+      }
+      if (profile.readOnlyMode || profile.hardRejectMutations) {
+        const riskClass = tool.riskClass ?? "read";
+        if (isMutatingCall(call.name, riskClass, parsed)) {
+          const reason = profile.readOnlyMode
+            ? `read-only mode (profile '${profile.name}') forbids mutating tool '${call.name}'`
+            : `profile '${profile.name}' forbids mutation — '${call.name}' is rejected even with approval`;
+          return { ok: false, content: `⛔ ${reason}` };
+        }
+      }
+    }
+
     const broker = this.approvalBroker;
     if (!broker || !tool.riskClass) {
       return await tool.execute(parsed, callCtx);
