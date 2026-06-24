@@ -672,6 +672,28 @@ program
     process.exit(await runDoctor({ probe: opts.probe }));
   });
 
+// ─── workspace gc — NEW-F4 ──────────────────────────────────────────────
+const workspaceCmd = program
+  .command("workspace")
+  .description("Workspace maintenance commands");
+
+workspaceCmd
+  .command("gc")
+  .description("Garbage-collect stale workspace state (failed goals + .bak files + orphan index entries)")
+  .option("--workspace <dir>", "Workspace root", process.cwd())
+  .option("--apply", "Actually delete (default: dry-run)", false)
+  .option("--keep-days <n>", "Retention window for terminal goals + empty chats", (v) => parseInt(v, 10), 30)
+  .option("--bak-keep-days <n>", "Retention window for *.bak.* backup files", (v) => parseInt(v, 10), 7)
+  .action(async (opts: { workspace: string; apply: boolean; keepDays: number; bakKeepDays: number }) => {
+    const { runWorkspaceGc } = await import("./commands/workspace-gc.js");
+    await runWorkspaceGc({
+      workspace: opts.workspace,
+      apply: opts.apply,
+      keepDays: opts.keepDays,
+      bakKeepDays: opts.bakKeepDays,
+    });
+  });
+
 // `bun build --compile` produces an argv that matches Node's convention:
 // argv[0] = bun runtime, argv[1] = embedded script path, argv[2+] = user args.
 // So commander's default "node" parsing works without further help (the
