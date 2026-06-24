@@ -430,6 +430,32 @@ export async function endGoal(
 }
 
 /**
+ * NEW-F1 — flip a non-terminal goal status (e.g. active → paused) without
+ * setting endedAt / endReason (those are reserved for terminal flips).
+ * Appends a `status` audit step so the history shows the transition.
+ * Returns the updated goal, or null if it doesn't exist.
+ */
+export async function flipGoalStatus(
+  workspace: string,
+  goalId: string,
+  to: Goal["status"],
+  reason: string,
+): Promise<Goal | null> {
+  const g = await readGoal(workspace, goalId);
+  if (!g) return null;
+  if (g.status === to) return g;
+  const from = g.status;
+  g.status = to;
+  g.steps.push({
+    at: new Date().toISOString(),
+    kind: "status",
+    payload: { from, to, reason },
+  });
+  await writeGoal(workspace, g);
+  return g;
+}
+
+/**
  * Attach a chat conversation id to the goal (idempotent).
  * Called when the runner spins up its first ChatSession so the goal can
  * point back at the chat jsonl on disk.

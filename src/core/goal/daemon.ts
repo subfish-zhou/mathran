@@ -28,7 +28,7 @@
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { listGoals, type Goal } from "./store.js";
+import { listGoals, flipGoalStatus, type Goal } from "./store.js";
 import {
   flushConversationHistory,
   loadConversationHistory,
@@ -274,11 +274,54 @@ export class GoalDaemon {
       console.log("[goal-daemon] boot-resume: no active goals to resume");
       return;
     }
+    // ─── NEW-F1 (audit 2026-06-24): stale-active triage ────────────────
+    // A goal whose last audit step is > STALE_HOURS_THRESHOLD ago but
+    // still status="active" is almost certainly a victim of a hard crash
+    // (mathran serve died mid-iteration without flipping the status).
+    // Re-kicking such a goal can loop forever if the underlying failure
+    // (token expired, network broken, prompt too long) is structural.
+    // Strategy: don't auto-resume it. Flip it to "paused" with an audit
+    // step explaining why so the user sees a yellow badge in the SPA
+    // and can /resume manually after fixing the upstream issue.
+    const STALE_HOURS_THRESHOLD = 6;
+    const stale: Goal[] = [];
+    const fresh: Goal[] = [];
+    const nowMs = Date.now();
+    for (const g of active) {
+      const lastStep = g.steps[g.steps.length - 1];
+      const lastAtMs = lastStep ? Date.parse(lastStep.at) : Date.parse(g.createdAt);
+      const ageHours = Number.isFinite(lastAtMs) ? (nowMs - lastAtMs) / (60 * 60 * 1000) : Infinity;
+      if (ageHours > STALE_HOURS_THRESHOLD) stale.push(g);
+      else fresh.push(g);
+    }
+    if (stale.length > 0) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[goal-daemon] boot-resume: ${stale.length} stale goal(s) (>${STALE_HOURS_THRESHOLD}h since last activity) — flipping to paused`,
+      );
+      for (const g of stale) {
+        try {
+          await flipGoalStatus(this.opts.workspace, g.id, "paused", "boot-resume: stale active (>6h since last step)");
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[goal-daemon] boot-resume: goal ${g.id.slice(0, 8)} paused (use POST /api/goals/:id/resume to revive)`,
+          );
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(`[goal-daemon] boot-resume: failed to pause ${g.id}:`, err);
+        }
+      }
+    }
+    if (fresh.length === 0) {
+      // eslint-disable-next-line no-console
+      console.log("[goal-daemon] boot-resume: no fresh active goals to resume");
+      return;
+    }
     // eslint-disable-next-line no-console
     console.log(
-      `[goal-daemon] boot-resume: ${active.length} active goal(s) to resume`,
+      `[goal-daemon] boot-resume: ${fresh.length} active goal(s) to resume`,
     );
-    for (const g of active) {
+    for (const g of fresh) {
       // 1. Repair any dangling tool-call placeholders in this goal's
       //    conversations. Best-effort: a single goal's repair failure
       //    shouldn't block the rest of the boot-resume sweep.

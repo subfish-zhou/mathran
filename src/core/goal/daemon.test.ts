@@ -439,7 +439,7 @@ describe("GoalDaemon C5 — boot-resume + graceful stop + dangling-tool repair",
     const g1 = await createGoal(workspace, { objective: "g1", scope: { kind: "global" }, model: "fake" });
     const g2 = await createGoal(workspace, { objective: "g2", scope: { kind: "global" }, model: "fake" });
     const g3 = await createGoal(workspace, { objective: "g3", scope: { kind: "global" }, model: "fake" });
-    await endGoal(workspace, g3.id, "done");
+    await endGoal(workspace, g3.id, "complete", "test setup");
 
     // Build a runnerFactory that records its calls + returns runners
     // that exit immediately. Each runner emits one iteration-end /
@@ -635,6 +635,55 @@ describe("GoalDaemon C5 — boot-resume + graceful stop + dangling-tool repair",
     const daemon = new GoalDaemon({ workspace });
     await daemon.stop(10);
     await expect(daemon.start()).resolves.toBeUndefined();
+  });
+
+  // ─── NEW-F1 (audit 2026-06-24): stale-active triage ──────────────────
+  it("flips active goals stale >6h to paused instead of auto-resuming", async () => {
+    const { createGoal, readGoal, writeGoal } = await import("./store.js");
+    // Make two active goals: one fresh (just created), one stale (last
+    // step is 8 hours ago). Boot-resume should kick only the fresh one
+    // and flip the stale one to paused with a status step explaining why.
+    const fresh = await createGoal(workspace, { objective: "fresh", scope: { kind: "global" }, model: "fake" });
+    const stale = await createGoal(workspace, { objective: "stale", scope: { kind: "global" }, model: "fake" });
+    const eightHoursAgo = new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString();
+    // Override the last step's timestamp so the staleness check trips.
+    stale.steps[stale.steps.length - 1]!.at = eightHoursAgo;
+    stale.createdAt = eightHoursAgo;
+    await writeGoal(workspace, stale);
+
+    const kicks: string[] = [];
+    const runnerFactory = (goalId: string) => {
+      kicks.push(goalId);
+      const noopIter: IterationFn = async () => ({
+        completed: true,
+        failed: false,
+        exhausted: false,
+        aborted: false,
+      });
+      return new GoalTurnRunner({
+        goalId,
+        iterationBudget: 1,
+        iterIdleMs: 1,
+        iterationFn: noopIter,
+        onEvent: () => undefined,
+      });
+    };
+
+    const daemon = new GoalDaemon({ workspace, runnerFactory });
+    await daemon.start();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Fresh goal was kicked, stale was not.
+    expect(kicks).toEqual([fresh.id]);
+
+    // Stale goal is now paused with an audit step.
+    const staleAfter = await readGoal(workspace, stale.id);
+    expect(staleAfter!.status).toBe("paused");
+    const lastStep = staleAfter!.steps[staleAfter!.steps.length - 1]!;
+    expect(lastStep.kind).toBe("status");
+    expect((lastStep.payload as any).to).toBe("paused");
+    expect((lastStep.payload as any).from).toBe("active");
+    expect((lastStep.payload as any).reason).toMatch(/stale/i);
   });
 });
 
