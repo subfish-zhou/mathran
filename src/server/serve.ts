@@ -401,6 +401,105 @@ function makePendingAskRecord(err: AskUserPending): PendingAskAnnotation {
   return record;
 }
 
+/**
+ * Orphan-pendingAsk cancellation (TODO-3).
+ *
+ * Symptom we're fixing: a chat round emits an `ask_user` tool call; the
+ * SPA persists a `pendingAsk` annotation + a placeholder tool message in
+ * history (see {@link ASK_USER_PENDING_PLACEHOLDER}); the user navigates
+ * away or just sends a new chat message instead of answering. Without
+ * intervention, the placeholder + sidecar slot live forever, the next
+ * `session.send` sees a tool-result placeholder it never wrote and the
+ * conversation gets stuck or the model gets confused.
+ *
+ * Fix: when the user sends a new message (or rerun, or any other entry
+ * that's NOT /answer-ask), patch the placeholder tool message with a
+ * structured cancellation result so the model knows the prior ask was
+ * superseded, then clear the sidecar slot + cancel any pending timeout.
+ *
+ * Idempotent: returns false ("nothing to do") when there's no
+ * pendingAsk, or when the placeholder is already gone from history
+ * (which happens if the round was truncated under us). All failures are
+ * best-effort — a chat send must not 500 because a cleanup couldn't
+ * write a sidecar file.
+ *
+ * Returns true when at least one of {history patch, sidecar clear,
+ * timer cancel} succeeded.
+ *
+ * Exported so server-route tests can verify the cleanup contract
+ * without standing up a real LLM provider.
+ */
+export async function cancelOrphanPendingAsk(args: {
+  store: ScopedChatSessionStore;
+  scope: ChatScope;
+  conversationId: string;
+  session: ChatSession;
+  reason: string;
+}): Promise<boolean> {
+  const { store, scope, conversationId, session, reason } = args;
+  let sidecar: ConversationAnnotations;
+  try {
+    sidecar = await loadAnnotations(store.getWorkspace(), scope, conversationId);
+  } catch {
+    return false;
+  }
+  const pending = sidecar.pendingAsk;
+  if (!pending) return false;
+
+  // Build the structured cancellation payload. Use JSON so the model
+  // can pattern-match on `cancelled:true` reliably (the placeholder is
+  // a plain marker string; a free-text reason would confuse the model
+  // into thinking it was the user's actual answer).
+  const cancellationContent = JSON.stringify({
+    cancelled: true,
+    reason,
+    callId: pending.callId,
+    cancelledAt: new Date().toISOString(),
+  });
+
+  // Patch the placeholder tool message in the session's live history.
+  // Match on toolCallId (the only race-free key — see /answer-ask).
+  const history = session.history();
+  let patched = false;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+    if (
+      msg.role === "tool" &&
+      msg.toolCallId === pending.callId &&
+      msg.content === ASK_USER_PENDING_PLACEHOLDER
+    ) {
+      history[i] = { ...msg, content: cancellationContent };
+      patched = true;
+      break;
+    }
+  }
+  if (patched) session.replaceHistory(history);
+
+  // Clear the sidecar slot whether or not we patched — a missing
+  // placeholder means the round was rewound, but the dangling sidecar
+  // would still confuse the SPA's pending-ask UI.
+  const cleared: ConversationAnnotations = { ...sidecar };
+  delete (cleared as { pendingAsk?: unknown }).pendingAsk;
+  try {
+    await saveAnnotations(store.getWorkspace(), scope, conversationId, cleared);
+  } catch {
+    /* best-effort */
+  }
+
+  // Cancel any pending auto-resolve timer so it doesn't fire after we
+  // already wrote a cancellation tool-result.
+  cancelAskTimeout(pending.callId);
+
+  // Best-effort log so operators can grep for orphan cancellations when
+  // debugging a stuck conversation.
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[mathran] cancelled orphan pendingAsk for ${conversationId} ` +
+      `(callId=${pending.callId}, patched=${patched}, reason="${reason}")`,
+  );
+  return true;
+}
+
 
 /**
  * outcomes 收尾 C-2 — subscribe an active SSE stream to background `goal-graded`
@@ -1465,6 +1564,30 @@ function registerChatScope(
       session = await store.getOrCreate(scope, conversationId, model);
     } catch (err: any) {
       return c.json({ error: err?.message ?? String(err) }, 500);
+    }
+
+    // TODO-3: if the previous round left a pending `ask_user` (placeholder
+    // tool message + sidecar slot), and the user sent a fresh message
+    // instead of POSTing /answer-ask, cancel the orphan first. Otherwise
+    // the placeholder lives in history forever and the model sees an
+    // unanswered tool-call slot every subsequent round, which has been
+    // observed to block follow-up rounds (e.g. propose_goal call
+    // call_hHeDrux1BJHcPhjWAnkBmiZF in c-a9c24f1d-mqlb9nqk). Best-effort:
+    // never fails the send.
+    try {
+      await cancelOrphanPendingAsk({
+        store,
+        scope,
+        conversationId,
+        session,
+        reason: "user sent a new message instead of answering",
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[mathran] cancelOrphanPendingAsk threw for ${conversationId}; proceeding with send:`,
+        err,
+      );
     }
 
     let augmentedMessage: MessageContent;
