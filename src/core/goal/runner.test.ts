@@ -210,7 +210,7 @@ describe("runGoalRound", () => {
     ]);
     const r1 = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
     expect(r1.exhausted).toBe(true);
-    expect(r1.endReason).toMatch(/round budget/);
+    expect(r1.endReason).toMatch(/iteration budget/);
     // A second call must short-circuit on the inactive status
     // (the goal already ended; runner returns the original end reason).
     const r2 = await runGoalRound({ workspace, goalId: g.id, userMessage: "go again", llm, tools: [] });

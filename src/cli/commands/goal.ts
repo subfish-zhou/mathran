@@ -264,7 +264,7 @@ async function driveOneRound(
       console.log(`mathran: goal EXHAUSTED — ${r.endReason}`);
       return 0;
     }
-    console.log(`mathran: round done. Stats: ${r.goal.stats.roundsRun} rounds, ${r.goal.stats.tokensUsed} tokens, ${r.goal.stats.toolCallCount} tool calls.`);
+    console.log(`mathran: iteration done. Stats: ${r.goal.stats.iterationsRun} iter (turns: ${r.goal.stats.assistantTurnsTotal}), ${r.goal.stats.tokensUsed} tokens, ${r.goal.stats.toolCallCount} tool calls.`);
     console.log(`mathran: resume with 'mathran goal resume ${goalId}'.`);
     return 0;
   } catch (err: any) {
@@ -323,7 +323,7 @@ export async function runGoalList(opts: GoalListOptions): Promise<number> {
   for (const g of filtered) {
     const shortId = g.id.slice(0, 8);
     const objLine = g.objective.split("\n")[0].slice(0, 80);
-    console.log(`  ${shortId}  [${g.status.padEnd(9)}] r=${g.stats.roundsRun} t=${g.stats.tokensUsed}  ${objLine}`);
+    console.log(`  ${shortId}  [${g.status.padEnd(9)}] iter=${g.stats.iterationsRun} turns=${g.stats.assistantTurnsTotal} t=${g.stats.tokensUsed}  ${objLine}`);
   }
   return 0;
 }
@@ -470,8 +470,8 @@ function printGoalSummary(g: Goal): void {
   console.log(`  objective:  ${g.objective}`);
   console.log(`  scope:      ${formatScope(g.scope)}`);
   console.log(`  model:      ${g.model}`);
-  console.log(`  budget:     tokens=${g.budget.tokensMax ?? "∞"}  rounds=${g.budget.roundsMax ?? "∞"}`);
-  console.log(`  spent:      ${g.stats.tokensUsed} tokens, ${g.stats.roundsRun} rounds, ${g.stats.toolCallCount} tool calls`);
+  console.log(`  budget:     tokens=${g.budget.tokensMax ?? "∞"}  iterations=${g.budget.roundsMax ?? "∞"}`);
+  console.log(`  spent:      ${g.stats.tokensUsed} tokens, ${g.stats.iterationsRun} iterations (turns: ${g.stats.assistantTurnsTotal}, llm calls: ${g.stats.llmCallsTotal}), ${g.stats.toolCallCount} tool calls`);
   console.log(`  createdAt:  ${g.createdAt}`);
   if (g.endedAt) {
     console.log(`  endedAt:    ${g.endedAt}`);

@@ -26,7 +26,7 @@ function makeGoal(): Goal {
     model: "fake-model",
     createdAt: new Date(0).toISOString(),
     budget: { tokensMax: 1000, roundsMax: 5 },
-    stats: { tokensUsed: 0, roundsRun: 0, toolCallCount: 0 },
+    stats: { tokensUsed: 0, iterationsRun: 0, assistantTurnsTotal: 0, llmCallsTotal: 0, toolCallCount: 0, roundsRun: 0 },
     steps: [],
     conversationIds: ["c_test"],
     parentGoalId: null,

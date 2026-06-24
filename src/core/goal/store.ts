@@ -62,8 +62,32 @@ export interface Goal {
   endReason?: string;
   stats: {
     tokensUsed: number;
-    roundsRun: number;
+    /**
+     * Number of daemon iterations run (each `runOneIteration` /
+     * `ChatSession.send`). This is what the user's `--max-rounds` /
+     * `budget.roundsMax` controls. Renamed from `roundsRun` (defect #3)
+     * because a single iteration can contain many assistant turns.
+     */
+    iterationsRun: number;
+    /**
+     * Total distinct assistant turns across all iterations — i.e. every
+     * LLM call result that produced text and/or tool calls. In a
+     * daemon-driven iteration this can be far larger than `iterationsRun`.
+     */
+    assistantTurnsTotal: number;
+    /**
+     * Total distinct chat-completions calls. Equal to `assistantTurnsTotal`
+     * unless the infrastructure tracks retries separately (it currently
+     * doesn't, so they match).
+     */
+    llmCallsTotal: number;
     toolCallCount: number;
+    /**
+     * @deprecated Alias for {@link iterationsRun}, kept for backward
+     * compatibility with on-disk goal records and existing API/SPA
+     * consumers. Always serialized equal to `iterationsRun`.
+     */
+    roundsRun: number;
   };
   /** Chat conversation ids this goal spawned. The first one is the primary. */
   conversationIds: string[];
@@ -171,11 +195,33 @@ export function goalsDirFor(workspace: string): string {
 export async function readGoal(workspace: string, goalId: string): Promise<Goal | null> {
   try {
     const raw = await fs.readFile(goalFileFor(workspace, goalId), "utf-8");
-    return JSON.parse(raw) as Goal;
+    const goal = JSON.parse(raw) as Goal;
+    goal.stats = migrateGoalStats((goal as { stats?: unknown }).stats);
+    return goal;
   } catch (err: any) {
     if (err?.code === "ENOENT") return null;
     throw err;
   }
+}
+
+/**
+ * Defect #3 migration shim. Older goal records (and sub-goal stubs) only
+ * carried `roundsRun`; newer code reads `iterationsRun` plus turn counters.
+ * Map `roundsRun → iterationsRun` when the newer field is absent, default the
+ * turn counters to 0, and keep `roundsRun` aliased to `iterationsRun` so the
+ * on-disk format never loses the deprecated field.
+ */
+export function migrateGoalStats(raw: unknown): Goal["stats"] {
+  const s = (raw ?? {}) as Partial<Goal["stats"]> & { roundsRun?: number };
+  const iterationsRun = s.iterationsRun ?? s.roundsRun ?? 0;
+  return {
+    tokensUsed: s.tokensUsed ?? 0,
+    iterationsRun,
+    assistantTurnsTotal: s.assistantTurnsTotal ?? 0,
+    llmCallsTotal: s.llmCallsTotal ?? 0,
+    toolCallCount: s.toolCallCount ?? 0,
+    roundsRun: iterationsRun,
+  };
 }
 
 /** Write one goal to disk, creating the goals/ directory if needed. */
@@ -200,6 +246,7 @@ export async function listGoals(workspace: string): Promise<Goal[]> {
     try {
       const raw = await fs.readFile(path.join(dir, name), "utf-8");
       const g = JSON.parse(raw) as Goal;
+      g.stats = migrateGoalStats((g as { stats?: unknown }).stats);
       goals.push(g);
     } catch {
       /* skip malformed */
@@ -250,7 +297,7 @@ export async function createGoal(
     },
     model: input.model,
     createdAt: now,
-    stats: { tokensUsed: 0, roundsRun: 0, toolCallCount: 0 },
+    stats: { tokensUsed: 0, iterationsRun: 0, assistantTurnsTotal: 0, llmCallsTotal: 0, toolCallCount: 0, roundsRun: 0 },
     conversationIds: [],
     parentGoalId: input.parentGoalId ?? null,
     subGoalIds: [],
@@ -295,10 +342,14 @@ export async function updateGoalStats(
 ): Promise<void> {
   const g = await readGoal(workspace, goalId);
   if (!g) return;
+  const iterationsRun = g.stats.iterationsRun + (delta.iterationsRun ?? delta.roundsRun ?? 0);
   g.stats = {
     tokensUsed: g.stats.tokensUsed + (delta.tokensUsed ?? 0),
-    roundsRun: g.stats.roundsRun + (delta.roundsRun ?? 0),
+    iterationsRun,
+    assistantTurnsTotal: g.stats.assistantTurnsTotal + (delta.assistantTurnsTotal ?? 0),
+    llmCallsTotal: g.stats.llmCallsTotal + (delta.llmCallsTotal ?? 0),
     toolCallCount: g.stats.toolCallCount + (delta.toolCallCount ?? 0),
+    roundsRun: iterationsRun,
   };
   await writeGoal(workspace, g);
 }
@@ -390,8 +441,8 @@ export function withinBudget(g: Goal): { ok: true } | { ok: false; reason: strin
   if (g.budget.tokensMax !== null && g.stats.tokensUsed >= g.budget.tokensMax) {
     return { ok: false, reason: `token budget exhausted (${g.stats.tokensUsed}/${g.budget.tokensMax})` };
   }
-  if (g.budget.roundsMax !== null && g.stats.roundsRun >= g.budget.roundsMax) {
-    return { ok: false, reason: `round budget exhausted (${g.stats.roundsRun}/${g.budget.roundsMax})` };
+  if (g.budget.roundsMax !== null && g.stats.iterationsRun >= g.budget.roundsMax) {
+    return { ok: false, reason: `iteration budget exhausted (${g.stats.iterationsRun}/${g.budget.roundsMax})` };
   }
   return { ok: true };
 }

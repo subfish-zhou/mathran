@@ -4020,6 +4020,8 @@ function buildApp(
       endReason: string | null;
       conversationId: string | null;
       roundsRun: number;
+      iterationsRun: number;
+      assistantTurnsTotal: number;
       tokensUsed: number;
     }> = [];
     for (const subId of subGoalIds) {
@@ -4033,6 +4035,8 @@ function buildApp(
         endReason: sg.endReason ?? null,
         conversationId: sg.conversationIds[0] ?? null,
         roundsRun: sg.stats.roundsRun,
+        iterationsRun: sg.stats.iterationsRun,
+        assistantTurnsTotal: sg.stats.assistantTurnsTotal,
         tokensUsed: sg.stats.tokensUsed,
       });
     }
@@ -4099,8 +4103,8 @@ function buildApp(
       switch (g.status) {
         case "active":
           // A freshly-created goal that's never run a round is rendered
-          // as `pending`; once any round records stats it's `running`.
-          return g.stats.roundsRun === 0 ? "pending" : "running";
+          // as `pending`; once any iteration records stats it's `running`.
+          return g.stats.iterationsRun === 0 ? "pending" : "running";
         case "paused":
           return "pending";
         case "complete":
@@ -4800,6 +4804,9 @@ function buildApp(
       status: g.status,
       endReason: g.endReason ?? null,
       round: g.stats.roundsRun,
+      iterationsRun: g.stats.iterationsRun,
+      assistantTurnsTotal: g.stats.assistantTurnsTotal,
+      llmCallsTotal: g.stats.llmCallsTotal,
       roundsMax: g.budget.roundsMax,
       tokensUsed: g.stats.tokensUsed,
       tokensMax: g.budget.tokensMax,

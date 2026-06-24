@@ -157,7 +157,14 @@ describe("updateGoalStats", () => {
     await updateGoalStats(workspace, g.id, { tokensUsed: 100, roundsRun: 1, toolCallCount: 1 });
     await updateGoalStats(workspace, g.id, { tokensUsed: 50, roundsRun: 1 });
     const round = await readGoal(workspace, g.id);
-    expect(round?.stats).toEqual({ tokensUsed: 150, roundsRun: 2, toolCallCount: 1 });
+    expect(round?.stats).toEqual({
+      tokensUsed: 150,
+      iterationsRun: 2,
+      assistantTurnsTotal: 0,
+      llmCallsTotal: 0,
+      toolCallCount: 1,
+      roundsRun: 2,
+    });
   });
 });
 
@@ -208,15 +215,15 @@ describe("withinBudget", () => {
     expect(r.reason).toMatch(/token budget/);
   });
 
-  it("trips on round budget", () => {
+  it("trips on iteration budget", () => {
     const g = {
-      stats: { tokensUsed: 0, roundsRun: 5, toolCallCount: 0 },
+      stats: { tokensUsed: 0, iterationsRun: 5, toolCallCount: 0 },
       budget: { tokensMax: null, roundsMax: 5 },
     } as any;
     const r = withinBudget(g);
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error();
-    expect(r.reason).toMatch(/round budget/);
+    expect(r.reason).toMatch(/iteration budget/);
   });
 });
 
@@ -261,6 +268,75 @@ describe("writeGoal round-trip", () => {
     });
     const round = await readGoal(workspace, g.id);
     expect(round?.summaryPath).toBeUndefined();
+  });
+});
+
+// ─── Defect #3: stats migration (roundsRun → iterationsRun) ───────────────
+describe("Defect #3 — legacy stats migration", () => {
+  it("populates iterationsRun from a legacy goal JSON that only has roundsRun", async () => {
+    // Hand-write a pre-defect-#3 goal record: stats carries `roundsRun` but
+    // none of the newer iteration / turn counters. Such files live in real
+    // workspaces and MUST still load + run.
+    const id = "legacy-0001";
+    const legacy = {
+      id,
+      objective: "legacy goal",
+      scope: { kind: "global" },
+      status: "active",
+      budget: { tokensMax: null, roundsMax: 30 },
+      model: "m",
+      createdAt: new Date().toISOString(),
+      stats: { tokensUsed: 4242, roundsRun: 7, toolCallCount: 13 },
+      conversationIds: [],
+      steps: [],
+    };
+    const file = goalFileFor(workspace, id);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, JSON.stringify(legacy, null, 2) + "\n", "utf-8");
+
+    const g = await readGoal(workspace, id);
+    expect(g).not.toBeNull();
+    expect(g?.stats.iterationsRun).toBe(7);
+    // Deprecated alias is kept in lockstep.
+    expect(g?.stats.roundsRun).toBe(7);
+    // New counters default to 0 (the legacy file never tracked them).
+    expect(g?.stats.assistantTurnsTotal).toBe(0);
+    expect(g?.stats.llmCallsTotal).toBe(0);
+    // Untouched fields survive the migration.
+    expect(g?.stats.tokensUsed).toBe(4242);
+    expect(g?.stats.toolCallCount).toBe(13);
+  });
+
+  it("prefers iterationsRun over roundsRun when both are present", async () => {
+    const id = "mixed-0001";
+    const mixed = {
+      id,
+      objective: "mixed goal",
+      scope: { kind: "global" },
+      status: "active",
+      budget: { tokensMax: null, roundsMax: null },
+      model: "m",
+      createdAt: new Date().toISOString(),
+      stats: {
+        tokensUsed: 0,
+        roundsRun: 2,
+        iterationsRun: 9,
+        assistantTurnsTotal: 40,
+        llmCallsTotal: 41,
+        toolCallCount: 0,
+      },
+      conversationIds: [],
+      steps: [],
+    };
+    const file = goalFileFor(workspace, id);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, JSON.stringify(mixed, null, 2) + "\n", "utf-8");
+
+    const g = await readGoal(workspace, id);
+    expect(g?.stats.iterationsRun).toBe(9);
+    expect(g?.stats.roundsRun).toBe(9);
+    expect(g?.stats.assistantTurnsTotal).toBe(40);
+    expect(g?.stats.llmCallsTotal).toBe(41);
   });
 });
 

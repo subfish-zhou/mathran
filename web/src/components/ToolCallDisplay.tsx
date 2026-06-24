@@ -605,8 +605,8 @@ function SubGoalInlinePreview({ goalId }: { goalId: string }): JSX.Element {
         <span className="font-medium">Preview sub-goal</span>
         {thread && (
           <span className="ml-2 text-[10px] text-slate-600">
-            · {thread.goal.status} · {thread.goal.stats.roundsRun} round
-            {thread.goal.stats.roundsRun === 1 ? "" : "s"}
+            · {thread.goal.status} · {thread.goal.stats.iterationsRun} iter
+            {thread.goal.stats.iterationsRun === 1 ? "" : "s"} (turns: {thread.goal.stats.assistantTurnsTotal})
           </span>
         )}
       </button>

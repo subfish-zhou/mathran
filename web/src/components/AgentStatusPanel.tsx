@@ -151,11 +151,11 @@ export function AgentStatusPanel(props: AgentStatusPanelProps): JSX.Element | nu
       {round && (
         <span
           className="inline-flex items-center gap-1 rounded-full bg-white px-2 py-0.5 ring-1 ring-slate-200"
-          title="Goal round counter"
+          title="Goal iteration counter"
         >
           <span aria-hidden="true">🔄</span>
           <span>
-            Step {round.current}
+            iter {round.current}
             {typeof round.max === "number" && round.max > 0 ? `/${round.max}` : ""}
           </span>
         </span>
