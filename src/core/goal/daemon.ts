@@ -26,7 +26,12 @@
  */
 
 import { EventEmitter } from "node:events";
-import type { Goal } from "./store.js";
+import { listGoals, type Goal } from "./store.js";
+import {
+  flushConversationHistory,
+  loadConversationHistory,
+} from "../chat/store.js";
+import type { LLMMessage } from "../providers/llm.js";
 
 /** Daemon-level configuration. */
 export interface GoalDaemonOptions {
@@ -120,7 +125,25 @@ export class GoalDaemon {
    * Boot: enumerate active goals and kick them. Called once on serve.ts
    * startup. Skips work when MATHRAN_DISABLE_GOAL_DAEMON=1.
    *
-   * SKELETON: does not yet read from store; full implementation in C5.
+   * **C5 (boot-resume + dangling-tool repair):**
+   *   1. Lists every Goal record in the workspace.
+   *   2. For each goal whose `status === "active"`, scans every
+   *      conversation tied to it and repairs any *dangling tool-call*
+   *      — i.e. an assistant message whose `toolCalls[i].id` has no
+   *      matching `{role:"tool", toolCallId: i}` follower. Splices in
+   *      a synthetic `{aborted: true, reason: "server restart"}`
+   *      tool-result so the next LLM call doesn't fail provider
+   *      validation (OpenAI 400 "each `tool_call` must have a
+   *      corresponding `tool_message`").
+   *   3. Calls `kickGoal(goalId, { source: "boot-resume" })` so the
+   *      daemon's runner factory drives the loop again.
+   *
+   * Boot-resume requires a `runnerFactory` in the daemon's options
+   * (production wiring from C3). Without one, the kicks would throw the
+   * "not yet wired" error, which boot-resume catches + logs (so unit
+   * tests that don't provide a factory still get a no-op start). Errors
+   * during disk scans or repair are logged + swallowed so a single
+   * corrupt goal doesn't block boot.
    */
   async start(): Promise<void> {
     if (process.env.MATHRAN_DISABLE_GOAL_DAEMON === "1") {
@@ -128,8 +151,158 @@ export class GoalDaemon {
       console.warn("[goal-daemon] disabled via MATHRAN_DISABLE_GOAL_DAEMON=1");
       return;
     }
-    // TODO(C5): const active = await listGoals(this.opts.workspace, { status: "active" });
-    // TODO(C5):   for (const g of active) this.kickGoal(g.id, { source: "boot-resume" });
+    if (this.stopped) {
+      // Started after stop() — reuse is unsupported. Just log and return.
+      // eslint-disable-next-line no-console
+      console.warn("[goal-daemon] start() called on a stopped daemon — ignoring");
+      return;
+    }
+    let active: Goal[] = [];
+    try {
+      const all = await listGoals(this.opts.workspace);
+      active = all.filter((g) => g.status === "active");
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[goal-daemon] listGoals() failed on boot:", err);
+      return;
+    }
+    if (active.length === 0) {
+      // eslint-disable-next-line no-console
+      console.log("[goal-daemon] boot-resume: no active goals to resume");
+      return;
+    }
+    // eslint-disable-next-line no-console
+    console.log(
+      `[goal-daemon] boot-resume: ${active.length} active goal(s) to resume`,
+    );
+    for (const g of active) {
+      // 1. Repair any dangling tool-call placeholders in this goal's
+      //    conversations. Best-effort: a single goal's repair failure
+      //    shouldn't block the rest of the boot-resume sweep.
+      try {
+        const repaired = await this.repairDanglingToolCalls(g);
+        if (repaired > 0) {
+          // eslint-disable-next-line no-console
+          console.log(
+            `[goal-daemon] boot-resume: goal ${g.id} — patched ${repaired} dangling tool-call(s)`,
+          );
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[goal-daemon] boot-resume: goal ${g.id} — dangling-repair failed:`,
+          err,
+        );
+      }
+      // 2. Kick the goal. Errors logged + swallowed so one bad goal
+      //    can't block the rest of the sweep.
+      try {
+        this.kickGoal(g.id, { source: "boot-resume" });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[goal-daemon] boot-resume: goal ${g.id} — kick failed (no runner factory?):`,
+          err,
+        );
+      }
+    }
+  }
+
+  /**
+   * **C5 helper:** scan each conversation attached to a goal and patch
+   * any unanswered tool-call.
+   *
+   * A dangling tool-call is an assistant message with `toolCalls[i].id`
+   * whose conversation has no subsequent `{role:"tool",
+   * toolCallId: i}`. The server crashed (or was kill -9'd) between the
+   * LLM emitting the call + the tool result being persisted. Replaying
+   * the conversation as-is to the LLM provider returns HTTP 400
+   * "messages with role 'tool' must follow a message with tool_calls"
+   * — the goal is wedged until someone manually rewrites the jsonl.
+   *
+   * Repair: splice in a synthetic
+   * `{role:"tool", toolCallId, name, content: '{"aborted":true,"reason":"server restart"}'}`
+   * right after the assistant turn so the LLM sees a clean "that tool
+   * call was aborted by a server restart" signal on the next round.
+   *
+   * Returns the number of placeholders inserted across all
+   * conversations of this goal.
+   */
+  private async repairDanglingToolCalls(g: Goal): Promise<number> {
+    if (!g.conversationIds || g.conversationIds.length === 0) return 0;
+    let totalPatched = 0;
+    for (const cid of g.conversationIds) {
+      let history: LLMMessage[];
+      try {
+        history = await loadConversationHistory(this.opts.workspace, g.scope, cid);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[goal-daemon] dangling-repair: load failed for conv ${cid}:`,
+          err,
+        );
+        continue;
+      }
+      if (history.length === 0) continue;
+      // Walk left-to-right and splice; we mutate `history` in place
+      // and re-flush if any repair was needed.
+      const patched: LLMMessage[] = [];
+      let patchedThisConv = 0;
+      for (let i = 0; i < history.length; i++) {
+        const msg = history[i]!;
+        patched.push(msg);
+        if (msg.role !== "assistant" || !msg.toolCalls || msg.toolCalls.length === 0) {
+          continue;
+        }
+        // Find which of this assistant's tool-call ids ALREADY have a
+        // tool-result follower in the rest of the history. Order
+        // doesn't matter for OpenAI's validator — as long as every
+        // toolCallId is answered SOMEWHERE in the subsequent
+        // messages, the conversation replays cleanly.
+        const answered = new Set<string>();
+        for (let j = i + 1; j < history.length; j++) {
+          const follower = history[j]!;
+          if (follower.role !== "tool") continue;
+          if (typeof follower.toolCallId === "string") {
+            answered.add(follower.toolCallId);
+          }
+        }
+        for (const call of msg.toolCalls) {
+          if (answered.has(call.id)) continue;
+          // Splice a synthetic tool-result. Use the same shape the
+          // runner uses for the tool-call-budget-exhausted branch:
+          // {role:"tool", content, toolCallId, name}.
+          patched.push({
+            role: "tool",
+            content: JSON.stringify({
+              aborted: true,
+              reason: "server restart",
+            }),
+            toolCallId: call.id,
+            name: call.name,
+          });
+          patchedThisConv += 1;
+          totalPatched += 1;
+        }
+      }
+      if (patchedThisConv > 0) {
+        try {
+          await flushConversationHistory(
+            this.opts.workspace,
+            g.scope,
+            cid,
+            patched,
+          );
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(
+            `[goal-daemon] dangling-repair: flush failed for conv ${cid}:`,
+            err,
+          );
+        }
+      }
+    }
+    return totalPatched;
   }
 
   /**

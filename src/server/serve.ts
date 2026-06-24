@@ -5352,9 +5352,28 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
 
   const close = () =>
     new Promise<void>((resolve, reject) => {
-      void mcpRegistry.shutdown().finally(() => {
+      // C5: graceful daemon shutdown. Order matters:
+      //   1. daemon.stop(30_000) — interrupts every running
+      //      GoalTurnRunner, waits for them to finish their CURRENT
+      //      iteration (or 30s, whichever comes first), then
+      //      force-stops anything still alive. This lets a runner's
+      //      in-flight LLM call drain cleanly and its result/iteration
+      //      step persist to disk, so a subsequent boot-resume sees
+      //      consistent state.
+      //   2. mcpRegistry.shutdown() — tears down MCP server processes.
+      //   3. server.close() — closes the HTTP listener.
+      void (async () => {
+        if (goalDaemon) {
+          try {
+            await goalDaemon.stop(30_000);
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.error("[mathran] goalDaemon.stop(30_000) error:", err);
+          }
+        }
+        await mcpRegistry.shutdown();
         server.close((err?: unknown) => (err ? reject(err) : resolve()));
-      });
+      })();
     });
 
   return {

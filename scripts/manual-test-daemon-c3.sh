@@ -165,10 +165,13 @@ else
   exit 1
 fi
 
-# Sanity: GET /api/goals returns the goal. We don't drive a round
-# (would need a working LLM); the heavy lifting is covered by the
-# vitest server suite's 428 tests against the daemon path.
-LIST_RESP="$(curl -sS "http://127.0.0.1:$PORT/api/goals" || true)"
+# Sanity: GET /api/goals?all=1 returns the goal (we use ?all=1 because
+# C5 boot-resume kicks the goal on Phase 2 restart; without a real LLM
+# the runner errors out and the goal flips to status=failed, which the
+# default /api/goals filter (active|paused) excludes. The C3 test only
+# cares that the goal RECORD survived the restart; the daemon-path
+# behaviour itself is covered by the 434-test vitest suite.
+LIST_RESP="$(curl -sS "http://127.0.0.1:$PORT/api/goals?all=1" || true)"
 if printf '%s' "$LIST_RESP" | grep -q "$GOAL_ID"; then
   echo "[OK] goal listed via /api/goals (enabled path)"
 else
