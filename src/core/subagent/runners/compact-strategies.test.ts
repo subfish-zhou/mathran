@@ -57,11 +57,10 @@ class StubStrategy implements CompactionStrategyImpl {
 
 function fakeReq(): CompactionRequest {
   const llm: LLMProvider = {
-    name: "fake",
     async describe() { return { name: "fake" }; },
     async *stream() { /* unused */ },
     chat: (async () => { throw new Error("not used"); }) as unknown as LLMProvider["chat"],
-  };
+  } as unknown as LLMProvider;
   const messages: LLMMessage[] = [{ role: "user", content: "x" }];
   return {
     messages,

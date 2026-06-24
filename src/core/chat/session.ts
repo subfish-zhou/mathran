@@ -29,11 +29,25 @@ import type { ReasoningEffortLevel } from "../reasoning-effort/index.js";
 import { capToolOutput } from "./tool-output-cap.js";
 import {
   compactRunner,
+  LocalCompactionStrategy,
   type CompactRunnerInput,
   type CompactedArtifact,
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_KEEP_RECENT_ROUNDS,
 } from "../subagent/runners/compact.js";
+import {
+  ensureBuiltInsRegistered,
+  pickStrategy,
+} from "../subagent/runners/compact-strategies.js";
+import { injectionPolicyForPhase } from "../subagent/runners/compact-injection.js";
+import type {
+  CompactionHooks,
+  CompactionOutcome,
+  CompactionPhase,
+  CompactionReason,
+  CompactionRequest,
+  CompactionTrigger,
+} from "../subagent/runners/compact-types.js";
 import { readSummarizeRunner } from "../subagent/runners/read-summarize.js";
 import { searchRunner } from "../subagent/runners/search.js";
 import { SubagentRegistry } from "../subagent/registry.js";
@@ -390,18 +404,32 @@ export interface ChatSessionOptions {
    */
   toolOutputCap?: { maxInlineBytes?: number; workspace?: string | null };
   /**
-   * Auto-compact (v0.2 §5). When `enabled: true`, every `send()` call checks
-   * the token count of `this.messages` against `contextWindow * thresholdPct`
-   * and runs `compact()` first if we'd overflow. Requires the wrapped
-   * LLMProvider to implement `countTokens`; falls back to a silent no-op
-   * when the provider can't count tokens. Defaults: thresholdPct=0.75,
-   * keepRecentRounds=5, contextWindow=200000.
+   * Auto-compact (v0.2 §5 + TODO-2 §3.2). When `enabled: true`, every
+   * `send()` call checks the token count of `this.messages` against
+   * `contextWindow * thresholdPct` and runs `compactV2({ phase: "pre_turn" })`
+   * first if we'd overflow. Requires the wrapped LLMProvider to implement
+   * `countTokens`; falls back to a silent no-op when the provider can't
+   * count tokens. Defaults: thresholdPct=0.75, keepRecentRounds=5,
+   * contextWindow=200000.
+   *
+   * TODO-2 §3.2 mid-turn precheck (opt-in): when `enableMidTurnPrecheck`
+   * is true, every LLM round-trip inside a `send()` loop also tallies the
+   * provider-reported input token count and runs an extra mid-turn
+   * compaction when the cumulative tally exceeds
+   * `midTurnThresholdPct * contextWindow` (default = thresholdPct + 0.05).
+   * This is the codex InitialContextInjection::BeforeLastUserMessage path:
+   * summary is spliced INSIDE the tail just above the last real user
+   * message so the model stays in-distribution.
    */
   autoCompact?: {
     enabled?: boolean;
     thresholdPct?: number;
     keepRecentRounds?: number;
     contextWindow?: number;
+    /** TODO-2 §3.2 — opt in to mid-turn precheck (default false). */
+    enableMidTurnPrecheck?: boolean;
+    /** TODO-2 §3.2 — mid-turn trigger threshold (default thresholdPct + 0.05). */
+    midTurnThresholdPct?: number;
   };
   /**
    * Workspace root for subagent artifacts (v0.2 §5). Required for `compact()`
@@ -888,6 +916,10 @@ export class ChatSession {
   private planMode: boolean = false;
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
+  /** TODO-2 §3.2 — promise of an in-flight compactV2() — second caller awaits it. */
+  private compactInFlightV2: Promise<CompactionOutcome> | null = null;
+  /** TODO-2 §3.2 — cumulative provider-reported input tokens for the current send() turn. */
+  private cumulativeInputTokens = 0;
   private messages: LLMMessage[] = [];
   /**
    * Skills/Plugins 二层: skills carrying a `trigger` (keyword / regex). These
@@ -1891,11 +1923,13 @@ export class ChatSession {
   }
 
   /**
-   * Auto-compact pre-check (v0.2 §5). Called once at the start of {@link send}
-   * when `autoCompact.enabled` is true. Silent no-op when the provider can't
-   * count tokens, or when the count is under the configured threshold.
+   * Auto-compact pre-turn check (v0.2 §5 + TODO-2 §3.2). Called once at
+   * the start of {@link send} when `autoCompact.enabled` is true. Silent
+   * no-op when the provider can't count tokens, or when the count is
+   * under the configured threshold. Routes through `compactV2({
+   * phase: "pre_turn", policy: "do_not_inject" })`.
    */
-  private async maybeAutoCompact(): Promise<void> {
+  private async maybeAutoCompactPreTurn(): Promise<void> {
     const cfg = this.autoCompactCfg;
     if (!cfg?.enabled) return;
     const llm = this.llm as LLMProvider & { countTokens?: (m: LLMMessage[]) => number };
@@ -1911,10 +1945,176 @@ export class ChatSession {
     const threshold = window * (cfg.thresholdPct ?? 0.75);
     if (count <= threshold) return;
     try {
-      await this.compact();
+      // Reset mid-turn accumulator on every pre-turn boundary — the
+      // counter restarts cleanly each user-initiated send.
+      this.cumulativeInputTokens = 0;
+      const out = await this.compactV2({
+        reason: "budget_exceeded",
+        phase: "pre_turn",
+        trigger: "auto",
+      });
+      // After a successful compact, the mid-turn precheck shouldn't
+      // immediately re-trigger off pre-compaction token measurements.
+      if (out.ok) this.cumulativeInputTokens = 0;
     } catch {
       // Swallow: auto-compact must never block the user's send.
     }
+  }
+
+  /**
+   * TODO-2 §3.2 — Auto-compact mid-turn check. Invoked from the inner
+   * LLM round-trip loop AFTER each provider-reported `usage` event.
+   * Tallies the cumulative input tokens spent inside this send() and
+   * triggers `compactV2({ phase: "mid_turn", policy: "before_last_user_message" })`
+   * when the cumulative tally exceeds `midTurnThresholdPct * contextWindow`.
+   *
+   * The default `midTurnThresholdPct = thresholdPct + 0.05` is slightly
+   * above the pre-turn threshold so a single high-usage round inside a
+   * conversation that's already close to the limit doesn't double-fire
+   * pre-turn + mid-turn compaction back-to-back.
+   *
+   * Mid-turn compaction is OPT-IN via `autoCompact.enableMidTurnPrecheck`.
+   * For the default chat-mode case (off), this is a zero-cost no-op.
+   */
+  private async maybeAutoCompactMidTurn(args: {
+    realPromptTokens?: number;
+  }): Promise<void> {
+    const cfg = this.autoCompactCfg;
+    if (!cfg?.enabled || !cfg.enableMidTurnPrecheck) return;
+    if (typeof args.realPromptTokens !== "number" || !Number.isFinite(args.realPromptTokens)) return;
+    // Accumulate. mid-turn precheck uses *provider-reported* tokens
+    // rather than countTokens — the provider's count IS the truth.
+    this.cumulativeInputTokens += args.realPromptTokens;
+    const window = cfg.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+    const midPct = cfg.midTurnThresholdPct ?? ((cfg.thresholdPct ?? 0.75) + 0.05);
+    const threshold = window * midPct;
+    if (this.cumulativeInputTokens <= threshold) return;
+    try {
+      const out = await this.compactV2({
+        reason: "token_limit",
+        phase: "mid_turn",
+        trigger: "auto",
+      });
+      // Successful mid-turn compaction → reset accumulator so the next
+      // few rounds don't immediately re-trigger.
+      if (out.ok) this.cumulativeInputTokens = 0;
+    } catch {
+      // Swallow — mid-turn compaction must NEVER break the send loop.
+    }
+  }
+
+  /**
+   * TODO-2 §3.2 — V2 compaction entry. Routes through the multi-strategy
+   * dispatcher (compact-strategies.ts) so plugins can register alternate
+   * strategies. The built-in `LocalCompactionStrategy` is lazily
+   * registered on first call.
+   *
+   * Concurrent calls are deduped (second caller awaits the first).
+   *
+   * Callers pass only the request-specific fields (reason, phase, trigger,
+   * optional hooks); this method fills in messages / llm / model /
+   * contextWindow / keepRecentRounds from the session state and resolves
+   * the appropriate SummaryInjectionPolicy via injectionPolicyForPhase().
+   *
+   * On ok=true the new history is swapped into `this.messages`. On
+   * ok=false (cancelled / skipped / failed), `this.messages` is left
+   * untouched — the original prompt will be sent to the LLM unchanged,
+   * which may then throw context-overflow itself. Compaction is a
+   * best-effort optimization, NOT a correctness invariant.
+   */
+  async compactV2(req: {
+    reason: CompactionReason;
+    phase: CompactionPhase;
+    trigger: CompactionTrigger;
+    policy?: import("../subagent/runners/compact-types.js").SummaryInjectionPolicy;
+    hooks?: CompactionHooks;
+    signal?: AbortSignal;
+  }): Promise<CompactionOutcome> {
+    if (this.compactInFlightV2) return this.compactInFlightV2;
+    this.compactInFlightV2 = this.compactV2Impl(req).finally(() => {
+      this.compactInFlightV2 = null;
+    });
+    return this.compactInFlightV2;
+  }
+
+  private async compactV2Impl(req: {
+    reason: CompactionReason;
+    phase: CompactionPhase;
+    trigger: CompactionTrigger;
+    policy?: import("../subagent/runners/compact-types.js").SummaryInjectionPolicy;
+    hooks?: CompactionHooks;
+    signal?: AbortSignal;
+  }): Promise<CompactionOutcome> {
+    // Lazy register built-in strategies on first call.
+    ensureBuiltInsRegistered(() => new LocalCompactionStrategy());
+
+    const cfg = this.autoCompactCfg;
+    const fullReq: CompactionRequest = {
+      messages: this.messages.map((m) => ({ ...m })),
+      reason: req.reason,
+      phase: req.phase,
+      trigger: req.trigger,
+      policy: req.policy ?? injectionPolicyForPhase(req.phase),
+      keepRecentRounds: cfg?.keepRecentRounds ?? DEFAULT_KEEP_RECENT_ROUNDS,
+      contextWindow: cfg?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+      modelHint: this.model,
+      llm: this.llm,
+      signal: req.signal,
+      hooks: req.hooks,
+    };
+
+    // Optional PreCompact hook: caller can veto.
+    if (fullReq.hooks?.pre) {
+      try {
+        const pre = await fullReq.hooks.pre(fullReq);
+        if (pre.kind === "stopped") {
+          const now = Date.now();
+          return {
+            ok: false,
+            status: "skipped",
+            error: pre.reason,
+            telemetry: {
+              reason: fullReq.reason,
+              phase: fullReq.phase,
+              trigger: fullReq.trigger,
+              policy: fullReq.policy,
+              strategy: "local",
+              startedAtMs: now,
+              endedAtMs: now,
+              durationMs: 0,
+              status: "skipped",
+              originalTokens: 0,
+              newTokens: 0,
+              droppedRoundCount: 0,
+              retryAttempts: 0,
+              hookOutcomes: { pre: "stopped" },
+            },
+          };
+        }
+      } catch {
+        // Hook crashes are non-fatal — proceed with compaction.
+      }
+    }
+
+    const strategy = pickStrategy(fullReq);
+    const outcome = await strategy.run(fullReq);
+
+    // Swap messages on success ONLY. Failure / cancel / skip leaves
+    // this.messages intact (best-effort contract).
+    if (outcome.ok && outcome.newMessages) {
+      this.messages = outcome.newMessages.map((m) => ({ ...m }));
+    }
+
+    // Optional PostCompact hook.
+    if (outcome.ok && fullReq.hooks?.post) {
+      try {
+        await fullReq.hooks.post(outcome.telemetry);
+      } catch {
+        // Hook crashes are non-fatal.
+      }
+    }
+
+    return outcome;
   }
 
   /**
@@ -1929,9 +2129,13 @@ export class ChatSession {
     // Abort before we touch history: leave `messages` untouched and bail.
     if (signal?.aborted) throw abortError();
 
-    // Auto-compact pre-check (v0.2 §5): compact BEFORE we push the new user
-    // message, so we don't immediately discard it. Silent on failure.
-    await this.maybeAutoCompact();
+    // Reset mid-turn token accumulator for this fresh user-initiated send().
+    this.cumulativeInputTokens = 0;
+
+    // Auto-compact pre-check (v0.2 §5 + TODO-2 §3.2): compact BEFORE we
+    // push the new user message, so we don't immediately discard it.
+    // Silent on failure.
+    await this.maybeAutoCompactPreTurn();
 
     // Skills/Plugins 二层 §B.2: match trigger-bearing skills against this
     // message and inject their rendered prompt as a TRANSIENT system message
@@ -2152,6 +2356,16 @@ export class ChatSession {
         type: "usage",
         ...(usage ? { inputTokens: usage.promptTokens, outputTokens: usage.completionTokens } : {}),
       };
+
+      // TODO-2 §3.2 — mid-turn auto-compact precheck. Opt-in via
+      // autoCompact.enableMidTurnPrecheck. Uses the provider-reported
+      // promptTokens (truth, not estimate) and accumulates across rounds.
+      // Triggers an extra compactV2({ phase: "mid_turn", ... }) when
+      // cumulative tally exceeds midTurnThresholdPct * contextWindow.
+      // Silent no-op when feature is off OR provider didn't report usage.
+      if (this.autoCompactCfg?.enableMidTurnPrecheck && usage) {
+        await this.maybeAutoCompactMidTurn({ realPromptTokens: usage.promptTokens });
+      }
 
       if (toolCalls.length === 0) {
         // on-goal-complete hooks — the model finished the user's request this
