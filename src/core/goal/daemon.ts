@@ -79,6 +79,34 @@ export interface GoalDaemonOptions {
   iterationLogPath?: string;
 }
 
+/**
+ * **Defect #2:** Live, in-iteration progress for one runner. Populated while
+ * an iteration is in flight (between `iteration-start` and `iteration-end`)
+ * and reset to `null` between iterations. Lets a polling observer of
+ * `GET /api/goals/daemon/status` see what a long-running iteration is
+ * actually doing without an SSE subscription.
+ */
+export interface IterationProgress {
+  /** Iteration index for this runner (matches GoalRunnerStatus.iterations). */
+  iteration: number;
+  /** Epoch ms when this iteration started. */
+  startedAt: number;
+  /** Count of assistant turns seen (one per LLM `done` frame). */
+  assistantTurns: number;
+  /** Count of tool-call frames seen. */
+  toolCalls: number;
+  /** Count of tool-result frames seen. */
+  toolResults: number;
+  /** Count of text frames seen. */
+  textChunks: number;
+  /** Name of the most recent tool call, or null if none yet. */
+  lastToolName: string | null;
+  /** Epoch ms of the most recent tool-call frame, or null. */
+  lastToolCallAt: number | null;
+  /** Epoch ms of the most recent text frame, or null. */
+  lastTextAt: number | null;
+}
+
 /** **C6:** Per-runner status row returned by GoalDaemon.status(). */
 export interface GoalRunnerStatus {
   goalId: string;
@@ -92,6 +120,11 @@ export interface GoalRunnerStatus {
   state: GoalRunnerState;
   /** What kicked off this runner (e.g. "user-send" / "boot-resume" / "steer" / "answer-ask"). */
   source?: string;
+  /**
+   * **Defect #2:** live in-iteration progress, or `null` when the runner is
+   * between iterations (sleeping / waiting-user / starting / done).
+   */
+  progress: IterationProgress | null;
 }
 
 export type GoalRunnerState =
@@ -143,6 +176,7 @@ export interface DaemonEvent {
     | "iteration-start"
     | "iteration-end"
     | "turn-end"
+    | "done"
     | "error";
   [k: string]: unknown;
 }
@@ -488,6 +522,12 @@ export class GoalDaemon {
           const result = (ev as { result?: unknown }).result as
             | { completed?: boolean; failed?: boolean; exhausted?: boolean; aborted?: boolean; naturalTurnEnd?: boolean; endReason?: string }
             | undefined;
+          // **Defect #2:** the runner stamps the final per-iteration counts
+          // onto the iteration-end frame; persist them so a long-tail log
+          // observer can reconstruct in-iteration progress after the fact.
+          const progress = (ev as { progress?: unknown }).progress as
+            | { assistantTurns?: number; toolCalls?: number; toolResults?: number; textChunks?: number }
+            | undefined;
           this.appendIterationLog({
             ts: now,
             goalId,
@@ -503,6 +543,16 @@ export class GoalDaemon {
                     aborted: !!result.aborted,
                     ...(result.naturalTurnEnd ? { naturalTurnEnd: true } : {}),
                     ...(result.endReason ? { endReason: result.endReason } : {}),
+                  },
+                }
+              : {}),
+            ...(progress
+              ? {
+                  progress: {
+                    assistantTurns: Number(progress.assistantTurns ?? 0),
+                    toolCalls: Number(progress.toolCalls ?? 0),
+                    toolResults: Number(progress.toolResults ?? 0),
+                    textChunks: Number(progress.textChunks ?? 0),
                   },
                 }
               : {}),
@@ -735,6 +785,9 @@ export class GoalTurnRunner {
   /** **C6:** label set by `kickGoal({source})` so the status snapshot can
    *  report what kicked off this loop. */
   private source: string | undefined;
+  /** **Defect #2:** live progress for the in-flight iteration, or null when
+   *  the runner is between iterations. */
+  private currentProgress: IterationProgress | null = null;
 
   constructor(
     private readonly opts: {
@@ -778,6 +831,7 @@ export class GoalTurnRunner {
     lastEventAt: number;
     state: GoalRunnerState;
     source?: string;
+    progress: IterationProgress | null;
   } {
     return {
       startedAt: this.startedAt,
@@ -785,14 +839,48 @@ export class GoalTurnRunner {
       lastEventAt: this.lastEventAt,
       state: this.state,
       ...(this.source ? { source: this.source } : {}),
+      progress: this.currentProgress ? { ...this.currentProgress } : null,
     };
   }
 
   /** **C6:** wrap the configured onEvent so we can stamp `lastEventAt`
-   *  on every emit — cheap, single property write. */
+   *  on every emit — cheap, single property write. **Defect #2:** also
+   *  fold the frame into the live in-iteration progress counters. */
   private emit(ev: DaemonEvent): void {
     this.lastEventAt = Date.now();
+    this.updateProgress(ev);
     this.opts.onEvent(ev);
+  }
+
+  /** **Defect #2:** event-driven progress accumulation. No polling — this is
+   *  invoked synchronously from `emit()` for every frame the iteration emits.
+   *  Counters are only updated while an iteration is in flight (i.e. while
+   *  `currentProgress` is non-null). */
+  private updateProgress(ev: DaemonEvent): void {
+    const p = this.currentProgress;
+    if (!p) return;
+    switch (ev.type) {
+      case "text":
+        p.textChunks++;
+        p.lastTextAt = Date.now();
+        break;
+      case "tool-call":
+        p.toolCalls++;
+        p.lastToolName =
+          typeof (ev as { name?: unknown }).name === "string"
+            ? ((ev as { name?: unknown }).name as string)
+            : p.lastToolName;
+        p.lastToolCallAt = Date.now();
+        break;
+      case "tool-result":
+        p.toolResults++;
+        break;
+      case "done":
+        p.assistantTurns++;
+        break;
+      default:
+        break;
+    }
   }
 
   /**
@@ -831,6 +919,20 @@ export class GoalTurnRunner {
       // 5. Run one iteration (test seam: opts.iterationFn).
       this.iter++;
       this.state = "iterating";
+      // **Defect #2:** open a fresh progress struct for this iteration BEFORE
+      // emitting iteration-start, so every subsequent frame (text/tool-call/
+      // tool-result/done) folds into it via emit() → updateProgress().
+      this.currentProgress = {
+        iteration: this.iter,
+        startedAt: Date.now(),
+        assistantTurns: 0,
+        toolCalls: 0,
+        toolResults: 0,
+        textChunks: 0,
+        lastToolName: null,
+        lastToolCallAt: null,
+        lastTextAt: null,
+      };
       this.emit({
         type: "iteration-start",
         iteration: this.iter,
@@ -850,17 +952,35 @@ export class GoalTurnRunner {
       } catch (err) {
         const message = String((err as { message?: unknown })?.message ?? err);
         this.state = "done";
+        this.currentProgress = null;
         this.emit({ type: "error", message });
         this.emit({ type: "turn-end", reason: "iteration-threw" });
         return;
       } finally {
         this.currentAbort = null;
       }
+      // **Defect #2:** snapshot the final per-iteration counts onto the
+      // iteration-end frame so the daemon's iteration-log listener can
+      // persist them (and any late status() poll between here and the next
+      // iteration still sees the final tally via the event). Reset to null
+      // immediately after so "between iterations" reports progress: null.
+      const finalProgress = this.currentProgress;
       this.emit({
         type: "iteration-end",
         iteration: this.iter,
         result,
+        ...(finalProgress
+          ? {
+              progress: {
+                assistantTurns: finalProgress.assistantTurns,
+                toolCalls: finalProgress.toolCalls,
+                toolResults: finalProgress.toolResults,
+                textChunks: finalProgress.textChunks,
+              },
+            }
+          : {}),
       });
+      this.currentProgress = null;
 
       // 6. Terminal conditions check.
       if (result.completed) {

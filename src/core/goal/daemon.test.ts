@@ -778,6 +778,128 @@ describe("GoalDaemon C6 — status snapshot + iteration log", () => {
   });
 });
 
+// ───────────── Defect #2: in-iteration progress observability ─────────────
+
+describe("GoalTurnRunner in-iteration progress (defect #2)", () => {
+  /** Build an iterationFn that emits a fixed set of frames and then blocks on
+   *  `barrier` so the test can observe live progress mid-iteration. */
+  function gatedIterFn(
+    barrier: Promise<void>,
+    result: Partial<DaemonIterationResult> = { completed: true },
+  ): IterationFn {
+    return async ({ emit }) => {
+      emit({ type: "text", delta: "thinking…" });
+      emit({ type: "tool-call", id: "1", name: "read_file" });
+      emit({ type: "tool-result", id: "1", name: "read_file", ok: true, content: "ok" });
+      emit({ type: "text", delta: "more text" });
+      emit({ type: "tool-call", id: "2", name: "bash" });
+      emit({ type: "tool-result", id: "2", name: "bash", ok: true, content: "ok" });
+      emit({ type: "done", finishReason: "stop" });
+      await barrier; // hold the iteration open
+      return {
+        completed: false,
+        failed: false,
+        exhausted: false,
+        aborted: false,
+        ...result,
+      };
+    };
+  }
+
+  it("status().runners[…].progress reflects live counts mid-iteration", async () => {
+    const d = new GoalDaemon({ workspace: "/tmp/x" });
+    let release!: () => void;
+    const barrier = new Promise<void>((r) => {
+      release = r;
+    });
+    const runner = new GoalTurnRunner(
+      baseRunnerOpts({
+        iterationFn: gatedIterFn(barrier),
+        onEvent: (ev) => d.eventBus.emit("goal:g1", ev),
+      }) as any,
+    );
+    d.kickGoalWithRunner("g1", runner);
+
+    // Let the iteration emit its frames and park on the barrier.
+    await new Promise((r) => setTimeout(r, 20));
+
+    const row = d.status().runners.find((x) => x.goalId === "g1");
+    expect(row).toBeDefined();
+    expect(row!.state).toBe("iterating");
+    expect(row!.progress).not.toBeNull();
+    const p = row!.progress!;
+    expect(p.iteration).toBe(1);
+    expect(p.textChunks).toBe(2);
+    expect(p.toolCalls).toBe(2);
+    expect(p.toolResults).toBe(2);
+    expect(p.assistantTurns).toBe(1);
+    expect(p.lastToolName).toBe("bash");
+    expect(typeof p.lastToolCallAt).toBe("number");
+    expect(typeof p.lastTextAt).toBe("number");
+    expect(typeof p.startedAt).toBe("number");
+
+    // Release so the iteration completes and the runner exits cleanly.
+    release();
+    await new Promise((r) => setTimeout(r, 20));
+  });
+
+  it("progress is null between iterations and final counts ride the iteration-end frame", async () => {
+    const { events, emit } = localEvents();
+    const runner = new GoalTurnRunner(
+      baseRunnerOpts({
+        iterationFn: gatedIterFn(Promise.resolve(), { completed: true }),
+        onEvent: emit,
+      }) as any,
+    );
+    await runner.run();
+
+    // After run() returns the runner is between/after iterations.
+    expect(runner.statusSnapshot().progress).toBeNull();
+
+    const end = events.find((e) => e.type === "iteration-end") as
+      | (DaemonEvent & { progress?: Record<string, number> })
+      | undefined;
+    expect(end).toBeDefined();
+    expect(end!.progress).toMatchObject({
+      assistantTurns: 1,
+      toolCalls: 2,
+      toolResults: 2,
+      textChunks: 2,
+    });
+  });
+
+  it("iteration log persists per-iteration progress counts on iteration-end", async () => {
+    const fs = await import("node:fs/promises");
+    const ws = await mkTmpWorkspace();
+    const path = await import("node:path");
+    const logPath = path.join(ws, "daemon.log");
+    const d = new GoalDaemon({ workspace: ws, iterationLogPath: logPath });
+    const runner = new GoalTurnRunner(
+      baseRunnerOpts({
+        iterationFn: gatedIterFn(Promise.resolve(), { completed: true }),
+        onEvent: (ev) => d.eventBus.emit("goal:g1", ev),
+      }) as any,
+    );
+    d.kickGoalWithRunner("g1", runner);
+    await new Promise((r) => setTimeout(r, 40));
+    await d.stop();
+
+    const raw = await fs.readFile(logPath, "utf8");
+    const endLine = raw
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .find((r) => r.event === "iteration-end");
+    expect(endLine).toBeDefined();
+    expect(endLine.progress).toMatchObject({
+      assistantTurns: 1,
+      toolCalls: 2,
+      toolResults: 2,
+      textChunks: 2,
+    });
+  });
+});
+
 // Tiny mktemp helper used by C5 tests above (mirrors the runner.test.ts
 // helper so this file stays self-contained).
 async function mkTmpWorkspace(): Promise<string> {
