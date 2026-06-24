@@ -19,6 +19,7 @@
 
 import * as fs from "node:fs/promises";
 import * as fssync from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
@@ -3125,9 +3126,27 @@ function buildApp(
 
   // Construct the daemon now that the factory closure is ready.
   if (!daemonDisabled) {
+    // **C6:** route iteration-level observability into
+    // `~/.mathran/logs/daemon.log` (append-mode JSONL). Tests / CI can
+    // opt out via MATHRAN_DAEMON_LOG=0 (or any falsy non-empty value);
+    // a custom path is honoured via MATHRAN_DAEMON_LOG=/abs/path. The
+    // file is opened lazily on the first iteration event so we don't
+    // create directories during unit tests that never kick a goal.
+    const daemonLogEnv = process.env.MATHRAN_DAEMON_LOG;
+    const daemonLogDisabled =
+      daemonLogEnv === "0" ||
+      daemonLogEnv === "false" ||
+      daemonLogEnv === "off" ||
+      daemonLogEnv === "";
+    const iterationLogPath = daemonLogDisabled
+      ? undefined
+      : daemonLogEnv && daemonLogEnv !== "1"
+        ? daemonLogEnv
+        : path.join(os.homedir(), ".mathran", "logs", "daemon.log");
     goalDaemon = new GoalDaemon({
       workspace,
       runnerFactory: buildProductionRunnerFactory(),
+      ...(iterationLogPath ? { iterationLogPath } : {}),
     });
   }
 
@@ -3882,6 +3901,41 @@ function buildApp(
       extraInstructions,
     });
     return c.json({ goal }, 201);
+  });
+
+  /**
+   * **C6:** GET /api/goals/daemon/status — ops/observability endpoint.
+   *
+   * Returns a structured snapshot of the GoalDaemon's current state:
+   *   - enabled / stopped flags
+   *   - configured maxConcurrent + iterIdleMs
+   *   - runnerCount + queueLength (queue length is reserved — the
+   *     current daemon doesn't enforce a hard concurrency cap, see
+   *     design doc §7 risk #9)
+   *   - per-runner rows: goalId, startedAt, iterations, lastEventAt,
+   *     state, source (when known)
+   *   - iterationLogPath (when iteration JSONL log is wired)
+   *
+   * When the daemon is disabled (MATHRAN_DAEMON=0 in tests/CI) returns
+   * a stub with enabled=false so callers can still detect liveness.
+   *
+   * Design doc: ~/.openclaw/workspace/_tasks/todo1-design.md §8 C6.
+   */
+  app.get("/api/goals/daemon/status", (c) => {
+    if (!goalDaemon) {
+      return c.json({
+        enabled: false,
+        stopped: true,
+        maxConcurrent: 0,
+        iterIdleMs: 0,
+        runnerCount: 0,
+        queueLength: 0,
+        runners: [],
+        running: [],
+        iterations: {},
+      });
+    }
+    return c.json(goalDaemon.status());
   });
 
   /** GET /api/goals?all=1 — default lists active+paused only. */

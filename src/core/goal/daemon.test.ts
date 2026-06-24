@@ -75,7 +75,8 @@ const baseRunnerOpts = (overrides: Partial<{
 describe("GoalDaemon", () => {
   it("constructs and exposes empty status", () => {
     const d = new GoalDaemon({ workspace: "/tmp/x" });
-    expect(d.status()).toEqual({ running: [], iterations: {} });
+    // C6 widened status() shape; legacy flat fields still present.
+    expect(d.status()).toMatchObject({ running: [], iterations: {}, runnerCount: 0 });
     expect(d.isRunning("g1")).toBe(false);
   });
 
@@ -634,6 +635,146 @@ describe("GoalDaemon C5 — boot-resume + graceful stop + dangling-tool repair",
     const daemon = new GoalDaemon({ workspace });
     await daemon.stop(10);
     await expect(daemon.start()).resolves.toBeUndefined();
+  });
+});
+
+// ────────────────────── GoalDaemon C6 — observability ───────────────────────
+//
+// status() returns a rich snapshot (startedAt / lastEventAt / state /
+// source / iterationLogPath); the iteration log writes JSONL with
+// durationMs on iteration-end; opening a write stream is best-effort.
+//
+// Design doc: ~/.openclaw/workspace/_tasks/todo1-design.md §8 C6.
+
+describe("GoalDaemon C6 — status snapshot + iteration log", () => {
+  it("status() includes maxConcurrent / iterIdleMs / runnerCount / queueLength", () => {
+    const d = new GoalDaemon({
+      workspace: "/tmp/x",
+      maxConcurrent: 4,
+      iterIdleMs: 7,
+    });
+    const s = d.status();
+    expect(s.enabled).toBe(true);
+    expect(s.stopped).toBe(false);
+    expect(s.maxConcurrent).toBe(4);
+    expect(s.iterIdleMs).toBe(7);
+    expect(s.runnerCount).toBe(0);
+    expect(s.queueLength).toBe(0);
+    expect(s.runners).toEqual([]);
+    // Backwards-compatible flat projection (pre-C6 shape).
+    expect(s.running).toEqual([]);
+    expect(s.iterations).toEqual({});
+  });
+
+  it("status().runners reports per-runner startedAt / iterations / lastEventAt / state / source", async () => {
+    const d = new GoalDaemon({ workspace: "/tmp/x" });
+    const tStart = Date.now();
+    // Iteration that blocks forever so the runner stays "iterating".
+    const blocker = new Promise<DaemonIterationResult>(() => {});
+    const runner = new GoalTurnRunner(
+      baseRunnerOpts({
+        iterationFn: () => blocker,
+        onEvent: (ev) => d.eventBus.emit("goal:g1", ev),
+      }) as any,
+    );
+    runner.setSource("user-send");
+    d.kickGoalWithRunner("g1", runner);
+    // Let the loop reach the first iteration.
+    await new Promise((r) => setTimeout(r, 10));
+
+    const s = d.status();
+    expect(s.runnerCount).toBe(1);
+    expect(s.runners.length).toBe(1);
+    const row = s.runners[0]!;
+    expect(row.goalId).toBe("g1");
+    expect(row.iterations).toBeGreaterThanOrEqual(1);
+    expect(row.startedAt).toBeGreaterThanOrEqual(tStart);
+    expect(row.lastEventAt).toBeGreaterThanOrEqual(row.startedAt);
+    expect(row.state).toBe("iterating");
+    expect(row.source).toBe("user-send");
+
+    runner.forceStop();
+    await new Promise((r) => setTimeout(r, 20));
+  });
+
+  it("status() after all runners drain returns enabled+empty", async () => {
+    const d = new GoalDaemon({ workspace: "/tmp/x" });
+    const runner = new GoalTurnRunner(
+      baseRunnerOpts({
+        iterationFn: scriptedIterFn([{ completed: true }]),
+        onEvent: (ev) => d.eventBus.emit("goal:g1", ev),
+      }) as any,
+    );
+    d.kickGoalWithRunner("g1", runner);
+    await new Promise((r) => setTimeout(r, 20));
+    const s = d.status();
+    expect(s.runnerCount).toBe(0);
+    expect(s.runners).toEqual([]);
+    expect(s.enabled).toBe(true);
+  });
+
+  it("iteration log writes JSONL lines with durationMs on iteration-end", async () => {
+    const workspace = await mkTmpWorkspace();
+    const { default: path } = await import("node:path");
+    const fs = await import("node:fs/promises");
+    const logPath = path.join(workspace, "logs", "daemon.log");
+    const d = new GoalDaemon({ workspace, iterationLogPath: logPath });
+    const runner = new GoalTurnRunner(
+      baseRunnerOpts({
+        iterationFn: async () => {
+          await new Promise((r) => setTimeout(r, 5));
+          return { completed: true, failed: false, exhausted: false, aborted: false };
+        },
+        onEvent: (ev) => d.eventBus.emit("goal:g1", ev),
+      }) as any,
+    );
+    d.kickGoalWithRunner("g1", runner);
+    await new Promise((r) => setTimeout(r, 40));
+    await d.stop(50);
+
+    // Wait briefly for the stream to flush.
+    await new Promise((r) => setTimeout(r, 20));
+    const text = await fs.readFile(logPath, "utf8");
+    const lines = text.trim().split("\n").filter((l) => l.length > 0);
+    expect(lines.length).toBeGreaterThanOrEqual(2);
+    const records = lines.map((l) => JSON.parse(l));
+    const events = records.map((r) => r.event);
+    expect(events).toContain("iteration-start");
+    expect(events).toContain("iteration-end");
+    expect(events).toContain("turn-end");
+    const endRec = records.find((r) => r.event === "iteration-end");
+    expect(endRec).toBeDefined();
+    expect(endRec.goalId).toBe("g1");
+    expect(endRec.iteration).toBe(1);
+    expect(typeof endRec.durationMs).toBe("number");
+    expect(endRec.durationMs).toBeGreaterThanOrEqual(0);
+    expect(endRec.result.completed).toBe(true);
+    // ts field is epoch ms (Date.now()).
+    expect(typeof endRec.ts).toBe("number");
+    expect(endRec.ts).toBeGreaterThan(1_700_000_000_000);
+  });
+
+  it("iteration log is opt-in: omitting iterationLogPath skips file I/O entirely", async () => {
+    const d = new GoalDaemon({ workspace: "/tmp/x" });
+    const runner = new GoalTurnRunner(
+      baseRunnerOpts({
+        iterationFn: scriptedIterFn([{ completed: true }]),
+        onEvent: (ev) => d.eventBus.emit("goal:g1", ev),
+      }) as any,
+    );
+    d.kickGoalWithRunner("g1", runner);
+    await new Promise((r) => setTimeout(r, 20));
+    // No throw, no log path in status.
+    const s = d.status();
+    expect(s.iterationLogPath).toBeUndefined();
+  });
+
+  it("iteration log surfaces iterationLogPath in status()", () => {
+    const d = new GoalDaemon({
+      workspace: "/tmp/x",
+      iterationLogPath: "/tmp/some-daemon.log",
+    });
+    expect(d.status().iterationLogPath).toBe("/tmp/some-daemon.log");
   });
 });
 

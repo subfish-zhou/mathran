@@ -26,6 +26,8 @@
  */
 
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { listGoals, type Goal } from "./store.js";
 import {
   flushConversationHistory,
@@ -65,6 +67,61 @@ export interface GoalDaemonOptions {
     goalId: string,
     kickOpts: { userMessage?: string; source?: string },
   ) => GoalTurnRunner;
+  /**
+   * **C6:** absolute path to an append-mode JSONL log file. When set,
+   * the daemon writes one line per iteration-start / iteration-end /
+   * turn-end event, including `durationMs` for iteration-end. Parent
+   * directories are created on demand. Errors during open/write are
+   * logged but never thrown — log failures must not break the loop.
+   *
+   * Default: not set (no log).
+   */
+  iterationLogPath?: string;
+}
+
+/** **C6:** Per-runner status row returned by GoalDaemon.status(). */
+export interface GoalRunnerStatus {
+  goalId: string;
+  /** Epoch ms when GoalTurnRunner instance was constructed. */
+  startedAt: number;
+  /** Iteration counter (post-iteration-start). */
+  iterations: number;
+  /** Epoch ms of the most recent event emitted by this runner. */
+  lastEventAt: number;
+  /** Coarse runtime state — useful for ops dashboards. */
+  state: GoalRunnerState;
+  /** What kicked off this runner (e.g. "user-send" / "boot-resume" / "steer" / "answer-ask"). */
+  source?: string;
+}
+
+export type GoalRunnerState =
+  | "starting"            // constructed, run() not yet entered
+  | "iterating"           // inside an iterationFn await
+  | "sleeping"            // inside the iter-idle gap
+  | "waiting-user"        // parked after naturalTurnEnd, awaiting kick
+  | "interrupting"        // interrupt/abort requested, draining
+  | "done";               // run() returned (transient — runner cleared from Map ASAP)
+
+/** **C6:** Full daemon-level status snapshot. */
+export interface GoalDaemonStatus {
+  enabled: boolean;
+  stopped: boolean;
+  maxConcurrent: number;
+  iterIdleMs: number;
+  runnerCount: number;
+  /**
+   * Number of kicks queued beyond `maxConcurrent`. The current daemon
+   * doesn't enforce that cap (see TODO §7 risk #9), so this is always
+   * 0 in practice; reserved so the status shape is stable when the cap
+   * lands.
+   */
+  queueLength: number;
+  /** Path to the JSONL iteration log when enabled. */
+  iterationLogPath?: string;
+  runners: GoalRunnerStatus[];
+  /** Backwards-compatible flat projection (kept for any pre-C6 caller). */
+  running: string[];
+  iterations: Record<string, number>;
 }
 
 /** Per-iteration event sent to the daemon's eventBus. Shape matches the
@@ -106,9 +163,15 @@ export class GoalDaemon {
     iterIdleMs: number;
     maxConcurrent: number;
     runnerFactory?: GoalDaemonOptions["runnerFactory"];
+    iterationLogPath?: string;
   };
   private readonly runners = new Map<string, GoalTurnRunner>();
   private stopped = false;
+  /** **C6:** open append-mode stream for the iteration log. Created lazily on
+   *  first write and closed by `stop()`. `null` when no log path configured. */
+  private iterationLogStream: fs.WriteStream | null = null;
+  /** **C6:** flag so we only attempt to open the stream once even if open fails. */
+  private iterationLogOpenAttempted = false;
 
   constructor(opts: GoalDaemonOptions) {
     this.opts = {
@@ -116,6 +179,7 @@ export class GoalDaemon {
       iterIdleMs: opts.iterIdleMs ?? GoalDaemon.ITER_IDLE_MS_DEFAULT,
       maxConcurrent: opts.maxConcurrent ?? GoalDaemon.MAX_CONCURRENT_DEFAULT,
       ...(opts.runnerFactory ? { runnerFactory: opts.runnerFactory } : {}),
+      ...(opts.iterationLogPath ? { iterationLogPath: opts.iterationLogPath } : {}),
     };
     // Avoid the EE memory warning under heavy multi-tab SSE load.
     this.eventBus.setMaxListeners(100);
@@ -327,6 +391,19 @@ export class GoalDaemon {
         await new Promise((r) => setTimeout(r, 10));
       }
     }
+    // **C6:** flush + close the iteration log stream so test workers
+    // and graceful shutdowns don't leak file descriptors. Best-effort.
+    if (this.iterationLogStream) {
+      const s = this.iterationLogStream;
+      this.iterationLogStream = null;
+      await new Promise<void>((resolve) => {
+        try {
+          s.end(() => resolve());
+        } catch {
+          resolve();
+        }
+      });
+    }
   }
 
   /**
@@ -357,6 +434,9 @@ export class GoalDaemon {
     // must use `kickGoalWithRunner`).
     if (this.opts.runnerFactory) {
       const runner = this.opts.runnerFactory(goalId, opts ?? {});
+      // **C6:** stamp the kick source onto the runner so the status
+      // endpoint can report what set this loop in motion.
+      if (opts?.source) runner.setSource(opts.source);
       this.kickGoalWithRunner(goalId, runner);
       return;
     }
@@ -377,6 +457,92 @@ export class GoalDaemon {
       throw new Error(`Runner for goal ${goalId} already registered`);
     }
     this.runners.set(goalId, runner);
+
+    // **C6:** subscribe to this runner's events for iteration-log
+    // writing. We tap directly on the eventBus channel rather than
+    // wrapping runner.onEvent so we also see events emitted by the
+    // wrapped iterationFn (e.g. tool-call frames forwarded from
+    // runOneIteration). Track per-iteration start timestamps so
+    // iteration-end gets a `durationMs` field.
+    if (this.opts.iterationLogPath) {
+      const iterStartTs = new Map<number, number>();
+      const channel = `goal:${goalId}`;
+      const listener = (ev: DaemonEvent) => {
+        const type = ev.type;
+        if (type === "iteration-start") {
+          const it = Number((ev as { iteration?: unknown }).iteration ?? 0);
+          const now = Date.now();
+          iterStartTs.set(it, now);
+          this.appendIterationLog({
+            ts: now,
+            goalId,
+            event: "iteration-start",
+            iteration: it,
+            budget: (ev as { budget?: unknown }).budget,
+          });
+        } else if (type === "iteration-end") {
+          const it = Number((ev as { iteration?: unknown }).iteration ?? 0);
+          const now = Date.now();
+          const start = iterStartTs.get(it);
+          if (start !== undefined) iterStartTs.delete(it);
+          const result = (ev as { result?: unknown }).result as
+            | { completed?: boolean; failed?: boolean; exhausted?: boolean; aborted?: boolean; naturalTurnEnd?: boolean; endReason?: string }
+            | undefined;
+          this.appendIterationLog({
+            ts: now,
+            goalId,
+            event: "iteration-end",
+            iteration: it,
+            ...(start !== undefined ? { durationMs: now - start } : {}),
+            ...(result
+              ? {
+                  result: {
+                    completed: !!result.completed,
+                    failed: !!result.failed,
+                    exhausted: !!result.exhausted,
+                    aborted: !!result.aborted,
+                    ...(result.naturalTurnEnd ? { naturalTurnEnd: true } : {}),
+                    ...(result.endReason ? { endReason: result.endReason } : {}),
+                  },
+                }
+              : {}),
+          });
+        } else if (type === "turn-end") {
+          this.appendIterationLog({
+            ts: Date.now(),
+            goalId,
+            event: "turn-end",
+            reason: (ev as { reason?: unknown }).reason,
+          });
+        } else if (type === "error") {
+          this.appendIterationLog({
+            ts: Date.now(),
+            goalId,
+            event: "error",
+            message: (ev as { message?: unknown }).message,
+          });
+        }
+      };
+      this.eventBus.on(channel, listener);
+      runner
+        .run()
+        .catch((err: unknown) => {
+          // eslint-disable-next-line no-console
+          console.error(`[goal-daemon] runner crashed for goal ${goalId}:`, err);
+          this.eventBus.emit(`goal:${goalId}`, {
+            type: "error",
+            message: String(
+              (err as { message?: unknown })?.message ?? err,
+            ),
+          });
+        })
+        .finally(() => {
+          this.eventBus.off(channel, listener);
+          this.runners.delete(goalId);
+        });
+      return;
+    }
+
     runner
       .run()
       .catch((err: unknown) => {
@@ -422,11 +588,89 @@ export class GoalDaemon {
     return this.runners.has(goalId);
   }
 
-  /** Snapshot for status endpoint. */
-  status(): { running: string[]; iterations: Record<string, number> } {
-    const iterations: Record<string, number> = {};
-    for (const [id, r] of this.runners) iterations[id] = r.iterationCount();
-    return { running: [...this.runners.keys()], iterations };
+  /**
+   * **C6:** Rich daemon status snapshot for the
+   * `GET /api/goals/daemon/status` endpoint. Returns per-runner
+   * timestamps, iteration counters, and coarse state so ops can see
+   * what's running.
+   */
+  status(): GoalDaemonStatus {
+    const runners: GoalRunnerStatus[] = [];
+    const flatIters: Record<string, number> = {};
+    for (const [id, r] of this.runners) {
+      const snap = r.statusSnapshot();
+      runners.push({ goalId: id, ...snap });
+      flatIters[id] = snap.iterations;
+    }
+    const out: GoalDaemonStatus = {
+      enabled: !this.stopped,
+      stopped: this.stopped,
+      maxConcurrent: this.opts.maxConcurrent,
+      iterIdleMs: this.opts.iterIdleMs,
+      runnerCount: this.runners.size,
+      // The current daemon doesn't enforce maxConcurrent (see TODO
+      // §7 risk #9), so queue length is always 0. The field is
+      // reserved so the shape stays stable once the cap lands.
+      queueLength: 0,
+      runners,
+      running: [...this.runners.keys()],
+      iterations: flatIters,
+    };
+    if (this.opts.iterationLogPath) out.iterationLogPath = this.opts.iterationLogPath;
+    return out;
+  }
+
+  /**
+   * **C6:** Append one JSON line to the iteration log. Opens the
+   * append-mode WriteStream lazily on first call. All errors are
+   * swallowed (with a console warning) — log failures must NEVER
+   * break the daemon's main loop.
+   */
+  private appendIterationLog(record: Record<string, unknown>): void {
+    const p = this.opts.iterationLogPath;
+    if (!p) return;
+    if (!this.iterationLogStream && !this.iterationLogOpenAttempted) {
+      this.iterationLogOpenAttempted = true;
+      try {
+        // Best-effort mkdir of the parent so the daemon can recover
+        // from a missing ~/.mathran/logs directory.
+        const dir = path.dirname(p);
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+        } catch {
+          /* dir may already exist or be unwritable — open will surface it */
+        }
+        this.iterationLogStream = fs.createWriteStream(p, {
+          flags: "a",
+          encoding: "utf8",
+        });
+        this.iterationLogStream.on("error", (err) => {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[goal-daemon] iteration log stream error (${p}):`,
+            err?.message ?? err,
+          );
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[goal-daemon] failed to open iteration log at ${p}:`,
+          (err as Error)?.message ?? err,
+        );
+        this.iterationLogStream = null;
+      }
+    }
+    const stream = this.iterationLogStream;
+    if (!stream) return;
+    try {
+      stream.write(JSON.stringify(record) + "\n");
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[goal-daemon] iteration log write failed:`,
+        (err as Error)?.message ?? err,
+      );
+    }
   }
 }
 
@@ -482,6 +726,15 @@ export class GoalTurnRunner {
   private pendingSteer = "";
   private sleepResolver: (() => void) | null = null;
   private currentAbort: AbortController | null = null;
+  /** **C6:** epoch ms when this runner instance was constructed. */
+  private readonly startedAt: number = Date.now();
+  /** **C6:** epoch ms of the most recent event emitted by this runner. */
+  private lastEventAt: number = Date.now();
+  /** **C6:** coarse runtime state for the status endpoint. */
+  private state: GoalRunnerState = "starting";
+  /** **C6:** label set by `kickGoal({source})` so the status snapshot can
+   *  report what kicked off this loop. */
+  private source: string | undefined;
 
   constructor(
     private readonly opts: {
@@ -513,6 +766,35 @@ export class GoalTurnRunner {
     return this.iter;
   }
 
+  /** **C6:** Set the kick source label (e.g. "user-send" / "boot-resume"). */
+  setSource(s: string): void {
+    this.source = s;
+  }
+
+  /** **C6:** Per-runner snapshot for GoalDaemon.status(). */
+  statusSnapshot(): {
+    startedAt: number;
+    iterations: number;
+    lastEventAt: number;
+    state: GoalRunnerState;
+    source?: string;
+  } {
+    return {
+      startedAt: this.startedAt,
+      iterations: this.iter,
+      lastEventAt: this.lastEventAt,
+      state: this.state,
+      ...(this.source ? { source: this.source } : {}),
+    };
+  }
+
+  /** **C6:** wrap the configured onEvent so we can stamp `lastEventAt`
+   *  on every emit — cheap, single property write. */
+  private emit(ev: DaemonEvent): void {
+    this.lastEventAt = Date.now();
+    this.opts.onEvent(ev);
+  }
+
   /**
    * Main loop. Runs until a terminal condition. Returns normally — caller
    * should NOT await it inside a request handler (it can run for hours).
@@ -523,17 +805,20 @@ export class GoalTurnRunner {
     while (!this.forceStopped) {
       // 1. External status check (paused/cancelled by another endpoint).
       if (!(await isActive())) {
-        this.opts.onEvent({ type: "turn-end", reason: "status-flipped" });
+        this.state = "done";
+        this.emit({ type: "turn-end", reason: "status-flipped" });
         return;
       }
 
       // 2. Pre-iteration interrupt/abort guards.
       if (this.interrupted) {
-        this.opts.onEvent({ type: "turn-end", reason: "interrupted" });
+        this.state = "done";
+        this.emit({ type: "turn-end", reason: "interrupted" });
         return;
       }
       if (this.aborted) {
-        this.opts.onEvent({ type: "turn-end", reason: "aborted" });
+        this.state = "done";
+        this.emit({ type: "turn-end", reason: "aborted" });
         return;
       }
 
@@ -545,7 +830,8 @@ export class GoalTurnRunner {
 
       // 5. Run one iteration (test seam: opts.iterationFn).
       this.iter++;
-      this.opts.onEvent({
+      this.state = "iterating";
+      this.emit({
         type: "iteration-start",
         iteration: this.iter,
         budget: this.opts.iterationBudget,
@@ -559,17 +845,18 @@ export class GoalTurnRunner {
           steerText,
           iteration: this.iter,
           signal: this.currentAbort.signal,
-          emit: (ev) => this.opts.onEvent(ev),
+          emit: (ev) => this.emit(ev),
         });
       } catch (err) {
         const message = String((err as { message?: unknown })?.message ?? err);
-        this.opts.onEvent({ type: "error", message });
-        this.opts.onEvent({ type: "turn-end", reason: "iteration-threw" });
+        this.state = "done";
+        this.emit({ type: "error", message });
+        this.emit({ type: "turn-end", reason: "iteration-threw" });
         return;
       } finally {
         this.currentAbort = null;
       }
-      this.opts.onEvent({
+      this.emit({
         type: "iteration-end",
         iteration: this.iter,
         result,
@@ -577,19 +864,23 @@ export class GoalTurnRunner {
 
       // 6. Terminal conditions check.
       if (result.completed) {
-        this.opts.onEvent({ type: "turn-end", reason: "completed" });
+        this.state = "done";
+        this.emit({ type: "turn-end", reason: "completed" });
         return;
       }
       if (result.failed) {
-        this.opts.onEvent({ type: "turn-end", reason: "failed" });
+        this.state = "done";
+        this.emit({ type: "turn-end", reason: "failed" });
         return;
       }
       if (result.exhausted) {
-        this.opts.onEvent({ type: "turn-end", reason: "exhausted" });
+        this.state = "done";
+        this.emit({ type: "turn-end", reason: "exhausted" });
         return;
       }
       if (result.aborted) {
-        this.opts.onEvent({
+        this.state = "done";
+        this.emit({
           type: "turn-end",
           reason: "interrupted-mid-iteration",
         });
@@ -598,15 +889,20 @@ export class GoalTurnRunner {
       if (result.naturalTurnEnd) {
         // Model ended the turn voluntarily (final text, no tool_calls).
         // Wait for next user message or external notify (no polling).
-        this.opts.onEvent({ type: "turn-end", reason: "natural" });
+        this.state = "waiting-user";
+        this.emit({ type: "turn-end", reason: "natural" });
         const woke = await this.sleepUntilNotified();
-        if (!woke) return; // forceStop or abort during sleep
+        if (!woke) {
+          this.state = "done";
+          return; // forceStop or abort during sleep
+        }
         continue;
       }
 
       // 7. Iteration budget guard.
       if (this.iter >= this.opts.iterationBudget) {
-        this.opts.onEvent({
+        this.state = "done";
+        this.emit({
           type: "turn-end",
           reason: `budget-exhausted(${this.iter}/${this.opts.iterationBudget})`,
         });
@@ -614,21 +910,26 @@ export class GoalTurnRunner {
       }
 
       // 8. Idle gap (interruptible).
+      this.state = "sleeping";
       await this.sleepInterruptible(this.opts.iterIdleMs);
     }
+    this.state = "done";
   }
 
   interrupt(): void {
+    this.state = "interrupting";
     this.interrupted = true;
     this.currentAbort?.abort();
     this.wake();
   }
   abort(): void {
+    this.state = "interrupting";
     this.aborted = true;
     this.currentAbort?.abort();
     this.wake();
   }
   forceStop(): void {
+    this.state = "interrupting";
     this.forceStopped = true;
     this.currentAbort?.abort();
     this.wake();
