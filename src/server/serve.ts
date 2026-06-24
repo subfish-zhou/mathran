@@ -4822,6 +4822,11 @@ function buildApp(
       planPath: g.planPath ?? null,
       parentGoalId: g.parentGoalId ?? null,
       subGoalCount: (g.subGoalIds ?? []).length,
+      // TODO-2 §3.2 / C9 — surface compaction stats to the SPA badge.
+      compactionRuns: g.stats.compactionRuns ?? 0,
+      compactionTokensDropped: g.stats.compactionTokensDropped ?? 0,
+      lastCompactionReason: g.stats.lastCompactionReason ?? null,
+      lastCompactionAt: g.stats.lastCompactionAt ?? null,
     });
   });
 

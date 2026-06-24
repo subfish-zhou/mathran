@@ -173,6 +173,26 @@ export type ChatEvent =
         durationMs?: number;
       };
     }
+  | {
+      /** TODO-2 §3.2 / C9 — compaction lifecycle event from the server.
+       *  Emitted by ChatSession.compactV2 → goal runner emit() → serve
+       *  SSE pass-through. The SPA's AgentStatusPanel + GoalRunStatusPanel
+       *  show a 🧹 badge with the cumulative count + tooltip carrying
+       *  reason/phase/tokens-saved. Noop compactions (droppedRoundCount=0)
+       *  are filtered server-side, so any frame the client sees represents
+       *  a real swap. */
+      type: "compaction";
+      outcome: "ok" | "skipped" | "cancelled" | "failed";
+      reason: string;
+      phase: string;
+      trigger: string;
+      policy: string;
+      originalTokens: number;
+      newTokens: number;
+      droppedRoundCount: number;
+      durationMs: number;
+      summaryTokens?: number;
+    }
   | { type: "done"; finishReason: string }
   | { type: "error"; message: string };
 
@@ -885,6 +905,14 @@ export interface GoalStatus {
   planPath: string | null;
   parentGoalId: string | null;
   subGoalCount: number;
+  /** TODO-2 §3.2 / C9 — total successful compactions on this goal so far. */
+  compactionRuns?: number;
+  /** TODO-2 §3.2 / C9 — cumulative tokens saved by compaction (best-effort). */
+  compactionTokensDropped?: number;
+  /** TODO-2 §3.2 / C9 — reason on the most recent successful compaction. */
+  lastCompactionReason?: string | null;
+  /** TODO-2 §3.2 / C9 — ISO timestamp of the most recent compaction. */
+  lastCompactionAt?: string | null;
 }
 
 /** GET /api/goals/:id/status — cheap polling probe; never throws on 404

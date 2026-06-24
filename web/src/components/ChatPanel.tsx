@@ -477,6 +477,15 @@ export default function ChatPanel({
   // `null` for plain chat (which never emits round-start) so the
   // panel hides its `Step N/M` segment.
   const [round, setRound] = useState<{ current: number; max?: number } | null>(null);
+  // TODO-2 §3.2 / C9 — compaction summary fed from SSE 'compaction' events.
+  // Resets at the start of every new send (each turn gets a fresh count).
+  const [compaction, setCompaction] = useState<{
+    runs: number;
+    lastReason?: string;
+    lastPhase?: string;
+    tokensSaved: number;
+    lastAt?: string;
+  } | null>(null);
   // Tick state for the 1Hz elapsed-time refresh while `busy` is true.
   // Without this React would only re-render when an SSE event arrives,
   // so a slow tool call would freeze the `⏱ Xs` counter visually.
@@ -1062,6 +1071,8 @@ export default function ChatPanel({
       setActiveToolCalls({});
       setSubAgentActive(false);
       setRound(null);
+      // TODO-2 §3.2 / C9 — reset compaction summary at every turn boundary.
+      setCompaction(null);
 
       const onEvent = (ev: ChatEvent) => {
         if (ev.type === "session") {
@@ -1086,6 +1097,27 @@ export default function ChatPanel({
           setRound({
             current: ev.round,
             ...(typeof ev.maxRounds === "number" ? { max: ev.maxRounds } : {}),
+          });
+        }
+        // TODO-2 §3.2 / C9 — accumulate compaction events into the badge
+        // state shown by AgentStatusPanel. Server filters noop swaps,
+        // so any frame we see represents a real compaction OR an
+        // explicit non-ok status. Successful swaps bump the count + sum
+        // tokens saved; failures/skips/cancels surface in the tooltip
+        // but don't add to the saved-tokens estimate.
+        if (ev.type === "compaction") {
+          setCompaction((prev) => {
+            const base = prev ?? { runs: 0, tokensSaved: 0 };
+            const isOk = ev.outcome === "ok";
+            return {
+              runs: base.runs + (isOk ? 1 : 0),
+              tokensSaved:
+                base.tokensSaved +
+                (isOk ? Math.max(0, ev.originalTokens - ev.newTokens) : 0),
+              lastReason: ev.reason,
+              lastPhase: ev.phase,
+              lastAt: new Date().toISOString(),
+            };
           });
         }
         // v0.17 mathub parity W9 — the server confirms it consumed our
@@ -3398,6 +3430,7 @@ export default function ChatPanel({
           subAgentActive={subAgentActive}
           elapsedMs={sendStartMs > 0 ? Date.now() - sendStartMs : 0}
           round={round}
+          compaction={compaction}
         />
 
         {/* ─── GoalProposalBanner (v0.17 follow-up P2) ───────────────────────────

@@ -292,6 +292,22 @@ export default function GoalRunStatusPanel({
           🔧 {status.toolCount}
         </span>
 
+        {/* TODO-2 §3.2 / C9 — Compaction badge. Only renders when at
+         *  least one compaction has fired. Tooltip exposes reason +
+         *  tokens saved so the user can see what triggered the shrink
+         *  without opening the goal record. Persistent across rounds
+         *  unlike the per-turn AgentStatusPanel badge. */}
+        {typeof status.compactionRuns === "number" && status.compactionRuns > 0 && (
+          <span
+            className="text-amber-700"
+            title={`${status.compactionRuns} compaction${status.compactionRuns === 1 ? "" : "s"}${
+              status.lastCompactionReason ? ` (last: ${status.lastCompactionReason})` : ""
+            } — ~${(status.compactionTokensDropped ?? 0).toLocaleString()} tokens saved`}
+          >
+            🧹 {status.compactionRuns}
+          </span>
+        )}
+
         {/* Heartbeat freshness. We only show the dot when a heartbeat
          *  exists AND the goal isn't terminal — a finished goal's
          *  freshness is irrelevant. */}
