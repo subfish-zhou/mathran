@@ -105,6 +105,222 @@ function uploadsUrlFor(ref: ChatAttachmentRef): string {
   return `/api/uploads/${encodeURIComponent(ref.path)}`;
 }
 
+// ─── v0.18: Discord-style conversation tree ─────────────────────────────
+
+interface ConversationTreeNode {
+  conv: ConversationSummary;
+  depth: number;
+  children: ConversationTreeNode[];
+}
+
+/**
+ * Group a flat list of conversations into a forest where each child
+ * thread is nested under its `parentConversationId`.
+ *
+ * Algorithm:
+ *   1. Bucket by parent id (or `__root__`).
+ *   2. Walk roots → recursively attach buckets, computing depth.
+ *   3. Children of any node are sorted by `lastUsedAt` desc so the most
+ *      recently active thread floats to the top — same convention the
+ *      flat sidebar already uses for root conversations.
+ *
+ * Orphaned threads (parent missing in this scope — shouldn't happen but
+ * could after a manual delete) get promoted to root level so they're at
+ * least visible. We log to console.warn so the user knows something is
+ * off without losing data.
+ */
+function buildConversationTree(
+  conversations: ConversationSummary[],
+): ConversationTreeNode[] {
+  const byParent = new Map<string, ConversationSummary[]>();
+  const ROOT = "__root__";
+  const allIds = new Set(conversations.map((c) => c.id));
+
+  for (const c of conversations) {
+    let bucket = c.parentConversationId ?? ROOT;
+    // Defensive: parent missing → promote to root and warn once.
+    if (bucket !== ROOT && !allIds.has(bucket)) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[ConversationTree] orphan thread ${c.id} (parent ${bucket} missing) — rendering at root`,
+      );
+      bucket = ROOT;
+    }
+    if (!byParent.has(bucket)) byParent.set(bucket, []);
+    byParent.get(bucket)!.push(c);
+  }
+
+  // Sort each bucket by recency.
+  for (const arr of byParent.values()) {
+    arr.sort((a, b) => Date.parse(b.lastUsedAt) - Date.parse(a.lastUsedAt));
+  }
+
+  function walk(conv: ConversationSummary, depth: number): ConversationTreeNode {
+    const childConvs = byParent.get(conv.id) ?? [];
+    return {
+      conv,
+      depth,
+      children: childConvs.map((c) => walk(c, depth + 1)),
+    };
+  }
+
+  return (byParent.get(ROOT) ?? []).map((c) => walk(c, 0));
+}
+
+interface ConversationTreeItemProps {
+  node: ConversationTreeNode;
+  activeId: string | null;
+  collapsed: Set<string>;
+  onToggleCollapsed: (id: string) => void;
+  onSelect: (id: string) => void;
+  onDelete: (id: string) => void;
+  onCreateThread: (parentId: string) => void;
+}
+
+/**
+ * Render one tree node + its descendants. Depth drives left padding (12px
+ * per level, capped via clamp to 36px so deeply-nested threads still fit
+ * in the 240px sidebar). The triangle ▸/▾ collapse toggle is shown for
+ * any node with at least one child; clicking it does NOT switch the
+ * active conversation, only the expand state.
+ */
+function ConversationTreeItem({
+  node,
+  activeId,
+  collapsed,
+  onToggleCollapsed,
+  onSelect,
+  onDelete,
+  onCreateThread,
+}: ConversationTreeItemProps) {
+  const { conv, depth, children } = node;
+  const active = conv.id === activeId;
+  const hasChildren = children.length > 0;
+  const isCollapsed = collapsed.has(conv.id);
+  // Cap visual indent so depth-6 threads still leave room for the label.
+  const padPx = Math.min(depth * 12, 36);
+
+  return (
+    <li>
+      <div
+        style={{ paddingLeft: padPx }}
+        className={`group flex items-center gap-1 rounded-md py-1.5 pr-2 text-xs transition ${
+          active ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-100"
+        }`}
+      >
+        {/* Collapse triangle (only when there are children) */}
+        {hasChildren ? (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleCollapsed(conv.id);
+            }}
+            className={`shrink-0 w-3 text-center text-[10px] leading-none ${
+              active ? "text-slate-300" : "text-slate-400 hover:text-slate-700"
+            }`}
+            title={isCollapsed ? "Expand thread" : "Collapse thread"}
+            aria-label={isCollapsed ? "Expand thread" : "Collapse thread"}
+          >
+            {isCollapsed ? "▸" : "▾"}
+          </button>
+        ) : (
+          <span className="shrink-0 w-3" aria-hidden />
+        )}
+
+        <button
+          type="button"
+          onClick={() => onSelect(conv.id)}
+          className="min-w-0 flex-1 truncate text-left"
+          title={
+            `${conv.title}\n${conv.messageCount} message${
+              conv.messageCount === 1 ? "" : "s"
+            } · ${new Date(conv.lastUsedAt).toLocaleString()}` +
+            (conv.threadDescription ? `\n\n${conv.threadDescription}` : "") +
+            (typeof conv.anchorBubbleIdx === "number"
+              ? `\nForked at bubble #${conv.anchorBubbleIdx}`
+              : "")
+          }
+        >
+          <div className="truncate font-medium">
+            {/* Thread badge for child threads */}
+            {depth > 0 && (
+              <span
+                className={`mr-1 text-[10px] ${
+                  active ? "text-slate-300" : "text-slate-400"
+                }`}
+                aria-hidden
+              >
+                ⤳
+              </span>
+            )}
+            {conv.title || conv.id}
+          </div>
+          <div
+            className={`truncate text-[10px] ${
+              active ? "text-slate-300" : "text-slate-400"
+            }`}
+          >
+            {conv.messageCount} msg · {new Date(conv.lastUsedAt).toLocaleDateString()}
+          </div>
+        </button>
+
+        {/* Hover actions: + new thread / × delete */}
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onCreateThread(conv.id);
+          }}
+          className={`shrink-0 rounded px-1 py-0.5 text-[10px] opacity-0 transition group-hover:opacity-100 ${
+            active
+              ? "text-slate-300 hover:bg-slate-700"
+              : "text-slate-400 hover:bg-slate-200 hover:text-slate-700"
+          }`}
+          title="Start a thread off this conversation"
+          aria-label={`Start a thread off ${conv.id}`}
+        >
+          ⤳
+        </button>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete(conv.id);
+          }}
+          className={`shrink-0 rounded px-1 py-0.5 text-[10px] opacity-0 transition group-hover:opacity-100 ${
+            active
+              ? "text-slate-300 hover:bg-slate-700"
+              : "text-slate-400 hover:bg-red-100 hover:text-red-700"
+          }`}
+          title="Delete this conversation"
+          aria-label={`Delete ${conv.id}`}
+        >
+          ✕
+        </button>
+      </div>
+
+      {/* Children */}
+      {hasChildren && !isCollapsed && (
+        <ul className="space-y-1">
+          {children.map((child) => (
+            <ConversationTreeItem
+              key={child.conv.id}
+              node={child}
+              activeId={activeId}
+              collapsed={collapsed}
+              onToggleCollapsed={onToggleCollapsed}
+              onSelect={onSelect}
+              onDelete={onDelete}
+              onCreateThread={onCreateThread}
+            />
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
 export default function ChatPanel({
   scope,
   scopeLabel,
@@ -143,6 +359,33 @@ export default function ChatPanel({
   const [usageHistory, setUsageHistory] = useState<number[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  // v0.18 — Discord-style threads: collapsed state for the sidebar tree.
+  // Persisted to localStorage so refresh keeps the user's view; one key
+  // per scope so different projects don't share collapse state.
+  const collapsedThreadsKey = useMemo(
+    () => `mathran:collapsedThreads:${chatScopeBase(scope)}`,
+    [scope],
+  );
+  const [collapsedThreads, setCollapsedThreads] = useState<Set<string>>(() => {
+    if (typeof window === "undefined") return new Set();
+    try {
+      const raw = window.localStorage.getItem(collapsedThreadsKey);
+      if (!raw) return new Set();
+      const arr = JSON.parse(raw);
+      return new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === "string") : []);
+    } catch {
+      return new Set();
+    }
+  });
+  // Sync to localStorage whenever the set changes. Stored as a JSON array.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(collapsedThreadsKey, JSON.stringify([...collapsedThreads]));
+    } catch {
+      /* quota / disabled — not fatal */
+    }
+  }, [collapsedThreads, collapsedThreadsKey]);
   // Abort controller for the in-flight chat stream. `send` / `reRun` set it
   // before kicking off pumpSSE; the Stop button calls `.abort()` to interrupt.
   // Cleared in `runChatStream`'s finally block so the next turn starts fresh.
@@ -1623,6 +1866,83 @@ export default function ChatPanel({
     }
   }
 
+  /**
+   * v0.18 — Discord-style threads: create a child thread off a parent
+   * conversation (clicked from the sidebar ⤳ button). The thread is
+   * created without an anchor bubble ("generic child") because there's
+   * no bubble in context here — anchored threads come from the per-bubble
+   * action menu in the chat surface (`createThreadFromBubble`).
+   *
+   * After creation: refresh the sidebar (so the new thread appears under
+   * the parent), expand the parent (in case it was collapsed), and
+   * switch the active conversation to the new thread.
+   */
+  async function createThreadFromConv(parentId: string) {
+    try {
+      const meta = await api.createThread(scope, parentId);
+      // Make sure parent shows the new child even if user had it collapsed.
+      setCollapsedThreads((prev) => {
+        if (!prev.has(parentId)) return prev;
+        const next = new Set(prev);
+        next.delete(parentId);
+        return next;
+      });
+      await refreshList();
+      setConversationId(meta.id);
+      setBubbles([]);
+      setError(null);
+      setUsage(null);
+      setUsageHistory([]);
+    } catch (err) {
+      setError(`Failed to create thread: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * v0.18 — thread off a SPECIFIC bubble in the current conversation.
+   * Called from the bubble-hover action menu. The new thread's
+   * `anchorBubbleIdx` records the source bubble so the SPA renders a
+   * "forked at #N" pill on the parent and a "forked from <quoted snippet>"
+   * header on the thread. Default title uses the bubble idx.
+   */
+  async function createThreadFromBubble(bubbleIdx: number) {
+    if (!conversationId) return;
+    try {
+      const bubble = bubbles[bubbleIdx];
+      const snippet =
+        bubble && bubble.kind !== "tool"
+          ? (bubble.text ?? "").slice(0, 120).replace(/\s+/g, " ").trim()
+          : undefined;
+      const meta = await api.createThread(scope, conversationId, {
+        anchorBubbleIdx: bubbleIdx,
+        threadDescription: snippet ? `Forked at: ${snippet}…` : undefined,
+      });
+      setCollapsedThreads((prev) => {
+        if (!prev.has(conversationId)) return prev;
+        const next = new Set(prev);
+        next.delete(conversationId);
+        return next;
+      });
+      await refreshList();
+      setConversationId(meta.id);
+      setBubbles([]);
+      setError(null);
+      setUsage(null);
+      setUsageHistory([]);
+    } catch (err) {
+      setError(`Failed to create thread: ${(err as Error).message}`);
+    }
+  }
+
+  function toggleThreadCollapsed(id: string) {
+    setCollapsedThreads((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   // ─── Export ───────────────────────────────────────────────────────────
   //
   // mathran chats are math-heavy and we (subfish, 2026-06-19) want both a quick
@@ -2218,50 +2538,21 @@ export default function ChatPanel({
           {conversations.length === 0 && (
             <p className="px-2 py-3 text-xs text-slate-400">No chats yet.</p>
           )}
+          {/* v0.18 — Discord-style threads: tree render. See
+              buildConversationTree + ConversationTreeItem above. */}
           <ul className="space-y-1">
-            {conversations.map((c) => {
-              const active = c.id === conversationId;
-              return (
-                <li key={c.id}>
-                  <div
-                    className={`group flex items-center gap-1 rounded-md px-2 py-1.5 text-xs transition ${
-                      active
-                        ? "bg-slate-900 text-white"
-                        : "text-slate-700 hover:bg-slate-100"
-                    }`}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => selectConv(c.id)}
-                      className="min-w-0 flex-1 truncate text-left"
-                      title={`${c.title}\n${c.messageCount} message${c.messageCount === 1 ? "" : "s"} · ${new Date(c.lastUsedAt).toLocaleString()}`}
-                    >
-                      <div className="truncate font-medium">{c.title || c.id}</div>
-                      <div
-                        className={`truncate text-[10px] ${
-                          active ? "text-slate-300" : "text-slate-400"
-                        }`}
-                      >
-                        {c.messageCount} msg · {new Date(c.lastUsedAt).toLocaleDateString()}
-                      </div>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void deleteConv(c.id)}
-                      className={`shrink-0 rounded px-1 py-0.5 text-[10px] opacity-0 transition group-hover:opacity-100 ${
-                        active
-                          ? "text-slate-300 hover:bg-slate-700"
-                          : "text-slate-400 hover:bg-red-100 hover:text-red-700"
-                      }`}
-                      title="Delete this conversation"
-                      aria-label={`Delete ${c.id}`}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                </li>
-              );
-            })}
+            {buildConversationTree(conversations).map((node) => (
+              <ConversationTreeItem
+                key={node.conv.id}
+                node={node}
+                activeId={conversationId}
+                collapsed={collapsedThreads}
+                onToggleCollapsed={toggleThreadCollapsed}
+                onSelect={selectConv}
+                onDelete={(id) => void deleteConv(id)}
+                onCreateThread={(parentId) => void createThreadFromConv(parentId)}
+              />
+            ))}
           </ul>
         </div>
       </aside>
@@ -2280,6 +2571,44 @@ export default function ChatPanel({
                 </>
               )}
             </p>
+            {/* v0.18 — Discord-style threads: when the active conv is a
+                child thread, show a breadcrumb "⤳ thread of <parent title>"
+                and a one-click jump to the parent. Lets the user navigate
+                up the chain without going back to the sidebar. */}
+            {(() => {
+              if (!conversationId) return null;
+              const current = conversations.find((c) => c.id === conversationId);
+              if (!current?.parentConversationId) return null;
+              const parent = conversations.find(
+                (c) => c.id === current.parentConversationId,
+              );
+              const parentLabel = parent?.title || current.parentConversationId;
+              return (
+                <p className="mt-0.5 truncate text-[11px] text-slate-500">
+                  <span className="mr-1" aria-hidden>⤳</span>
+                  Thread of{" "}
+                  <button
+                    type="button"
+                    onClick={() => selectConv(current.parentConversationId!)}
+                    className="font-medium text-blue-600 hover:underline"
+                    title="Jump back to parent conversation"
+                  >
+                    {parentLabel}
+                  </button>
+                  {typeof current.anchorBubbleIdx === "number" && (
+                    <>
+                      {" "}
+                      forked at #{current.anchorBubbleIdx}
+                    </>
+                  )}
+                  {current.threadDescription && (
+                    <span className="ml-1 text-slate-400">
+                      — {current.threadDescription}
+                    </span>
+                  )}
+                </p>
+              );
+            })()}
           </div>
           <input
             value={model}
@@ -3002,6 +3331,18 @@ export default function ChatPanel({
                         title="Reply to this message: the next prompt will quote it"
                       >
                         ↩ Reply
+                      </button>
+                      {/* v0.18 — Discord-style threads: fork off this bubble.
+                          The new thread is a child conversation of the
+                          current one, with anchorBubbleIdx=row.bubbleIdx so
+                          the sidebar shows the fork point. */}
+                      <button
+                        type="button"
+                        onClick={() => void createThreadFromBubble(row.bubbleIdx)}
+                        className="rounded px-1 py-0.5 hover:bg-slate-200"
+                        title="Start a thread off this message (Discord-style, nested under this chat in the sidebar)"
+                      >
+                        ⤳ Thread
                       </button>
                       <button
                         type="button"

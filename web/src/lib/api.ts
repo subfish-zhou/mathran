@@ -87,6 +87,19 @@ export interface ConversationSummary {
   createdAt: string;
   lastUsedAt: string;
   messageCount: number;
+  /**
+   * v0.18 — Discord-style threads. When set, this conversation is a child
+   * thread of another conversation in the same scope. The sidebar renders
+   * threads nested under their parent (a tree, not a flat list).
+   */
+  parentConversationId?: string;
+  /**
+   * v0.18 — the bubble index in the parent the thread was forked off of.
+   * The SPA may render "💬 N replies" pill next to that bubble.
+   */
+  anchorBubbleIdx?: number;
+  /** v0.18 — optional one-line hover description for the thread. */
+  threadDescription?: string;
 }
 
 /**
@@ -429,6 +442,31 @@ export const api = {
       case "effort":
         return this.listEffortChats(scope.projectSlug, scope.effortSlug);
     }
+  },
+
+  /**
+   * v0.18 — Discord-style threads. Create a child thread parented to
+   * `parentId` in the same scope. The thread shows up in `listChats` as a
+   * conversation with `parentConversationId === parentId` and an optional
+   * `anchorBubbleIdx` if it was forked off a specific bubble in the parent.
+   */
+  async createThread(
+    scope: ChatScopeSpec,
+    parentId: string,
+    opts?: {
+      anchorBubbleIdx?: number;
+      title?: string;
+      threadDescription?: string;
+    },
+  ): Promise<ConversationSummary> {
+    const res = await jsonOrThrow<{ conversation: ConversationSummary }>(
+      await fetch(`${chatScopeBase(scope)}/${enc(parentId)}/threads`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(opts ?? {}),
+      }),
+    );
+    return res.conversation;
   },
 
   /**
