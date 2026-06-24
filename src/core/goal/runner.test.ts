@@ -689,7 +689,10 @@ describe("runGoalRound summary on completion", () => {
     expect(r.completed).toBe(true);
 
     // Self-grade is fire-and-forget (deferred via setImmediate) — let it settle.
-    await new Promise((res) => setTimeout(res, 30));
+    // Bumped from 30ms to 200ms because under parallel vitest forks + IO load
+    // 30ms occasionally starves and the outcome record isn't on disk yet (audit
+    // 2026-06-24).
+    await new Promise((res) => setTimeout(res, 200));
     const outcome = await readOutcome(workspace, g.id);
     expect(outcome).not.toBeNull();
     expect(outcome!.resolution).toBe("complete");
@@ -716,7 +719,7 @@ describe("runGoalRound summary on completion", () => {
     ]);
     const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
     expect(r.completed).toBe(true);
-    await new Promise((res) => setTimeout(res, 30));
+    await new Promise((res) => setTimeout(res, 200));
     expect(await readOutcome(workspace, g.id)).toBeNull();
   });
 

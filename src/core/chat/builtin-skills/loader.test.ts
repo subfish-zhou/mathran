@@ -11,7 +11,7 @@ describe("loadBuiltinSkills", () => {
   it("loads the shipped builtin skills at layer 'builtin'", () => {
     const { skills } = loadBuiltinSkills();
     const names = skills.map((s) => s.name).sort();
-    expect(names).toEqual(["propose-goal", "propose-plan"]);
+    expect(names).toEqual(["goal-send-message", "propose-goal", "propose-plan"]);
     for (const s of skills) {
       expect(s.layer).toBe("builtin");
       expect(s.manifest.allowedTools?.length).toBeGreaterThan(0);
@@ -36,6 +36,7 @@ describe("loadLayeredSkills builtin integration", () => {
     });
     const builtins = skills.filter((s) => s.layer === "builtin");
     expect(builtins.map((s) => s.name).sort()).toEqual([
+      "goal-send-message",
       "propose-goal",
       "propose-plan",
     ]);

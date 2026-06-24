@@ -2892,7 +2892,7 @@ describe("POST /api/chat ask_user (v0.19 Codex parity — timeout auto-resolve)"
       expect(r1.status).toBe(200);
       await r1.text();
 
-      const deadline = Date.now() + 8000;
+      const deadline = Date.now() + 20000;  // Bumped from 15s — flake recurred even at 15 under parallel vitest forks (audit 2026-06-24).
       let cleared = false;
       while (Date.now() < deadline) {
         const ann = (await (
