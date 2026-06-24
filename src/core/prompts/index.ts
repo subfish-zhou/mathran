@@ -63,6 +63,58 @@ with the complete source; read its messages and iterate. Don't hand-wave
 "this should typecheck"; just call the tool.`;
 
 // ────────────────────────────────────────────────────────────────────
+// arXiv source fidelity (v0.18 — TXT vs TeX precision incident)
+// ────────────────────────────────────────────────────────────────────
+
+/**
+ * When pulling an arXiv paper into the workspace as reference material,
+ * always prefer the LaTeX e-print over a PDF-to-text extraction.
+ *
+ * Background: a real incident showed that pdftotext-derived plaintext
+ * loses too much mathematical structure to be a safe reference for
+ * formula-level verification. Concretely, on arXiv:2606.05224 (Li & Liu,
+ * "(1+1.9) Goldbach"), the 111 KB PDF→txt file dropped \\frac fractions
+ * ("a/b" split across lines), rendered every \\sum as the bare letter
+ * "X" (284 occurrences) and every \\prod as "Y", and fragmented short
+ * displayed equations like the singular series C(N) across ~9 separate
+ * lines. The agent confidently quoted the resulting garbled formula and
+ * went on to compute several numerical constants from the wrong
+ * normalization before this was caught. Fetching the e-print TeX from
+ * `https://arxiv.org/e-print/<id>` would have made the same equation a
+ * single legible line and avoided the entire detour.
+ */
+export const ARXIV_TEX_SOURCE_FRAGMENT = `When you need to consult an arXiv paper as a reference (for definitions,
+constants, sieve indices, integral formulas, theorem statements, etc.):
+
+  1. ALWAYS pull the LaTeX e-print, NOT the PDF. The canonical URL is
+     \`https://arxiv.org/e-print/<arxiv-id>\` (e.g. for 2606.05224 use
+     \`https://arxiv.org/e-print/2606.05224\`). The download is a tar.gz
+     containing the original .tex sources. Store under \`sources/\` with
+     a descriptive filename, e.g. \`sources/<topic>_<id>_arxiv_source.tex\`.
+
+  2. Treat \`pdftotext\` (or any PDF→plaintext) output as LOSSY and unsafe
+     for formula-level work. Known failure modes on real papers:
+       - \`\\frac{a}{b}\` becomes "a / b" or worse, split across several lines
+       - \`\\sum\` and \`\\prod\` render as bare letters "X" / "Y"
+       - Subscript/superscript relationships are flattened
+       - Short displayed equations are fragmented across 5–10 lines
+     Use plaintext extraction only for navigation / locating sections, never
+     as the source of truth for constants, indices, or formulas you will
+     reproduce in a computation.
+
+  3. If you find an existing \`*.txt\` reference file in the workspace that
+     was clearly produced by pdftotext on an arXiv paper (it has
+     "arXiv:<id>" in the header, or its name matches an arXiv ID), STOP
+     and fetch the .tex e-print before quoting any formula from it. Flag
+     this to the user in your status / notes; do not silently keep using
+     the PDF-extracted text.
+
+  4. If arXiv blocks the e-print download (some papers have only PDF
+     posted, or rate-limit hits a 403), say so explicitly in your status
+     and ask the user before falling back to the PDF — do not just
+     proceed with the PDF and hope.`;
+
+// ────────────────────────────────────────────────────────────────────
 // Subagent dispatch guidance
 // ────────────────────────────────────────────────────────────────────
 
@@ -400,6 +452,11 @@ export interface BaseSystemPromptOpts {
    *  auto-drafting a plan when the user asks for a plan/sketch/approach
    *  BEFORE the work itself. */
   includeProposePlan?: boolean;
+  /** Default true. v0.18 — "prefer .tex e-print over pdftotext" guidance.
+   *  Triggered by the (1+1.9) Goldbach incident where pdftotext on
+   *  arXiv:2606.05224 silently corrupted formulas and the agent quoted
+   *  the garbled output as if it were the paper. */
+  includeArxivTexSource?: boolean;
 }
 
 /** Single source of truth for "what's the system prompt for a normal chat?". */
@@ -407,6 +464,7 @@ export function buildBaseSystemPrompt(opts: BaseSystemPromptOpts = {}): string {
   const sections: string[] = [IDENTITY_FRAGMENT];
   if (opts.includeFilesystemTools !== false) sections.push(FILESYSTEM_TOOLS_FRAGMENT);
   if (opts.includeLean !== false) sections.push(LEAN_FRAGMENT);
+  if (opts.includeArxivTexSource !== false) sections.push(ARXIV_TEX_SOURCE_FRAGMENT);
   if (opts.includeSubagentDispatch !== false) sections.push(SUBAGENT_DISPATCH_FRAGMENT);
   if (opts.includeAskUser !== false) sections.push(ASK_USER_FRAGMENT);
   if (opts.includeTodoTracker !== false) sections.push(TODO_TRACKER_FRAGMENT);
