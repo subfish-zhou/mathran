@@ -38,11 +38,13 @@ import {
   type TodoList,
 } from "../lib/chat.ts";
 import GoalControls from "./GoalControls.tsx";
-import {
-  AUTO_RUN_TICK_MS,
-  autoRunCountdownSeconds,
-  shouldAutoRunNextRound,
-} from "../lib/goal-auto-run.ts";
+// C4 (todo1-design.md §5.4): the SPA-side auto-run setInterval driver
+// was deleted. The GoalDaemon (`src/core/goal/daemon.ts`) now owns
+// goal-loop progress server-side; ChatPanel is a passive observer of
+// the SSE stream and only kicks a round in direct response to user
+// input. The pure-policy helpers in `goal-auto-run.ts` survive as
+// compile-time noop shims (see that file's header for the rationale)
+// and are intentionally NOT imported here any more.
 import GoalRunStatusPanel from "./GoalRunStatusPanel.tsx";
 import GoalAutonomyCard from "./GoalAutonomyCard.tsx";
 import { TodoListPanel } from "./TodoListPanel.tsx";
@@ -547,88 +549,28 @@ export default function ChatPanel({
   // colour ahead of the panel's next poll.
   const [bgCompletedFrame, setBgCompletedFrame] =
     useState<SubagentCompletedFrame | null>(null);
-  // goal-defaults-timer (commit 6/7): auto-run state.
-  //   * lastKeystrokeTsRef avoids a re-render storm on every keystroke.
-  //     The 1Hz countdown ticker (autoRunNowMs) re-renders cheaply
-  //     enough that we don't need the keystroke timestamp itself to
-  //     be a useState.
-  //   * nextAutoRunAt is the wall-clock unix-ms the timer expects to
-  //     fire next; reset every time the timer (re)installs.
-  //   * autoRunNowMs is bumped 1×/sec so the badge counts down
-  //     smoothly even while the goal is otherwise idle.
-  const lastKeystrokeTsRef = useRef<number>(0);
-  const [nextAutoRunAt, setNextAutoRunAt] = useState<number>(0);
-  const [autoRunNowMs, setAutoRunNowMs] = useState<number>(() => Date.now());
-  // Auto-run driver. Only installs while we're in a goal-mode chat
-  // that's currently in "active" status — paused / terminal goals
-  // (complete / failed / cancelled / exhausted) tear it down via the
-  // effect's cleanup. The interval CALLBACK still consults the gate
-  // (shouldAutoRunNextRound) on every tick, so a transient busy / the
-  // user typing simply skips a tick without restarting the interval.
+  // ─── Auto-run driver — REMOVED in C4 (todo1-design.md §5.4) ───────
   //
-  // We deliberately do NOT include `busy` or `input.length` in the
-  // deps array: doing so would tear down and re-install the timer on
-  // every keystroke, which would (a) reset the cadence (b) thrash
-  // setNextAutoRunAt on every render. Keeping the deps narrow means
-  // the same 120s rhythm persists; only goal-status changes (which
-  // are rare — once per round at most) re-anchor it.
-  useEffect(() => {
-    if (!owningGoal || owningGoal.status !== "active") {
-      setNextAutoRunAt(0);
-      return;
-    }
-    let cancelled = false;
-    setNextAutoRunAt(Date.now() + AUTO_RUN_TICK_MS);
-    const id = setInterval(() => {
-      if (cancelled) return;
-      // Read live values via closure — these refs/state are mutated
-      // outside this effect's dep array, which is exactly why we need
-      // a fresh read on every tick instead of stale captures.
-      const fire = shouldAutoRunNextRound({
-        owningGoal,
-        busy,
-        unsentTextLength: input.trim().length,
-        lastKeystrokeTs: lastKeystrokeTsRef.current,
-        now: Date.now(),
-      });
-      setNextAutoRunAt(Date.now() + AUTO_RUN_TICK_MS);
-      if (!fire) return;
-      // Fire-and-forget; the onRoundRan-equivalent handling matches
-      // the manual "Next round" button below: refresh owningGoal +
-      // pull in the new history.
-      runGoalRound(owningGoal.id)
-        .then((r) => {
-          if (cancelled) return;
-          setOwningGoal(r.goal);
-          if (r.goal.conversationIds[0]) {
-            if (r.goal.conversationIds[0] !== conversationId) {
-              setConversationId(r.goal.conversationIds[0]);
-            } else {
-              setReloadTick((t) => t + 1);
-            }
-          }
-        })
-        .catch((e) => {
-          if (cancelled) return;
-          setError(String((e as Error).message ?? e));
-        });
-    }, AUTO_RUN_TICK_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-      setNextAutoRunAt(0);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [owningGoal?.id, owningGoal?.status]);
-  // 1Hz refresh just for the auto-run countdown badge. Skipped when
-  // there's no countdown to display (saves an idle interval on plain
-  // chat). Coalesces with the existing busy-status ticker visually
-  // (both 1Hz) but lives separately because the gates are different.
-  useEffect(() => {
-    if (!nextAutoRunAt) return;
-    const id = setInterval(() => setAutoRunNowMs(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [nextAutoRunAt]);
+  // Pre-C4 this slot housed a `setInterval(AUTO_RUN_TICK_MS, …)` that
+  // POSTed `runGoalRound(owningGoal.id)` every 120s while a goal was
+  // active, a 1Hz countdown ticker, the `nextAutoRunAt` /
+  // `autoRunNowMs` / `lastKeystrokeTsRef` state, and the
+  // `shouldAutoRunNextRound` typing-grace gate.
+  //
+  // Post-C4 the **server-side GoalDaemon** drives goal progress (see
+  // `src/core/goal/daemon.ts` + `src/server/serve.ts`). The SPA is now
+  // a passive observer of the goal SSE stream and only triggers a
+  // streaming round in direct response to a user-initiated action
+  // (composer send, manual "Next round" button, propose_goal banner
+  // accept, etc.). No timer-based POSTs originate here any more.
+  //
+  // The companion countdown badge ("🕒 Auto-run in Xs") was deleted
+  // from the goal-status header for the same reason — there is no
+  // timer to count down to. `goal-auto-run.ts` is kept around as a
+  // compile-time noop shim (`shouldAutoRunNextRound` → `false`,
+  // `autoRunCountdownSeconds` → `null`) so any out-of-tree import keeps
+  // building; in-tree we no longer reference it.
+  // ──────────────────────────────────────────────────────────────────
   // v0.17 mathub parity W12: in-conversation TODO tracker maintained by
   // the `todo_write` built-in tool. Seeded by `fetchTodos` whenever the
   // active conversation changes, then live-updated by `todos` SSE frames
@@ -2835,30 +2777,11 @@ export default function ChatPanel({
                 : ""}
             </button>
           )}
-          {/* goal-defaults-timer (commit 6/7): auto-run countdown badge.
-              Only surfaces when the gate is currently open (active goal,
-              not busy, not typing) — hidden state means "timer paused".
-              Mirrors the existing busy ticker's 1Hz cadence so the
-              countdown decrements smoothly. */}
-          {owningGoal && (() => {
-            const secs = autoRunCountdownSeconds({
-              owningGoal,
-              busy,
-              unsentTextLength: input.trim().length,
-              lastKeystrokeTs: lastKeystrokeTsRef.current,
-              now: autoRunNowMs,
-              nextTickAt: nextAutoRunAt,
-            });
-            if (secs === null) return null;
-            return (
-              <span
-                className="ml-1 shrink-0 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900"
-                title="Next goal round runs automatically in this many seconds. Typing in the composer or pausing the goal stops the timer."
-              >
-                🕒 Auto-run in {secs}s
-              </span>
-            );
-          })()}
+          {/* C4 (todo1-design.md §5.4): the "🕒 Auto-run in Xs" badge
+              that lived here was deleted alongside the
+              `setInterval(AUTO_RUN_TICK_MS, …)` driver. The GoalDaemon
+              drives goal progress server-side now, so there is no SPA
+              timer to count down to. */}
           {/* W10 (v0.17 mathub parity): forest view toggle. Only surfaces
               when the goal has at least one sub-goal — a leaf goal has
               nothing to see in tree form. */}
@@ -3715,11 +3638,12 @@ export default function ChatPanel({
               value={input}
               onChange={(e) => {
                 setInput(e.target.value);
-                // goal-defaults-timer (commit 6/7): keystroke tracking
-                // for the auto-run gate. Use a ref so we don't churn
-                // renders on every character; the countdown badge
-                // already re-renders at 1Hz via autoRunNowMs.
-                lastKeystrokeTsRef.current = Date.now();
+                // C4 (todo1-design.md §5.4): pre-C4 we also stamped
+                // `lastKeystrokeTsRef.current = Date.now()` here so the
+                // auto-run typing-grace gate could see that the user
+                // was still mid-thought. The auto-run driver is gone
+                // (daemon-side now), so the keystroke timestamp has no
+                // consumer left and the side-effect was deleted.
               }}
               onCompositionStart={() => {
                 isComposingRef.current = true;

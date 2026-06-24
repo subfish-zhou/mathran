@@ -1,77 +1,71 @@
 /**
- * goal-defaults-timer (commit 6/7) — auto-run gate.
+ * goal-auto-run — compile-time noop shim (C4, todo1-design.md §5.4).
  *
- * Pure decision helper for "should the SPA fire the next goal round
- * right now?". Lives in its own file so the policy is unit-testable
- * without dragging React/ChatPanel state into the test setup.
+ * Before TODO-1 Phase 2 (C4), this file housed the SPA's `setInterval`
+ * auto-run gate: every 120s the ChatPanel asked
+ * `shouldAutoRunNextRound(...)` whether to POST `/api/goals/:id/run`
+ * to kick the next goal iteration, and rendered a "🕒 Auto-run in Xs"
+ * countdown via `autoRunCountdownSeconds(...)`.
  *
- * The driver lives in `ChatPanel.tsx`:
+ * After C4 the **server-side GoalDaemon** owns goal-loop progress
+ * (see `src/core/goal/daemon.ts`, `src/server/serve.ts`), so the SPA
+ * no longer needs a timer driver at all — it is now a **passive
+ * observer**. The ChatPanel `setInterval(AUTO_RUN_TICK_MS, …)` and
+ * the countdown badge have been deleted.
  *
- *    setInterval(120_000) tick
- *      → call shouldAutoRunNextRound({ ...current state })
- *      → if true, fire runGoalRound(owningGoal.id)
+ * What remains here:
+ *   * The exported names (`shouldAutoRunNextRound`,
+ *     `autoRunCountdownSeconds`, `AUTO_RUN_TICK_MS`, `TYPING_GRACE_MS`,
+ *     `AutoRunGateInputs`) survive as **noop shims** so any out-of-tree
+ *     importer (e.g. an old reference in a future rebase, a leftover
+ *     test, or a downstream fork) keeps compiling.
+ *   * `shouldAutoRunNextRound` returns `false` unconditionally — there
+ *     is no SPA-side driver to gate any more.
+ *   * `autoRunCountdownSeconds` returns `null` unconditionally — there
+ *     is no countdown to display.
  *
- * Rules (intentionally minimal — anything we can NOT see clearly
- * from the SPA's existing state should bias us toward "skip"):
- *
- *   1. No goal owning the conversation → never auto-run.
- *   2. Goal is not in "active" status → never auto-run. (paused /
- *      complete / failed / cancelled / exhausted should all stop the
- *      timer cleanly.)
- *   3. A round is currently in-flight (`busy === true`) → skip this
- *      tick; the on-going stream will land its own completion and the
- *      next tick will reconsider.
- *   4. The composer textarea has unsent content → skip. The user is
- *      mid-thought; firing a round here would race their typing.
- *   5. The user typed something into the composer in the last 30s →
- *      skip. Even if they cleared it, they were just there — give
- *      them a moment before kicking off a fresh round.
- *
- * The 30s typing-grace window is deliberately shorter than the 120s
- * tick interval: it's not meant to be "the user is still typing", it's
- * meant to be "they were JUST here, don't surprise them". 30s is the
- * same order of magnitude as a "wait for them to come back from a
- * brief context switch" timeout.
+ * The companion test file (`goal-auto-run.test.ts`) was deleted with
+ * this change: it pinned the gating *policy*, and the policy no longer
+ * exists.
  */
 
 export interface AutoRunGateInputs {
-  /** The Goal record that owns the current conversation, if any. */
+  /** Retained for source-compat; ignored by the shim. */
   owningGoal: { status: string } | null;
-  /** True while a goal-round stream is open (sets `busy` in ChatPanel). */
+  /** Retained for source-compat; ignored by the shim. */
   busy: boolean;
-  /** Length of the composer textarea's current content (after trim). */
+  /** Retained for source-compat; ignored by the shim. */
   unsentTextLength: number;
-  /** Unix ms of the last keystroke in the composer. 0 = never. */
+  /** Retained for source-compat; ignored by the shim. */
   lastKeystrokeTs: number;
-  /** Unix ms "now" — injected so tests are deterministic. */
+  /** Retained for source-compat; ignored by the shim. */
   now: number;
 }
 
-/** Typing-grace window (ms). See module header for rationale. */
+/** Retained for source-compat. Value is the pre-C4 historical default. */
 export const TYPING_GRACE_MS = 30_000;
 
-/** Auto-run cadence (ms). The driver's setInterval period. */
+/** Retained for source-compat. Value is the pre-C4 historical default. */
 export const AUTO_RUN_TICK_MS = 120_000;
 
-export function shouldAutoRunNextRound(opts: AutoRunGateInputs): boolean {
-  if (!opts.owningGoal) return false;
-  if (opts.owningGoal.status !== "active") return false;
-  if (opts.busy) return false;
-  if (opts.unsentTextLength > 0) return false;
-  if (opts.now - opts.lastKeystrokeTs < TYPING_GRACE_MS) return false;
-  return true;
+/**
+ * Noop shim — always `false` after C4.
+ *
+ * Pre-C4 this decided whether the SPA's `setInterval` driver should
+ * POST `/api/goals/:id/run` on the current tick. After C4 the daemon
+ * is the sole driver, so there is no SPA-side decision to make.
+ */
+export function shouldAutoRunNextRound(_opts: AutoRunGateInputs): boolean {
+  return false;
 }
 
 /**
- * Helper for the "🕒 Auto-run in Xs" badge the goal-status pill
- * surfaces in the UI. Returns the seconds remaining until the next
- * scheduled tick, or `null` if auto-run is currently gated off (e.g.
- * busy, or the user is typing).
+ * Noop shim — always `null` after C4.
  *
- * `nextTickAt` is the unix-ms the driver expects to fire next. The
- * driver maintains this state in tandem with its `setInterval`.
+ * Pre-C4 this fed the "🕒 Auto-run in Xs" badge; that badge was
+ * removed in C4 (see ChatPanel.tsx).
  */
-export function autoRunCountdownSeconds(opts: {
+export function autoRunCountdownSeconds(_opts: {
   owningGoal: { status: string } | null;
   busy: boolean;
   unsentTextLength: number;
@@ -79,13 +73,5 @@ export function autoRunCountdownSeconds(opts: {
   now: number;
   nextTickAt: number;
 }): number | null {
-  // Same gating as shouldAutoRunNextRound — if the tick wouldn't fire,
-  // the badge shouldn't tease a countdown.
-  if (!opts.owningGoal) return null;
-  if (opts.owningGoal.status !== "active") return null;
-  if (opts.busy) return null;
-  if (opts.unsentTextLength > 0) return null;
-  if (opts.now - opts.lastKeystrokeTs < TYPING_GRACE_MS) return null;
-  const remainingMs = Math.max(0, opts.nextTickAt - opts.now);
-  return Math.ceil(remainingMs / 1000);
+  return null;
 }
