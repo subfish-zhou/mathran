@@ -362,6 +362,26 @@ export type ChatEvent =
       outputTokens?: number;
     }
   | {
+      /** TODO-2 §3.2 / C8 — compaction lifecycle event. Emitted by
+       *  compactV2() when a compaction attempt completes (success OR
+       *  failure). Carries the full telemetry so the goal runner can
+       *  bump compactionRuns / compactionTokensDropped and the SSE
+       *  layer can push a real-time badge to the SPA. NOT emitted
+       *  for noop (droppedRoundCount=0) compactions — those are
+       *  silent. */
+      type: "compaction";
+      outcome: "ok" | "skipped" | "cancelled" | "failed";
+      reason: string;
+      phase: string;
+      trigger: string;
+      policy: string;
+      originalTokens: number;
+      newTokens: number;
+      droppedRoundCount: number;
+      durationMs: number;
+      summaryTokens?: number;
+    }
+  | {
       type: "done";
       finishReason: Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
     };
@@ -437,6 +457,18 @@ export interface ChatSessionOptions {
    * back to a per-session temp dir.
    */
   workspace?: string;
+  /**
+   * TODO-2 §3.2 / C8 — observer for compaction lifecycle events. Invoked
+   * synchronously after every compactV2() attempt (success OR failure)
+   * with a `{ type: "compaction", ... }` ChatEvent. Goal-mode runner
+   * wires this to its `emit()` so SSE clients see compaction in real
+   * time and `updateGoalStats` can bump `compactionRuns`. Listener
+   * exceptions are caught — never block the send loop.
+   *
+   * Noop compactions (droppedRoundCount=0) are NOT reported here to
+   * avoid noise.
+   */
+  onCompactionEvent?: (ev: ChatEvent & { type: "compaction" }) => void;
   /**
    * Optional injected subagent scheduler. Tests pass a custom one; production
    * code lets ChatSession build its own (with the compact runner registered)
@@ -878,6 +910,8 @@ export class ChatSession {
   readonly sessionId: string;
   private readonly toolOutputCap?: { maxInlineBytes?: number; workspace?: string | null };
   private readonly autoCompactCfg?: ChatSessionOptions["autoCompact"];
+  /** TODO-2 §3.2 / C8 — compaction event observer (goal-mode wires emit). */
+  private readonly onCompactionEvent?: ChatSessionOptions["onCompactionEvent"];
   private readonly workspace?: string;
   private readonly subagentScheduler?: SubagentScheduler;
   /**
@@ -954,6 +988,7 @@ export class ChatSession {
     this.toolOutputCap = opts.toolOutputCap;
     this.autoCompactCfg = opts.autoCompact;
     this.workspace = opts.workspace;
+    this.onCompactionEvent = opts.onCompactionEvent;
     this.subagentScheduler = opts.subagentScheduler;
     // v0.5 wire-up: prefer `opts.scheduler` for the dispatch tool, but fall
     // back to `opts.subagentScheduler` so production callers that already
@@ -2069,7 +2104,7 @@ export class ChatSession {
         const pre = await fullReq.hooks.pre(fullReq);
         if (pre.kind === "stopped") {
           const now = Date.now();
-          return {
+          const skipped: CompactionOutcome = {
             ok: false,
             status: "skipped",
             error: pre.reason,
@@ -2090,6 +2125,8 @@ export class ChatSession {
               hookOutcomes: { pre: "stopped" },
             },
           };
+          this.emitCompactionToObserver(skipped);
+          return skipped;
         }
       } catch {
         // Hook crashes are non-fatal — proceed with compaction.
@@ -2114,7 +2151,44 @@ export class ChatSession {
       }
     }
 
+    // TODO-2 §3.2 / C8 — emit a 'compaction' ChatEvent to the configured
+    // observer (goal-mode runner forwards this to SSE + bumps Goal.stats).
+    // Skip the noop case (droppedRoundCount=0) to avoid noise; only
+    // actual compactions OR explicit failures are surfaced.
+    this.emitCompactionToObserver(outcome);
+
     return outcome;
+  }
+
+  /**
+   * TODO-2 §3.2 / C8 — push a compaction outcome to the optional
+   * onCompactionEvent observer. Filters noop (status=ok with no rounds
+   * dropped); reports actual compactions AND failure/cancel/skip
+   * statuses. Listener exceptions are swallowed.
+   */
+  private emitCompactionToObserver(outcome: CompactionOutcome): void {
+    if (!this.onCompactionEvent) return;
+    const isNoop = outcome.ok && outcome.telemetry.droppedRoundCount === 0;
+    if (isNoop) return;
+    try {
+      this.onCompactionEvent({
+        type: "compaction",
+        outcome: outcome.status,
+        reason: outcome.telemetry.reason,
+        phase: outcome.telemetry.phase,
+        trigger: outcome.telemetry.trigger,
+        policy: outcome.telemetry.policy,
+        originalTokens: outcome.telemetry.originalTokens,
+        newTokens: outcome.telemetry.newTokens,
+        droppedRoundCount: outcome.telemetry.droppedRoundCount,
+        durationMs: outcome.telemetry.durationMs,
+        ...(outcome.telemetry.summaryTokens !== undefined
+          ? { summaryTokens: outcome.telemetry.summaryTokens }
+          : {}),
+      });
+    } catch {
+      // Listener crashes never escape compactV2.
+    }
   }
 
   /**

@@ -202,7 +202,9 @@ export interface GoalStep {
     | "plan"
     | "reflect"
     | "status"
-    | "ask-user-auto-resolved";
+    | "ask-user-auto-resolved"
+    /** TODO-2 §3.2 / C8 — compaction lifecycle event durable record. */
+    | "compaction";
   payload: Record<string, unknown> | string;
 }
 

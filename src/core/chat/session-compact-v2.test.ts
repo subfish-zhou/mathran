@@ -189,4 +189,114 @@ describe("ChatSession.compactV2", () => {
     const args = postSpy.mock.calls[0] as unknown as Array<{ status: string }>;
     expect(args[0].status).toBe("ok");
   });
+
+  it("C8 — emits a 'compaction' ChatEvent to onCompactionEvent listener on success", async () => {
+    const events: Array<{ type: string; outcome?: string; reason?: string; droppedRoundCount?: number; originalTokens?: number; newTokens?: number }> = [];
+    const sess = new ChatSession({
+      llm: fakeSummarizer("V2 summary"),
+      model: "gpt-5.5",
+      tools: [],
+      systemPrompt: "you are mathran",
+      autoCompact: { enabled: true, thresholdPct: 0.5, keepRecentRounds: 2, contextWindow: 200000 },
+      onCompactionEvent: (ev) => { events.push(ev); },
+    });
+    sess.replaceHistory([
+      sys("sys"),
+      user("d1"), asst("o1"),
+      user("d2"), asst("o2"),
+      user("d3"), asst("o3"),
+      user("kept"), asst("ok kept"),
+    ]);
+    const out = await sess.compactV2({
+      reason: "user_requested",
+      phase: "standalone",
+      trigger: "manual",
+    });
+    expect(out.ok).toBe(true);
+    expect(events.length).toBe(1);
+    expect(events[0].type).toBe("compaction");
+    expect(events[0].outcome).toBe("ok");
+    expect(events[0].reason).toBe("user_requested");
+    expect(events[0].droppedRoundCount).toBeGreaterThan(0);
+    expect(events[0].originalTokens).toBeGreaterThan(0);
+    expect(events[0].newTokens).toBeGreaterThanOrEqual(0);
+  });
+
+  it("C8 — does NOT emit compaction event for noop (droppedRoundCount=0)", async () => {
+    const events: Array<{ type: string }> = [];
+    const sess = new ChatSession({
+      llm: fakeSummarizer("V2 summary"),
+      model: "gpt-5.5",
+      tools: [],
+      systemPrompt: "you are mathran",
+      autoCompact: { enabled: true, thresholdPct: 0.5, keepRecentRounds: 50, contextWindow: 200000 },
+      onCompactionEvent: (ev) => { events.push(ev); },
+    });
+    // keepRecentRounds=50 with only 1 round → middle is empty → noop
+    sess.replaceHistory([sys("sys"), user("only kept"), asst("ok")]);
+    const out = await sess.compactV2({
+      reason: "user_requested",
+      phase: "standalone",
+      trigger: "manual",
+    });
+    expect(out.ok).toBe(true);
+    expect(out.telemetry.droppedRoundCount).toBe(0);
+    expect(events.length).toBe(0); // silent on noop
+  });
+
+  it("C8 — emits compaction event on failure (hook stopped)", async () => {
+    const events: Array<{ type: string; outcome?: string }> = [];
+    const sess = new ChatSession({
+      llm: fakeSummarizer("V2 summary"),
+      model: "gpt-5.5",
+      tools: [],
+      systemPrompt: "you are mathran",
+      autoCompact: { enabled: true, thresholdPct: 0.5, keepRecentRounds: 2, contextWindow: 200000 },
+      onCompactionEvent: (ev) => { events.push(ev); },
+    });
+    sess.replaceHistory([
+      sys("sys"),
+      user("d1"), asst("o1"),
+      user("d2"), asst("o2"),
+      user("d3"), asst("o3"),
+      user("kept"), asst("ok kept"),
+    ]);
+    const out = await sess.compactV2({
+      reason: "user_requested",
+      phase: "standalone",
+      trigger: "manual",
+      hooks: {
+        pre: async () => ({ kind: "stopped", reason: "disabled" }),
+      },
+    });
+    expect(out.ok).toBe(false);
+    expect(out.status).toBe("skipped");
+    expect(events.length).toBe(1);
+    expect(events[0].outcome).toBe("skipped");
+  });
+
+  it("C8 — listener exceptions never escape compactV2", async () => {
+    const sess = new ChatSession({
+      llm: fakeSummarizer("V2 summary"),
+      model: "gpt-5.5",
+      tools: [],
+      systemPrompt: "you are mathran",
+      autoCompact: { enabled: true, thresholdPct: 0.5, keepRecentRounds: 2, contextWindow: 200000 },
+      onCompactionEvent: () => { throw new Error("listener boom"); },
+    });
+    sess.replaceHistory([
+      sys("sys"),
+      user("d1"), asst("o1"),
+      user("d2"), asst("o2"),
+      user("d3"), asst("o3"),
+      user("kept"), asst("ok kept"),
+    ]);
+    // Must not throw; outcome must still be ok.
+    const out = await sess.compactV2({
+      reason: "user_requested",
+      phase: "standalone",
+      trigger: "manual",
+    });
+    expect(out.ok).toBe(true);
+  });
 });

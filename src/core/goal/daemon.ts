@@ -176,6 +176,11 @@ export interface DaemonEvent {
     | "iteration-start"
     | "iteration-end"
     | "turn-end"
+    /** TODO-2 §3.2 / C8 — compaction lifecycle event. Forwarded from
+     *  ChatSession.compactV2 via the goal runner's emit(). Persisted
+     *  to daemon.log AND exposed via SSE so the SPA shows a real-time
+     *  🧹 badge. */
+    | "compaction"
     | "done"
     | "error";
   [k: string]: unknown;
@@ -563,6 +568,28 @@ export class GoalDaemon {
             goalId,
             event: "turn-end",
             reason: (ev as { reason?: unknown }).reason,
+          });
+        } else if (type === "compaction") {
+          // TODO-2 §3.2 / C8 — durably record compaction telemetry so a
+          // long-tail log observer can audit how often compaction fires,
+          // how much it saved, and which phase / reason / policy was
+          // used. Mirrors the SSE event shape.
+          this.appendIterationLog({
+            ts: Date.now(),
+            goalId,
+            event: "compaction",
+            outcome: (ev as { outcome?: unknown }).outcome,
+            reason: (ev as { reason?: unknown }).reason,
+            phase: (ev as { phase?: unknown }).phase,
+            trigger: (ev as { trigger?: unknown }).trigger,
+            policy: (ev as { policy?: unknown }).policy,
+            originalTokens: (ev as { originalTokens?: unknown }).originalTokens,
+            newTokens: (ev as { newTokens?: unknown }).newTokens,
+            droppedRoundCount: (ev as { droppedRoundCount?: unknown }).droppedRoundCount,
+            durationMs: (ev as { durationMs?: unknown }).durationMs,
+            ...((ev as { summaryTokens?: unknown }).summaryTokens !== undefined
+              ? { summaryTokens: (ev as { summaryTokens?: unknown }).summaryTokens }
+              : {}),
           });
         } else if (type === "error") {
           this.appendIterationLog({

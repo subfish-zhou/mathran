@@ -4390,6 +4390,11 @@ function buildApp(
             type === "ask_user" ||
             type === "todos" ||
             type === "steer-received" ||
+            // TODO-2 §3.2 / C8 — compaction lifecycle event. SPA's
+            // chat.ts adds a handler that flips a 🧹 badge + updates
+            // the cumulative compactionRuns counter shown in
+            // AgentStatusPanel.
+            type === "compaction" ||
             type === "done"
           ) {
             queue.push({ event: type, data: JSON.stringify(ev) });

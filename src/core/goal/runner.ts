@@ -999,7 +999,7 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
       },
     },
     ...(opts.scheduler ? { subagentScheduler: opts.scheduler, scheduler: opts.scheduler } : {}),
-    // TODO-2 §3.2 / C7 — opt goal-mode INTO the V2 auto-compaction
+    // TODO-2 §3.2 / C8 — opt goal-mode INTO the V2 auto-compaction
     // pipeline. Long-running goals (24h+, dozens of rounds, 1MB+
     // conversations) need both pre-turn and mid-turn precheck or they
     // silently outgrow the model context window.
@@ -1014,6 +1014,54 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
       keepRecentRounds: 6,              // yachiyo 6/17 patch — tool-heavy workflows need 6
       contextWindow: contextWindowForModel(goal.model),
       enableMidTurnPrecheck: true,
+    },
+    // TODO-2 §3.2 / C8 — forward every compaction lifecycle event to:
+    //   1. emit() → SSE clients (real-time SPA compaction badge),
+    //   2. updateGoalStats → compactionRuns / compactionTokensDropped /
+    //      lastCompactionReason / lastCompactionAt durable bump,
+    //   3. appendStep(kind="compaction") → audit log on disk.
+    // emit() is defined a few lines below — defer access via closure.
+    // The stats + audit calls are async; fire-and-forget so they never
+    // delay the send loop. Errors are swallowed (compaction event
+    // observability is best-effort, never blocks compute).
+    onCompactionEvent: (ev) => {
+      try { emit(ev); } catch { /* never fatal */ }
+      // Successful compactions bump durable stats; failures / cancels /
+      // skips only log to the audit step. droppedRoundCount > 0 in this
+      // event already (noops are filtered upstream in ChatSession).
+      void (async () => {
+        const nowIso = new Date().toISOString();
+        try {
+          if (ev.outcome === "ok") {
+            await updateGoalStats(workspace, goalId, {
+              compactionRuns: 1,
+              compactionTokensDropped: Math.max(0, ev.originalTokens - ev.newTokens),
+              lastCompactionReason: ev.reason,
+              lastCompactionAt: nowIso,
+            });
+          }
+          await appendStep(workspace, goalId, {
+            kind: "compaction",
+            payload: {
+              outcome: ev.outcome,
+              reason: ev.reason,
+              phase: ev.phase,
+              trigger: ev.trigger,
+              policy: ev.policy,
+              originalTokens: ev.originalTokens,
+              newTokens: ev.newTokens,
+              droppedRoundCount: ev.droppedRoundCount,
+              durationMs: ev.durationMs,
+              ...(ev.summaryTokens !== undefined ? { summaryTokens: ev.summaryTokens } : {}),
+            },
+          });
+        } catch (err) {
+          console.warn(
+            `[mathran] compaction observer side-effect failed for goal ${goalId}:`,
+            err,
+          );
+        }
+      })();
     },
   });
   if (history.length > 0) session.replaceHistory(history);
