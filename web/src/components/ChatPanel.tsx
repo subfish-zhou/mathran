@@ -80,6 +80,12 @@ import { SubagentTreePanel } from "./SubagentTreePanel.tsx";
 import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel.tsx";
 import type { SubagentCompletedFrame } from "../lib/subagents.ts";
 import SlashSuggester from "./SlashSuggester.tsx";
+import { fetchGoalAutonomy } from "../lib/goal-autonomy.ts";
+import {
+  loadProposals,
+  saveGoalProposal,
+  savePlanProposal,
+} from "../lib/proposal-persistence.ts";
 import {
   loadCommandStyle,
   subscribeCommandStyle,
@@ -1034,6 +1040,48 @@ export default function ChatPanel({
     showPinnedFirstRunRef.current = true;
   }, [conversationId]);
 
+  // TODO-3 UI #4.F — hydrate persisted propose_plan / propose_goal banner
+  // state from localStorage on conversation switch. Without this a tab
+  // reload while a proposal is in flight drops the inline Accept/Reject
+  // affordance, leaving the user with no UI surface to act on the
+  // already-on-disk proposal.
+  useEffect(() => {
+    if (!conversationId) {
+      setGoalProposed(null);
+      setPlanProposed(null);
+      return;
+    }
+    const cached = loadProposals(conversationId);
+    if (cached.goal) {
+      setGoalProposed({
+        goalId: cached.goal.goalId,
+        objective: cached.goal.objective,
+        maxRounds: cached.goal.maxRounds,
+        tokensCap: cached.goal.tokensCap,
+        autoRun: cached.goal.autoRun,
+      });
+    }
+    if (cached.plan) {
+      setPlanProposed({
+        planId: cached.plan.planId,
+        objective: cached.plan.objective,
+        autoRun: cached.plan.autoRun,
+      });
+    }
+  }, [conversationId]);
+
+  // TODO-3 UI #4.F — mirror banner state to localStorage whenever the
+  // banner state changes. Clearing (setting to null) erases the
+  // persisted entry too so a Reject/Accept doesn't reappear on reload.
+  useEffect(() => {
+    if (!conversationId) return;
+    saveGoalProposal(conversationId, goalProposed);
+  }, [conversationId, goalProposed]);
+  useEffect(() => {
+    if (!conversationId) return;
+    savePlanProposal(conversationId, planProposed);
+  }, [conversationId, planProposed]);
+
   // ─── Usage meter: refetch whenever conversationId changes ──────────────
   const refreshUsage = useCallback(async () => {
     if (!conversationId) return;
@@ -1627,12 +1675,30 @@ export default function ChatPanel({
             return { handled: true };
           }
           try {
+            // TODO-3 UI #4.I — honour the user's pinned per-scope goal
+            // autonomy defaults (defaultTokensCap / defaultMaxRounds)
+            // when /goal kicks a goal. Falls back to null/null when
+            // the scope has nothing pinned (matches the old behaviour).
+            let budgetTokens: number | null = null;
+            let maxRounds: number | null = null;
+            try {
+              const autonomy = await fetchGoalAutonomy(scope);
+              const eff = autonomy.effective;
+              if (typeof eff.defaultTokensCap === "number" && eff.defaultTokensCap > 0) {
+                budgetTokens = eff.defaultTokensCap;
+              }
+              if (typeof eff.defaultMaxRounds === "number" && eff.defaultMaxRounds > 0) {
+                maxRounds = eff.defaultMaxRounds;
+              }
+            } catch {
+              // Autonomy fetch failure is non-fatal — proceed with no budget caps.
+            }
             const created = await createGoal({
               objective,
               scope,
               model: model ?? undefined,
-              budgetTokens: null,
-              maxRounds: null,
+              budgetTokens,
+              maxRounds,
             });
             setOwningGoal(created);
             // Mirror the header button's onGoalCreated path: kick the

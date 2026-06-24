@@ -25,12 +25,14 @@ import {
 } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { api, type ProjectSummary } from "./lib/api.ts";
+import { listGoals, type GoalRow } from "./lib/chat.ts";
 import ProjectsPanel from "./components/ProjectsPanel.tsx";
 import WikiPanel from "./components/WikiPanel.tsx";
 import ChatPanel from "./components/ChatPanel.tsx";
 import ProvidersPanel from "./components/ProvidersPanel.tsx";
 import SettingsPanel from "./components/SettingsPanel.tsx";
 import McpServersPanel from "./components/McpServersPanel.tsx";
+import SettingsLayout from "./components/SettingsLayout.tsx";
 import McpConfigForm from "./components/McpConfigForm.tsx";
 import EffortsPanel from "./components/EffortsPanel.tsx";
 import EffortDocumentPanel from "./components/EffortDocumentPanel.tsx";
@@ -46,10 +48,15 @@ export default function App() {
             path="/global-chat"
             element={<ChatPanel scope={{ kind: "global" }} scopeLabel="global" />}
           />
-          <Route path="/settings" element={<SettingsPanel />} />
-          <Route path="/settings/providers" element={<ProvidersPanel />} />
-          <Route path="/settings/mcp" element={<McpServersPanel />} />
-          <Route path="/settings/mcp/config" element={<McpConfigForm />} />
+          {/* TODO-3 UI #4.B — Settings tabs share a layout shell so all four
+              sub-routes get the same top tab bar. Deep-links still work
+              because each child <Route> retains its own path. */}
+          <Route path="/settings" element={<SettingsLayout />}>
+            <Route index element={<SettingsPanel />} />
+            <Route path="providers" element={<ProvidersPanel />} />
+            <Route path="mcp" element={<McpServersPanel />} />
+            <Route path="mcp/config" element={<McpConfigForm />} />
+          </Route>
 
           <Route path="/projects/:slug" element={<ProjectLayout />}>
             <Route index element={<ProjectHome />} />
@@ -116,6 +123,8 @@ function GlobalSidebar() {
       <NavLink to="/settings" className={linkClass}>
         ⚙️ Settings
       </NavLink>
+
+      <RecentGoalsRail />
 
       <div className="mt-6 px-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
         Projects
@@ -339,5 +348,82 @@ function EffortChatRoute() {
       scope={{ kind: "effort", projectSlug: slug, effortSlug }}
       scopeLabel={`effort: ${slug}/${effortSlug}`}
     />
+  );
+}
+
+// ─── TODO-3 UI #4.C — Recent goals rail ─────────────────────────────
+// Lists active+paused goals across the workspace so the user can jump
+// back to a long-running goal without scrolling through the Home rail.
+// Polls /api/goals every 30s (cheap — daemon state changes slowly) and
+// refreshes on window focus so a goal kicked from another tab shows up
+// quickly. Self-hides when there's nothing to show.
+function RecentGoalsRail() {
+  const [goals, setGoals] = useState<GoalRow[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const list = await listGoals();
+        if (!cancelled) {
+          // Sort: active before paused, then by id desc (UUID v7 / time-sortable
+          // — not perfect but stable). Cap to 5 entries.
+          const sorted = [...list].sort((a, b) => {
+            const rank = (s: GoalRow["status"]) => (s === "active" ? 0 : s === "paused" ? 1 : 2);
+            const r = rank(a.status) - rank(b.status);
+            if (r !== 0) return r;
+            return b.id.localeCompare(a.id);
+          });
+          setGoals(sorted.slice(0, 5));
+        }
+      } catch {
+        // ignore — silent failure keeps the rail empty
+      }
+    };
+    void load();
+    const id = window.setInterval(load, 30_000);
+    const onFocus = () => void load();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
+  if (goals.length === 0) return null;
+  const linkClass = ({ isActive }: { isActive: boolean }) =>
+    `block rounded-md px-3 py-1.5 text-xs transition truncate ${
+      isActive ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"
+    }`;
+  return (
+    <div className="mt-6">
+      <div className="px-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+        🎯 Recent goals
+      </div>
+      <ul className="mt-1 space-y-0.5" data-testid="recent-goals-rail">
+        {goals.map((g) => {
+          const convId = g.conversationIds[0];
+          // Without a conversation we can't deep-link into a chat; skip.
+          if (!convId) return null;
+          const href =
+            g.scope.kind === "global"
+              ? `/global-chat?conversation=${encodeURIComponent(convId)}`
+              : g.scope.kind === "project"
+                ? `/projects/${g.scope.projectSlug}/chat?conversation=${encodeURIComponent(convId)}`
+                : g.scope.kind === "effort"
+                  ? `/projects/${g.scope.projectSlug}/effort/${g.scope.effortKey ?? ""}/chat?conversation=${encodeURIComponent(convId)}`
+                  : "#";
+          const icon = g.status === "active" ? "🟢" : "🟡";
+          const titlePreview = g.objective.slice(0, 60);
+          return (
+            <li key={g.id}>
+              <NavLink to={href} className={linkClass} title={g.objective}>
+                <span className="mr-1" aria-hidden="true">{icon}</span>
+                <span>{titlePreview}</span>
+              </NavLink>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
   );
 }

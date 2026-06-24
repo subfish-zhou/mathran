@@ -3001,16 +3001,17 @@ function buildApp(
             bootstrapPlan: "auto",
             selfGrade: true,
             onEvent: (ev) => {
-              // Forward inner ChatEvent frames onto the daemon's
-              // eventBus AND into the runner's local emit (which
-              // currently no-ops since GoalTurnRunner.onEvent is
-              // already the same emit closure). We avoid double
-              // emission by ONLY pushing to the eventBus here — the
-              // runner's emit is reserved for daemon-shape events
-              // (iteration-start / iteration-end / turn-end).
-              if (goalDaemon) {
-                goalDaemon.eventBus.emit(`goal:${goalId}`, ev);
-              }
+              // TODO-3 #4.H — feed inner ChatEvent into the daemon's
+              // own emit (). That path:
+              //   1. updates currentProgress (so the iteration-end
+              //      snapshot has non-zero counts — was always 0,0,0,0
+              //      before this fix because the eventBus side-channel
+              //      skipped daemon.updateProgress entirely),
+              //   2. calls daemon.opts.onEvent → eventBus → SSE clients.
+              // We deliberately do NOT double-push to the eventBus
+              // here; daemon.opts.onEvent already does that, and a
+              // direct eventBus.emit would deliver each frame twice.
+              emit(ev as DaemonEvent);
               // v0.17 W12: synthesise a `todos` frame after a
               // successful todo_write so the SPA's ActivePlanPanel
               // stays in sync. Same logic as the inline endpoint.

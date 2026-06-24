@@ -815,6 +815,20 @@ export interface CreateGoalInput {
   extraInstructions?: string;
 }
 
+/**
+ * TODO-3 UI #4.C — List goals across the workspace (default: active +
+ * paused only; pass `all=true` to also include terminal goals). Used
+ * by the left rail's "Recent goals" section.
+ */
+export async function listGoals(opts: { all?: boolean; signal?: AbortSignal } = {}): Promise<GoalRow[]> {
+  const url = opts.all ? "/api/goals?all=1" : "/api/goals";
+  const init = opts.signal ? { signal: opts.signal } : {};
+  const res = await fetch(url, init);
+  if (!res.ok) throw new Error(`listGoals failed (${res.status})`);
+  const body = (await res.json()) as { goals: GoalRow[] };
+  return body.goals;
+}
+
 export async function createGoal(input: CreateGoalInput): Promise<GoalRow> {
   const res = await fetch("/api/goals", {
     method: "POST",

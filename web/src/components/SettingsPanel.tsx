@@ -17,7 +17,9 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { Link } from "react-router-dom";
+// TODO-3 UI #4.B: removed `Link` import (was only used by the deleted
+// "See also" footer; the SettingsLayout tab bar now handles peer-route
+// navigation).
 
 import { api, type ProjectSummary } from "../lib/api.ts";
 import {
@@ -361,20 +363,9 @@ export default function SettingsPanel() {
           <ComposerCommandStyleToggle />
         </div>
 
-        <div className="mt-8 border-t border-slate-200 pt-4 text-sm">
-          See also:{" "}
-          <Link to="/settings/providers" className="font-medium text-slate-700 underline">
-            LLM Providers →
-          </Link>
-          {" · "}
-          <Link to="/settings/mcp" className="font-medium text-slate-700 underline">
-            🔌 MCP Servers →
-          </Link>
-          {" · "}
-          <Link to="/settings/mcp/config" className="font-medium text-slate-700 underline">
-            🛠 MCP Config →
-          </Link>
-        </div>
+        {/* TODO-3 UI #4.B — 'See also' footer links removed; the top
+            SettingsLayout tab bar now exposes Providers / MCP / MCP Config
+            as first-class peers, so the footer is redundant. */}
       </div>
 
       {/* Sticky save bar */}
