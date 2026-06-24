@@ -63,8 +63,8 @@ interface GoalRunStatusPanelProps {
   onStatus?: (status: GoalStatus) => void;
 }
 
-const POLL_INTERVAL_MS = 3000;
-const STALE_THRESHOLD_MS = 30_000;
+const POLL_INTERVAL_MS = 10_000;
+const STALE_THRESHOLD_MS = 60_000;
 
 /** Render-time mapping from (status, abortRequested) → human badge.
  *  Kept exhaustive so a future Goal["status"] addition lights up an

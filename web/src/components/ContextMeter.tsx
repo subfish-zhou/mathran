@@ -28,10 +28,25 @@ function formatTokens(n: number): string {
   return `${(n / 1_000_000_000).toFixed(1)}B`;
 }
 
+/**
+ * Compaction threshold as a fraction of the model's real context cap.
+ * Matches `autoCompact.thresholdPct` in src/core/goal/runner.ts (TODO-2 C7).
+ * 100% on the meter = "the next send() will trigger compaction".
+ */
+const COMPACTION_THRESHOLD_FRACTION = 0.75;
+
 function pickColor(percentage: number): MeterColor {
-  if (!Number.isFinite(percentage) || percentage < 50) return "green";
-  if (percentage < 75) return "yellow";
-  if (percentage < 90) return "orange";
+  // TODO-3 #4.G recalibration: now that contextWindow reflects REAL
+  // copilot caps (gpt-5.5: 922K, claude-opus-4.7/4.8: 936K, etc.),
+  // the meter denominates against the compaction trigger threshold
+  // (75% of cap). So 60%/85%/100% map roughly to:
+  //   - green : plenty of room (< 45% of full cap),
+  //   - yellow: closing in    (45–63% of full cap),
+  //   - orange: about to compact (63–75% of full cap),
+  //   - red   : in / past the compaction zone.
+  if (!Number.isFinite(percentage) || percentage < 60) return "green";
+  if (percentage < 85) return "yellow";
+  if (percentage < 100) return "orange";
   return "red";
 }
 
@@ -72,15 +87,22 @@ export default function ContextMeter({
   percentage,
   loading,
 }: ContextMeterProps) {
+  // TODO-3 #4.G — re-anchor the meter on the compaction threshold so
+  // 100% means "next send() triggers compaction". Without this rebase
+  // a healthy long goal at 50% of a 922K real cap looked alarmingly
+  // empty even though it was actually 67% of the way to compaction.
+  const effectiveCap = contextWindow * COMPACTION_THRESHOLD_FRACTION;
   const pct = typeof percentage === "number"
     ? percentage
-    : (contextWindow > 0 ? (tokens / contextWindow) * 100 : 0);
+    : (effectiveCap > 0 ? (tokens / effectiveCap) * 100 : 0);
   const color = pickColor(pct);
   const width = clampPercentage(pct);
   const t = formatTokens(tokens);
   const w = formatTokens(contextWindow);
   const pctLabel = Number.isFinite(pct) ? Math.round(pct) : 0;
-  const label = `${t} / ${w} tokens (${pctLabel}%)`;
+  // Label format: "{tokens} / {compact-threshold} (raw cap: {full})"
+  // — exposes both numbers so power users see the math.
+  const label = `${t} / ${formatTokens(effectiveCap)} compact (${pctLabel}%) · cap ${w}`;
 
   return (
     <div
