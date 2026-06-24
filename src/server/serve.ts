@@ -3935,6 +3935,89 @@ function buildApp(
     return c.json(goalDaemon.status());
   });
 
+  // ─── NEW-F5: /healthz + /metrics (audit 2026-06-24) ───────────────────
+  // /healthz: cheap liveness probe — returns 200 + JSON body always (even
+  // when the daemon is disabled), so a supervisor (systemd, k8s, etc.)
+  // can ping every few seconds without a daemon dependency.
+  // /metrics: Prometheus-formatted snapshot of useful counters/gauges so
+  // a separate `prometheus + grafana` stack can build dashboards.
+  const serveBootMs = Date.now();
+  app.get("/healthz", async (c) => {
+    let activeGoals = 0;
+    try {
+      const all = await listGoals(workspace);
+      activeGoals = all.filter((g) => g.status === "active").length;
+    } catch {
+      // listGoals failure is non-fatal for /healthz — keep returning 200.
+    }
+    return c.json({
+      ok: true,
+      daemon: goalDaemon ? { enabled: true, stopped: false } : { enabled: false },
+      activeGoals,
+      uptimeMs: Date.now() - serveBootMs,
+      ts: new Date().toISOString(),
+    });
+  });
+
+  app.get("/metrics", async (c) => {
+    // Prometheus text exposition format 0.0.4. Keep cardinality LOW —
+    // labels with goal IDs would explode storage. We only emit per-status
+    // gauges + a few process-wide counters.
+    let goals: Goal[] = [];
+    try {
+      goals = await listGoals(workspace);
+    } catch {
+      // empty
+    }
+    const byStatus: Record<string, number> = {};
+    for (const g of goals) {
+      byStatus[g.status] = (byStatus[g.status] ?? 0) + 1;
+    }
+    const lines: string[] = [];
+    lines.push("# HELP mathran_goals_total Number of goals in the workspace, by status.");
+    lines.push("# TYPE mathran_goals_total gauge");
+    for (const s of ["active", "paused", "complete", "failed", "cancelled", "exhausted"]) {
+      lines.push(`mathran_goals_total{status="${s}"} ${byStatus[s] ?? 0}`);
+    }
+    lines.push("# HELP mathran_daemon_enabled 1 if the goal daemon is running, 0 otherwise.");
+    lines.push("# TYPE mathran_daemon_enabled gauge");
+    lines.push(`mathran_daemon_enabled ${goalDaemon ? 1 : 0}`);
+    lines.push("# HELP mathran_uptime_ms Milliseconds since `mathran serve` started.");
+    lines.push("# TYPE mathran_uptime_ms gauge");
+    lines.push(`mathran_uptime_ms ${Date.now() - serveBootMs}`);
+    if (goalDaemon) {
+      const st = goalDaemon.status();
+      lines.push("# HELP mathran_daemon_runners Active runner count in the goal daemon.");
+      lines.push("# TYPE mathran_daemon_runners gauge");
+      lines.push(`mathran_daemon_runners ${st.runnerCount ?? 0}`);
+      lines.push("# HELP mathran_daemon_queue_length Queued (waiting) goal kick count.");
+      lines.push("# TYPE mathran_daemon_queue_length gauge");
+      lines.push(`mathran_daemon_queue_length ${st.queueLength ?? 0}`);
+    }
+    // Total tokens spent across active+complete goals — useful for cost.
+    let totalTokens = 0;
+    let totalIterations = 0;
+    let totalCompactionRuns = 0;
+    for (const g of goals) {
+      totalTokens += g.stats.tokensUsed ?? 0;
+      totalIterations += g.stats.iterationsRun ?? 0;
+      totalCompactionRuns += g.stats.compactionRuns ?? 0;
+    }
+    lines.push("# HELP mathran_tokens_total Sum of stats.tokensUsed across all goals.");
+    lines.push("# TYPE mathran_tokens_total counter");
+    lines.push(`mathran_tokens_total ${totalTokens}`);
+    lines.push("# HELP mathran_iterations_total Sum of stats.iterationsRun across all goals.");
+    lines.push("# TYPE mathran_iterations_total counter");
+    lines.push(`mathran_iterations_total ${totalIterations}`);
+    lines.push("# HELP mathran_compaction_runs_total Sum of stats.compactionRuns across all goals.");
+    lines.push("# TYPE mathran_compaction_runs_total counter");
+    lines.push(`mathran_compaction_runs_total ${totalCompactionRuns}`);
+    return new Response(lines.join("\n") + "\n", {
+      status: 200,
+      headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" },
+    });
+  });
+
   /** GET /api/goals?all=1 — default lists active+paused only. */
   app.get("/api/goals", async (c) => {
     const all = c.req.query("all") === "1" || c.req.query("all") === "true";
