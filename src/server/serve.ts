@@ -4209,10 +4209,14 @@ function buildApp(
     }
     let body: any = {};
     try { body = await c.req.json(); } catch { /* empty body is fine */ }
-    const userMessage =
+    // C9: empty / blank body → undefined userMessage. Symmetric with
+    // /run/stream below; lets `runOneIteration` emit a `[daemon: continue]`
+    // nudge instead of materialising a fake user turn in the
+    // conversation. See todo1-design.md §6.2.
+    const userMessage: string | undefined =
       typeof body?.message === "string" && body.message.trim().length > 0
         ? body.message
-        : "Continue with the current objective.";
+        : undefined;
 
     // v0.17 W8: clear any stale abortRequested flag from a previous round
     // (e.g. the user clicked Abort then Resume / Run). The runner checks
@@ -4232,7 +4236,12 @@ function buildApp(
     const controller = new AbortController();
     inflightGoals.set(goalId, controller);
     try {
-      const r = await runGoalRound({
+      // C9: call runOneIteration directly (not runGoalRound) so an
+      // `undefined` userMessage stays undefined instead of falling back
+      // to the legacy fake-continue sentinel inside the wrapper.
+      // `/run/stream` already takes this path through the daemon; we
+      // keep the two endpoints symmetric.
+      const r = await runOneIteration({
         workspace,
         goalId,
         userMessage,
@@ -4296,10 +4305,19 @@ function buildApp(
     }
     let body: any = {};
     try { body = await c.req.json(); } catch { /* empty body is fine */ }
-    const userMessage =
+    // C9: when the SPA / CLI client sends an empty / blank message body,
+    // hand `undefined` to the runner. `runOneIteration` (see runner.ts
+    // §C2-1) then synthesises a minimal internal `[daemon: continue]`
+    // nudge instead of injecting the historical fake
+    // `"Continue with the current objective."` user turn — completing
+    // todo1-design.md §6.2 (the C7 script migrated existing on-disk
+    // fake-continue rows; this stops new ones from being generated).
+    // Real user messages (non-empty trimmed string) flow through
+    // unchanged.
+    const userMessage: string | undefined =
       typeof body?.message === "string" && body.message.trim().length > 0
         ? body.message
-        : "Continue with the current objective.";
+        : undefined;
 
     await clearGoalAbortRequest(workspace, goalId);
 

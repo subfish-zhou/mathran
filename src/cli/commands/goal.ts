@@ -28,7 +28,7 @@ import {
   writeGoal,
   type Goal,
 } from "../../core/goal/store.js";
-import { runGoalRound } from "../../core/goal/runner.js";
+import { runOneIteration } from "../../core/goal/runner.js";
 import type { ChatScope } from "../../core/chat/store.js";
 import type { ToolExecuteContext } from "../../core/chat/session.js";
 import { resolveScopeRoot } from "./scope-paths.js";
@@ -168,14 +168,19 @@ export async function runGoalResume(goalId: string, opts: GoalResumeOptions): Pr
     console.error(`mathran goal resume: goal is ${g.status} (${g.endReason ?? "no reason"}); cannot resume`);
     return 1;
   }
-  const userMessage = opts.message ?? "Continue with the current objective.";
+  // C9: when `mathran goal resume` is invoked without --message, pass
+  // undefined down so `runOneIteration` synthesises a `[daemon: continue]`
+  // nudge instead of forcing a fake-continue user turn into the
+  // conversation. Symmetric with the HTTP /run endpoints.
+  // See todo1-design.md §6.2.
+  const userMessage: string | undefined = opts.message ?? undefined;
   return await driveOneRound(workspace, resolved, userMessage, opts);
 }
 
 async function driveOneRound(
   workspace: string,
   goalId: string,
-  userMessage: string,
+  userMessage: string | undefined,
   opts: { configPath?: string },
 ): Promise<number> {
   const config = loadConfig(opts.configPath);
@@ -203,7 +208,11 @@ async function driveOneRound(
     : { workspace };
 
   try {
-    const r = await runGoalRound({
+    // C9: call runOneIteration directly so an undefined userMessage
+    // does NOT get rewritten to the fake-continue sentinel inside the
+    // runGoalRound wrapper. Matches /api/goals/:id/run + /run/stream
+    // behaviour. See todo1-design.md §6.2.
+    const r = await runOneIteration({
       workspace,
       goalId,
       userMessage,
