@@ -94,6 +94,7 @@ import {
   type AskUserResolver,
 } from "./tools/ask-user.js";
 import { createProposeGoalTool } from "./tools/propose-goal.js";
+import { createGoalSendMessageTool } from "./tools/goal-send-message.js";
 import { createProposePlanTool } from "./tools/propose-plan.js";
 import { createMemoryListTool } from "./tools/memory-list.js";
 import { createMemoryReadTool } from "./tools/memory-read.js";
@@ -488,6 +489,22 @@ export interface ChatSessionOptions {
       scope: { kind: "global" | "project" | "effort"; projectSlug?: string; effortSlug?: string };
       model: string;
       /** v0.17 P2 — see ProposeGoalToolOptions.autoRunner. */
+      autoRunner?: (goalId: string, userMessage: string) => void;
+    };
+    /**
+     * v0.18 — chat-mode steer for an existing long-running goal. Lets the
+     * chat LLM (and therefore the user) inject a `[Steer from user: …]`
+     * message into a goal's next round without leaving the chat, without
+     * forking a new goal, and without bypassing the chat transcript with a
+     * raw HTTP `/api/goals/:id/steer` call. See
+     * {@link createGoalSendMessageTool} for full rationale and behaviour.
+     *
+     * Wired with the same `workspace` and `autoRunner` the propose_goal
+     * binding already has — the autoRunner is reused to kick idle/failed
+     * goals so the steer is consumed without delay.
+     */
+    goal_send_message?: {
+      workspace: string;
       autoRunner?: (goalId: string, userMessage: string) => void;
     };
     /**
@@ -1299,6 +1316,19 @@ export class ChatSession {
             });
             return formatOutcomesFewShot(hits);
           },
+        }),
+      );
+    }
+    // v0.18 — chat-mode steer for an existing long-running goal. See
+    // `createGoalSendMessageTool` for full rationale (essentially the
+    // (1+1.9) Goldbach incident: user wanted to update a running goal
+    // mid-search without forking a new one or bypassing the chat
+    // transcript with a raw API call).
+    if (cfg.goal_send_message) {
+      out.push(
+        createGoalSendMessageTool({
+          workspace: cfg.goal_send_message.workspace,
+          autoRunner: cfg.goal_send_message.autoRunner,
         }),
       );
     }

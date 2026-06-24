@@ -1189,6 +1189,13 @@ export function defaultSessionFactory(
           model: resolvedModel,
           autoRunner: autoRunGoal,
         },
+        // v0.18 — chat-mode steer for an existing long-running goal.
+        // Same workspace + autoRunner the propose_goal binding uses;
+        // see createGoalSendMessageTool for full rationale.
+        goal_send_message: {
+          workspace: scopedWorkspace,
+          autoRunner: autoRunGoal,
+        },
         propose_plan: {
           resolver: async (question, { callId }) => {
             throw new AskUserPending({ question, callId });
