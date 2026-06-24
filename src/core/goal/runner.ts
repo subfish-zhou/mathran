@@ -184,8 +184,31 @@ export function buildGoalSystemPrompt(input: {
 export interface RunRoundOptions {
   workspace: string;
   goalId: string;
-  /** Build the per-round prompt the assistant is going to receive. */
-  userMessage: string;
+  /**
+   * Build the per-round prompt the assistant is going to receive.
+   *
+   * **C2 (daemon-mode):** may be `undefined` when the goal daemon is
+   * self-driving the loop (no human-typed message for this turn). The
+   * thin `runGoalRound` wrapper still defaults `undefined` to the
+   * historical `"Continue with the current objective."` sentinel so
+   * existing CLI / SPA callers keep their behavior; the lower-level
+   * `runOneIteration` instead emits a synthetic `[continue]` nudge
+   * (or steer text, when supplied) so the daemon path no longer
+   * pollutes conversation history with dozens of fake "Continue…"
+   * messages on every iteration.
+   */
+  userMessage: string | undefined;
+  /**
+   * **C2 (daemon-mode):** pre-iteration steer text drained from the
+   * daemon's per-goal pending-steer queue. When set, the runner
+   * prepends a `[Steer from user: <text>]` line in front of
+   * `userMessage` (or uses it as the user message when none was
+   * provided), so the model sees the steer immediately on the next
+   * API call instead of waiting for the in-flight `steerProbe` to
+   * fire mid-round. Plain `runGoalRound` callers omit this — the
+   * existing `steerProbe` mechanism still works for live-stream steers.
+   */
+  steerText?: string;
   /** The LLM provider (already configured with the right model). */
   llm: LLMProvider;
   /** Tools available in this round (typically the same set the REST server exposes). */
@@ -314,6 +337,16 @@ export interface RunRoundResult {
   aborted: boolean;
   /** End reason, only set when status changed. */
   endReason?: string;
+  /**
+   * **C2 (daemon-mode):** true when the model finished the turn
+   * voluntarily — produced final assistant text with NO tool calls and
+   * no completion/abort/exhaustion. The goal daemon uses this as the
+   * "wait for next user message or external notify" signal so its
+   * loop doesn't spin trying to drive a model that's already said
+   * "I'm done for now". Plain HTTP `/run/stream` callers ignore this
+   * field (one round per request, no looping).
+   */
+  naturalTurnEnd?: boolean;
 }
 
 /**
@@ -588,8 +621,107 @@ async function maybeBootstrapGoalPlan(input: {
  * Run exactly one round (one `ChatSession.send` call). Persists the round's
  * events to the goal's audit log and re-evaluates status + budget on exit.
  */
+/**
+ * **Thin backward-compatible wrapper** around `runOneIteration` (C2).
+ *
+ * Existing HTTP / CLI / test callers pass `userMessage: string` and get one
+ * round per call. The wrapper normalises an empty / missing `userMessage`
+ * to the historical `"Continue with the current objective."` sentinel so
+ * its on-the-wire behaviour is byte-identical to the v0.17 implementation.
+ *
+ * **NEW callers (the goal daemon, C3+) should call `runOneIteration`
+ * directly** with `userMessage: undefined` so it can synthesise a
+ * lower-noise `[daemon: continue]` nudge that does NOT pollute the
+ * conversation history on every self-driven iteration.
+ */
 export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResult> {
+  // Preserve the v0.17 wire contract: an unset / blank `userMessage`
+  // falls back to the literal "Continue with the current objective."
+  // string the HTTP `/run` + `/run/stream` endpoints used to inject.
+  // This keeps the 47 existing runner.test.ts tests + every CLI / SPA
+  // caller working unchanged. Daemon-mode callers (C3+) bypass this
+  // wrapper and call `runOneIteration` with `userMessage: undefined`
+  // directly.
+  const normalisedUserMessage =
+    typeof opts.userMessage === "string" && opts.userMessage.trim().length > 0
+      ? opts.userMessage
+      : "Continue with the current objective.";
+  return runOneIteration({ ...opts, userMessage: normalisedUserMessage });
+}
+
+/**
+ * Run exactly one round (one `ChatSession.send` call). Persists the round's
+ * events to the goal's audit log and re-evaluates status + budget on exit.
+ *
+ * **C2 (daemon-mode) extensions over the v0.17 `runGoalRound`:**
+ *
+ *   1. `userMessage` may be `undefined`. When the caller (typically the
+ *      goal daemon's `GoalTurnRunner`) is self-driving the loop, this
+ *      function synthesises an internal `[daemon: continue]` nudge
+ *      instead of injecting a fake `"Continue with the current
+ *      objective."` user turn. The nudge is intentionally short and
+ *      labelled so post-hoc conversation inspection can tell
+ *      daemon-driven turns apart from human-typed ones.
+ *
+ *   2. `steerText` (optional): the daemon drains its per-goal pending
+ *      steer queue right before calling us, and forwards the result
+ *      here. We splice it into the user-turn body as a
+ *      `[Steer from user: …]` prefix so the steer is visible on the
+ *      VERY NEXT API call. Live mid-round steers still flow through
+ *      the existing `steerProbe` callback (forwarded into
+ *      `ChatSession.send`).
+ *
+ *   3. Returns `naturalTurnEnd: true` when the round produced final
+ *      assistant text with zero tool calls and zero completion / abort
+ *      / exhaustion. The daemon uses this as the "wait for next user
+ *      message or external notify" signal so its outer loop doesn't
+ *      spin trying to drive a model that has already said "I'm done
+ *      for now".
+ *
+ * The persistence, audit-log, plan-bootstrap, sub-goal-tool, summary, and
+ * self-grade logic is the same as v0.17 — the function is intentionally a
+ * 1:1 rename of the previous `runGoalRound` body with the three deltas
+ * above. The v0.17 wrapper above (`runGoalRound`) preserves the old
+ * contract for non-daemon callers.
+ */
+export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundResult> {
   const { workspace, goalId, userMessage, llm, tools, toolContext, systemPromptBase, signal } = opts;
+  // ── C2 (daemon-mode): synthesise the *effective* user message ────
+  //
+  //   1. If the caller supplied a `userMessage` AND a `steerText`, the
+  //      steer wins on visibility — splice it as a `[Steer from user:
+  //      …]` prefix so the model can't miss it, then the original user
+  //      message follows. (Mirrors the `steer-received` ChatEvent the
+  //      in-flight `steerProbe` injects on later rounds.)
+  //
+  //   2. If only `steerText` is set (daemon kicked the goal with no
+  //      user text), use the steer line as the entire user message.
+  //
+  //   3. If only `userMessage` is set, pass it through unchanged.
+  //
+  //   4. If both are unset (daemon self-continuation), emit a
+  //      `[daemon: continue]` marker. The marker is intentionally
+  //      short + labelled so post-hoc inspection can tell
+  //      daemon-driven turns apart from human-typed ones. We do NOT
+  //      reuse the historical `"Continue with the current
+  //      objective."` string because that's the polluting fake-user
+  //      turn the daemon was built to eliminate.
+  const steerText =
+    typeof opts.steerText === "string" && opts.steerText.trim().length > 0
+      ? opts.steerText.trim()
+      : undefined;
+  const trimmedUserMessage =
+    typeof userMessage === "string" && userMessage.trim().length > 0
+      ? userMessage
+      : undefined;
+  const effectiveUserMessage = (() => {
+    if (steerText && trimmedUserMessage) {
+      return `[Steer from user: ${steerText}]\n\n${trimmedUserMessage}`;
+    }
+    if (steerText) return `[Steer from user: ${steerText}]`;
+    if (trimmedUserMessage) return trimmedUserMessage;
+    return "[daemon: continue]";
+  })();
   // Recursion depth (v0.3 §15). Default 0 = top-level. Only depth 0 gets
   // `spawn_sub_goal`; depth >= 1 omits it so sub-goals cannot recurse.
   const depth = opts.depth ?? 0;
@@ -868,7 +1000,7 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   if (history.length > 0) session.replaceHistory(history);
 
   // Audit the user's prompt for this round before driving the LLM.
-  await appendStep(workspace, goalId, { kind: "plan", payload: { userMessage } });
+  await appendStep(workspace, goalId, { kind: "plan", payload: { userMessage: effectiveUserMessage } });
 
   // v0.17 mathub parity W7: emit `round-start` BEFORE we open the inner
   // chat stream so SSE consumers (AgentStatusPanel) can show
@@ -899,7 +1031,7 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   let textBuf = "";
   let toolCallCount = 0;
   try {
-    for await (const ev of session.send(userMessage, {
+    for await (const ev of session.send(effectiveUserMessage, {
       signal,
       ...(opts.steerProbe ? { steerProbe: opts.steerProbe } : {}),
     }) as AsyncIterable<ChatEvent>) {
@@ -965,10 +1097,10 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     toolCallCount,
     tokensUsed: llm.countTokens
       ? llm.countTokens([
-          { role: "user", content: userMessage },
+          { role: "user", content: effectiveUserMessage },
           { role: "assistant", content: textBuf },
         ])
-      : Math.ceil((userMessage.length + textBuf.length) / 4),
+      : Math.ceil((effectiveUserMessage.length + textBuf.length) / 4),
   });
 
   // mark_done / give_up tool calls wrap the goal (recorded on the handler
@@ -1042,5 +1174,26 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     return { goal: ended ?? goal, text: textBuf, completed: false, exhausted: true, failed: false, aborted: false, endReason: after.reason };
   }
 
-  return { goal, text: textBuf, completed: false, exhausted: false, failed: false, aborted: false };
+  // C2 (daemon-mode): detect natural turn end. When the round
+  // produced final assistant text AND made zero tool calls AND no
+  // terminal condition was hit (mark_done / give_up / abort /
+  // exhaustion are returned above before this point), the model has
+  // voluntarily said "I'm done for this turn". The daemon uses this
+  // signal to halt its inner loop and wait for the next user message
+  // or external notify, instead of spinning a fake `[daemon: continue]`
+  // every iterIdleMs.
+  //
+  // Plain HTTP `/run/stream` callers (one round per request) ignore
+  // this field, so the historical contract is preserved.
+  const naturalTurnEnd =
+    toolCallCount === 0 && textBuf.trim().length > 0;
+  return {
+    goal,
+    text: textBuf,
+    completed: false,
+    exhausted: false,
+    failed: false,
+    aborted: false,
+    ...(naturalTurnEnd ? { naturalTurnEnd: true } : {}),
+  };
 }
