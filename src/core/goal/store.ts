@@ -52,8 +52,12 @@ export interface Goal {
    * "failed"     unrecoverable error during the run
    * "cancelled"  user cancelled via \`mathran goal cancel\`
    * "exhausted"  budget hit before completion
+   * "stalled"    auto-flagged by scripts/audit-stale-goals.ts: was
+   *              "active" with no live daemon runner past a threshold
+   *              (likely a pre-daemon SPA-driver zombie). endReason
+   *              records when/why it was flagged.
    */
-  status: "active" | "paused" | "complete" | "failed" | "cancelled" | "exhausted";
+  status: "active" | "paused" | "complete" | "failed" | "cancelled" | "exhausted" | "stalled";
   /** Budgets and the model used for this run. `null` = no budget set. */
   budget: { tokensMax: number | null; roundsMax: number | null };
   model: string;

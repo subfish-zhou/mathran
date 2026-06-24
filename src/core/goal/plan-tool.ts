@@ -45,22 +45,42 @@ export interface UpdatePlanItemContext {
   workspace: string;
   /** Id of the goal whose plan we'll edit. */
   goalId: string;
+  /**
+   * defect#4 dedup window (ms). A repeated `(index, status)` call within
+   * this window — i.e. more than once in the current iteration, or within
+   * 30s — returns a no-op success ("plan already at that state") without
+   * touching disk and without re-deriving plan state. Default 30_000.
+   * Exposed for tests so they can drive the window deterministically.
+   */
+  dedupWindowMs?: number;
+  /** Injectable clock for tests. Default `Date.now`. */
+  now?: () => number;
 }
 
 const DESCRIPTION =
   "Update one checklist item in the goal's active plan file. Use `index` " +
   "(1-based, global position of the `- [ ]` / `- [x]` bullet in document " +
-  "order) and `status` ('done' to mark complete, 'todo' to re-open). Call " +
-  "this as you make progress so the next round's prompt reflects what's " +
-  "already finished. One item per call.";
+  "order) and `status` ('done' to mark complete, 'todo' to re-open). Only " +
+  "call this when the plan's structure actually changes — do NOT mark items " +
+  "done one at a time as you work. One item per call.";
 
 /**
  * Build the `update_plan_item` ToolSpec. The closure binds `workspace`
  * and `goalId` so the model only has to supply the user-meaningful
  * `index` + `status` arguments — it can't accidentally point the tool
  * at someone else's plan file.
+ *
+ * defect#4: the closure also holds a small `(index:status) -> lastMs` map
+ * so over-eager repeat calls (the observed "12 update_plan_item in one
+ * iteration" pattern) collapse to a single real state-change. A repeat of
+ * the same `(index, status)` within `dedupWindowMs` returns a no-op
+ * success without writing the plan file or re-reading it.
  */
 export function buildUpdatePlanItemTool(ctx: UpdatePlanItemContext): ToolSpec {
+  const dedupWindowMs = ctx.dedupWindowMs ?? 30_000;
+  const clock = ctx.now ?? Date.now;
+  // Keyed `${index}:${status}` -> timestamp of the last accepted call.
+  const recentCalls = new Map<string, number>();
   return {
     name: "update_plan_item",
     description: DESCRIPTION,
@@ -107,6 +127,20 @@ export function buildUpdatePlanItemTool(ctx: UpdatePlanItemContext): ToolSpec {
         };
       }
 
+      // ─── defect#4 dedup: collapse repeated `(index, status)` calls. ───
+      // The same toggle issued again within `dedupWindowMs` (same
+      // iteration / within 30s) is pure noise — return a no-op success
+      // without re-reading or rewriting the plan file.
+      const dedupKey = `${idx}:${status}`;
+      const nowMs = clock();
+      const lastMs = recentCalls.get(dedupKey);
+      if (lastMs !== undefined && nowMs - lastMs < dedupWindowMs) {
+        return {
+          ok: true,
+          content: `update_plan_item: item ${idx} already set to ${status} (recent duplicate); plan already at that state, no change`,
+        };
+      }
+
       // ─── Load the plan file (missing = the runner didn't bootstrap one). ───
       let body: string | null;
       try {
@@ -138,6 +172,7 @@ export function buildUpdatePlanItemTool(ctx: UpdatePlanItemContext): ToolSpec {
       if (nextBody === body) {
         // Already in the requested state — common after a resume, don't
         // burn a disk write and don't pretend we changed something.
+        recentCalls.set(dedupKey, nowMs);
         const steps = parsePlanSteps(body);
         const step = steps[idx - 1];
         return {
@@ -162,6 +197,7 @@ export function buildUpdatePlanItemTool(ctx: UpdatePlanItemContext): ToolSpec {
       const steps = parsePlanSteps(nextBody);
       const step = steps[idx - 1];
       const remaining = steps.filter((s) => s.status === "todo").length;
+      recentCalls.set(dedupKey, nowMs);
       return {
         ok: true,
         content: `update_plan_item: marked item ${idx} as ${status}${
