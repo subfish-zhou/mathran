@@ -42,6 +42,24 @@ export interface GoalDaemonOptions {
    * kicks are FIFO-queued. Default 8.
    */
   maxConcurrent?: number;
+  /**
+   * **C3:** production runner factory. Called by `kickGoal()` when a goal
+   * is not yet running. Receives the goalId + the kick options (initial
+   * user message, source label) and returns a fully-constructed
+   * `GoalTurnRunner` whose `iterationFn` wraps `runOneIteration` with all
+   * production deps (LLM, tools, inflight-abort registration,
+   * steerProbe, SSE-event broadcast, etc).
+   *
+   * When `undefined` (C1 / unit-test default), `kickGoal()` falls back to
+   * its skeleton behaviour and throws — tests must use
+   * `kickGoalWithRunner` to inject hand-rolled runners. C3+ production
+   * code (serve.ts buildApp) passes a factory so the daemon can drive
+   * real goals end-to-end.
+   */
+  runnerFactory?: (
+    goalId: string,
+    kickOpts: { userMessage?: string; source?: string },
+  ) => GoalTurnRunner;
 }
 
 /** Per-iteration event sent to the daemon's eventBus. Shape matches the
@@ -78,7 +96,12 @@ export class GoalDaemon {
 
   readonly eventBus = new EventEmitter();
 
-  private readonly opts: Required<GoalDaemonOptions>;
+  private readonly opts: {
+    workspace: string;
+    iterIdleMs: number;
+    maxConcurrent: number;
+    runnerFactory?: GoalDaemonOptions["runnerFactory"];
+  };
   private readonly runners = new Map<string, GoalTurnRunner>();
   private stopped = false;
 
@@ -87,6 +110,7 @@ export class GoalDaemon {
       workspace: opts.workspace,
       iterIdleMs: opts.iterIdleMs ?? GoalDaemon.ITER_IDLE_MS_DEFAULT,
       maxConcurrent: opts.maxConcurrent ?? GoalDaemon.MAX_CONCURRENT_DEFAULT,
+      ...(opts.runnerFactory ? { runnerFactory: opts.runnerFactory } : {}),
     };
     // Avoid the EE memory warning under heavy multi-tab SSE load.
     this.eventBus.setMaxListeners(100);
@@ -152,8 +176,17 @@ export class GoalDaemon {
       else existing.notify();
       return;
     }
-    // SKELETON: no factory yet — caller must use kickGoalWithRunner for tests.
-    // Production wiring (C3): instantiate GoalTurnRunner with full deps here.
+    // C3 production path: if the daemon was constructed with a
+    // `runnerFactory`, use it to build a real GoalTurnRunner (wired to
+    // runOneIteration + LLM + tools + steerProbe + SSE event
+    // broadcast) and register it. Falls back to the C1 "not yet wired"
+    // error when no factory was supplied (unit-test path — those tests
+    // must use `kickGoalWithRunner`).
+    if (this.opts.runnerFactory) {
+      const runner = this.opts.runnerFactory(goalId, opts ?? {});
+      this.kickGoalWithRunner(goalId, runner);
+      return;
+    }
     throw new Error(
       "GoalDaemon.kickGoal not yet wired to production runner factory (C3). " +
         "Use kickGoalWithRunner for tests.",
