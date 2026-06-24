@@ -1670,6 +1670,67 @@ function registerChatScope(
     return c.json({ conversations });
   });
 
+  // v0.18 — POST <base>/:parentConversationId/threads
+  // Discord-style child thread on a parent conversation. Body:
+  //   {
+  //     anchorBubbleIdx?: number,    // bubble in the parent to fork off of
+  //     title?: string,              // initial sidebar label (default derived)
+  //     threadDescription?: string,  // optional hover tooltip text
+  //   }
+  // Response: { conversation: ConversationMeta }
+  //
+  // The new thread's .jsonl is NOT created server-side; it appears on the
+  // first send() to the thread (same as every other new conversation).
+  // We immediately bump the parent's lastUsedAt so the SPA sidebar's
+  // sort order surfaces the new activity.
+  app.post(`${basePath}/:parentConversationId/threads`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const parentId = c.req.param("parentConversationId");
+    if (!isSafeSlug(parentId)) {
+      return c.json({ error: "invalid parent conversation id" }, 400);
+    }
+    let body: unknown = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      // Empty body is allowed — caller may just want a generic child thread.
+      body = {};
+    }
+    const b = (body ?? {}) as {
+      anchorBubbleIdx?: unknown;
+      title?: unknown;
+      threadDescription?: unknown;
+    };
+    const anchorBubbleIdx =
+      typeof b.anchorBubbleIdx === "number" &&
+      Number.isInteger(b.anchorBubbleIdx) &&
+      b.anchorBubbleIdx >= 0
+        ? b.anchorBubbleIdx
+        : undefined;
+    const title = typeof b.title === "string" ? b.title : undefined;
+    const threadDescription =
+      typeof b.threadDescription === "string" ? b.threadDescription : undefined;
+
+    try {
+      const meta = await store.createThread(resolved.scope!, parentId, {
+        anchorBubbleIdx,
+        title,
+        threadDescription,
+      });
+      return c.json({ conversation: meta });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Parent not found is the only checked failure mode today; surface as 404.
+      if (msg.includes("not found")) {
+        return c.json({ error: msg }, 404);
+      }
+      return c.json({ error: msg }, 500);
+    }
+  });
+
   // GET <base>/:conversationId  — read history of one conversation
   app.get(`${basePath}/:conversationId`, async (c) => {
     const resolved = getScope(c);

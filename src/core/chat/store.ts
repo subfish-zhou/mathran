@@ -77,6 +77,50 @@ export interface ConversationMeta {
   createdAt: string;
   lastUsedAt: string;
   messageCount: number;
+  /**
+   * v0.18 — Discord-style threads.
+   *
+   * When set, this conversation is a CHILD thread of `parentConversationId`.
+   * The SPA sidebar renders threads nested under their parent (a tree view
+   * rather than a flat list), so the user can fork a side-discussion from
+   * any point in the parent conversation without it polluting the main
+   * stream OR vanishing into a separate top-level chat.
+   *
+   * `parentConversationId` MUST point to a conversation in the SAME scope.
+   * (Cross-scope parenting would require touching the `.index.json` of two
+   * directories per write — out of scope for v0.18.)
+   *
+   * Top-level conversations leave this `undefined`; the loader treats
+   * `undefined` parent as "render at root level" so legacy index files
+   * continue to work without migration.
+   */
+  parentConversationId?: string;
+  /**
+   * v0.18 — the bubble index in the parent conversation that this thread
+   * was forked off of. The SPA renders a small "💬 N replies" affordance
+   * next to that bubble in the parent view, and the thread itself shows
+   * a "forked from <parent>: <quoted snippet>" header.
+   *
+   * Undefined when the thread was created without a specific anchor
+   * (e.g. via `+ New thread` button on the parent — no specific bubble),
+   * in which case the SPA renders the thread as a generic child without
+   * an anchor pill.
+   *
+   * Independent of `parentConversationId`: a thread MAY have a parent
+   * without an anchor, but MAY NOT have an anchor without a parent
+   * (the loader normalises that case by clearing the orphan anchor).
+   */
+  anchorBubbleIdx?: number;
+  /**
+   * v0.18 — optional one-line description shown when hovering over a
+   * thread in the sidebar. The SPA uses `title` as the primary label, but
+   * `description` can carry e.g. the quoted snippet of the anchor bubble
+   * so the user remembers what the thread is about without opening it.
+   *
+   * Undefined when not set; the SPA falls back to the bubble at
+   * `anchorBubbleIdx` (if any) or just shows the title alone.
+   */
+  threadDescription?: string;
 }
 
 /** Shape of `.index.json`. */
@@ -492,6 +536,19 @@ export async function flushConversationHistory(
     createdAt: existing?.createdAt ?? now,
     lastUsedAt: now,
     messageCount: history.length,
+    // v0.18 — preserve thread linkage on every flush. Without this the
+    // first send() in a freshly-created thread would wipe the parent
+    // pointer because flushConversationHistory rebuilds the meta from
+    // scratch using only the title-derivation inputs.
+    ...(existing?.parentConversationId !== undefined && {
+      parentConversationId: existing.parentConversationId,
+    }),
+    ...(existing?.anchorBubbleIdx !== undefined && {
+      anchorBubbleIdx: existing.anchorBubbleIdx,
+    }),
+    ...(existing?.threadDescription !== undefined && {
+      threadDescription: existing.threadDescription,
+    }),
   };
   await writeIndex(dir, idx);
 
@@ -735,6 +792,95 @@ export class ScopedChatSessionStore {
     return Object.values(idx.conversations).sort(
       (a, b) => Date.parse(b.lastUsedAt) - Date.parse(a.lastUsedAt),
     );
+  }
+
+  /**
+   * v0.18 — Create a CHILD thread conversation parented at `parentId`.
+   *
+   * Discord-style: the thread is a sibling .jsonl file in the same scope
+   * directory, but its `.index.json` entry carries `parentConversationId`
+   * (and optionally `anchorBubbleIdx`) so the SPA renders it nested under
+   * the parent rather than at root level.
+   *
+   * Validation:
+   *   - The parent must exist in this scope's index. We reject silently
+   *     with `{ok: false}` shape via a thrown Error to keep the chat-tool
+   *     surface honest (no silent linkage corruption).
+   *   - Cross-scope parenting is rejected: caller must be in the same
+   *     scope.
+   *   - Nesting depth is NOT bounded server-side; the SPA caps display
+   *     depth at 3 (parent / thread / sub-thread) and renders deeper
+   *     children inline at depth 3. The server records the true depth
+   *     so a future SPA can render arbitrarily deep if desired.
+   *
+   * Side effects:
+   *   - Writes a NEW entry into `.index.json`.
+   *   - Does NOT create the `.jsonl` file yet — that happens on the first
+   *     `send()` to the thread, same as every other new conversation.
+   *   - Bumps the parent's `lastUsedAt` so the parent's sidebar position
+   *     reflects "there's recent activity (as a child thread)".
+   *
+   * Returns the new ConversationMeta entry (with the freshly-minted id).
+   */
+  async createThread(
+    scope: ChatScope,
+    parentId: string,
+    opts?: {
+      anchorBubbleIdx?: number;
+      title?: string;
+      threadDescription?: string;
+    },
+  ): Promise<ConversationMeta> {
+    const dir = scopeDir(this.workspace, scope);
+    const idx = await readIndex(dir);
+
+    const parent = idx.conversations[parentId];
+    if (!parent) {
+      throw new Error(
+        `createThread: parent conversation ${parentId} not found in this scope. ` +
+          "Cross-scope parenting is not supported — caller must be in the same scope.",
+      );
+    }
+
+    const now = new Date().toISOString();
+    const id = ScopedChatSessionStore.newConversationId();
+
+    // Default title: "⤳ thread" + optionally the bubble idx the user
+    // forked from. The user can rename later via the rename tool / SPA.
+    let defaultTitle: string;
+    if (opts?.title && opts.title.trim().length > 0) {
+      defaultTitle = opts.title.trim();
+    } else if (typeof opts?.anchorBubbleIdx === "number") {
+      defaultTitle = `Thread on #${opts.anchorBubbleIdx}`;
+    } else {
+      defaultTitle = `Thread of "${(parent.title || parent.id).slice(0, 40)}"`;
+    }
+
+    const newMeta: ConversationMeta = {
+      id,
+      title: defaultTitle,
+      createdAt: now,
+      lastUsedAt: now,
+      messageCount: 0,
+      parentConversationId: parentId,
+      ...(typeof opts?.anchorBubbleIdx === "number" && {
+        anchorBubbleIdx: opts.anchorBubbleIdx,
+      }),
+      ...(opts?.threadDescription && {
+        threadDescription: opts.threadDescription,
+      }),
+    };
+    idx.conversations[id] = newMeta;
+
+    // Bump parent's lastUsedAt so sidebar's root-level sort surfaces the
+    // "this conversation had activity (a new thread)" signal.
+    idx.conversations[parentId] = {
+      ...parent,
+      lastUsedAt: now,
+    };
+
+    await writeIndex(dir, idx);
+    return newMeta;
   }
 
   /** Read a conversation's history off disk. Returns null if no file. */
