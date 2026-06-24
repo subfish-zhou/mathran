@@ -29,6 +29,7 @@ import {
   toggleReaction,
   findGoalForConversation,
   runGoalRound,
+  createGoal,
   steerChatConversation,
   type ChatEvent,
   type ChatAttachmentRef,
@@ -1599,6 +1600,47 @@ export default function ChatPanel({
           return { handled: true };
         }
 
+        case "goal": {
+          // TODO-3 UI #2: invoke the same Start-goal flow that the
+          // header button used to expose. The slash-command path
+          // bypasses the modal entirely and just kicks the goal with
+          // the model's defaults, treating the args (or whatever sat
+          // in the composer before the user typed /goal) as the
+          // objective. Mirrors how openclaw / copilot CLI handle
+          // top-level commands.
+          const objective = args.trim() || input.trim().replace(/^\/goal\b\s*/i, "").trim();
+          setInput("");
+          if (!objective) {
+            pushInfoBubble("**/goal** — usage: `/goal <objective>` (or type the objective first, then `/goal`).");
+            return { handled: true };
+          }
+          try {
+            const created = await createGoal({
+              objective,
+              scope,
+              model: model ?? undefined,
+              budgetTokens: null,
+              maxRounds: null,
+            });
+            setOwningGoal(created);
+            // Mirror the header button's onGoalCreated path: kick the
+            // first round so the user lands on a live conversation
+            // instead of an empty stub.
+            runGoalRound(created.id)
+              .then((r) => {
+                setOwningGoal(r.goal);
+                if (r.goal.conversationIds[0]) {
+                  setConversationId(r.goal.conversationIds[0]);
+                }
+              })
+              .catch((e) => setError(String((e as Error).message ?? e)));
+            pushInfoBubble(`**🎯 Goal started** — \`${created.id.slice(0, 8)}…\` — objective: ${JSON.stringify(objective.slice(0, 120))}`);
+          } catch (e) {
+            setError(`/goal failed: ${(e as Error).message}`);
+          }
+          return { handled: true };
+        }
+
         case "compact": {
           setInput("");
           if (!conversationId) {
@@ -2745,22 +2787,27 @@ export default function ChatPanel({
               — useful entry point when you want to see goal status / end
               reason / round count without scrolling. Hidden when not a
               goal-mode chat. */}
-          {/* v0.16 §9 audit #2: 📋 Plan button. Spawns a plan-mode run in a
-              modal overlay; the user can Accept (writes the plan to
-              .mathran/plans/) or Reject without touching this chat. */}
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => setPlanOverlayOpen(true)}
-            className="ml-2 shrink-0 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
-            title="Draft a read-only plan (Approach / Steps / Key files / Risks / Acceptance) before doing the work"
-          >
-            📋 Plan
-          </button>
+          {/* TODO-3 UI #2 — Removed the inline 📋 Plan button.
+              Plan mode is now invoked via /plan slash-command in the
+              composer (modal-style overlay still opens), matching how
+              openclaw/copilot CLIs surface top-level commands.
+              The CreateGoalModal that GoalControls used to expose
+              for "🎯 Start a goal" is similarly retired in favour of
+              the /goal slash-command (see ChatPanel slash router). */}
+          {/* TODO-3 UI #3 — Goal autonomy card promoted from the
+              second-layer (between BackgroundAgentsPanel and
+              GoalRunStatusPanel) to the FIRST-LAYER chat header.
+              Now that the Plan / Start-goal buttons are gone, the
+              header has room for the autonomy default pin. Stays
+              collapsed by default — same component as before. */}
+          <div className="ml-2 shrink-0">
+            <GoalAutonomyCard scope={scope} />
+          </div>
           {/* v0.16 §4: GoalControls handles BOTH non-goal (Start) and goal
-              (Run / Interrupt / Cancel / budget meter) states. The thread
-              shortcut is kept as a separate button so users can pop the
-              drawer without disturbing run controls. */}
+              (Run / Interrupt / Cancel / budget meter) states. After
+              TODO-3 UI #2, the non-goal branch renders nothing (the
+              /goal slash-command replaces the Start modal); the goal
+              branch keeps its full Run/Interrupt/Cancel/budget UI. */}
           <GoalControls
             scope={scope}
             goal={owningGoal}
@@ -2846,12 +2893,9 @@ export default function ChatPanel({
           <BackgroundAgentsPanel completedFrame={bgCompletedFrame} />
         </div>
 
-        {/* v0.17 W11: per-scope goal-autonomy defaults card. Collapsed
-            by default; expands inline so the user can pin autonomy /
-            budget defaults without leaving the chat surface. */}
-        <div className="border-b border-slate-200 bg-slate-50 px-6 py-1.5">
-          <GoalAutonomyCard scope={scope} />
-        </div>
+        {/* v0.17 W11: per-scope goal-autonomy defaults card.
+            TODO-3 UI #3: This second-layer mount is removed in favour
+            of the first-layer (chat-header) mount above. */}
 
         {/* v0.17 W8: mathub-parity status strip. Only mounts when this
             conversation is the primary one of a goal-loop — plain chats

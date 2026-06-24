@@ -116,12 +116,6 @@ function GlobalSidebar() {
       <NavLink to="/settings" className={linkClass}>
         ⚙️ Settings
       </NavLink>
-      <NavLink to="/settings/mcp" className={linkClass}>
-        🔌 MCP servers
-      </NavLink>
-      <NavLink to="/settings/mcp/config" className={linkClass}>
-        🛠 MCP config
-      </NavLink>
 
       <div className="mt-6 px-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
         Projects

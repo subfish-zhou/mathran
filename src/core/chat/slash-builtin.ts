@@ -58,6 +58,7 @@ export const EXISTING_BUILTIN_SLASH_COMMANDS: readonly BuiltinSlashCommandSpec[]
 /** The nine new builtins introduced by the SPA Slash Commands task. */
 export const NEW_BUILTIN_SLASH_COMMANDS: readonly BuiltinSlashCommandSpec[] = [
   { name: "plan", description: "Open the plan runner for the current objective" },
+  { name: "goal", description: "Start an autonomous goal from the current input (TODO-3)" },
   { name: "compact", description: "Compact conversation history (keep last k rounds)" },
   { name: "context", description: "Show token usage and context-window percentage" },
   { name: "review", description: "Ask the reviewer to look at the latest exchange (MVP stub)" },

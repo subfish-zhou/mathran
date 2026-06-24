@@ -350,6 +350,14 @@ export default function SettingsPanel() {
           <Link to="/settings/providers" className="font-medium text-slate-700 underline">
             LLM Providers →
           </Link>
+          {" · "}
+          <Link to="/settings/mcp" className="font-medium text-slate-700 underline">
+            🔌 MCP Servers →
+          </Link>
+          {" · "}
+          <Link to="/settings/mcp/config" className="font-medium text-slate-700 underline">
+            🛠 MCP Config →
+          </Link>
         </div>
       </div>
 

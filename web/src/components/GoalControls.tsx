@@ -30,7 +30,6 @@ import { useState } from "react";
 import type { ChatScopeSpec } from "../lib/api.ts";
 import {
   cancelGoal,
-  createGoal,
   interruptGoal,
   runGoalRound,
   type GoalRoundResult,
@@ -56,57 +55,17 @@ export interface GoalControlsProps {
 }
 
 export default function GoalControls({
-  scope,
   goal,
-  defaultModel,
-  onGoalCreated,
   onRoundRan,
   busy,
 }: GoalControlsProps) {
-  const [modalOpen, setModalOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<"create" | "run" | "interrupt" | "cancel" | null>(null);
 
-  // ───── Non-goal chat: Start button ──────────────────────────────────
+  // ───── Non-goal chat: TODO-3 UI #2 — Start button replaced by the
+//       /goal slash-command in the composer. Render nothing here.
   if (!goal) {
-    return (
-      <>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => setModalOpen(true)}
-          className="ml-2 shrink-0 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
-          title="Convert this prompt into an autonomous goal with budget caps"
-        >
-          🎯 Start goal
-        </button>
-        {modalOpen && (
-          <CreateGoalModal
-            scope={scope}
-            defaultModel={defaultModel ?? null}
-            onClose={() => {
-              setModalOpen(false);
-              setError(null);
-            }}
-            onSubmit={async (input) => {
-              setPending("create");
-              setError(null);
-              try {
-                const created = await createGoal(input);
-                setModalOpen(false);
-                onGoalCreated(created);
-              } catch (e: any) {
-                setError(String(e?.message ?? e));
-              } finally {
-                setPending(null);
-              }
-            }}
-            pending={pending === "create"}
-            error={error}
-          />
-        )}
-      </>
-    );
+    return null;
   }
 
   // ───── Goal chat: status + run/interrupt/cancel + budget meter ──────
@@ -250,152 +209,3 @@ function formatCount(n: number): string {
   return `${(n / 1_000_000).toFixed(2)}M`;
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// CreateGoalModal — minimal blocking dialog. No portal, no library;
-// just a centered overlay since the rest of the app uses the same style.
-// ──────────────────────────────────────────────────────────────────────
-function CreateGoalModal({
-  scope,
-  defaultModel,
-  onClose,
-  onSubmit,
-  pending,
-  error,
-}: {
-  scope: ChatScopeSpec;
-  defaultModel: string | null;
-  onClose: () => void;
-  onSubmit: (input: Parameters<typeof createGoal>[0]) => Promise<void>;
-  pending: boolean;
-  error: string | null;
-}) {
-  const [objective, setObjective] = useState("");
-  const [model, setModel] = useState(defaultModel ?? "");
-  const [budgetTokens, setBudgetTokens] = useState("");
-  const [maxRounds, setMaxRounds] = useState("");
-  // goal-defaults-timer (commit 5/7): "额外指令" / additional context.
-  // Free-form text that ends up appended to every round's system
-  // prompt as a labelled tail block (see runner.buildGoalSystemPrompt).
-  // Server trims empty/whitespace to undefined, so leaving this blank
-  // is the no-op default.
-  const [extraInstructions, setExtraInstructions] = useState("");
-
-  const canSubmit = objective.trim().length > 0 && !pending;
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-md rounded-lg border border-slate-200 bg-white p-5 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2 className="mb-1 text-base font-semibold">🎯 Start a goal</h2>
-        <p className="mb-3 text-xs text-slate-600">
-          The agent will autonomously run rounds toward this objective, spawning
-          sub-goals as needed. Budgets are hard caps; leave blank for no cap.
-        </p>
-
-        <label className="block text-xs font-medium text-slate-700">
-          Objective
-          <textarea
-            value={objective}
-            onChange={(e) => setObjective(e.target.value)}
-            rows={3}
-            placeholder="e.g. Prove that every prime ≡ 1 (mod 4) is a sum of two squares."
-            className="mt-1 w-full rounded border border-slate-300 px-2 py-1 text-sm focus:border-amber-500 focus:outline-none"
-            autoFocus
-          />
-        </label>
-
-        <div className="mt-3 grid grid-cols-2 gap-2">
-          <label className="block text-xs font-medium text-slate-700">
-            Model (optional)
-            <input
-              type="text"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder={defaultModel ?? "default"}
-              className="mt-1 w-full rounded border border-slate-300 px-2 py-1 text-sm focus:border-amber-500 focus:outline-none"
-            />
-          </label>
-          <label className="block text-xs font-medium text-slate-700">
-            Max rounds
-            <input
-              type="number"
-              min="1"
-              value={maxRounds}
-              onChange={(e) => setMaxRounds(e.target.value)}
-              placeholder="e.g. 20"
-              className="mt-1 w-full rounded border border-slate-300 px-2 py-1 text-sm focus:border-amber-500 focus:outline-none"
-            />
-          </label>
-        </div>
-        <label className="mt-2 block text-xs font-medium text-slate-700">
-          Token budget (total across all rounds)
-          <input
-            type="number"
-            min="1"
-            value={budgetTokens}
-            onChange={(e) => setBudgetTokens(e.target.value)}
-            placeholder="e.g. 200000"
-            className="mt-1 w-full rounded border border-slate-300 px-2 py-1 text-sm focus:border-amber-500 focus:outline-none"
-          />
-        </label>
-
-        {/* goal-defaults-timer (commit 5/7): the 3rd field. Optional
-            standing instructions for the whole goal — anything the
-            user wants the assistant to keep in mind across every round
-            (output language, project conventions, "don't touch X",
-            stylistic notes). Spliced into the system prompt as the
-            tail-most block, so it sits closest to the assistant's next
-            response and wins recency bias against ephemeral steers. */}
-        <label className="mt-2 block text-xs font-medium text-slate-700">
-          额外指令 / Additional context (optional)
-          <textarea
-            value={extraInstructions}
-            onChange={(e) => setExtraInstructions(e.target.value)}
-            rows={3}
-            placeholder={"e.g. 中文回复。 / Always respond in Lean 4 syntax. / Don't modify files under vendored/."}
-            className="mt-1 w-full rounded border border-slate-300 px-2 py-1 text-sm focus:border-amber-500 focus:outline-none"
-          />
-        </label>
-
-        {error && (
-          <div className="mt-3 rounded border border-red-300 bg-red-50 px-2 py-1 text-xs text-red-800">
-            {error}
-          </div>
-        )}
-
-        <div className="mt-4 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={pending}
-            className="rounded border border-slate-300 bg-white px-3 py-1 text-sm hover:bg-slate-50 disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            disabled={!canSubmit}
-            onClick={() =>
-              void onSubmit({
-                objective: objective.trim(),
-                scope,
-                model: model.trim() || undefined,
-                budgetTokens: budgetTokens ? Number(budgetTokens) : null,
-                maxRounds: maxRounds ? Number(maxRounds) : null,
-                extraInstructions: extraInstructions.trim() || undefined,
-              })
-            }
-            className="rounded border border-amber-500 bg-amber-100 px-3 py-1 text-sm text-amber-900 hover:bg-amber-200 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {pending ? "Starting…" : "🎯 Start goal"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
