@@ -795,6 +795,90 @@ export class ScopedChatSessionStore {
   }
 
   /**
+   * v0.18 — idempotent: link an existing conversation to a parent (set
+   * parentConversationId / anchorBubbleIdx in its index entry). The
+   * conversation MAY not yet exist on disk — we create a stub entry so
+   * the link is recorded even before the first send().
+   *
+   * Unlike `createThread`, this does NOT mint a new id — caller supplies
+   * the conversationId. This is the hook the goal runner uses to register
+   * sub-goal conversations as threads of their parent goal's conversation
+   * AFTER both ids already exist (sub-goal-tool created the sub-goal
+   * record, runner attached a conversationId; we now retroactively mark
+   * the linkage on the chat-side index).
+   *
+   * Same scope as the parent. Cross-scope linkage rejected for the same
+   * reason as createThread.
+   *
+   * No-op when the conversation already has the EXACT same parent +
+   * anchor (we re-flush parent's lastUsedAt regardless, so the sidebar
+   * sort still surfaces the activity).
+   *
+   * Static because it only touches index.json — no need for the cache /
+   * eviction lock state the instance carries. Lets the goal runner call
+   * it without having to thread a ScopedChatSessionStore (and its factory)
+   * through every code path.
+   */
+  static async linkConversationToParent(
+    workspace: string,
+    scope: ChatScope,
+    conversationId: string,
+    parentConversationId: string,
+    opts?: { anchorBubbleIdx?: number; threadDescription?: string },
+  ): Promise<void> {
+    if (conversationId === parentConversationId) {
+      throw new Error(
+        `linkConversationToParent: refusing to make ${conversationId} a thread of itself.`,
+      );
+    }
+    const dir = scopeDir(workspace, scope);
+    const idx = await readIndex(dir);
+    const parent = idx.conversations[parentConversationId];
+    if (!parent) {
+      throw new Error(
+        `linkConversationToParent: parent conversation ${parentConversationId} not found in this scope.`,
+      );
+    }
+    const now = new Date().toISOString();
+    const existing = idx.conversations[conversationId];
+    if (existing) {
+      const sameLink =
+        existing.parentConversationId === parentConversationId &&
+        existing.anchorBubbleIdx === opts?.anchorBubbleIdx;
+      if (sameLink) {
+        idx.conversations[parentConversationId] = { ...parent, lastUsedAt: now };
+        await writeIndex(dir, idx);
+        return;
+      }
+      idx.conversations[conversationId] = {
+        ...existing,
+        parentConversationId,
+        ...(typeof opts?.anchorBubbleIdx === "number" && {
+          anchorBubbleIdx: opts.anchorBubbleIdx,
+        }),
+        ...(opts?.threadDescription && { threadDescription: opts.threadDescription }),
+      };
+    } else {
+      idx.conversations[conversationId] = {
+        id: conversationId,
+        title: opts?.threadDescription
+          ? opts.threadDescription.slice(0, 60)
+          : `Sub-thread of ${(parent.title || parent.id).slice(0, 40)}`,
+        createdAt: now,
+        lastUsedAt: now,
+        messageCount: 0,
+        parentConversationId,
+        ...(typeof opts?.anchorBubbleIdx === "number" && {
+          anchorBubbleIdx: opts.anchorBubbleIdx,
+        }),
+        ...(opts?.threadDescription && { threadDescription: opts.threadDescription }),
+      };
+    }
+    idx.conversations[parentConversationId] = { ...parent, lastUsedAt: now };
+    await writeIndex(dir, idx);
+  }
+
+  /**
    * v0.18 — Create a CHILD thread conversation parented at `parentId`.
    *
    * Discord-style: the thread is a sibling .jsonl file in the same scope

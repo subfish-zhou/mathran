@@ -41,6 +41,7 @@ import {
   conversationFilePath,
   flushConversationHistory,
   loadConversationHistory,
+  ScopedChatSessionStore,
 } from "../chat/store.js";
 import { atomicWriteFile } from "../chat/atomic-write.js";
 import { appendEffortDocument } from "../effort/store.js";
@@ -646,6 +647,45 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
   const conversationId = goal.conversationIds[0] ?? randomUUID();
   await attachConversation(workspace, goalId, conversationId);
   goal = (await readGoal(workspace, goalId)) ?? goal;
+
+  // v0.18 — Discord-style threads, P4: register sub-goal conversations
+  // as threads of their parent goal's primary conversation, so the SPA
+  // sidebar renders the goal tree (parent + nested sub-goal threads)
+  // automatically. Pure index-file write; goal/runner logic is untouched
+  // — the conversation it just attached has the SAME id whether or not
+  // we mark it as a thread.
+  //
+  // We only do this on the FIRST attach for a given conversation (i.e.
+  // when the conversation entry didn't exist before this round). If the
+  // conversation is already in the chat index and already has a parent
+  // (e.g. relinked from a previous run), the helper short-circuits.
+  //
+  // Errors here MUST NOT fail the goal round — worst case the thread
+  // appears at root level in the SPA sidebar, identical to pre-P4 behaviour.
+  if (goal.parentGoalId) {
+    try {
+      const parentGoal = await readGoal(workspace, goal.parentGoalId);
+      const parentConv = parentGoal?.conversationIds?.[0];
+      if (parentConv && parentConv !== conversationId) {
+        await ScopedChatSessionStore.linkConversationToParent(
+          workspace,
+          goal.scope,
+          conversationId,
+          parentConv,
+          {
+            // Sub-goal description = first 120 chars of its objective so the
+            // sidebar hover tooltip explains what this thread is about.
+            threadDescription:
+              `Sub-goal: ${(goal.objective || goal.id).slice(0, 120).replace(/\s+/g, " ").trim()}` +
+              (goal.objective && goal.objective.length > 120 ? "…" : ""),
+          },
+        );
+      }
+    } catch {
+      // Index write failed (rare — disk full, permissions). The goal
+      // continues running normally; the thread just doesn't get nested.
+    }
+  }
 
   // Persistence delegated to the same helpers `ScopedChatSessionStore` uses
   // (v0.2 §10): atomic writes, scope index, and Markdown transcript are all
