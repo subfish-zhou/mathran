@@ -103,11 +103,22 @@ every `active` goal is automatically resumed at boot, and dangling tool
 calls left behind by an interrupted iteration are repaired before the
 conversation is re-submitted to the model.
 
+Long sessions also stay within the model's context window automatically.
+Each `send()` runs **two-phase auto-compaction**: a pre-turn check at
+75 % of the model's real context cap (resolved from Copilot's `/models`
+endpoint, not a hardcoded guess), and a mid-turn check at 80 % using
+provider-reported token usage. When triggered, the middle of the
+history is replaced with a 9-section structured summary while the
+system block and most-recent 6 rounds are preserved verbatim. The SPA
+shows a 🧹 chip when a compaction fires, and `/api/goals/:id/status`
+echoes durable `compactionRuns` / `compactionTokensDropped` counters
+that survive tab reloads.
+
 Set `MATHRAN_DISABLE_GOAL_DAEMON=1` in the server environment to fall
 back to the pre-`0.13.0` SPA-driven inline-runner path. This is intended
 as a release safety-net for one-restart rollback; see
 [`docs/goal-mode.md`](docs/goal-mode.md) for the full architecture,
-rollout, and rollback notes.
+rollout, rollback, and compaction notes.
 
 ### Filesystem project layout
 

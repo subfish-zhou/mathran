@@ -285,7 +285,200 @@ If a code-level revert is required, the granularity is:
 
 ---
 
-## 9. Pointers into the code
+## 9. Conversation compaction (TODO-2)
+
+Goal mode runs unattended for hours or days. Without compaction the
+chat history grows monotonically until the model rejects the request
+for being over its context window. Compaction shrinks the middle of
+the history into a structured summary while keeping the system block
+and the most-recent rounds verbatim, so the model can keep working
+without losing the user's intent or the current state of play.
+
+### 9.1 Two-phase auto-compact
+
+`ChatSession.autoCompact` (configured by `runOneIteration` at session
+construction time) drives compaction at two points in every `send()`:
+
+| Phase | When it fires | Default threshold | Injection policy |
+|-------|---------------|-------------------|------------------|
+| `pre_turn` | `send()` entry, before new user message is pushed | 75 % × `contextWindow` | summary at front of history |
+| `mid_turn` | After every LLM round-trip inside the turn | 80 % × `contextWindow` of cumulative provider-reported `promptTokens` | summary inside tail, just above last *real* user message |
+
+The mid-turn precheck is gated by `autoCompact.enableMidTurnPrecheck`
+(default off; goal-mode turns it on). The 5 pp gap (75 % vs 80 %)
+prevents pre-turn and mid-turn compaction from double-firing on the
+same boundary.
+
+### 9.2 Strategy dispatcher
+
+`compactV2(req)` routes through the multi-strategy registry in
+`src/core/subagent/runners/compact-strategies.ts`. Today there's one
+built-in: `LocalCompactionStrategy`. Future plugins (remote
+summarizer, hierarchical summary, etc.) can register without
+modifying core.
+
+Strategy contract:
+
+- Never mutate `req.messages` — return a fresh `newMessages` only on
+  success.
+- Observe `req.signal` at every retry boundary AND forward it to the
+  LLM call (best-effort — providers that don't support a signal
+  ignore it).
+- Use the INDEPENDENT retry budget (`req.retryBudget`, default 2
+  extra attempts after the initial = 3 total) — NOT shared with the
+  main turn retry budget, so a 429-storm on the summarizer can't eat
+  the goal's main retry headroom. Backoffs: 500 ms / 1.5 s / 4 s.
+- Always populate a complete `CompactionTelemetry` (status, tokens,
+  durationMs, retryAttempts) — even on failure / cancellation /
+  skip.
+
+Failure / cancellation / skip return `ok: false` with the matching
+status; `ChatSession.compactV2` refuses to swap `this.messages` when
+`ok: false`. Compaction is a best-effort optimization, NOT a
+correctness invariant — if it fails, the next LLM call sees the
+unchanged-but-large prompt and may throw context-overflow itself.
+
+### 9.3 Summary placement (codex parity)
+
+For `pre_turn` / `standalone` phases, the policy is `do_not_inject`:
+the summary item lands at the front of history (right after the
+leading system block).
+
+For `mid_turn`, the policy is `before_last_user_message`. This
+mirrors codex's `insert_initial_context_before_last_real_user_or_summary`
+algorithm (`codex-rs/core/src/compact.rs`): the summary is spliced
+INSIDE the retained tail, just above the *last real* user message.
+"Real" means not a compaction summary item AND not a daemon
+synthetic continuation (mathran extension via the `isRealUser`
+predicate — codex doesn't have daemon synthetics).
+
+Fallback chain for placement (codex semantics):
+
+1. Most recent real user message in tail.
+2. Most recent user-role message of any kind (covers daemon
+   synthetic + previous compaction summaries when no real user
+   remains in the tail).
+3. Append at end of tail (no user-role item present at all — very
+   rare).
+
+The "summary just before last real user" placement matches what
+models trained on codex-style mid-turn compaction expect: a
+compaction summary at the end of history would put the model
+out-of-distribution.
+
+### 9.4 9-section structured summary prompt
+
+The summarizer LLM is prompted with a 9-section structured template
+(`src/core/subagent/runners/compact-prompt.ts`):
+
+1. Primary Request and Intent
+2. Key Technical Concepts
+3. Files and Code Sections
+4. Errors and Fixes
+5. Problem Solving
+6. **All User Messages (verbatim — DO NOT paraphrase)**
+7. Pending Tasks
+8. Current Work
+9. Optional Next Step
+
+The verbatim user-messages section is the rigid requirement: user
+intent must survive compaction byte-for-byte so any post-compaction
+turn can replay the user's exact phrasing. (This template is shared
+with the Claude Code `structured-compaction` skill — outperforms
+codex's 4-bullet prompt on identifier preservation.)
+
+### 9.5 Real Copilot model context windows
+
+`contextWindowForModel(model)` resolves to:
+
+1. Live cache from Copilot's `/models` endpoint, refreshed every
+   30 min alongside each session token cycle.
+2. Hardcoded snapshot fallback (`copilot-models-cache.ts`).
+3. 200 000 default for unknown models.
+
+This replaces an older `if startsWith("gpt-4o") return 128_000`
+chain that was wrong in both directions for many models:
+
+| Model | Hard-coded was | Real cap | Was off by |
+|---|---|---|---|
+| `gpt-4o` | 128 000 | **64 000** | 2× **OVER** (would overflow) |
+| `gpt-4o-mini` | 128 000 | **12 288** | 10× **OVER** (would overflow fast) |
+| `gpt-5.5` | 128 000 | 922 000 | 7× under (wasted capacity) |
+| `gpt-5.4` | 128 000 | 922 000 | 7× under |
+| `claude-opus-4.7/4.8` | (none) | 936 000 | fell through to 200 K |
+| `claude-sonnet-4.6` | (none) | 936 000 | fell through to 200 K |
+
+### 9.6 Observability
+
+Every compactV2 attempt that isn't a silent noop
+(`status: "ok"` with `droppedRoundCount: 0`) lands in five places:
+
+- **SSE event** `compaction` to any subscribed SPA tab, carrying
+  full telemetry.
+- **`AgentStatusPanel` per-turn chip** in the SPA — `🧹 N compacts`
+  with a tooltip carrying reason + tokens saved.
+- **`GoalRunStatusPanel` persistent counter** — `🧹 N` next to
+  `🔧 toolCount`. Driven by the `GET /api/goals/:id/status`
+  poll, so it survives tab reloads.
+- **Daemon iteration log** — one line per compaction at
+  `~/.mathran/logs/daemon.log` (machine-readable, post-hoc analysis
+  works without an SSE subscriber).
+- **Goal audit log** — a `kind: "compaction"` step appended to the
+  goal record's `steps[]` array on every attempt (success OR
+  failure / cancel / skip).
+
+`Goal.stats` also gains four durable fields:
+
+- `compactionRuns` — total successful swaps.
+- `compactionTokensDropped` — Σ (originalTokens − newTokens).
+- `lastCompactionReason` — the most recent successful compaction's
+  CompactionReason.
+- `lastCompactionAt` — ISO timestamp.
+
+`readGoal()` defaults these to `0` / `null` for goal records
+created before TODO-2.
+
+### 9.7 Hooks (plugin extension point)
+
+`compactV2(req)` accepts optional `hooks: { pre, post }` callbacks.
+The pre-hook can return `{ kind: "stopped", reason }` to veto the
+attempt (yields `status: "skipped"`, `messages` unchanged); the
+post-hook receives the telemetry of a successful compaction. No
+built-in hooks ship today — reserved for future plugins.
+
+### 9.8 Disabling compaction
+
+If you need to disable auto-compaction temporarily (debugging,
+benchmarking the no-compaction baseline), pass
+`autoCompact: { enabled: false }` to `new ChatSession({ ... })`.
+There's no environment-level kill-switch — compaction is an
+opt-in feature that goal-mode happens to enable for every session.
+
+For "compact this conversation now" on demand (CLI/API), call
+`ChatSession.compactV2({ reason: "user_requested", phase:
+"standalone", trigger: "manual" })`. The result swaps in
+immediately if `ok: true`.
+
+### 9.9 Pointers into the code (TODO-2)
+
+| Concern | File |
+|---|---|
+| Type contracts (Reason / Phase / Trigger / Policy / Status / Request / Outcome / Telemetry / Hooks) | `src/core/subagent/runners/compact-types.ts` |
+| `isRealUser` predicate + `rebuildHistory` placement algorithm | `src/core/subagent/runners/compact-injection.ts` |
+| Strategy dispatcher (`pickStrategy` / `registerCompactionStrategy` / `ensureBuiltInsRegistered`) | `src/core/subagent/runners/compact-strategies.ts` |
+| 9-section summarization prompt builder | `src/core/subagent/runners/compact-prompt.ts` |
+| `LocalCompactionStrategy` class (V2 path) | `src/core/subagent/runners/compact.ts` (bottom half) |
+| `ChatSession.compactV2 + maybeAutoCompactMidTurn + onCompactionEvent` | `src/core/chat/session.ts` |
+| Goal-mode `autoCompact` opt-in + listener wiring | `src/core/goal/runner.ts` |
+| Copilot model cap resolver | `src/providers/llm/copilot-models-cache.ts` |
+| Daemon log + SSE pass-through | `src/core/goal/daemon.ts`, `src/server/serve.ts` |
+| SPA per-turn badge | `web/src/components/AgentStatusPanel.tsx`, `web/src/components/ChatPanel.tsx` |
+| SPA persistent counter | `web/src/components/GoalRunStatusPanel.tsx` |
+| Original design doc (~1 380 lines) | `_tasks/todo2-compaction-design.md` |
+
+---
+
+## 10. Pointers into the code
 
 | Concern                                | File                                     |
 |----------------------------------------|------------------------------------------|

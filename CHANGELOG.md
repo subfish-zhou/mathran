@@ -49,6 +49,65 @@ rollout/rollback notes. Design lives at `_tasks/todo1-design.md`.
 - **feat-flag: `MATHRAN_DISABLE_GOAL_DAEMON=1`.** Setting this
   environment variable on the server falls back to the v0.17
   inline-runner path. Intended as a one-restart rollback safety-net.
+- **feat(compaction): V2 strategy-based auto-compaction (TODO-2 C1–C9).**
+  Goal-mode now opts in to a fully wired auto-compaction pipeline that
+  works in two phases of every `send()`:
+  - **Pre-turn** (default 75% of model context window): inspects the
+    full history's token count before pushing a new user message and
+    compacts when over threshold.
+  - **Mid-turn** (default 80%, opt-in via
+    `autoCompact.enableMidTurnPrecheck`): tallies provider-reported
+    `promptTokens` across each LLM round-trip inside the turn and
+    fires an extra compact when the cumulative tally crosses the
+    mid-turn threshold. Goal-mode always enables this.
+
+  Under the hood:
+  - `LocalCompactionStrategy` implements a strict contract:
+    AbortSignal observed at every retry boundary, independent retry
+    budget (default 2 attempts + 3 backoffs at 500ms/1.5s/4s) so a
+    summarizer 429-storm cannot eat the goal's main retry headroom,
+    and never mutates `messages` on failure.
+  - 9-section structured summarization prompt (Primary Request /
+    Technical Concepts / Files / Errors / Problem Solving / All User
+    Messages verbatim / Pending Tasks / Current Work / Next Step) —
+    higher signal density than a 4-bullet prompt; cf.
+    `~/.openclaw/workspace/skills/structured-compaction/SKILL.md`.
+  - Codex-aligned summary placement: pre-turn / standalone phases
+    inject the summary item right after the leading system block;
+    mid-turn phase injects it INSIDE the retained tail, just above
+    the last *real* user message (skipping daemon synthetic and
+    prior summary items via the `isRealUser` predicate). Translates
+    `insert_initial_context_before_last_real_user_or_summary` from
+    `codex-rs/core/src/compact.rs` and extends it for mathran's
+    `[daemon: continue]` continuation marker.
+  - Pluggable strategy dispatcher (`registerCompactionStrategy`)
+    leaves the door open for future remote / hierarchical strategies
+    without touching core.
+- **feat(compaction): real Copilot context windows.** Replaces the
+  hardcoded 128K guess for every `gpt-*` model with the actual caps
+  from Copilot's `/models` endpoint, refreshed alongside each session
+  token (every 30 min). Hardcoded snapshot fallback at
+  `src/providers/llm/copilot-models-cache.ts`. Key corrections:
+  `gpt-4o` → 64K (was 128K, would overflow), `gpt-4o-mini` → 12,288
+  (was 128K, 10× overestimate), `gpt-5.5/5.4` → 922K (was 128K, 7×
+  underestimate), `claude-opus-4.7/4.8` → 936K (no mapping before).
+- **feat(compaction): observability.** Every compactV2 attempt emits
+  a `compaction` SSE event with full telemetry (outcome, reason,
+  phase, trigger, policy, tokens, durationMs, summary tokens).
+  - The SPA's `AgentStatusPanel` shows a per-turn 🧹 chip with a
+    tooltip carrying reason + tokens saved.
+  - `GoalRunStatusPanel` shows a persistent 🧹 N counter, surviving
+    tab reloads via the `/api/goals/:id/status` poll (which now
+    echoes `compactionRuns`, `compactionTokensDropped`,
+    `lastCompactionReason`, `lastCompactionAt`).
+  - Daemon log gets a durable line per compaction so post-hoc
+    analysis works without an SSE subscriber.
+  - Goal record's audit log gains a `kind: \"compaction\"` step
+    entry on every attempt (success OR failure).
+- **chore(goal/stats): `Goal.stats` gains four new fields**
+  (`compactionRuns`, `compactionTokensDropped`, `lastCompactionReason`,
+  `lastCompactionAt`). `readGoal()` defaults them for pre-TODO-2
+  goal records via `migrateGoalStats`.
 
 ### Changed
 
@@ -62,6 +121,10 @@ rollout/rollback notes. Design lives at `_tasks/todo1-design.md`.
   `[daemon: continue]` marker (recognisable by C7's migration
   script). Existing inline-runner callers retain the old fallback
   for byte-identical behaviour under `MATHRAN_DISABLE_GOAL_DAEMON=1`.
+- **`resolveContextWindow()` (used by `/api/global-chat/:id/usage`
+  and goal mode) now delegates to `copilot-models-cache`.** Removed
+  the bare-startsWith if-chain. Tests updated: `gpt-4o` reports
+  64,000 not 128,000.
 
 ### Breaking
 
