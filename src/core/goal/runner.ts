@@ -33,6 +33,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { ChatSession, type ToolExecuteContext, type ToolSpec } from "../chat/session.js";
+import { contextWindowForModel } from "../../providers/llm/copilot-models-cache.js";
 import { ASK_USER_GOAL_AUTO_REPLY } from "../chat/tools/ask-user.js";
 import { createTodoWriteTool } from "../chat/tools/todo-write.js";
 import type { LLMMessage, LLMProvider } from "../providers/llm.js";
@@ -998,6 +999,22 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
       },
     },
     ...(opts.scheduler ? { subagentScheduler: opts.scheduler, scheduler: opts.scheduler } : {}),
+    // TODO-2 §3.2 / C7 — opt goal-mode INTO the V2 auto-compaction
+    // pipeline. Long-running goals (24h+, dozens of rounds, 1MB+
+    // conversations) need both pre-turn and mid-turn precheck or they
+    // silently outgrow the model context window.
+    //
+    // contextWindow comes from copilot's /models endpoint (real cap,
+    // cached for 30 min), with a hardcoded fallback snapshot. See
+    // src/providers/llm/copilot-models-cache.ts for the table.
+    autoCompact: {
+      enabled: true,
+      thresholdPct: 0.75,
+      midTurnThresholdPct: 0.80,        // 5pp above pre-turn → no double-fire
+      keepRecentRounds: 6,              // yachiyo 6/17 patch — tool-heavy workflows need 6
+      contextWindow: contextWindowForModel(goal.model),
+      enableMidTurnPrecheck: true,
+    },
   });
   if (history.length > 0) session.replaceHistory(history);
 

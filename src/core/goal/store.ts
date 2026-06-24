@@ -92,6 +92,31 @@ export interface Goal {
      * consumers. Always serialized equal to `iterationsRun`.
      */
     roundsRun: number;
+    /**
+     * TODO-2 §3.2 / C7 — total number of successful compactV2 swaps in
+     * this goal's lifetime. Incremented from runner.ts each time a
+     * compaction `iteration-end` event is received from the chat
+     * session. Defaults to 0 for goals created before TODO-2.
+     */
+    compactionRuns: number;
+    /**
+     * TODO-2 §3.2 / C7 — cumulative `originalTokens - newTokens` across
+     * all successful compactions. Approximates how many tokens were
+     * "saved" by compaction (best-effort, depends on the model-specific
+     * token counter). Defaults to 0 for goals created before TODO-2.
+     */
+    compactionTokensDropped: number;
+    /**
+     * TODO-2 §3.2 / C7 — reason on the most-recent successful compaction
+     * (budget_exceeded / token_limit / user_requested / ...). null when
+     * no compaction has run yet.
+     */
+    lastCompactionReason: string | null;
+    /**
+     * TODO-2 §3.2 / C7 — ISO timestamp of the most-recent successful
+     * compaction. null when no compaction has run yet.
+     */
+    lastCompactionAt: string | null;
   };
   /** Chat conversation ids this goal spawned. The first one is the primary. */
   conversationIds: string[];
@@ -225,6 +250,11 @@ export function migrateGoalStats(raw: unknown): Goal["stats"] {
     llmCallsTotal: s.llmCallsTotal ?? 0,
     toolCallCount: s.toolCallCount ?? 0,
     roundsRun: iterationsRun,
+    // TODO-2 §3.2 / C7 — compaction stats (default for pre-TODO-2 goals).
+    compactionRuns: s.compactionRuns ?? 0,
+    compactionTokensDropped: s.compactionTokensDropped ?? 0,
+    lastCompactionReason: s.lastCompactionReason ?? null,
+    lastCompactionAt: s.lastCompactionAt ?? null,
   };
 }
 
@@ -301,7 +331,18 @@ export async function createGoal(
     },
     model: input.model,
     createdAt: now,
-    stats: { tokensUsed: 0, iterationsRun: 0, assistantTurnsTotal: 0, llmCallsTotal: 0, toolCallCount: 0, roundsRun: 0 },
+    stats: {
+      tokensUsed: 0,
+      iterationsRun: 0,
+      assistantTurnsTotal: 0,
+      llmCallsTotal: 0,
+      toolCallCount: 0,
+      roundsRun: 0,
+      compactionRuns: 0,
+      compactionTokensDropped: 0,
+      lastCompactionReason: null,
+      lastCompactionAt: null,
+    },
     conversationIds: [],
     parentGoalId: input.parentGoalId ?? null,
     subGoalIds: [],
@@ -354,6 +395,13 @@ export async function updateGoalStats(
     llmCallsTotal: g.stats.llmCallsTotal + (delta.llmCallsTotal ?? 0),
     toolCallCount: g.stats.toolCallCount + (delta.toolCallCount ?? 0),
     roundsRun: iterationsRun,
+    // TODO-2 §3.2 / C7 — compaction stats: deltas can carry new values,
+    // otherwise carry forward. lastCompactionReason / lastCompactionAt
+    // are SET (not added) by callers — pass-through delta values.
+    compactionRuns: g.stats.compactionRuns + (delta.compactionRuns ?? 0),
+    compactionTokensDropped: g.stats.compactionTokensDropped + (delta.compactionTokensDropped ?? 0),
+    lastCompactionReason: delta.lastCompactionReason ?? g.stats.lastCompactionReason,
+    lastCompactionAt: delta.lastCompactionAt ?? g.stats.lastCompactionAt,
   };
   await writeGoal(workspace, g);
 }

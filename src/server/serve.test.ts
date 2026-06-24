@@ -2116,15 +2116,19 @@ describe("GET /api/global-chat/:id/usage (v0.3 §19)", () => {
   });
 
   it("honors the model query hint when picking contextWindow", async () => {
-    // Empty conv with model=gpt-4o → contextWindow=128_000.
+    // TODO-2 §5.6 / C7 — resolveContextWindow now delegates to the
+    // copilot-models-cache, which returns the REAL cap from copilot's
+    // /models endpoint (with a hardcoded fallback snapshot). gpt-4o's
+    // real cap is 64K, NOT the previously-hardcoded 128K guess.
     const a = await fetch(
       `${base}/api/global-chat/no-such-usage-conv/usage?model=gpt-4o`,
     );
     expect(a.status).toBe(200);
     const aBody = await a.json();
-    expect(aBody.contextWindow).toBe(128_000);
+    expect(aBody.contextWindow).toBe(64_000);
 
-    // model=claude-3-5-sonnet → 200_000.
+    // claude-3-5-sonnet isn't in the snapshot table → falls through to
+    // the 200K default for unknown models (sensible mid-range).
     const b = await fetch(
       `${base}/api/global-chat/no-such-usage-conv/usage?model=claude-3-5-sonnet-20240620`,
     );

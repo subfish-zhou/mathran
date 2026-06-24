@@ -116,6 +116,7 @@ import {
   createFallbackTokenCounter,
   type TokenCounter,
 } from "../core/chat/token-counter.js";
+import { contextWindowForModel } from "../providers/llm/copilot-models-cache.js";
 import type { LLMMessage, MessageContent } from "../core/providers/llm.js";
 import {
   ScopedChatSessionStore,
@@ -1439,18 +1440,13 @@ const PLACEHOLDER_HTML = `<!doctype html>
  */
 // Helper functions for the usage endpoint (Task 19).
 // We reuse the Task 4 token counters and the Task 5 default context window.
-// Per-model context-window table — keep in sync with provider docs.
+// Per-model context-window resolution (TODO-2 §5.6 / C7): delegate to the
+// copilot models cache so we use REAL caps from the /models endpoint
+// (refreshed each session token cycle) instead of guessed values.
+// Hardcoded snapshot fallback for cold start. Unknown models → 200K default.
 function resolveContextWindow(model: string | undefined): number {
   if (!model) return 200_000;
-  const m = model.toLowerCase();
-  // Strip any "<provider>/" prefix (e.g. "copilot/gpt-5.5" → "gpt-5.5").
-  const bare = m.includes("/") ? m.split("/").pop() ?? m : m;
-  if (bare.startsWith("gpt-4o") || bare.includes("4o-")) return 128_000;
-  if (bare.startsWith("gpt-5")) return 128_000;
-  if (bare.startsWith("claude-3-5-sonnet")) return 200_000;
-  if (bare.startsWith("claude-opus-4") || bare.startsWith("claude-sonnet-4")) return 200_000;
-  if (bare.startsWith("o1") || bare.startsWith("o3") || bare.startsWith("o4")) return 200_000;
-  return 200_000;
+  return contextWindowForModel(model);
 }
 
 /** Pick the right token counter for a model name (matches Task 4 conventions). */

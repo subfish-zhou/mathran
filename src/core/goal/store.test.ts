@@ -164,6 +164,12 @@ describe("updateGoalStats", () => {
       llmCallsTotal: 0,
       toolCallCount: 1,
       roundsRun: 2,
+      // TODO-2 §3.2 / C7 — compaction stats default to 0/null for goals
+      // created without any compaction having run yet.
+      compactionRuns: 0,
+      compactionTokensDropped: 0,
+      lastCompactionReason: null,
+      lastCompactionAt: null,
     });
   });
 });
