@@ -366,6 +366,49 @@ goalCmd
     process.exit(await runGoalStop(goalId, { workspace: opts.workspace }));
   });
 
+// ─── F6: goal template ──────────────────────────────────────────────────
+const goalTemplateCmd = goalCmd
+  .command("template")
+  .description("Reusable goal-objective templates with {var} placeholders");
+
+goalTemplateCmd
+  .command("list")
+  .description("List goal templates in <workspace>/.mathran/goal-templates/")
+  .option("--workspace <dir>", "Workspace root", process.cwd())
+  .action(async (opts: { workspace: string }) => {
+    const { runGoalTemplateList } = await import("./commands/goal-template.js");
+    process.exit(await runGoalTemplateList({ workspace: opts.workspace }));
+  });
+
+goalTemplateCmd
+  .command("show")
+  .description("Print a template's frontmatter + body")
+  .argument("<name>", "Template name (filename without .md)")
+  .option("--workspace <dir>", "Workspace root", process.cwd())
+  .action(async (name: string, opts: { workspace: string }) => {
+    const { runGoalTemplateShow } = await import("./commands/goal-template.js");
+    process.exit(await runGoalTemplateShow({ workspace: opts.workspace, name }));
+  });
+
+goalTemplateCmd
+  .command("use")
+  .description("Expand a template against --var name=value args, print the result")
+  .argument("<name>", "Template name (filename without .md)")
+  .option("--workspace <dir>", "Workspace root", process.cwd())
+  .option("--var <kv...>", "Repeated: --var name=value", [])
+  .action(async (name: string, opts: { workspace: string; var: string[] }) => {
+    const { runGoalTemplateUse, parseVarFlags } = await import("./commands/goal-template.js");
+    let vars: Record<string, string> = {};
+    try {
+      vars = parseVarFlags(opts.var ?? []);
+    } catch (e: any) {
+      // eslint-disable-next-line no-console
+      console.error(String(e?.message ?? e));
+      process.exit(2);
+    }
+    process.exit(await runGoalTemplateUse({ workspace: opts.workspace, name, vars }));
+  });
+
 const planCmd = program
   .command("plan")
   .description("Read-only planning ChatSession (v0.3 §13). Drafts an effort outline before any write happens.");
