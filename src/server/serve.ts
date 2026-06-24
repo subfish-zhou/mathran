@@ -4257,6 +4257,106 @@ function buildApp(
     return c.json({ goal: fresh });
   });
 
+  /**
+   * POST /api/goals/:id/resurrect — explicit revive of a terminally
+   * ended goal (`failed` / `cancelled`). The normal `/resume` endpoint
+   * refuses these statuses on purpose (terminal = pipeline thinks it's
+   * over). Resurrect exists as the documented escape hatch when the
+   * "terminal" was caused by infra (copilot token outage, fetch failure,
+   * server restart) rather than the goal actually being done.
+   *
+   * Body: `{ reason: string }` — required, free-form, written into a
+   * status step so the goal's history shows why it was revived. Refusing
+   * the call without a reason avoids accidental one-click revives that
+   * lose context about what went wrong the first time.
+   *
+   * Effects:
+   *   1. status → "active"
+   *   2. endedAt / endReason cleared (so the goal looks like it never
+   *      terminated for budget / UI purposes)
+   *   3. Pending abortRequested flag cleared (mirrors /resume).
+   *   4. A status step appended:
+   *        { from: prevStatus, to: "active", reason, via: "resurrect" }
+   *
+   * Non-terminal statuses (active / paused / complete / exhausted) are
+   * rejected with 400 — use /resume or start a fresh goal instead.
+   * `complete` and `exhausted` are intentionally NOT resurrectable: they
+   * represent a healthy end-of-life, not an outage.
+   *
+   * After this call the SPA can immediately `POST /run/stream` to
+   * continue work. No automatic re-run happens here — resurrect is
+   * metadata-only so the caller stays in control of when the next round
+   * fires.
+   */
+  app.post("/api/goals/:goalId/resurrect", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    let body: unknown = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid JSON body" }, 400);
+    }
+    const reason =
+      body !== null &&
+      typeof body === "object" &&
+      typeof (body as Record<string, unknown>).reason === "string"
+        ? ((body as Record<string, unknown>).reason as string).trim()
+        : "";
+    if (reason.length === 0) {
+      return c.json(
+        {
+          error:
+            "'reason' is required: explain why this terminally-ended goal should be " +
+            "revived (e.g. 'copilot token refreshed, retrying'). Avoids accidental " +
+            "one-click revives that lose context about what went wrong.",
+        },
+        400,
+      );
+    }
+    const g = await readGoal(workspace, goalId);
+    if (!g) return c.json({ error: "not found" }, 404);
+    if (g.status !== "failed" && g.status !== "cancelled") {
+      return c.json(
+        {
+          error:
+            `goal status is '${g.status}'; resurrect only revives 'failed' or 'cancelled'. ` +
+            `Use POST /api/goals/${goalId}/resume for paused goals, or start a fresh goal.`,
+        },
+        400,
+      );
+    }
+    const prevStatus = g.status;
+    const prevEndReason = g.endReason ?? null;
+    // Clear any abortRequested flag too — same defensive cleanup /resume does.
+    await clearGoalAbortRequest(workspace, goalId);
+    // Re-read after clearGoalAbortRequest in case it mutated other fields.
+    const fresh = await readGoal(workspace, goalId);
+    if (!fresh) return c.json({ error: "not found after clear" }, 500);
+    fresh.status = "active";
+    fresh.endedAt = undefined;
+    fresh.endReason = undefined;
+    fresh.steps.push({
+      at: new Date().toISOString(),
+      kind: "status",
+      payload: {
+        from: prevStatus,
+        to: "active",
+        reason,
+        via: "resurrect",
+        previousEndReason: prevEndReason,
+      },
+    });
+    await writeGoal(workspace, fresh);
+    const after = await readGoal(workspace, goalId);
+    return c.json({
+      resurrected: true,
+      previousStatus: prevStatus,
+      previousEndReason: prevEndReason,
+      goal: after,
+    });
+  });
+
   // Per-plan AbortControllers + a small in-memory queue so an SPA that POSTs
   // /api/plans and immediately opens /stream picks up every event — the
   // runner is started synchronously here and may have already emitted some
