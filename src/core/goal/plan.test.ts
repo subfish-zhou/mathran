@@ -142,7 +142,7 @@ describe("formatPlanFragment", () => {
     const body = "- [ ] alpha\n- [x] beta";
     const frag = formatPlanFragment(body);
     expect(frag).toContain("# Active plan");
-    expect(frag).toContain("update_plan_item");
+    expect(frag).toContain("Update the plan only when the plan itself changes");
     expect(frag).toContain("- [ ] alpha");
     expect(frag).toContain("- [x] beta");
   });

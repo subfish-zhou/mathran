@@ -86,6 +86,64 @@ describe("update_plan_item: happy paths", () => {
   });
 });
 
+describe("update_plan_item: defect#4 dedup of repeated calls", () => {
+  it("collapses a repeated (index,status) call: only first + third change the file", async () => {
+    const planFile = path.join(workspace, ".mathran", "goals", `${goalId}.plan.md`);
+    const tool = await withSeededPlan(["- [ ] a", "- [ ] b"].join("\n"));
+
+    // 1) update_plan_item(1, "done") — real state change.
+    const r1 = await tool.execute({ index: 1, status: "done" }, undefined as any);
+    expect(r1.ok).toBe(true);
+    expect(r1.content).toContain("marked item 1 as done");
+    const afterFirst = await fs.readFile(planFile, "utf-8");
+    expect(afterFirst).toContain("- [x] a");
+
+    // 2) update_plan_item(1, "done") again — dedup no-op, file untouched.
+    const mtimeBefore = (await fs.stat(planFile)).mtimeMs;
+    await new Promise((r) => setTimeout(r, 5));
+    const r2 = await tool.execute({ index: 1, status: "done" }, undefined as any);
+    expect(r2.ok).toBe(true);
+    expect(r2.content).toMatch(/recent duplicate|no change/);
+    const mtimeAfter = (await fs.stat(planFile)).mtimeMs;
+    expect(mtimeAfter).toBe(mtimeBefore);
+    const afterSecond = await fs.readFile(planFile, "utf-8");
+    expect(afterSecond).toBe(afterFirst);
+
+    // 3) update_plan_item(2, "done") — different key, real state change.
+    const r3 = await tool.execute({ index: 2, status: "done" }, undefined as any);
+    expect(r3.ok).toBe(true);
+    expect(r3.content).toContain("marked item 2 as done");
+    const afterThird = await fs.readFile(planFile, "utf-8");
+    expect(afterThird).toContain("- [x] b");
+  });
+
+  it("re-accepts the same toggle once the dedup window has elapsed", async () => {
+    let clockMs = 1_000_000;
+    await writeGoalPlan(workspace, goalId, ["- [ ] a"].join("\n"));
+    const tool = buildUpdatePlanItemTool({
+      workspace,
+      goalId,
+      dedupWindowMs: 30_000,
+      now: () => clockMs,
+    });
+
+    const r1 = await tool.execute({ index: 1, status: "done" }, undefined as any);
+    expect(r1.content).toContain("marked item 1 as done");
+
+    // Within the window → deduped (also exercises the already-done branch).
+    clockMs += 10_000;
+    const r2 = await tool.execute({ index: 1, status: "done" }, undefined as any);
+    expect(r2.content).toMatch(/recent duplicate|no change/);
+
+    // Past the window → re-evaluated; item is already done so it's the
+    // honest "no change" message, not the dedup short-circuit.
+    clockMs += 30_001;
+    const r3 = await tool.execute({ index: 1, status: "done" }, undefined as any);
+    expect(r3.ok).toBe(true);
+    expect(r3.content).toContain("no change");
+  });
+});
+
 describe("update_plan_item: argument validation", () => {
   let tool: Awaited<ReturnType<typeof withSeededPlan>>;
 
