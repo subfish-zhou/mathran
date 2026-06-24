@@ -264,14 +264,16 @@ export default function GoalRunStatusPanel({
           {badge}
         </span>
 
-        {/* Round counter — only when the goal has a roundsMax cap. */}
+        {/* Iteration counter — only when the goal has a roundsMax cap.
+            Defect #3: a daemon "iteration" can contain many assistant
+            turns, so we surface turns alongside the iteration count. */}
         {status.roundsMax !== null ? (
-          <span className="font-mono text-slate-700" title="goal rounds spent / cap">
-            Step {status.round}/{status.roundsMax}
+          <span className="font-mono text-slate-700" title="goal iterations spent / cap (assistant turns in parens)">
+            iter {status.round}/{status.roundsMax} (turns: {status.assistantTurnsTotal})
           </span>
         ) : (
-          <span className="font-mono text-slate-700" title="goal rounds spent">
-            Step {status.round}
+          <span className="font-mono text-slate-700" title="goal iterations spent (assistant turns in parens)">
+            iter {status.round} (turns: {status.assistantTurnsTotal})
           </span>
         )}
 
@@ -385,7 +387,7 @@ export default function GoalRunStatusPanel({
           {roundsPct !== null && (
             <div
               className="h-1 flex-1 overflow-hidden rounded bg-slate-100"
-              title={`rounds: ${status.round}/${status.roundsMax}`}
+              title={`iterations: ${status.round}/${status.roundsMax} (turns: ${status.assistantTurnsTotal})`}
             >
               <div
                 className={`h-full ${roundsPct >= 90 ? "bg-red-500" : roundsPct >= 70 ? "bg-amber-500" : "bg-emerald-500"}`}

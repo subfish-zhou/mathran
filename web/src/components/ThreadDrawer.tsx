@@ -196,7 +196,7 @@ export function ThreadDrawer({
             </div>
             {payload && (
               <div className="mt-0.5 flex gap-3 text-[10px] text-slate-500">
-                <span>{payload.goal.stats.roundsRun} rounds</span>
+                <span>{payload.goal.stats.iterationsRun} iter (turns: {payload.goal.stats.assistantTurnsTotal})</span>
                 <span>{payload.goal.stats.tokensUsed.toLocaleString()} tokens</span>
                 <span>id: {payload.goal.id.slice(0, 8)}…</span>
               </div>

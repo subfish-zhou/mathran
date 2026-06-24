@@ -333,6 +333,21 @@ export type ChatEvent =
       result?: SubagentResultLite;
     }
   | {
+      /** Defect #1 — token accounting. Emitted once per LLM round-trip
+       *  inside `send()` (i.e. once per `llm.chat()` call), carrying the
+       *  provider-reported usage so the goal runner can sum REAL token
+       *  consumption (system prompt + full history + tool calls + output)
+       *  instead of re-estimating only the (user, final-assistant) pair.
+       *  `inputTokens` / `outputTokens` are undefined when the provider
+       *  didn't return a `usage` block; the count of these events still
+       *  equals the number of assistant turns / LLM calls this `send()`
+       *  made, so the runner can populate `assistantTurnsTotal` /
+       *  `llmCallsTotal` regardless of token availability. */
+      type: "usage";
+      inputTokens?: number;
+      outputTokens?: number;
+    }
+  | {
       type: "done";
       finishReason: Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
     };
@@ -2071,6 +2086,7 @@ export class ChatSession {
 
       let text = "";
       let finishReason: Extract<LLMStreamChunk, { type: "done" }>["finishReason"] = "stop";
+      let usage: { promptTokens: number; completionTokens: number } | undefined;
       const callOrder: string[] = [];
       const calls = new Map<string, PendingToolCall>();
 
@@ -2092,6 +2108,7 @@ export class ChatSession {
             pending.args += chunk.argsDelta;
           } else if (chunk.type === "done") {
             finishReason = chunk.finishReason;
+            if (chunk.usage) usage = chunk.usage;
           }
         }
       } catch (err) {
@@ -2126,6 +2143,15 @@ export class ChatSession {
         }));
       }
       this.messages.push(assistantMessage);
+
+      // Defect #1 — surface this round's real token usage (and the fact
+      // that an LLM call happened) so the goal runner can sum actual
+      // consumption + count assistant turns. Emitted once per `llm.chat()`
+      // call regardless of whether the provider reported a `usage` block.
+      yield {
+        type: "usage",
+        ...(usage ? { inputTokens: usage.promptTokens, outputTokens: usage.completionTokens } : {}),
+      };
 
       if (toolCalls.length === 0) {
         // on-goal-complete hooks — the model finished the user's request this

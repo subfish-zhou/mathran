@@ -207,14 +207,14 @@ export default function GoalControls({
 // is immediately obvious in the header.
 // ──────────────────────────────────────────────────────────────────────
 function BudgetMeter({ goal }: { goal: GoalRow }) {
-  const { roundsRun, tokensUsed } = goal.stats;
+  const { iterationsRun, assistantTurnsTotal, tokensUsed } = goal.stats;
   const { roundsMax, tokensMax } = goal.budget;
   return (
     <span className="flex items-center gap-2 text-[10px] text-slate-700">
       {roundsMax !== null && roundsMax !== undefined ? (
-        <MiniBar label="rounds" used={roundsRun} max={roundsMax} />
+        <MiniBar label="iter" used={iterationsRun} max={roundsMax} title={`turns: ${assistantTurnsTotal}`} />
       ) : (
-        <span title="No round cap">⟳ {roundsRun}</span>
+        <span title={`No iteration cap · turns: ${assistantTurnsTotal}`}>⟳ {iterationsRun}</span>
       )}
       {tokensMax !== null && tokensMax !== undefined ? (
         <MiniBar label="tok" used={tokensUsed} max={tokensMax} />
@@ -225,13 +225,13 @@ function BudgetMeter({ goal }: { goal: GoalRow }) {
   );
 }
 
-function MiniBar({ label, used, max }: { label: string; used: number; max: number }) {
+function MiniBar({ label, used, max, title }: { label: string; used: number; max: number; title?: string }) {
   const pct = max > 0 ? Math.min(100, (used / max) * 100) : 0;
   const color = pct > 90 ? "bg-red-500" : pct > 75 ? "bg-amber-500" : "bg-emerald-500";
   return (
     <span
       className="inline-flex items-center gap-0.5"
-      title={`${label}: ${used} / ${max}`}
+      title={title ? `${label}: ${used} / ${max} · ${title}` : `${label}: ${used} / ${max}`}
     >
       <span className="relative h-1.5 w-10 overflow-hidden rounded bg-slate-200">
         <span

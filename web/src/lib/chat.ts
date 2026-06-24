@@ -674,7 +674,16 @@ export interface GoalRow {
    *  section in ThreadDrawer. */
   planPath?: string | null;
   budget: { tokensMax: number | null; roundsMax: number | null };
-  stats: { tokensUsed: number; roundsRun: number; toolCallCount: number };
+  stats: {
+    tokensUsed: number;
+    /** Defect #3: renamed from `roundsRun` (kept as deprecated alias). */
+    iterationsRun: number;
+    assistantTurnsTotal: number;
+    llmCallsTotal: number;
+    toolCallCount: number;
+    /** @deprecated alias for `iterationsRun`. */
+    roundsRun: number;
+  };
   createdAt: string;
   updatedAt: string;
   /** goal-defaults-timer (2026-06-23): optional free-form addendum the
@@ -690,7 +699,10 @@ export interface SubGoalStub {
   parentGoalId: string | null;
   endReason: string | null;
   conversationId: string | null;
+  /** @deprecated alias for `iterationsRun`. */
   roundsRun: number;
+  iterationsRun: number;
+  assistantTurnsTotal: number;
   tokensUsed: number;
 }
 
@@ -857,6 +869,9 @@ export interface GoalStatus {
   status: "active" | "paused" | "complete" | "failed" | "cancelled" | "exhausted";
   endReason: string | null;
   round: number;
+  iterationsRun: number;
+  assistantTurnsTotal: number;
+  llmCallsTotal: number;
   roundsMax: number | null;
   tokensUsed: number;
   tokensMax: number | null;
