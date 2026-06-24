@@ -4290,6 +4290,69 @@ function buildApp(
     return c.json({ goalId, count: entries.length, entries });
   });
 
+  // ─── F7: POST /api/goals/:id/ask ─────────────────────────────────────
+  // Natural-language status query against a goal. Body: {question}.
+  // Builds a read-only context bundle (id, status, stats, plan body,
+  // files-changed, last 25 audit steps) and asks the goal's model a
+  // one-shot question. Streams text back to the caller as a plain text
+  // response (Server-Sent Events would be overkill for a one-shot Q&A
+  // — the SPA can show a loading state then render the answer when
+  // the response finishes).
+  //
+  // Does NOT mutate goal state, does NOT push to conversation history,
+  // does NOT spawn a runner. Pure read + one LLM call.
+  app.post("/api/goals/:goalId/ask", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const goal = await readGoal(workspace, goalId);
+    if (!goal) return c.json({ error: "not found" }, 404);
+    let body: { question?: string } = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid json body; expected {question: string}" }, 400);
+    }
+    const question = (body.question ?? "").trim();
+    if (!question) return c.json({ error: "question is required" }, 400);
+    if (question.length > 4000) return c.json({ error: "question too long (>4000 chars)" }, 400);
+
+    // Best-effort plan body load (silently skipped on miss).
+    let planBody = "";
+    try {
+      const loaded = await readGoalPlan(workspace, goalId);
+      if (loaded) planBody = loaded;
+    } catch {
+      // skip
+    }
+
+    const { buildGoalAskContext } = await import("../core/goal/ask.js");
+    const context = buildGoalAskContext(goal, { planBody });
+
+    // Resolve LLM + model the same way other endpoints do — defer to
+    // the router so the goal's model selection is honoured.
+    const config = loadConfig(configPathFor(workspace));
+    const llm = new ModelRouter(config);
+    const messages = [
+      { role: "system" as const, content: context },
+      { role: "user" as const, content: question },
+    ];
+    try {
+      const res = await llm.chat({ model: goal.model, messages });
+      let answer = "";
+      for await (const chunk of res.stream()) {
+        if (chunk.type === "text" && typeof chunk.delta === "string") answer += chunk.delta;
+      }
+      return c.json({
+        goalId,
+        question,
+        answer: answer.trim(),
+        model: goal.model,
+      });
+    } catch (err: any) {
+      return c.json({ error: String(err?.message ?? err) }, 500);
+    }
+  });
+
   /**
    * POST /api/goals/:id/run
    *   body: { message?: string }
