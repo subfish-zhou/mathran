@@ -84,6 +84,7 @@ describe("ChatSession", () => {
     expect(events).toEqual([
       { type: "text", delta: "hello" },
       { type: "text", delta: " world" },
+      { type: "usage" },
       { type: "done", finishReason: "stop" },
     ]);
 
@@ -121,9 +122,11 @@ describe("ChatSession", () => {
     const types = events.map((e) => e.type);
     expect(types).toEqual([
       "text", // "Let me verify."
+      "usage",
       "tool-call",
       "tool-result",
       "text", // "It compiles."
+      "usage",
       "done",
     ]);
 

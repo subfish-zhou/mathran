@@ -36,6 +36,7 @@ import { ChatSession, type ToolExecuteContext, type ToolSpec } from "../chat/ses
 import { ASK_USER_GOAL_AUTO_REPLY } from "../chat/tools/ask-user.js";
 import { createTodoWriteTool } from "../chat/tools/todo-write.js";
 import type { LLMMessage, LLMProvider } from "../providers/llm.js";
+import { contentToString } from "../providers/llm.js";
 import type { ChatEvent } from "../chat/index.js";
 import {
   conversationFilePath,
@@ -372,7 +373,8 @@ function formatSummaryHeader(goal: Goal, outcome: "done" | "give_up", reason: st
     `- **endReason**: ${reason}`,
     `- **started**: ${goal.createdAt}`,
     `- **completed**: ${new Date().toISOString()}`,
-    `- **rounds**: ${goal.stats.roundsRun}`,
+    `- **iterations**: ${goal.stats.iterationsRun}`,
+    `- **assistant turns**: ${goal.stats.assistantTurnsTotal}`,
     `- **tokens**: ${goal.stats.tokensUsed}`,
   ];
   if (goal.scope.kind === "effort") {
@@ -1019,7 +1021,7 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
     }
   };
   {
-    const roundNum = goal.stats.roundsRun + 1;
+    const roundNum = goal.stats.iterationsRun + 1;
     const maxRounds = goal.budget.roundsMax;
     emit({
       type: "round-start",
@@ -1030,6 +1032,17 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
 
   let textBuf = "";
   let toolCallCount = 0;
+  // Defect #1 — real token accounting. Sum provider-reported usage across
+  // every LLM round-trip in this iteration (an iteration can make many
+  // `llm.chat()` calls when the assistant chains tool calls). `usageReported`
+  // tracks whether ANY round returned a usage block; when false we fall back
+  // to counting the WHOLE message list below. `llmCallCount` counts every
+  // usage event (one per `llm.chat()` call) and doubles as the assistant-turn
+  // count (1:1 — each round pushes exactly one assistant message).
+  let usageInputTokens = 0;
+  let usageOutputTokens = 0;
+  let usageReported = false;
+  let llmCallCount = 0;
   try {
     for await (const ev of session.send(effectiveUserMessage, {
       signal,
@@ -1038,6 +1051,13 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
       emit(ev);
       if (ev.type === "text") {
         textBuf += ev.delta;
+      } else if (ev.type === "usage") {
+        llmCallCount++;
+        if (typeof ev.inputTokens === "number" || typeof ev.outputTokens === "number") {
+          usageReported = true;
+          usageInputTokens += ev.inputTokens ?? 0;
+          usageOutputTokens += ev.outputTokens ?? 0;
+        }
       } else if (ev.type === "tool-call") {
         toolCallCount++;
         await appendStep(workspace, goalId, {
@@ -1090,17 +1110,22 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
     await appendStep(workspace, goalId, { kind: "text", payload: textBuf });
   }
 
-  // Per-round token count via llm.countTokens when available; cumulative goal
-  // stats sum across rounds (store.updateGoalStats).
+  // Defect #1 — token accounting. Prefer the REAL token usage reported by
+  // the provider for every LLM round-trip this iteration made (covers system
+  // prompt + full history + tool calls + output). Fall back to
+  // `llm.countTokens` over the WHOLE final message list (not just the
+  // user/assistant pair) when the provider reported no usage. Defect #3 —
+  // record iteration + assistant-turn + LLM-call counters.
+  const fullHistory = session.history();
+  const fallbackTokens = llm.countTokens
+    ? llm.countTokens(fullHistory)
+    : Math.ceil(fullHistory.reduce((n, m) => n + contentToString(m.content).length, 0) / 4);
   await updateGoalStats(workspace, goalId, {
-    roundsRun: 1,
+    iterationsRun: 1,
+    assistantTurnsTotal: llmCallCount,
+    llmCallsTotal: llmCallCount,
     toolCallCount,
-    tokensUsed: llm.countTokens
-      ? llm.countTokens([
-          { role: "user", content: effectiveUserMessage },
-          { role: "assistant", content: textBuf },
-        ])
-      : Math.ceil((effectiveUserMessage.length + textBuf.length) / 4),
+    tokensUsed: usageReported ? usageInputTokens + usageOutputTokens : fallbackTokens,
   });
 
   // mark_done / give_up tool calls wrap the goal (recorded on the handler
