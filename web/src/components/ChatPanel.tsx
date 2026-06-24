@@ -386,6 +386,65 @@ export default function ChatPanel({
       /* quota / disabled — not fatal */
     }
   }, [collapsedThreads, collapsedThreadsKey]);
+
+  // ─── v0.19 — sub-goal thread auto-unfurl (TODO-6) ────────────────────
+  //
+  // Symptom (before): P4 wired sub-goal conversations to register as child
+  // threads of their parent goal's conversation, but the SPA defaults all
+  // threads to collapsed (via `collapsedThreads` localStorage). So when
+  // the parent goal spawned a sub-goal and the sub-goal started talking,
+  // the user couldn't see anything — the new thread was hidden under a
+  // ▸ triangle in the sidebar.
+  //
+  // Fix: whenever the `conversations` list refreshes, find every conv
+  // whose `lastUsedAt` was within the last 30 seconds — i.e. is actively
+  // running right now — and force-expand the entire ancestor chain by
+  // removing each ancestor from `collapsedThreads`. The user can still
+  // manually collapse them after the 30s window passes; we only push the
+  // un-collapse one-shot when fresh activity shows up. This is a pure
+  // client-side enhancement — no backend / schema change needed and the
+  // 30s threshold matches the goal runner's natural round cadence.
+  //
+  // Why parent chain (not just direct parent): nested sub-goals can be
+  // 3+ levels deep (P4 supports arbitrary depth), so the visible chain
+  // from root → leaf must all be expanded for the active leaf to render.
+  const AUTO_UNFURL_WINDOW_MS = 30_000;
+  useEffect(() => {
+    if (conversations.length === 0) return;
+    const now = Date.now();
+    // Build parent lookup once per refresh (cheap: O(n)).
+    const parentOf = new Map<string, string | undefined>();
+    for (const c of conversations) parentOf.set(c.id, c.parentConversationId);
+    // Collect ancestor ids of every recently-active conv.
+    const toUnfurl = new Set<string>();
+    for (const c of conversations) {
+      const used = Date.parse(c.lastUsedAt);
+      if (!Number.isFinite(used)) continue;
+      if (now - used > AUTO_UNFURL_WINDOW_MS) continue;
+      // Walk up — include each ancestor; guard against cycles (shouldn't
+      // happen but defensive against malformed parent links).
+      let cur: string | undefined = parentOf.get(c.id);
+      const guard = new Set<string>();
+      while (cur && !guard.has(cur)) {
+        guard.add(cur);
+        toUnfurl.add(cur);
+        cur = parentOf.get(cur);
+      }
+    }
+    if (toUnfurl.size === 0) return;
+    setCollapsedThreads((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const id of toUnfurl) {
+        if (next.has(id)) {
+          next.delete(id);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [conversations]);
+
   // Abort controller for the in-flight chat stream. `send` / `reRun` set it
   // before kicking off pumpSSE; the Stop button calls `.abort()` to interrupt.
   // Cleared in `runChatStream`'s finally block so the next turn starts fresh.
