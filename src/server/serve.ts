@@ -4274,6 +4274,22 @@ function buildApp(
     });
   });
 
+  // ─── F8: GET /api/goals/:id/files-changed ────────────────────────────
+  // Returns a deduplicated list of files this goal has written/edited,
+  // newest-first. Pure read of goal.steps[]; cheap to poll alongside
+  // /status. Empty list (and 200) for a goal that exists but has no
+  // write tool calls yet, so the SPA can render an empty state without
+  // distinguishing 404 from "no writes".
+  app.get("/api/goals/:goalId/files-changed", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const goal = await readGoal(workspace, goalId);
+    if (!goal) return c.json({ error: "not found" }, 404);
+    const { extractFilesChanged } = await import("../core/goal/files-changed.js");
+    const entries = extractFilesChanged(goal);
+    return c.json({ goalId, count: entries.length, entries });
+  });
+
   /**
    * POST /api/goals/:id/run
    *   body: { message?: string }

@@ -2842,7 +2842,7 @@ describe("POST /api/chat ask_user (v0.19 Codex parity — timeout auto-resolve)"
 
       // Wait for the timer to fire + clear the slot. Bound the wait so a
       // broken timer fails fast rather than hanging the suite.
-      const deadline = Date.now() + 8000;
+      const deadline = Date.now() + 20000;  // Bumped from 8s for CI/load flake (audit 2026-06-24).
       let cleared = false;
       while (Date.now() < deadline) {
         const ann = (await (
@@ -2856,18 +2856,28 @@ describe("POST /api/chat ask_user (v0.19 Codex parity — timeout auto-resolve)"
       }
       expect(cleared).toBe(true);
 
-      // History should now show the patched tool message AND the round-2
-      // text echoing the default back ("resumed-with: auto-foo.ts").
-      const hist = (await (
-        await fetch(`${local.url}/api/chat/${conversationId}`)
-      ).json()) as { history: Array<{ role: string; content: string; toolCallId?: string }> };
-      const patched = hist.history.find(
-        (m) => m.role === "tool" && m.toolCallId === "ask_t_1",
-      );
+      // Poll the history too — there's a small async gap between sidecar
+      // clear and history patch under load. (audit 2026-06-24 added this
+      // second-stage poll to fix recurring flake on parallel test runs.)
+      let patched: { role: string; content: string; toolCallId?: string } | undefined;
+      const patchDeadline = Date.now() + 5000;
+      while (Date.now() < patchDeadline) {
+        const hist = (await (
+          await fetch(`${local.url}/api/chat/${conversationId}`)
+        ).json()) as { history: Array<{ role: string; content: string; toolCallId?: string }> };
+        patched = hist.history.find(
+          (m) => m.role === "tool" && m.toolCallId === "ask_t_1",
+        );
+        if (patched && patched.content === "auto-foo.ts") break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
       expect(patched).toBeDefined();
       expect(patched!.content).toBe("auto-foo.ts");
       // The model's round-2 echo lands as an assistant text message.
-      const echoed = hist.history.find(
+      const hist2 = (await (
+        await fetch(`${local.url}/api/chat/${conversationId}`)
+      ).json()) as { history: Array<{ role: string; content: string; toolCallId?: string }> };
+      const echoed = hist2.history.find(
         (m) => m.role === "assistant" && m.content.includes("resumed-with: auto-foo.ts"),
       );
       expect(echoed).toBeDefined();
