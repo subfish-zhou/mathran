@@ -127,8 +127,17 @@ export function buildGoalSystemPrompt(input: {
    * (the `balanced` default) is silently skipped.
    */
   autonomyFragment?: string;
+  /**
+   * NEW-F2 (audit 2026-06-24): pre-rendered "past lessons" block built
+   * by the caller from `retrieveSimilarOutcomes`. Spliced AFTER the
+   * autonomy/plan fragments and BEFORE the effort fragment so the
+   * model reads it as standing context (low-recency to avoid blunting
+   * the loop policy on the first round). Empty string = no relevant
+   * past outcomes, silently skipped.
+   */
+  lessonsFragment?: string;
 }): string {
-  const { goal, systemPromptBase, effortFragment, memoryFragment, planFragment, autonomyFragment } = input;
+  const { goal, systemPromptBase, effortFragment, memoryFragment, planFragment, autonomyFragment, lessonsFragment } = input;
   const scopeLabel =
     goal.scope.kind === "global"
       ? "global"
@@ -160,6 +169,9 @@ export function buildGoalSystemPrompt(input: {
   }
   if (planFragment && planFragment.trim().length > 0) {
     parts.push("", planFragment);
+  }
+  if (lessonsFragment && lessonsFragment.trim().length > 0) {
+    parts.push("", lessonsFragment);
   }
   if (effortFragment && effortFragment.trim().length > 0) {
     parts.push("", effortFragment);
@@ -901,6 +913,19 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
     ? formatPlanFragment(planBootstrapResult.planBody)
     : "";
 
+  // NEW-F2 (audit 2026-06-24): retrieve relevant past lessons and
+  // splice them into the system prompt. Pure read; failure is
+  // silently absorbed (returns "") so a missing outcomes index doesn't
+  // block goal start. Awaited inline rather than promise-chained so
+  // the resulting prompt is deterministic across runs.
+  let lessonsFragment = "";
+  try {
+    const { buildLessonsFragmentForGoal } = await import("./lessons-injection.js");
+    lessonsFragment = await buildLessonsFragmentForGoal({ workspace, goal });
+  } catch {
+    // best-effort
+  }
+
   const systemPrompt = buildGoalSystemPrompt({
     goal,
     systemPromptBase: systemPromptBase ?? buildBaseSystemPrompt(),
@@ -908,6 +933,7 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
     memoryFragment,
     planFragment,
     autonomyFragment,
+    lessonsFragment,
   });
   const handler = createGoalToolHandler();
   // Compose the per-round tool list:
