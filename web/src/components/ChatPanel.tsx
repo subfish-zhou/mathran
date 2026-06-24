@@ -81,6 +81,11 @@ import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel.tsx";
 import type { SubagentCompletedFrame } from "../lib/subagents.ts";
 import SlashSuggester from "./SlashSuggester.tsx";
 import {
+  loadCommandStyle,
+  subscribeCommandStyle,
+  type CommandStyle,
+} from "../lib/composer-prefs.ts";
+import {
   parseSlashInput,
   activeSlashPrefix,
   buildSuggesterItems,
@@ -1473,7 +1478,14 @@ export default function ChatPanel({
   );
   // Open while typing a command name that matches ≥1 command, and not while
   // a stream is in flight (Enter steers when busy — see onKeyDown).
-  const slashOpen = !busy && slashPrefix !== null && slashFiltered.length > 0;
+  // TODO-3 UI #2 — composer command style preference (selector | slash).
+  // Default "selector" preserves the existing Discord/copilot popup UX;
+  // "slash" suppresses the popup so power users can type full /cmd args
+  // openclaw-style without distraction. Persisted in localStorage; live
+  // updates across tabs via subscribeCommandStyle.
+  const [commandStyle, setCommandStyle] = useState<CommandStyle>(loadCommandStyle);
+  useEffect(() => subscribeCommandStyle(setCommandStyle), []);
+  const slashOpen = !busy && commandStyle === "selector" && slashPrefix !== null && slashFiltered.length > 0;
 
   // Clamp the highlight whenever the filtered list shrinks/changes.
   useEffect(() => {
