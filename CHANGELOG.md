@@ -4,6 +4,75 @@ All notable changes to mathran are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] — unreleased
+
+Goal-mode loop refactor (TODO-1). The SPA-driven `setInterval(120s)`
+driver is replaced by a backend **goal daemon** that owns the iteration
+loop in-process on the `mathran serve` server. See
+[`docs/goal-mode.md`](docs/goal-mode.md) for the full architecture and
+rollout/rollback notes. Design lives at `_tasks/todo1-design.md`.
+
+### Added
+
+- **feat(goal/daemon): backend goal-loop driver (C1–C5).** New
+  `src/core/goal/daemon.ts` (`GoalDaemon` + `GoalTurnRunner`) takes
+  over the goal iteration loop. `runGoalRound()` is split into a
+  reusable `runOneIteration()` plus a thin backwards-compatible
+  wrapper, with first-class `steerText` drain and `naturalTurnEnd`
+  detection. The three goal endpoints
+  (`/api/goals/:id/run/stream`, `/api/goals/:id/steer`,
+  `/api/goals/:id/answer-ask`) now route through
+  `daemon.kickGoal()` / `daemon.enqueueSteer()` while preserving the
+  existing SSE wire contract. Boot-resume re-kicks every `active`
+  goal at server startup and graceful shutdown via
+  `daemon.stop(30_000)` drains in-flight iterations cleanly.
+  Dangling tool-call repair on boot splices a synthetic
+  `{aborted:true,reason:"server restart"}` placeholder so OpenAI
+  no longer returns a `400` for assistant `tool_calls` left without
+  a matching `role:tool` message.
+- **feat(spa): passive SSE observer (C4).** `ChatPanel.tsx` no
+  longer runs a `setInterval(120_000)` driver; the auto-run
+  countdown badge is gone; `web/src/lib/goal-auto-run.ts` is
+  reduced to a noop shim that preserves its export shape for
+  backwards compatibility. The SPA only POSTs `/run/stream` when
+  the user explicitly sends a message, steers, or accepts a
+  `propose_goal` — the daemon does the periodic kicking on its
+  own.
+- **feat(goal/daemon): observability + migration tools (C6/C7).**
+  New `GET /api/goals/daemon/status` endpoint surfaces the per-goal
+  runner state for the SPA debug overlay; Prometheus-style
+  counters are emitted to the daemon log. The one-shot script
+  `scripts/migrate-fake-continue.ts` (`--dry-run` by default,
+  opt-in `--apply`) rewrites historical conversations to strip the
+  pre-`0.13.0` `Continue with the current objective.` fake-user
+  pollution.
+- **feat-flag: `MATHRAN_DISABLE_GOAL_DAEMON=1`.** Setting this
+  environment variable on the server falls back to the v0.17
+  inline-runner path. Intended as a one-restart rollback safety-net.
+
+### Changed
+
+- Goal iteration unit is now a daemon-owned `runOneIteration`
+  rather than a SPA-triggered `runGoalRound`. Round-level
+  persistence and SSE event order is unchanged; only the *driver*
+  moves from the SPA to the server.
+- Daemon-driven self-continuation no longer injects the literal
+  string `Continue with the current objective.` as a fake user
+  message. The new sentinel is the structurally distinct
+  `[daemon: continue]` marker (recognisable by C7's migration
+  script). Existing inline-runner callers retain the old fallback
+  for byte-identical behaviour under `MATHRAN_DISABLE_GOAL_DAEMON=1`.
+
+### Breaking
+
+- **SPA no longer periodically POSTs `/run/stream` on its own.**
+  Frontends, integrations, or tests that relied on the old
+  `setInterval(120_000)` driver to keep a goal advancing must now
+  rely on the backend daemon (default) or fall back to
+  `MATHRAN_DISABLE_GOAL_DAEMON=1` plus explicit user kicks. The
+  HTTP endpoints, SSE event shapes, and goal-on-disk layout are
+  unchanged.
+
 ## [0.1.0-rc.1] — 2026-06-16
 
 First release-candidate cut of v0.1.0. Lands the mathub-style architecture

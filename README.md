@@ -93,6 +93,22 @@ A four-panel SPA at `http://127.0.0.1:7878`:
 All artifacts land in `~/mathran-workspace/projects/<slug>/` (no database).
 The server only ever binds to `127.0.0.1`.
 
+### Goal mode (daemon-driven)
+
+Long-running *goals* run inside a backend **goal daemon** that owns the
+iteration loop in-process on the `mathran serve` server. Closing the SPA
+tab no longer stops a goal — the daemon keeps grinding, and the SPA
+reconnects as a passive SSE observer. Server restarts are also safe:
+every `active` goal is automatically resumed at boot, and dangling tool
+calls left behind by an interrupted iteration are repaired before the
+conversation is re-submitted to the model.
+
+Set `MATHRAN_DISABLE_GOAL_DAEMON=1` in the server environment to fall
+back to the pre-`0.13.0` SPA-driven inline-runner path. This is intended
+as a release safety-net for one-restart rollback; see
+[`docs/goal-mode.md`](docs/goal-mode.md) for the full architecture,
+rollout, and rollback notes.
+
 ### Filesystem project layout
 
 ```
