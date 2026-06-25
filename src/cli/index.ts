@@ -366,6 +366,25 @@ goalCmd
     process.exit(await runGoalStop(goalId, { workspace: opts.workspace }));
   });
 
+goalCmd
+  .command("watch")
+  .description("Live-tail a goal's progress from a running 'mathran serve' (read-only)")
+  .argument("<goalId>", "Goal id (or its 8-char prefix)")
+  .option("--server <url>", "mathran serve base URL", "http://127.0.0.1:7878")
+  .option("--no-color", "Disable ANSI colors (CI mode)")
+  .option("--no-follow", "Print the current status once and exit (no streaming)")
+  .option("--workspace <dir>", "Workspace root (accepted for consistency; resolution is server-side)")
+  .action(async (goalId: string, opts: any) => {
+    const { runGoalWatch } = await import("./commands/goal-watch.js");
+    process.exit(
+      await runGoalWatch(goalId, {
+        server: opts.server,
+        color: opts.color,
+        follow: opts.follow,
+      }),
+    );
+  });
+
 // ─── F6: goal template ──────────────────────────────────────────────────
 const goalTemplateCmd = goalCmd
   .command("template")

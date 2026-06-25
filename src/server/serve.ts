@@ -5060,6 +5060,140 @@ function buildApp(
   });
 
   /**
+   * GET /api/goals/:id/events — read-only live tail (UX gap D).
+   *
+   * Subscribes to the goal daemon's `goal:<id>` eventBus and forwards every
+   * frame onto an SSE stream WITHOUT kicking a run (contrast with
+   * POST /run/stream, which both kicks the loop and streams). This is the
+   * endpoint `mathran goal watch <id>` connects to: a remote operator can
+   * ssh in and `tail` a goal that some other process (SPA / daemon) is
+   * driving, with zero side effects on the run loop.
+   *
+   * Wire contract:
+   *   - leading `snapshot:` frame carries a small status projection so the
+   *     watcher can print a header before any live event arrives.
+   *   - daemon-shape frames are forwarded verbatim under their own `type`
+   *     (iteration-start / iteration-end / text / tool-call / tool-result /
+   *     compaction / budget-continuation / round-start / done / turn-end /
+   *     error / ask_user / todos / steer-received).
+   *   - periodic `ping:` keep-alive frames.
+   *   - a terminal `status:` frame ({status, endReason, terminal:true}) is
+   *     emitted (and the stream closed) the moment the goal record reaches a
+   *     terminal status. Terminal detection is driven by a cheap disk poll so
+   *     it works even when the daemon is disabled or the goal is idle.
+   */
+  app.get("/api/goals/:goalId/events", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const g0 = await readGoal(workspace, goalId);
+    if (!g0) return c.json({ error: "not found" }, 404);
+
+    const TERMINAL = new Set(["complete", "failed", "cancelled", "exhausted"]);
+    const snapshotOf = (g: Goal) => ({
+      id: g.id,
+      objective: g.objective,
+      status: g.status,
+      model: g.model,
+      iterationsRun: g.stats.iterationsRun,
+      assistantTurnsTotal: g.stats.assistantTurnsTotal,
+      toolCount: g.stats.toolCallCount,
+      tokensUsed: g.stats.tokensUsed,
+      tokensMax: g.budget.tokensMax,
+      roundsMax: g.budget.roundsMax,
+      costUsd: computeGoalCostUsd(g),
+      endReason: g.endReason ?? null,
+      createdAt: g.createdAt,
+    });
+
+    return streamSSE(c, async (stream) => {
+      await stream.writeSSE({ event: "snapshot", data: JSON.stringify(snapshotOf(g0)) });
+
+      // Already terminal: emit the closing status frame and we're done.
+      if (TERMINAL.has(g0.status)) {
+        await stream.writeSSE({
+          event: "status",
+          data: JSON.stringify({ status: g0.status, endReason: g0.endReason ?? null, terminal: true }),
+        });
+        return;
+      }
+
+      const queue: { event: string; data: string }[] = [];
+      let done = false;
+      let wake: (() => void) | null = null;
+      const wakePump = () => {
+        const w = wake;
+        wake = null;
+        if (w) w();
+      };
+      const pump = (async () => {
+        while (!done || queue.length > 0) {
+          while (queue.length > 0) {
+            await stream.writeSSE(queue.shift()!);
+          }
+          if (done) return;
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+        }
+      })();
+
+      // Forward every daemon frame verbatim. Read-only: we never call
+      // kickGoal, so this subscription is a pure side-channel.
+      const listener = (ev: unknown) => {
+        if (!ev || typeof ev !== "object") return;
+        const type = String((ev as { type?: unknown }).type ?? "");
+        if (!type) return;
+        queue.push({ event: type, data: JSON.stringify(ev) });
+        wakePump();
+      };
+      if (goalDaemon) goalDaemon.eventBus.on(`goal:${goalId}`, listener);
+
+      // Terminal authority + keep-alive: poll the goal record on disk. This
+      // closes the stream on terminal even when the daemon is disabled or the
+      // goal is idle (no live frames). A `ping` every ~16s keeps proxies open.
+      let tick = 0;
+      const poll = setInterval(() => {
+        void (async () => {
+          tick++;
+          const fresh = await readGoal(workspace, goalId);
+          if (!fresh || TERMINAL.has(fresh.status)) {
+            queue.push({
+              event: "status",
+              data: JSON.stringify({
+                status: fresh?.status ?? "missing",
+                endReason: fresh?.endReason ?? null,
+                terminal: true,
+              }),
+            });
+            done = true;
+            wakePump();
+            return;
+          }
+          if (tick % 8 === 0) {
+            queue.push({ event: "ping", data: JSON.stringify({ at: Date.now() }) });
+            wakePump();
+          }
+        })();
+      }, 2000);
+
+      // Client disconnect (CLI Ctrl-C / stream close) → unwind the pump.
+      stream.onAbort(() => {
+        done = true;
+        wakePump();
+      });
+
+      try {
+        await pump;
+      } finally {
+        clearInterval(poll);
+        if (goalDaemon) goalDaemon.eventBus.off(`goal:${goalId}`, listener);
+        done = true;
+        wakePump();
+      }
+    });
+  });
+
+  /**
    * POST /api/goals/:id/abort — request a cooperative abort of the
    * goal loop. Sets `meta.abortRequested = true` (which the runner
    * checks at round-top) AND aborts any in-flight AbortController
