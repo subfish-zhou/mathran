@@ -73,6 +73,12 @@ import {
 import { buildGoalTools, createGoalToolHandler } from "./tools.js";
 import { checkGoalBudget } from "./budget-continuation.js";
 import {
+  reviewMarkDone,
+  MARK_DONE_REJECT_CAP,
+  DEFAULT_REVIEWER_MODEL,
+  type MarkDoneReviewMode,
+} from "./mark-done-review.js";
+import {
   resolutionFromCompletion,
   triggerSelfGrade,
 } from "../outcomes/self-grade.js";
@@ -333,6 +339,30 @@ export interface RunRoundOptions {
    * opt in explicitly.
    */
   selfGrade?: boolean;
+  /**
+   * Layer 2 (mark_done review) — content-level gate that runs the moment
+   * the model calls `mark_done`, BEFORE Layer 1's token-budget check. When
+   * the configured mode rejects (e.g. the `.plan.md` still has unchecked
+   * items, or the LLM reviewer says the work is incomplete), the mark_done
+   * is blocked, the rejection feedback is injected into the conversation,
+   * `goal.stats.markDoneReviewRejectionCount` is incremented, and the goal
+   * stays active for the daemon to reschedule.
+   *
+   * Default `mode: "off"` — backward-compatible: the goal flow is then
+   * identical to before Layer 2 (only Layer 1 + endGoal). See
+   * DESIGN-REFERENCE.md §8.
+   */
+  markDoneReview?: {
+    mode?: MarkDoneReviewMode;
+    reviewerModel?: string;
+  };
+  /**
+   * Layer 2 — optional dedicated LLM provider for the Mode B ("llm" /
+   * "both") reviewer pass. Defaults to the main `llm` (the reviewer model
+   * id selects the cheap model via the router). Omit for `"off"` /
+   * `"deterministic"` modes.
+   */
+  reviewerLlm?: LLMProvider;
 }
 
 export interface RunRoundResult {
@@ -787,6 +817,79 @@ async function maybeContinueByBudget(
     tokensUsed: goal.stats.tokensUsed,
     budget: decision.budget,
     nudgeMessage: decision.nudgeMessage,
+  };
+}
+
+/**
+ * Layer 2 — mark_done content review. Called the moment the model calls
+ * `mark_done`, BEFORE Layer 1's token-budget check (content gate first,
+ * token-volume gate second — DESIGN-REFERENCE.md §8.5).
+ *
+ * Delegates the actual verdict to {@link reviewMarkDone} (deterministic
+ * plan-checkbox scan and/or a cheap LLM reviewer). On rejection it:
+ *   - increments + persists `goal.stats.markDoneReviewRejectionCount`,
+ *   - appends a `mark-done-review-rejected` audit step,
+ * and returns `{ blocked: true, ... }` so the caller injects the feedback
+ * into conversation history and returns WITHOUT ending the goal.
+ *
+ * Force-accept cap: {@link reviewMarkDone} short-circuits to accept once
+ * the goal has already been rejected {@link MARK_DONE_REJECT_CAP} times, so
+ * the model can never be trapped in an unbreakable nudge loop. We emit a
+ * warn log here when that cap is in effect.
+ *
+ * Returns `{ blocked: false }` for `mode === "off"` (the default) so the
+ * normal Layer 1 + endGoal path runs unchanged.
+ */
+async function maybeBlockByReview(
+  workspace: string,
+  goal: Goal,
+  conversation: import("../providers/llm.js").LLMMessage[],
+  opts: {
+    mode: MarkDoneReviewMode;
+    reviewerModel?: string;
+    llm?: LLMProvider;
+  },
+): Promise<{ blocked: boolean; blockingError?: string; hint?: string[] }> {
+  if (opts.mode === "off") return { blocked: false };
+
+  const atCap =
+    (goal.stats.markDoneReviewRejectionCount ?? 0) >= MARK_DONE_REJECT_CAP;
+  if (atCap) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[mathran] goal ${goal.id}: mark_done review force-accepted after ` +
+        `${goal.stats.markDoneReviewRejectionCount} rejections (cap reached).`,
+    );
+  }
+
+  const result = await reviewMarkDone({
+    workspace,
+    goal,
+    mode: opts.mode,
+    conversation,
+    reviewerModel: opts.reviewerModel,
+    llm: opts.llm,
+  });
+
+  if (result.accept) return { blocked: false };
+
+  goal.stats.markDoneReviewRejectionCount =
+    (goal.stats.markDoneReviewRejectionCount ?? 0) + 1;
+  goal.steps.push({
+    at: new Date().toISOString(),
+    kind: "mark-done-review-rejected",
+    payload: {
+      rejectionCount: goal.stats.markDoneReviewRejectionCount,
+      mode: opts.mode,
+      blockingError: result.blockingError ?? "",
+    },
+  });
+  await writeGoal(workspace, goal);
+
+  return {
+    blocked: true,
+    blockingError: result.blockingError,
+    hint: result.suggestedNextSteps,
   };
 }
 
@@ -1322,15 +1425,67 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
   // during session.send above — see ./tools.ts for why we can't throw).
   if (handler.completion?.outcome === "done") {
     const reason = handler.completion.reason;
-    // Layer 1 — token budget continuation. Re-read the goal first so the
-    // budget check sees the FRESH `stats.tokensUsed` just persisted by
-    // `updateGoalStats` above (the in-memory `goal` is stale). If the goal
-    // still has > 10% of its token budget unspent (and isn't a sub-goal, and
-    // hasn't hit diminishing returns), block the mark_done: inject a nudge
-    // user message into history, emit a `budget-continuation` event, and
-    // return WITHOUT ending the goal so the daemon reschedules. See
-    // DESIGN-REFERENCE.md §7.
+    // Re-read the goal first so both review layers see the FRESH
+    // `stats.tokensUsed` / rejection counters just persisted by
+    // `updateGoalStats` above (the in-memory `goal` is stale).
     goal = (await readGoal(workspace, goalId)) ?? goal;
+
+    // Layer 2 — mark_done content review (DESIGN-REFERENCE.md §8). Runs
+    // BEFORE Layer 1: a content-level gate (plan checkboxes / LLM reviewer)
+    // is cheaper + more meaningful than the token-volume gate, so we reject
+    // an obviously-incomplete completion before even consulting the budget.
+    // On rejection we inject the reviewer's blockingError + hint into the
+    // conversation as a user message (mirroring CC's TaskCompleted
+    // `success:false` → "retry the tool" signal) and return WITHOUT ending
+    // the goal so the daemon reschedules. Default mode "off" → no-op.
+    const reviewMode: MarkDoneReviewMode = opts.markDoneReview?.mode ?? "off";
+    if (reviewMode !== "off") {
+      const review = await maybeBlockByReview(
+        workspace,
+        goal,
+        session.history(),
+        {
+          mode: reviewMode,
+          reviewerModel:
+            opts.markDoneReview?.reviewerModel ?? DEFAULT_REVIEWER_MODEL,
+          llm: opts.reviewerLlm ?? llm,
+        },
+      );
+      if (review.blocked) {
+        const hintBlock =
+          review.hint && review.hint.length > 0
+            ? `\n\nSuggested next steps:\n${review.hint
+                .map((h) => `  - ${h}`)
+                .join("\n")}`
+            : "";
+        const feedback =
+          `[mark_done blocked by review] ${review.blockingError ?? ""}` +
+          hintBlock +
+          `\n\nKeep working to address this, then call mark_done again.`;
+        const nudged = [
+          ...session.history(),
+          { role: "user" as const, content: feedback },
+        ];
+        await flushConversationHistory(workspace, goal.scope, conversationId, nudged, {
+          title: `goal ${goal.id}`,
+        });
+        return {
+          goal,
+          text: textBuf,
+          completed: false,
+          exhausted: false,
+          failed: false,
+          aborted: false,
+        };
+      }
+    }
+
+    // Layer 1 — token budget continuation. If the goal still has > 10% of
+    // its token budget unspent (and isn't a sub-goal, and hasn't hit
+    // diminishing returns), block the mark_done: inject a nudge user
+    // message into history, emit a `budget-continuation` event, and return
+    // WITHOUT ending the goal so the daemon reschedules. See
+    // DESIGN-REFERENCE.md §7.
     const cont = await maybeContinueByBudget(workspace, goal);
     if (cont.continued) {
       const nudged = [

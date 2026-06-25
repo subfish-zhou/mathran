@@ -151,6 +151,14 @@ export interface Goal {
      * check, used to compute the next delta. Defaults to 0.
      */
     budgetLastCheckTokens: number;
+    /**
+     * Layer 2 (mark_done review) — number of times a `mark_done` was
+     * blocked by the content-review hook (deterministic plan check or LLM
+     * reviewer) and the model was nudged to keep working. Persisted across
+     * iterations so the force-accept cap (count >= 3) survives daemon
+     * reschedules. Defaults to 0 for goals created before Layer 2.
+     */
+    markDoneReviewRejectionCount: number;
   };
   /** Chat conversation ids this goal spawned. The first one is the primary. */
   conversationIds: string[];
@@ -242,7 +250,10 @@ export interface GoalStep {
     /** Layer 1 — token budget continuation: mark_done was blocked and the
      *  model nudged to keep working. Payload carries
      *  {pct, continuationCount, tokensUsed, budget}. */
-    | "budget-continuation";
+    | "budget-continuation"
+    /** Layer 2 — mark_done content review blocked the completion. Payload
+     *  carries {rejectionCount, mode, blockingError}. */
+    | "mark-done-review-rejected";
   payload: Record<string, unknown> | string;
 }
 
@@ -303,6 +314,8 @@ export function migrateGoalStats(raw: unknown): Goal["stats"] {
     budgetContinuationCount: s.budgetContinuationCount ?? 0,
     budgetLastDeltaTokens: s.budgetLastDeltaTokens ?? 0,
     budgetLastCheckTokens: s.budgetLastCheckTokens ?? 0,
+    // Layer 2 — mark_done review (default for pre-Layer-2 goals).
+    markDoneReviewRejectionCount: s.markDoneReviewRejectionCount ?? 0,
   };
 }
 
@@ -395,6 +408,7 @@ export async function createGoal(
       budgetContinuationCount: 0,
       budgetLastDeltaTokens: 0,
       budgetLastCheckTokens: 0,
+      markDoneReviewRejectionCount: 0,
     },
     conversationIds: [],
     parentGoalId: input.parentGoalId ?? null,
@@ -465,6 +479,10 @@ export async function updateGoalStats(
       delta.budgetLastDeltaTokens ?? g.stats.budgetLastDeltaTokens,
     budgetLastCheckTokens:
       delta.budgetLastCheckTokens ?? g.stats.budgetLastCheckTokens,
+    // Layer 2 — mark_done review rejection counter: carried forward
+    // (the runner SETs this directly via writeGoal, not via deltas).
+    markDoneReviewRejectionCount:
+      delta.markDoneReviewRejectionCount ?? g.stats.markDoneReviewRejectionCount,
   };
   await writeGoal(workspace, g);
 }
