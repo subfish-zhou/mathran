@@ -41,9 +41,23 @@ const EXT_TO_MIME: Record<string, string> = {
   ".txt": "text/plain; charset=utf-8",
   ".md": "text/markdown; charset=utf-8",
   ".tex": "application/x-tex",
+  ".bib": "application/x-bibtex",
+  ".cls": "application/x-tex",
+  ".sty": "application/x-tex",
   ".json": "application/json",
   ".zip": "application/zip",
   ".csv": "text/csv; charset=utf-8",
+  ".toml": "application/toml",
+  ".yaml": "application/yaml",
+  ".yml": "application/yaml",
+  ".xml": "application/xml",
+  ".html": "text/html; charset=utf-8",
+  ".log": "text/plain; charset=utf-8",
+  ".rst": "text/plain; charset=utf-8",
+  ".lean": "text/plain; charset=utf-8",
+  ".py": "text/x-python",
+  ".ts": "application/typescript",
+  ".js": "application/javascript",
 };
 
 /** Maximum accepted upload size, in bytes. 25 MiB matches the task spec. */
@@ -65,9 +79,17 @@ export const ALLOWED_UPLOAD_TYPES = new Set<string>([
   "text/markdown",
   "text/x-tex",
   "application/x-tex",
+  "application/x-bibtex",
   "application/json",
   "application/zip",
   "text/csv",
+  "application/toml",
+  "application/yaml",
+  "application/xml",
+  "text/html",
+  "text/x-python",
+  "application/typescript",
+  "application/javascript",
 ]);
 
 /**
@@ -123,7 +145,24 @@ export function registerUploadRoutes(app: Hono, workspace: string): void {
       return c.json({ error: "too large", maxBytes: MAX_UPLOAD_BYTES }, 413);
     }
 
-    const mimeType = file.type || "application/octet-stream";
+    // Browser-provided `file.type` is often empty for extensions the OS
+    // doesn't register (notably .tex / .md / .bib on stock Windows / some
+    // Linux setups). Without a fallback we'd reject every .tex paste with
+    // a 415, which is the opposite of what users expect — LaTeX is
+    // explicitly in the allowlist. Map by extension when `file.type` is
+    // missing or the generic octet-stream catch-all.
+    let mimeType = file.type || "";
+    if (!mimeType || mimeType === "application/octet-stream") {
+      const ext = path.extname(file.name).toLowerCase();
+      const fromExt = EXT_TO_MIME[ext];
+      if (fromExt) {
+        // EXT_TO_MIME values may carry charset; strip for the allowlist
+        // check but keep the raw value for the stored record below.
+        mimeType = fromExt.split(";")[0]!.trim();
+      } else {
+        mimeType = "application/octet-stream";
+      }
+    }
     if (!ALLOWED_UPLOAD_TYPES.has(mimeType)) {
       return c.json({ error: "type not allowed", mimeType }, 415);
     }

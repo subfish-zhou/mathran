@@ -118,6 +118,45 @@ describe("POST /api/uploads", () => {
     expect(body.error).toBe("type not allowed");
   });
 
+  it("accepts .tex even when browser leaves file.type empty (extension fallback)", async () => {
+    // Stock Windows / some Linux desktops don't register .tex MIME, so
+    // `file.type` arrives as "". Server must fall back to the extension
+    // map; otherwise every .tex paste 415s. Regression for the bug
+    // surfaced 2026-06-25 testing on subfish's machine.
+    const res = await postUpload(
+      "paper.tex",
+      "", // empty MIME — what the browser actually sends
+      new TextEncoder().encode("\\documentclass{article}\\begin{document}hi\\end{document}"),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      filename: string;
+      mimeType: string;
+    };
+    expect(body.filename).toBe("paper.tex");
+    expect(body.mimeType).toBe("application/x-tex");
+  });
+
+  it("accepts .bib via extension fallback", async () => {
+    const res = await postUpload(
+      "refs.bib",
+      "",
+      new TextEncoder().encode("@article{x,title={t}}"),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { mimeType: string };
+    expect(body.mimeType).toBe("application/x-bibtex");
+  });
+
+  it("still rejects octet-stream when extension is unknown", async () => {
+    const res = await postUpload(
+      "blob.xyz",
+      "application/octet-stream",
+      new Uint8Array([0, 1, 2]),
+    );
+    expect(res.status).toBe(415);
+  });
+
   it("400 when the `file` field is missing", async () => {
     const form = new FormData();
     form.set("not-file", "oops");
