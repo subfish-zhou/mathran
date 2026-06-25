@@ -29,6 +29,7 @@ import {
   toggleReaction,
   findGoalForConversation,
   runGoalRound,
+  createGoal,
   steerChatConversation,
   type ChatEvent,
   type ChatAttachmentRef,
@@ -38,11 +39,13 @@ import {
   type TodoList,
 } from "../lib/chat.ts";
 import GoalControls from "./GoalControls.tsx";
-import {
-  AUTO_RUN_TICK_MS,
-  autoRunCountdownSeconds,
-  shouldAutoRunNextRound,
-} from "../lib/goal-auto-run.ts";
+// C4 (todo1-design.md §5.4): the SPA-side auto-run setInterval driver
+// was deleted. The GoalDaemon (`src/core/goal/daemon.ts`) now owns
+// goal-loop progress server-side; ChatPanel is a passive observer of
+// the SSE stream and only kicks a round in direct response to user
+// input. The pure-policy helpers in `goal-auto-run.ts` survive as
+// compile-time noop shims (see that file's header for the rationale)
+// and are intentionally NOT imported here any more.
 import GoalRunStatusPanel from "./GoalRunStatusPanel.tsx";
 import GoalAutonomyCard from "./GoalAutonomyCard.tsx";
 import { TodoListPanel } from "./TodoListPanel.tsx";
@@ -53,6 +56,12 @@ import {
   type ApprovalRequest,
   type ApprovalDecision,
 } from "../lib/approval-client.ts";
+import DiffPreviewModal from "./DiffPreviewModal.tsx";
+import {
+  postWriteProposalDecision,
+  type WriteProposal,
+  type WriteProposalDecision,
+} from "../lib/write-proposal-client.ts";
 import { AgentStatusPanel, type ChatEventPhase } from "./AgentStatusPanel.tsx";
 import { api, chatScopeBase, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
 import {
@@ -72,11 +81,23 @@ import {
 import UsageSparkline from "./UsageSparkline.tsx";
 import ContextMeter from "./ContextMeter.tsx";
 import ToolCallGroup from "./ToolCallGroup.tsx";
+import { ReasoningBlock } from "./ReasoningBlock.tsx";
 import { ThreadDrawer } from "./ThreadDrawer.tsx";
 import { SubagentTreePanel } from "./SubagentTreePanel.tsx";
 import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel.tsx";
 import type { SubagentCompletedFrame } from "../lib/subagents.ts";
 import SlashSuggester from "./SlashSuggester.tsx";
+import { fetchGoalAutonomy } from "../lib/goal-autonomy.ts";
+import {
+  loadProposals,
+  saveGoalProposal,
+  savePlanProposal,
+} from "../lib/proposal-persistence.ts";
+import {
+  loadCommandStyle,
+  subscribeCommandStyle,
+  type CommandStyle,
+} from "../lib/composer-prefs.ts";
 import {
   parseSlashInput,
   activeSlashPrefix,
@@ -475,6 +496,15 @@ export default function ChatPanel({
   // `null` for plain chat (which never emits round-start) so the
   // panel hides its `Step N/M` segment.
   const [round, setRound] = useState<{ current: number; max?: number } | null>(null);
+  // TODO-2 §3.2 / C9 — compaction summary fed from SSE 'compaction' events.
+  // Resets at the start of every new send (each turn gets a fresh count).
+  const [compaction, setCompaction] = useState<{
+    runs: number;
+    lastReason?: string;
+    lastPhase?: string;
+    tokensSaved: number;
+    lastAt?: string;
+  } | null>(null);
   // Tick state for the 1Hz elapsed-time refresh while `busy` is true.
   // Without this React would only re-render when an SSE event arrives,
   // so a slow tool call would freeze the `⏱ Xs` counter visually.
@@ -547,88 +577,28 @@ export default function ChatPanel({
   // colour ahead of the panel's next poll.
   const [bgCompletedFrame, setBgCompletedFrame] =
     useState<SubagentCompletedFrame | null>(null);
-  // goal-defaults-timer (commit 6/7): auto-run state.
-  //   * lastKeystrokeTsRef avoids a re-render storm on every keystroke.
-  //     The 1Hz countdown ticker (autoRunNowMs) re-renders cheaply
-  //     enough that we don't need the keystroke timestamp itself to
-  //     be a useState.
-  //   * nextAutoRunAt is the wall-clock unix-ms the timer expects to
-  //     fire next; reset every time the timer (re)installs.
-  //   * autoRunNowMs is bumped 1×/sec so the badge counts down
-  //     smoothly even while the goal is otherwise idle.
-  const lastKeystrokeTsRef = useRef<number>(0);
-  const [nextAutoRunAt, setNextAutoRunAt] = useState<number>(0);
-  const [autoRunNowMs, setAutoRunNowMs] = useState<number>(() => Date.now());
-  // Auto-run driver. Only installs while we're in a goal-mode chat
-  // that's currently in "active" status — paused / terminal goals
-  // (complete / failed / cancelled / exhausted) tear it down via the
-  // effect's cleanup. The interval CALLBACK still consults the gate
-  // (shouldAutoRunNextRound) on every tick, so a transient busy / the
-  // user typing simply skips a tick without restarting the interval.
+  // ─── Auto-run driver — REMOVED in C4 (todo1-design.md §5.4) ───────
   //
-  // We deliberately do NOT include `busy` or `input.length` in the
-  // deps array: doing so would tear down and re-install the timer on
-  // every keystroke, which would (a) reset the cadence (b) thrash
-  // setNextAutoRunAt on every render. Keeping the deps narrow means
-  // the same 120s rhythm persists; only goal-status changes (which
-  // are rare — once per round at most) re-anchor it.
-  useEffect(() => {
-    if (!owningGoal || owningGoal.status !== "active") {
-      setNextAutoRunAt(0);
-      return;
-    }
-    let cancelled = false;
-    setNextAutoRunAt(Date.now() + AUTO_RUN_TICK_MS);
-    const id = setInterval(() => {
-      if (cancelled) return;
-      // Read live values via closure — these refs/state are mutated
-      // outside this effect's dep array, which is exactly why we need
-      // a fresh read on every tick instead of stale captures.
-      const fire = shouldAutoRunNextRound({
-        owningGoal,
-        busy,
-        unsentTextLength: input.trim().length,
-        lastKeystrokeTs: lastKeystrokeTsRef.current,
-        now: Date.now(),
-      });
-      setNextAutoRunAt(Date.now() + AUTO_RUN_TICK_MS);
-      if (!fire) return;
-      // Fire-and-forget; the onRoundRan-equivalent handling matches
-      // the manual "Next round" button below: refresh owningGoal +
-      // pull in the new history.
-      runGoalRound(owningGoal.id)
-        .then((r) => {
-          if (cancelled) return;
-          setOwningGoal(r.goal);
-          if (r.goal.conversationIds[0]) {
-            if (r.goal.conversationIds[0] !== conversationId) {
-              setConversationId(r.goal.conversationIds[0]);
-            } else {
-              setReloadTick((t) => t + 1);
-            }
-          }
-        })
-        .catch((e) => {
-          if (cancelled) return;
-          setError(String((e as Error).message ?? e));
-        });
-    }, AUTO_RUN_TICK_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-      setNextAutoRunAt(0);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [owningGoal?.id, owningGoal?.status]);
-  // 1Hz refresh just for the auto-run countdown badge. Skipped when
-  // there's no countdown to display (saves an idle interval on plain
-  // chat). Coalesces with the existing busy-status ticker visually
-  // (both 1Hz) but lives separately because the gates are different.
-  useEffect(() => {
-    if (!nextAutoRunAt) return;
-    const id = setInterval(() => setAutoRunNowMs(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [nextAutoRunAt]);
+  // Pre-C4 this slot housed a `setInterval(AUTO_RUN_TICK_MS, …)` that
+  // POSTed `runGoalRound(owningGoal.id)` every 120s while a goal was
+  // active, a 1Hz countdown ticker, the `nextAutoRunAt` /
+  // `autoRunNowMs` / `lastKeystrokeTsRef` state, and the
+  // `shouldAutoRunNextRound` typing-grace gate.
+  //
+  // Post-C4 the **server-side GoalDaemon** drives goal progress (see
+  // `src/core/goal/daemon.ts` + `src/server/serve.ts`). The SPA is now
+  // a passive observer of the goal SSE stream and only triggers a
+  // streaming round in direct response to a user-initiated action
+  // (composer send, manual "Next round" button, propose_goal banner
+  // accept, etc.). No timer-based POSTs originate here any more.
+  //
+  // The companion countdown badge ("🕒 Auto-run in Xs") was deleted
+  // from the goal-status header for the same reason — there is no
+  // timer to count down to. `goal-auto-run.ts` is kept around as a
+  // compile-time noop shim (`shouldAutoRunNextRound` → `false`,
+  // `autoRunCountdownSeconds` → `null`) so any out-of-tree import keeps
+  // building; in-tree we no longer reference it.
+  // ──────────────────────────────────────────────────────────────────
   // v0.17 mathub parity W12: in-conversation TODO tracker maintained by
   // the `todo_write` built-in tool. Seeded by `fetchTodos` whenever the
   // active conversation changes, then live-updated by `todos` SSE frames
@@ -667,6 +637,15 @@ export default function ChatPanel({
   );
   const [approvalSubmitting, setApprovalSubmitting] = useState(false);
   const [approvalError, setApprovalError] = useState<string | null>(null);
+  // UX gap A — Diff preview before file write. `pendingWrites` maps a write
+  // tool-call id to its in-flight proposal; the DiffPreviewModal renders the
+  // head of this map. The server stream parks awaiting our POST. A
+  // `propose-write-resolved` event (or the decision POST success) clears it.
+  const [pendingWrites, setPendingWrites] = useState<
+    Map<string, WriteProposal>
+  >(new Map());
+  const [writeSubmitting, setWriteSubmitting] = useState(false);
+  const [writeError, setWriteError] = useState<string | null>(null);
   const [planSavedToast, setPlanSavedToast] = useState<string | null>(null);
   // outcomes 收尾 C-2 — transient toast surfaced when a background self-grade
   // round lands a `goal-graded` SSE frame ("📊 Goal graded: X/5").
@@ -1077,6 +1056,48 @@ export default function ChatPanel({
     showPinnedFirstRunRef.current = true;
   }, [conversationId]);
 
+  // TODO-3 UI #4.F — hydrate persisted propose_plan / propose_goal banner
+  // state from localStorage on conversation switch. Without this a tab
+  // reload while a proposal is in flight drops the inline Accept/Reject
+  // affordance, leaving the user with no UI surface to act on the
+  // already-on-disk proposal.
+  useEffect(() => {
+    if (!conversationId) {
+      setGoalProposed(null);
+      setPlanProposed(null);
+      return;
+    }
+    const cached = loadProposals(conversationId);
+    if (cached.goal) {
+      setGoalProposed({
+        goalId: cached.goal.goalId,
+        objective: cached.goal.objective,
+        maxRounds: cached.goal.maxRounds,
+        tokensCap: cached.goal.tokensCap,
+        autoRun: cached.goal.autoRun,
+      });
+    }
+    if (cached.plan) {
+      setPlanProposed({
+        planId: cached.plan.planId,
+        objective: cached.plan.objective,
+        autoRun: cached.plan.autoRun,
+      });
+    }
+  }, [conversationId]);
+
+  // TODO-3 UI #4.F — mirror banner state to localStorage whenever the
+  // banner state changes. Clearing (setting to null) erases the
+  // persisted entry too so a Reject/Accept doesn't reappear on reload.
+  useEffect(() => {
+    if (!conversationId) return;
+    saveGoalProposal(conversationId, goalProposed);
+  }, [conversationId, goalProposed]);
+  useEffect(() => {
+    if (!conversationId) return;
+    savePlanProposal(conversationId, planProposed);
+  }, [conversationId, planProposed]);
+
   // ─── Usage meter: refetch whenever conversationId changes ──────────────
   const refreshUsage = useCallback(async () => {
     if (!conversationId) return;
@@ -1120,6 +1141,8 @@ export default function ChatPanel({
       setActiveToolCalls({});
       setSubAgentActive(false);
       setRound(null);
+      // TODO-2 §3.2 / C9 — reset compaction summary at every turn boundary.
+      setCompaction(null);
 
       const onEvent = (ev: ChatEvent) => {
         if (ev.type === "session") {
@@ -1144,6 +1167,27 @@ export default function ChatPanel({
           setRound({
             current: ev.round,
             ...(typeof ev.maxRounds === "number" ? { max: ev.maxRounds } : {}),
+          });
+        }
+        // TODO-2 §3.2 / C9 — accumulate compaction events into the badge
+        // state shown by AgentStatusPanel. Server filters noop swaps,
+        // so any frame we see represents a real compaction OR an
+        // explicit non-ok status. Successful swaps bump the count + sum
+        // tokens saved; failures/skips/cancels surface in the tooltip
+        // but don't add to the saved-tokens estimate.
+        if (ev.type === "compaction") {
+          setCompaction((prev) => {
+            const base = prev ?? { runs: 0, tokensSaved: 0 };
+            const isOk = ev.outcome === "ok";
+            return {
+              runs: base.runs + (isOk ? 1 : 0),
+              tokensSaved:
+                base.tokensSaved +
+                (isOk ? Math.max(0, ev.originalTokens - ev.newTokens) : 0),
+              lastReason: ev.reason,
+              lastPhase: ev.phase,
+              lastAt: new Date().toISOString(),
+            };
           });
         }
         // v0.17 mathub parity W9 — the server confirms it consumed our
@@ -1183,6 +1227,28 @@ export default function ChatPanel({
           setPendingApproval((cur) => (cur && cur.id === ev.id ? null : cur));
           setApprovalSubmitting(false);
           setApprovalError(null);
+        }
+        // UX gap A — a write needs review. Stash the proposal so the
+        // DiffPreviewModal renders; the server stream stays open awaiting our
+        // POST. `propose-write-resolved` (or the POST success) clears it.
+        if (ev.type === "propose-write") {
+          setPendingWrites((cur) => {
+            const next = new Map(cur);
+            next.set(ev.proposal.toolCallId, ev.proposal);
+            return next;
+          });
+          setWriteError(null);
+          setWriteSubmitting(false);
+        }
+        if (ev.type === "propose-write-resolved") {
+          setPendingWrites((cur) => {
+            if (!cur.has(ev.toolCallId)) return cur;
+            const next = new Map(cur);
+            next.delete(ev.toolCallId);
+            return next;
+          });
+          setWriteSubmitting(false);
+          setWriteError(null);
         }
         // v0.17 P2 — propose_goal confirmation produced a real Goal.
         // Show a banner notification, and when the model + user opted
@@ -1294,6 +1360,20 @@ export default function ChatPanel({
             } else {
               next.push({ kind: "assistant", text: ev.delta });
             }
+          } else if (ev.type === "reasoning") {
+            // UX gap B — fold the reasoning delta onto the active assistant
+            // bubble. Reasoning typically arrives BEFORE the first text token,
+            // so an empty-text assistant bubble (the "Thinking…" slate) is the
+            // natural target; create one if no assistant bubble is open yet.
+            const last = next[next.length - 1];
+            if (last && last.kind === "assistant") {
+              next[next.length - 1] = {
+                ...last,
+                reasoning: (last.reasoning ?? "") + ev.delta,
+              };
+            } else {
+              next.push({ kind: "assistant", text: "", reasoning: ev.delta });
+            }
           } else if (ev.type === "tool-call") {
             next.push({ kind: "tool", id: ev.id, name: ev.name, args: ev.args });
           } else if (ev.type === "tool-result") {
@@ -1398,7 +1478,13 @@ export default function ChatPanel({
         // get rid of.
         setBubbles((prev) => {
           const last = prev[prev.length - 1];
-          if (last && last.kind === "assistant" && last.text === "") return prev.slice(0, -1);
+          if (
+            last &&
+            last.kind === "assistant" &&
+            last.text === "" &&
+            !last.reasoning
+          )
+            return prev.slice(0, -1);
           return prev;
         });
         void refreshUsage();
@@ -1426,6 +1512,31 @@ export default function ChatPanel({
       }
     },
     [pendingApproval, conversationId, scope],
+  );
+
+  // UX gap A — POST the user's decision for the head write proposal. Mirrors
+  // the approval flow: keep the modal until `propose-write-resolved` lands; on
+  // failure surface the error inline and re-enable the buttons.
+  const handleWriteDecide = useCallback(
+    async (decision: WriteProposalDecision) => {
+      const first = pendingWrites.values().next();
+      if (first.done || !conversationId) return;
+      const proposal = first.value;
+      setWriteSubmitting(true);
+      setWriteError(null);
+      try {
+        await postWriteProposalDecision(
+          scope,
+          conversationId,
+          proposal.toolCallId,
+          decision,
+        );
+      } catch (err) {
+        setWriteError((err as Error).message);
+        setWriteSubmitting(false);
+      }
+    },
+    [pendingWrites, conversationId, scope],
   );
 
   // ─── Stop the in-flight stream (v0.16 §1) ────────────────────────────────────
@@ -1498,7 +1609,14 @@ export default function ChatPanel({
   );
   // Open while typing a command name that matches ≥1 command, and not while
   // a stream is in flight (Enter steers when busy — see onKeyDown).
-  const slashOpen = !busy && slashPrefix !== null && slashFiltered.length > 0;
+  // TODO-3 UI #2 — composer command style preference (selector | slash).
+  // Default "selector" preserves the existing Discord/copilot popup UX;
+  // "slash" suppresses the popup so power users can type full /cmd args
+  // openclaw-style without distraction. Persisted in localStorage; live
+  // updates across tabs via subscribeCommandStyle.
+  const [commandStyle, setCommandStyle] = useState<CommandStyle>(loadCommandStyle);
+  useEffect(() => subscribeCommandStyle(setCommandStyle), []);
+  const slashOpen = !busy && commandStyle === "selector" && slashPrefix !== null && slashFiltered.length > 0;
 
   // Clamp the highlight whenever the filtered list shrinks/changes.
   useEffect(() => {
@@ -1622,6 +1740,65 @@ export default function ChatPanel({
           if (args) setInput(args);
           else setInput("");
           setPlanOverlayOpen(true);
+          return { handled: true };
+        }
+
+        case "goal": {
+          // TODO-3 UI #2: invoke the same Start-goal flow that the
+          // header button used to expose. The slash-command path
+          // bypasses the modal entirely and just kicks the goal with
+          // the model's defaults, treating the args (or whatever sat
+          // in the composer before the user typed /goal) as the
+          // objective. Mirrors how openclaw / copilot CLI handle
+          // top-level commands.
+          const objective = args.trim() || input.trim().replace(/^\/goal\b\s*/i, "").trim();
+          setInput("");
+          if (!objective) {
+            pushInfoBubble("**/goal** — usage: `/goal <objective>` (or type the objective first, then `/goal`).");
+            return { handled: true };
+          }
+          try {
+            // TODO-3 UI #4.I — honour the user's pinned per-scope goal
+            // autonomy defaults (defaultTokensCap / defaultMaxRounds)
+            // when /goal kicks a goal. Falls back to null/null when
+            // the scope has nothing pinned (matches the old behaviour).
+            let budgetTokens: number | null = null;
+            let maxRounds: number | null = null;
+            try {
+              const autonomy = await fetchGoalAutonomy(scope);
+              const eff = autonomy.effective;
+              if (typeof eff.defaultTokensCap === "number" && eff.defaultTokensCap > 0) {
+                budgetTokens = eff.defaultTokensCap;
+              }
+              if (typeof eff.defaultMaxRounds === "number" && eff.defaultMaxRounds > 0) {
+                maxRounds = eff.defaultMaxRounds;
+              }
+            } catch {
+              // Autonomy fetch failure is non-fatal — proceed with no budget caps.
+            }
+            const created = await createGoal({
+              objective,
+              scope,
+              model: model ?? undefined,
+              budgetTokens,
+              maxRounds,
+            });
+            setOwningGoal(created);
+            // Mirror the header button's onGoalCreated path: kick the
+            // first round so the user lands on a live conversation
+            // instead of an empty stub.
+            runGoalRound(created.id)
+              .then((r) => {
+                setOwningGoal(r.goal);
+                if (r.goal.conversationIds[0]) {
+                  setConversationId(r.goal.conversationIds[0]);
+                }
+              })
+              .catch((e) => setError(String((e as Error).message ?? e)));
+            pushInfoBubble(`**🎯 Goal started** — \`${created.id.slice(0, 8)}…\` — objective: ${JSON.stringify(objective.slice(0, 120))}`);
+          } catch (e) {
+            setError(`/goal failed: ${(e as Error).message}`);
+          }
           return { handled: true };
         }
 
@@ -2771,22 +2948,27 @@ export default function ChatPanel({
               — useful entry point when you want to see goal status / end
               reason / round count without scrolling. Hidden when not a
               goal-mode chat. */}
-          {/* v0.16 §9 audit #2: 📋 Plan button. Spawns a plan-mode run in a
-              modal overlay; the user can Accept (writes the plan to
-              .mathran/plans/) or Reject without touching this chat. */}
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => setPlanOverlayOpen(true)}
-            className="ml-2 shrink-0 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
-            title="Draft a read-only plan (Approach / Steps / Key files / Risks / Acceptance) before doing the work"
-          >
-            📋 Plan
-          </button>
+          {/* TODO-3 UI #2 — Removed the inline 📋 Plan button.
+              Plan mode is now invoked via /plan slash-command in the
+              composer (modal-style overlay still opens), matching how
+              openclaw/copilot CLIs surface top-level commands.
+              The CreateGoalModal that GoalControls used to expose
+              for "🎯 Start a goal" is similarly retired in favour of
+              the /goal slash-command (see ChatPanel slash router). */}
+          {/* TODO-3 UI #3 — Goal autonomy card promoted from the
+              second-layer (between BackgroundAgentsPanel and
+              GoalRunStatusPanel) to the FIRST-LAYER chat header.
+              Now that the Plan / Start-goal buttons are gone, the
+              header has room for the autonomy default pin. Stays
+              collapsed by default — same component as before. */}
+          <div className="ml-2 shrink-0">
+            <GoalAutonomyCard scope={scope} />
+          </div>
           {/* v0.16 §4: GoalControls handles BOTH non-goal (Start) and goal
-              (Run / Interrupt / Cancel / budget meter) states. The thread
-              shortcut is kept as a separate button so users can pop the
-              drawer without disturbing run controls. */}
+              (Run / Interrupt / Cancel / budget meter) states. After
+              TODO-3 UI #2, the non-goal branch renders nothing (the
+              /goal slash-command replaces the Start modal); the goal
+              branch keeps its full Run/Interrupt/Cancel/budget UI. */}
           <GoalControls
             scope={scope}
             goal={owningGoal}
@@ -2835,30 +3017,11 @@ export default function ChatPanel({
                 : ""}
             </button>
           )}
-          {/* goal-defaults-timer (commit 6/7): auto-run countdown badge.
-              Only surfaces when the gate is currently open (active goal,
-              not busy, not typing) — hidden state means "timer paused".
-              Mirrors the existing busy ticker's 1Hz cadence so the
-              countdown decrements smoothly. */}
-          {owningGoal && (() => {
-            const secs = autoRunCountdownSeconds({
-              owningGoal,
-              busy,
-              unsentTextLength: input.trim().length,
-              lastKeystrokeTs: lastKeystrokeTsRef.current,
-              now: autoRunNowMs,
-              nextTickAt: nextAutoRunAt,
-            });
-            if (secs === null) return null;
-            return (
-              <span
-                className="ml-1 shrink-0 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900"
-                title="Next goal round runs automatically in this many seconds. Typing in the composer or pausing the goal stops the timer."
-              >
-                🕒 Auto-run in {secs}s
-              </span>
-            );
-          })()}
+          {/* C4 (todo1-design.md §5.4): the "🕒 Auto-run in Xs" badge
+              that lived here was deleted alongside the
+              `setInterval(AUTO_RUN_TICK_MS, …)` driver. The GoalDaemon
+              drives goal progress server-side now, so there is no SPA
+              timer to count down to. */}
           {/* W10 (v0.17 mathub parity): forest view toggle. Only surfaces
               when the goal has at least one sub-goal — a leaf goal has
               nothing to see in tree form. */}
@@ -2891,12 +3054,9 @@ export default function ChatPanel({
           <BackgroundAgentsPanel completedFrame={bgCompletedFrame} />
         </div>
 
-        {/* v0.17 W11: per-scope goal-autonomy defaults card. Collapsed
-            by default; expands inline so the user can pin autonomy /
-            budget defaults without leaving the chat surface. */}
-        <div className="border-b border-slate-200 bg-slate-50 px-6 py-1.5">
-          <GoalAutonomyCard scope={scope} />
-        </div>
+        {/* v0.17 W11: per-scope goal-autonomy defaults card.
+            TODO-3 UI #3: This second-layer mount is removed in favour
+            of the first-layer (chat-header) mount above. */}
 
         {/* v0.17 W8: mathub-parity status strip. Only mounts when this
             conversation is the primary one of a goal-loop — plain chats
@@ -3095,7 +3255,9 @@ export default function ChatPanel({
                         </div>
                       </div>
                     </div>
-                  ) : row.bubble.kind === "assistant" && row.bubble.text === "" ? (
+                  ) : row.bubble.kind === "assistant" &&
+                    row.bubble.text === "" &&
+                    !row.bubble.reasoning ? (
                     /* ─── Streaming-thinking pill (v0.16 §10) ──────────────────
                        Before any tokens land we used to render a markdown bubble
                        containing a single horizontal-ellipsis fallback, which
@@ -3125,6 +3287,32 @@ export default function ChatPanel({
                         <span className="inline-block h-1 w-1 animate-bounce rounded-full bg-violet-400 [animation-delay:-0.15s]" />
                         <span className="inline-block h-1 w-1 animate-bounce rounded-full bg-violet-400" />
                       </span>
+                    </div>
+                  ) : row.bubble.kind === "assistant" &&
+                    row.bubble.text === "" &&
+                    row.bubble.reasoning ? (
+                    /* ─── Streaming reasoning (UX gap B) ──────────────────────
+                       Reasoning tokens arrive before the first answer token, so
+                       show the collapsed chain-of-thought panel alongside the
+                       "Thinking…" pill while we wait for the answer to start. */
+                    <div className="flex flex-col gap-1">
+                      <ReasoningBlock reasoning={row.bubble.reasoning} streaming />
+                      <div
+                        role="status"
+                        aria-live="polite"
+                        className="inline-flex w-fit items-center gap-2 rounded-full bg-violet-50/70 px-3 py-1 text-xs text-violet-700"
+                      >
+                        <svg
+                          className="h-3 w-3 animate-spin text-violet-500"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          aria-hidden="true"
+                        >
+                          <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25" />
+                          <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                        </svg>
+                        <span className="font-medium">Thinking</span>
+                      </div>
                     </div>
                   ) : row.bubble.kind === "user" &&
                     row.bubble.text === "" &&
@@ -3165,12 +3353,17 @@ export default function ChatPanel({
                         </span>
                       )}
                       {row.bubble.kind === "assistant" ? (
-                        <div
-                          className="md"
-                          dangerouslySetInnerHTML={{
-                            __html: marked.parse(row.bubble.text) as string,
-                          }}
-                        />
+                        <>
+                          {row.bubble.reasoning ? (
+                            <ReasoningBlock reasoning={row.bubble.reasoning} />
+                          ) : null}
+                          <div
+                            className="md"
+                            dangerouslySetInnerHTML={{
+                              __html: marked.parse(row.bubble.text) as string,
+                            }}
+                          />
+                        </>
                       ) : (
                         <span className="whitespace-pre-wrap">{row.bubble.text}</span>
                       )}
@@ -3475,6 +3668,7 @@ export default function ChatPanel({
           subAgentActive={subAgentActive}
           elapsedMs={sendStartMs > 0 ? Date.now() - sendStartMs : 0}
           round={round}
+          compaction={compaction}
         />
 
         {/* ─── GoalProposalBanner (v0.17 follow-up P2) ───────────────────────────
@@ -3715,11 +3909,12 @@ export default function ChatPanel({
               value={input}
               onChange={(e) => {
                 setInput(e.target.value);
-                // goal-defaults-timer (commit 6/7): keystroke tracking
-                // for the auto-run gate. Use a ref so we don't churn
-                // renders on every character; the countdown badge
-                // already re-renders at 1Hz via autoRunNowMs.
-                lastKeystrokeTsRef.current = Date.now();
+                // C4 (todo1-design.md §5.4): pre-C4 we also stamped
+                // `lastKeystrokeTsRef.current = Date.now()` here so the
+                // auto-run typing-grace gate could see that the user
+                // was still mid-thought. The auto-run driver is gone
+                // (daemon-side now), so the keystroke timestamp has no
+                // consumer left and the side-effect was deleted.
               }}
               onCompositionStart={() => {
                 isComposingRef.current = true;
@@ -3997,6 +4192,17 @@ export default function ChatPanel({
           onDecide={handleApprovalDecide}
           pending={approvalSubmitting}
           error={approvalError}
+        />
+      )}
+
+      {/* UX gap A — Diff preview before file write. Render the head of the
+          pending-writes map; resolving it advances to the next (rare) one. */}
+      {pendingWrites.size > 0 && (
+        <DiffPreviewModal
+          proposal={pendingWrites.values().next().value as WriteProposal}
+          onDecide={handleWriteDecide}
+          pending={writeSubmitting}
+          error={writeError}
         />
       )}
 

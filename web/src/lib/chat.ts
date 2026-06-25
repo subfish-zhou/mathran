@@ -4,6 +4,10 @@
 
 import { chatScopeBase, type ChatScopeSpec } from "./api.ts";
 import type { ApprovalRequest, ApprovalDecision } from "./approval-client.ts";
+import type {
+  WriteProposal,
+  WriteProposalDecision,
+} from "./write-proposal-client.ts";
 
 /**
  * v0.17 mathub parity W2: attachment ref the composer forwards alongside
@@ -47,6 +51,15 @@ export interface TodoList {
 export type ChatEvent =
   | { type: "session"; sessionId: string; conversationId: string; resumedFromAsk?: boolean }
   | { type: "text"; delta: string }
+  | {
+      /** UX gap B — reasoning / chain-of-thought delta streamed on a side
+       *  channel by reasoning models (Anthropic `thinking`, OpenAI / Copilot
+       *  `reasoning_content`). The SPA accumulates these onto the in-flight
+       *  assistant bubble and renders a collapsed "💭 N reasoning chars"
+       *  panel. Disposable — dropped first on compaction. */
+      type: "reasoning";
+      delta: string;
+    }
   | { type: "tool-call"; id: string; name: string; args: string }
   | { type: "tool-result"; id: string; name: string; ok: boolean; content: string }
   | {
@@ -147,6 +160,22 @@ export type ChatEvent =
       decision: ApprovalDecision;
     }
   | {
+      /** UX gap A — Diff preview before file write. An authorised write_file /
+       *  edit_file call whose rule set `requireDiffPreview` is about to run; the
+       *  serve stream parks awaiting the user's verdict. The SPA renders a
+       *  DiffPreviewModal and POSTs the decision via
+       *  {@link postWriteProposalDecision}. */
+      type: "propose-write";
+      proposal: WriteProposal;
+    }
+  | {
+      /** UX gap A — emitted right after a write proposal is resolved
+       *  (accept / decline). The SPA uses it to dismiss the modal. */
+      type: "propose-write-resolved";
+      toolCallId: string;
+      decision: WriteProposalDecision;
+    }
+  | {
       /** outcomes 收尾 C-2 — emitted by the host SSE layer when a background
        *  self-grade round lands an Outcome on disk while this stream is open.
        *  Self-grade is fire-and-forget (it runs after the goal's own stream
@@ -172,6 +201,26 @@ export type ChatEvent =
         artifactPath: string | null;
         durationMs?: number;
       };
+    }
+  | {
+      /** TODO-2 §3.2 / C9 — compaction lifecycle event from the server.
+       *  Emitted by ChatSession.compactV2 → goal runner emit() → serve
+       *  SSE pass-through. The SPA's AgentStatusPanel + GoalRunStatusPanel
+       *  show a 🧹 badge with the cumulative count + tooltip carrying
+       *  reason/phase/tokens-saved. Noop compactions (droppedRoundCount=0)
+       *  are filtered server-side, so any frame the client sees represents
+       *  a real swap. */
+      type: "compaction";
+      outcome: "ok" | "skipped" | "cancelled" | "failed";
+      reason: string;
+      phase: string;
+      trigger: string;
+      policy: string;
+      originalTokens: number;
+      newTokens: number;
+      droppedRoundCount: number;
+      durationMs: number;
+      summaryTokens?: number;
     }
   | { type: "done"; finishReason: string }
   | { type: "error"; message: string };
@@ -674,7 +723,16 @@ export interface GoalRow {
    *  section in ThreadDrawer. */
   planPath?: string | null;
   budget: { tokensMax: number | null; roundsMax: number | null };
-  stats: { tokensUsed: number; roundsRun: number; toolCallCount: number };
+  stats: {
+    tokensUsed: number;
+    /** Defect #3: renamed from `roundsRun` (kept as deprecated alias). */
+    iterationsRun: number;
+    assistantTurnsTotal: number;
+    llmCallsTotal: number;
+    toolCallCount: number;
+    /** @deprecated alias for `iterationsRun`. */
+    roundsRun: number;
+  };
   createdAt: string;
   updatedAt: string;
   /** goal-defaults-timer (2026-06-23): optional free-form addendum the
@@ -690,7 +748,10 @@ export interface SubGoalStub {
   parentGoalId: string | null;
   endReason: string | null;
   conversationId: string | null;
+  /** @deprecated alias for `iterationsRun`. */
   roundsRun: number;
+  iterationsRun: number;
+  assistantTurnsTotal: number;
   tokensUsed: number;
 }
 
@@ -783,6 +844,20 @@ export interface CreateGoalInput {
   extraInstructions?: string;
 }
 
+/**
+ * TODO-3 UI #4.C — List goals across the workspace (default: active +
+ * paused only; pass `all=true` to also include terminal goals). Used
+ * by the left rail's "Recent goals" section.
+ */
+export async function listGoals(opts: { all?: boolean; signal?: AbortSignal } = {}): Promise<GoalRow[]> {
+  const url = opts.all ? "/api/goals?all=1" : "/api/goals";
+  const init = opts.signal ? { signal: opts.signal } : {};
+  const res = await fetch(url, init);
+  if (!res.ok) throw new Error(`listGoals failed (${res.status})`);
+  const body = (await res.json()) as { goals: GoalRow[] };
+  return body.goals;
+}
+
 export async function createGoal(input: CreateGoalInput): Promise<GoalRow> {
   const res = await fetch("/api/goals", {
     method: "POST",
@@ -857,9 +932,21 @@ export interface GoalStatus {
   status: "active" | "paused" | "complete" | "failed" | "cancelled" | "exhausted";
   endReason: string | null;
   round: number;
+  iterationsRun: number;
+  assistantTurnsTotal: number;
+  llmCallsTotal: number;
   roundsMax: number | null;
   tokensUsed: number;
   tokensMax: number | null;
+  /** Phase ζ (cost meter) — estimated USD cost for this goal's lifetime LLM
+   *  usage, or null when the model has no public price (UI shows "—"). */
+  costUsd?: number | null;
+  /** Phase ζ — provider-reported input (prompt) tokens (0 for pre-ζ goals). */
+  inputTokensUsed?: number;
+  /** Phase ζ — provider-reported output (completion) tokens (0 for pre-ζ goals). */
+  outputTokensUsed?: number;
+  /** Phase ζ — model slug used for this goal (for the cost tooltip). */
+  model?: string;
   toolCount: number;
   resumeCount: number;
   heartbeatAt: number | null;
@@ -870,6 +957,14 @@ export interface GoalStatus {
   planPath: string | null;
   parentGoalId: string | null;
   subGoalCount: number;
+  /** TODO-2 §3.2 / C9 — total successful compactions on this goal so far. */
+  compactionRuns?: number;
+  /** TODO-2 §3.2 / C9 — cumulative tokens saved by compaction (best-effort). */
+  compactionTokensDropped?: number;
+  /** TODO-2 §3.2 / C9 — reason on the most recent successful compaction. */
+  lastCompactionReason?: string | null;
+  /** TODO-2 §3.2 / C9 — ISO timestamp of the most recent compaction. */
+  lastCompactionAt?: string | null;
 }
 
 /** GET /api/goals/:id/status — cheap polling probe; never throws on 404

@@ -1903,6 +1903,102 @@ describe("goal status + abort/resume (v0.17 W8)", () => {
     expect(res.status).toBe(400);
   });
 
+  // ── UX gap D — read-only live tail endpoint (GET /api/goals/:id/events) ──
+  describe("GET /api/goals/:id/events (read-only live tail)", () => {
+    /** Read an SSE response to completion, returning parsed {event,data} frames. */
+    async function collectSSE(res: Response): Promise<{ event: string; data: string }[]> {
+      const frames: { event: string; data: string }[] = [];
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let event = "message";
+      const dataLines: string[] = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          let line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.endsWith("\r")) line = line.slice(0, -1);
+          if (line === "") {
+            if (dataLines.length) frames.push({ event, data: dataLines.join("\n") });
+            event = "message";
+            dataLines.length = 0;
+            continue;
+          }
+          const colon = line.indexOf(":");
+          const field = colon < 0 ? line : line.slice(0, colon);
+          let val = colon < 0 ? "" : line.slice(colon + 1);
+          if (val.startsWith(" ")) val = val.slice(1);
+          if (field === "event") event = val;
+          else if (field === "data") dataLines.push(val);
+        }
+      }
+      return frames;
+    }
+
+    it("emits a leading snapshot frame then a terminal status frame for an already-ended goal", async () => {
+      const { goal } = await (await fetch(`${base}/api/goals`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ objective: "watch me end", scope: "global" }),
+      })).json();
+      // Drive it to a terminal status without touching the LLM.
+      const cancel = await fetch(`${base}/api/goals/${goal.id}/cancel`, { method: "POST" });
+      expect(cancel.status).toBe(200);
+
+      const res = await fetch(`${base}/api/goals/${goal.id}/events`, {
+        headers: { accept: "text/event-stream" },
+      });
+      expect(res.status).toBe(200);
+      const frames = await collectSSE(res);
+
+      // First frame is the snapshot header projection.
+      expect(frames[0].event).toBe("snapshot");
+      const snap = JSON.parse(frames[0].data);
+      expect(snap.id).toBe(goal.id);
+      expect(snap.objective).toBe("watch me end");
+      expect(snap.status).toBe("cancelled");
+
+      // Final frame is the terminal status close — the stream then ends.
+      const last = frames[frames.length - 1];
+      expect(last.event).toBe("status");
+      const st = JSON.parse(last.data);
+      expect(st.terminal).toBe(true);
+      expect(st.status).toBe("cancelled");
+    });
+
+    it("does NOT trigger a run (read-only): goal stats stay zero after watching", async () => {
+      const { goal } = await (await fetch(`${base}/api/goals`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ objective: "read only", scope: "global" }),
+      })).json();
+      await fetch(`${base}/api/goals/${goal.id}/cancel`, { method: "POST" });
+      const res = await fetch(`${base}/api/goals/${goal.id}/events`, {
+        headers: { accept: "text/event-stream" },
+      });
+      await collectSSE(res);
+      const status = await (await fetch(`${base}/api/goals/${goal.id}/status`)).json();
+      expect(status.iterationsRun).toBe(0);
+      expect(status.assistantTurnsTotal).toBe(0);
+    });
+
+    it("404s on an unknown goal id", async () => {
+      const res = await fetch(
+        `${base}/api/goals/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/events`,
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it("400s on a path-traversing id", async () => {
+      const res = await fetch(`${base}/api/goals/..%2Fetc/events`);
+      expect(res.status).toBe(400);
+    });
+  });
+
   it("runner stamps heartbeatAt at the top of every round", async () => {
     // Use a dedicated server with a fake LLM so the heartbeat test
     // doesn't depend on the real ModelRouter (which would fail with the
@@ -2116,15 +2212,19 @@ describe("GET /api/global-chat/:id/usage (v0.3 §19)", () => {
   });
 
   it("honors the model query hint when picking contextWindow", async () => {
-    // Empty conv with model=gpt-4o → contextWindow=128_000.
+    // TODO-2 §5.6 / C7 — resolveContextWindow now delegates to the
+    // copilot-models-cache, which returns the REAL cap from copilot's
+    // /models endpoint (with a hardcoded fallback snapshot). gpt-4o's
+    // real cap is 64K, NOT the previously-hardcoded 128K guess.
     const a = await fetch(
       `${base}/api/global-chat/no-such-usage-conv/usage?model=gpt-4o`,
     );
     expect(a.status).toBe(200);
     const aBody = await a.json();
-    expect(aBody.contextWindow).toBe(128_000);
+    expect(aBody.contextWindow).toBe(64_000);
 
-    // model=claude-3-5-sonnet → 200_000.
+    // claude-3-5-sonnet isn't in the snapshot table → falls through to
+    // the 200K default for unknown models (sensible mid-range).
     const b = await fetch(
       `${base}/api/global-chat/no-such-usage-conv/usage?model=claude-3-5-sonnet-20240620`,
     );
@@ -2838,7 +2938,7 @@ describe("POST /api/chat ask_user (v0.19 Codex parity — timeout auto-resolve)"
 
       // Wait for the timer to fire + clear the slot. Bound the wait so a
       // broken timer fails fast rather than hanging the suite.
-      const deadline = Date.now() + 8000;
+      const deadline = Date.now() + 20000;  // Bumped from 8s for CI/load flake (audit 2026-06-24).
       let cleared = false;
       while (Date.now() < deadline) {
         const ann = (await (
@@ -2852,18 +2952,28 @@ describe("POST /api/chat ask_user (v0.19 Codex parity — timeout auto-resolve)"
       }
       expect(cleared).toBe(true);
 
-      // History should now show the patched tool message AND the round-2
-      // text echoing the default back ("resumed-with: auto-foo.ts").
-      const hist = (await (
-        await fetch(`${local.url}/api/chat/${conversationId}`)
-      ).json()) as { history: Array<{ role: string; content: string; toolCallId?: string }> };
-      const patched = hist.history.find(
-        (m) => m.role === "tool" && m.toolCallId === "ask_t_1",
-      );
+      // Poll the history too — there's a small async gap between sidecar
+      // clear and history patch under load. (audit 2026-06-24 added this
+      // second-stage poll to fix recurring flake on parallel test runs.)
+      let patched: { role: string; content: string; toolCallId?: string } | undefined;
+      const patchDeadline = Date.now() + 5000;
+      while (Date.now() < patchDeadline) {
+        const hist = (await (
+          await fetch(`${local.url}/api/chat/${conversationId}`)
+        ).json()) as { history: Array<{ role: string; content: string; toolCallId?: string }> };
+        patched = hist.history.find(
+          (m) => m.role === "tool" && m.toolCallId === "ask_t_1",
+        );
+        if (patched && patched.content === "auto-foo.ts") break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
       expect(patched).toBeDefined();
       expect(patched!.content).toBe("auto-foo.ts");
       // The model's round-2 echo lands as an assistant text message.
-      const echoed = hist.history.find(
+      const hist2 = (await (
+        await fetch(`${local.url}/api/chat/${conversationId}`)
+      ).json()) as { history: Array<{ role: string; content: string; toolCallId?: string }> };
+      const echoed = hist2.history.find(
         (m) => m.role === "assistant" && m.content.includes("resumed-with: auto-foo.ts"),
       );
       expect(echoed).toBeDefined();
@@ -2888,7 +2998,7 @@ describe("POST /api/chat ask_user (v0.19 Codex parity — timeout auto-resolve)"
       expect(r1.status).toBe(200);
       await r1.text();
 
-      const deadline = Date.now() + 8000;
+      const deadline = Date.now() + 20000;  // Bumped from 15s — flake recurred even at 15 under parallel vitest forks (audit 2026-06-24).
       let cleared = false;
       while (Date.now() < deadline) {
         const ann = (await (

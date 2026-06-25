@@ -1,6 +1,5 @@
 /**
- * GitHub Copilot LLM provider — reads cached session token from OpenClaw
- * (or fetches a fresh one from GitHub OAuth on demand).
+ * GitHub Copilot LLM provider — auto-refreshing session-token resolver.
  *
  * Routing inside Copilot's proxy:
  *   gpt-*        → POST <base>/responses          (OpenAI Responses API)
@@ -10,10 +9,33 @@
  * Where <base> is derived from the `proxy-ep=<host>` field embedded in the
  * Copilot session token (individual vs enterprise routing).
  *
- * Auth chain:
- *   1. env COPILOT_TOKEN — explicit override
- *   2. ~/.openclaw/credentials/github-copilot.token.json — OpenClaw cache
- *   3. ~/.copilot/config.json copilotTokens[...] + exchange — fresh OAuth flow
+ * Token model (mirrors hermes-agent `hermes_cli/copilot_auth.py:280-345`):
+ *
+ *   - Raw OAuth token (gho_*, ghu_*, github_pat_*) is LONG-lived. We never
+ *     persist it ourselves; we read it from one of several known stores.
+ *   - Session token (semicolon-separated, ~30 min lifetime) is short-lived.
+ *     We cache it in-process by raw-token fingerprint and refresh
+ *     automatically a couple minutes before expiry.
+ *   - A successful exchange is also written to
+ *     `~/.openclaw/credentials/github-copilot.token.json` so a `mathran
+ *     serve` restart can reuse it for the remainder of its 30 min window
+ *     without hitting the GitHub exchange endpoint again.
+ *
+ * Raw-token resolution order (first hit wins for exchange; on exchange
+ * failure we fall through to the next source so a misconfigured `copilot`
+ * CLI token can't shadow a working `ghu_*` from OpenClaw):
+ *
+ *   1. env COPILOT_TOKEN      — explicit session-token override (skips exchange)
+ *   2. env COPILOT_GITHUB_TOKEN > GH_TOKEN > GITHUB_TOKEN  (raw OAuth tokens)
+ *   3. OpenClaw sqlite auth profile store
+ *        (`~/.openclaw/agents/main/agent/openclaw-agent.sqlite` →
+ *         table `auth_profile_store` → store_key='primary' →
+ *         JSON `profiles["github-copilot:<host>"].token`)
+ *   4. ~/.copilot/config.json  (GitHub Copilot CLI's `copilotTokens` map)
+ *   5. `gh auth token` subprocess (GitHub CLI)
+ *
+ * Final fallback (after every raw source failed): the disk-cached session
+ * token, used read-only as a last-resort.
  *
  * Reference for the Copilot endpoint convention: OpenClaw's
  * extensions/github-copilot module (we mirror its model→transport routing
@@ -23,9 +45,14 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
+import * as crypto from "node:crypto";
+import { execFile as _execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 import type { LLMStreamChunk, MessageContent, ContentPart } from "../../core/providers/llm.js";
 import { contentToString } from "../../core/providers/llm.js";
+
+const execFile = promisify(_execFile);
 
 type FinishReason = Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
 
@@ -36,15 +63,52 @@ const COPILOT_HEADERS = {
   "User-Agent": "GitHubCopilotChat/0.35.0",
 } as const;
 
-const OPENCLAW_TOKEN_CACHE = path.join(
-  process.env.OPENCLAW_STATE_DIR ?? path.join(os.homedir(), ".openclaw"),
-  "credentials",
-  "github-copilot.token.json",
-);
+const OPENCLAW_TOKEN_CACHE_REL = ["credentials", "github-copilot.token.json"];
+const OPENCLAW_SQLITE_REL = ["agents", "main", "agent", "openclaw-agent.sqlite"];
+const COPILOT_CLI_CONFIG_REL = [".copilot", "config.json"];
 
-const COPILOT_CONFIG_PATH = path.join(os.homedir(), ".copilot", "config.json");
+/**
+ * Path helpers — resolved at call time (not at module load) so tests can swap
+ * `OPENCLAW_STATE_DIR` / `HOME` between cases and the resolver picks up the
+ * new locations on the next call.
+ */
+function openclawStateDir(): string {
+  return process.env.OPENCLAW_STATE_DIR ?? path.join(os.homedir(), ".openclaw");
+}
+function openclawTokenCachePath(): string {
+  return path.join(openclawStateDir(), ...OPENCLAW_TOKEN_CACHE_REL);
+}
+function openclawAgentSqlitePath(): string {
+  return path.join(openclawStateDir(), ...OPENCLAW_SQLITE_REL);
+}
+function copilotCliConfigPath(): string {
+  return path.join(os.homedir(), ...COPILOT_CLI_CONFIG_REL);
+}
 const TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token";
 const DEFAULT_API_BASE = "https://api.individual.githubcopilot.com";
+
+/**
+ * Refresh a session token this many ms before its GitHub-stated expiry.
+ * Matches hermes-agent `_JWT_REFRESH_MARGIN_SECONDS = 120`.
+ */
+const SESSION_TOKEN_REFRESH_MARGIN_MS = 2 * 60_000;
+
+const RAW_TOKEN_PREFIXES = /^(gho_|ghu_|github_pat_)/;
+const CLASSIC_PAT_PREFIX = "ghp_";
+
+/**
+ * Minimal type shim for the Node ≥ 22.5 `node:sqlite` API. We avoid taking a
+ * hard build dependency on the freshest `@types/node` just for this one
+ * read-only call site. The schema is verified at runtime; if Node is too old
+ * the dynamic `import("node:sqlite")` throws and we fall through.
+ */
+interface SqliteStatement {
+  get(...params: unknown[]): unknown;
+}
+interface SqliteDb {
+  prepare(sql: string): SqliteStatement;
+  close(): void;
+}
 
 interface CachedToken {
   token: string;
@@ -58,19 +122,48 @@ interface ResolvedToken {
   expiresAt: number;
 }
 
-function deriveBaseUrl(token: string): string {
-  const m = token.match(/proxy-ep=([^;]+)/);
+interface RawTokenWithSource {
+  token: string;
+  source: string;
+}
+
+/* ─── module-level session-token cache ───────────────────────────────────── */
+
+/**
+ * In-memory cache of exchanged session tokens, keyed by a short fingerprint of
+ * the raw OAuth token. Avoids hitting `copilot_internal/v2/token` on every
+ * LLM call — exchanged tokens are good for ~30 min and the GitHub endpoint
+ * is rate-limited. We only store the sha256 prefix as the key so a memory
+ * dump can't recover the raw secret from the cache.
+ */
+const _sessionCache = new Map<string, ResolvedToken>();
+
+function tokenFingerprint(rawToken: string): string {
+  return crypto.createHash("sha256").update(rawToken).digest("hex").slice(0, 16);
+}
+
+function deriveBaseUrl(sessionToken: string): string {
+  const m = sessionToken.match(/proxy-ep=([^;]+)/);
   if (!m) return DEFAULT_API_BASE;
   return `https://${m[1].replace(/^proxy\./, "api.")}`;
 }
 
-function isUsable(t: CachedToken, now: number = Date.now()): boolean {
-  return t.integrationId === "vscode-chat" && t.expiresAt - now > 5 * 60_000;
+function isSessionCacheUsable(t: ResolvedToken, now: number = Date.now()): boolean {
+  return t.expiresAt - now > SESSION_TOKEN_REFRESH_MARGIN_MS;
+}
+
+function isDiskCacheUsable(t: CachedToken, now: number = Date.now()): boolean {
+  return t.integrationId === "vscode-chat" && t.expiresAt - now > SESSION_TOKEN_REFRESH_MARGIN_MS;
+}
+
+function isUsableRawToken(t: string): boolean {
+  return !t.startsWith(CLASSIC_PAT_PREFIX) && RAW_TOKEN_PREFIXES.test(t);
 }
 
 async function loadJsonRelaxed<T = unknown>(p: string): Promise<T | null> {
   try {
     const txt = await fs.readFile(p, "utf-8");
+    // ~/.copilot/config.json is JSON-with-comments; strip `// ...` line comments.
     const cleaned = txt.replace(/^\s*\/\/.*$/gm, "");
     return JSON.parse(cleaned) as T;
   } catch {
@@ -78,33 +171,173 @@ async function loadJsonRelaxed<T = unknown>(p: string): Promise<T | null> {
   }
 }
 
-async function saveCacheToken(t: CachedToken): Promise<void> {
+async function saveDiskCache(t: CachedToken): Promise<void> {
   try {
-    await fs.mkdir(path.dirname(OPENCLAW_TOKEN_CACHE), { recursive: true });
-    await fs.writeFile(OPENCLAW_TOKEN_CACHE, JSON.stringify({ ...t, updatedAt: Date.now() }, null, 2), "utf-8");
+    await fs.mkdir(path.dirname(openclawTokenCachePath()), { recursive: true });
+    await fs.writeFile(
+      openclawTokenCachePath(),
+      JSON.stringify({ ...t, updatedAt: Date.now() }, null, 2),
+      "utf-8",
+    );
+    await fs.chmod(openclawTokenCachePath(), 0o600).catch(() => {});
   } catch {
     // best-effort; don't fail if cache dir is read-only
   }
 }
 
-async function exchangeOauthToken(githubToken: string): Promise<CachedToken> {
+/* ─── raw-token sources (each returns null if not available) ─────────────── */
+
+function readEnvRawToken(): RawTokenWithSource | null {
+  for (const envName of ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] as const) {
+    const v = process.env[envName]?.trim();
+    if (v && isUsableRawToken(v)) {
+      return { token: v, source: `env:${envName}` };
+    }
+  }
+  return null;
+}
+
+/**
+ * Read a raw OAuth token from the OpenClaw 2026.x sqlite auth profile store.
+ *
+ * Schema (verified 2026-06-24):
+ *   table `auth_profile_store` (store_key TEXT, store_json TEXT, updated_at INTEGER)
+ *     store_key='primary'
+ *     store_json={"version":1, "profiles":{"github-copilot:<host>":{"type":"token","provider":"github-copilot","token":"ghu_..."}}}
+ *
+ * Uses Node's built-in `node:sqlite` module (stable from Node 22.5, marked
+ * experimental). Failures (missing module, missing file, lock contention,
+ * schema drift) are non-fatal — we simply return null and the caller falls
+ * through to the next source.
+ */
+async function readOpenClawSqliteRawToken(): Promise<RawTokenWithSource | null> {
+  try {
+    await fs.access(openclawAgentSqlitePath());
+  } catch {
+    return null;
+  }
+
+  let sqlite: { DatabaseSync: new (path: string, opts?: { readOnly?: boolean }) => SqliteDb };
+  try {
+    // @ts-expect-error — `node:sqlite` is stable in Node 22.5+ but absent from
+    //   the @types/node@20 bundled with the project. Treat it as `any` here
+    //   and gate on a runtime try/catch so older Node versions silently
+    //   fall through to the next token source.
+    sqlite = await import("node:sqlite");
+  } catch {
+    return null;
+  }
+
+  let db: SqliteDb;
+  try {
+    db = new sqlite.DatabaseSync(openclawAgentSqlitePath(), { readOnly: true });
+  } catch {
+    return null;
+  }
+
+  try {
+    const row = db
+      .prepare("SELECT store_json FROM auth_profile_store WHERE store_key = ?")
+      .get("primary") as { store_json?: string } | undefined;
+    if (!row || typeof row.store_json !== "string") return null;
+    const parsed = JSON.parse(row.store_json) as {
+      version?: number;
+      profiles?: Record<string, { type?: string; provider?: string; token?: string }>;
+    };
+    const profiles = parsed.profiles ?? {};
+    for (const [name, p] of Object.entries(profiles)) {
+      if (!name.startsWith("github-copilot:")) continue;
+      if (p?.type !== "token" || typeof p.token !== "string") continue;
+      const tok = p.token.trim();
+      if (isUsableRawToken(tok)) {
+        return { token: tok, source: `openclaw-sqlite:${name}` };
+      }
+    }
+  } catch {
+    // schema drift / parse failure — ignore, try next source
+  } finally {
+    try { db.close(); } catch { /* noop */ }
+  }
+  return null;
+}
+
+async function readCopilotCliRawToken(): Promise<RawTokenWithSource | null> {
+  const cfg = await loadJsonRelaxed<{
+    copilotTokens?: Record<string, string>;
+    lastLoggedInUser?: { host?: string; login?: string };
+  }>(copilotCliConfigPath());
+  if (!cfg) return null;
+
+  const lastUser = cfg.lastLoggedInUser;
+  const tokens = cfg.copilotTokens ?? {};
+  const entries = Object.entries(tokens);
+  if (entries.length === 0) return null;
+
+  const preferKey = lastUser ? `${lastUser.host}:${lastUser.login}` : "";
+  const tok = (tokens[preferKey] ?? entries[0][1]).trim();
+  if (!isUsableRawToken(tok)) return null;
+
+  // Note: `copilot` CLI's gho_* tokens currently have `gh-copilot` OAuth scope
+  // and return 404 on a vscode-chat exchange. We still try them (cheap) so
+  // that mathran self-heals if GitHub later widens the scope. On 404 the
+  // caller falls through.
+  return { token: tok, source: "copilot-cli-config" };
+}
+
+async function readGhAuthRawToken(): Promise<RawTokenWithSource | null> {
+  try {
+    const { stdout } = await execFile("gh", ["auth", "token"], { timeout: 5000 });
+    const tok = stdout.trim();
+    if (!isUsableRawToken(tok)) return null;
+    return { token: tok, source: "gh-auth-cli" };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Yield raw tokens in priority order. Exported for testing — production
+ * callers should use {@link resolveCopilotToken}.
+ */
+export async function* iterRawTokenSources(): AsyncGenerator<RawTokenWithSource, void, unknown> {
+  const env = readEnvRawToken();
+  if (env) yield env;
+
+  const sqliteTok = await readOpenClawSqliteRawToken();
+  if (sqliteTok) yield sqliteTok;
+
+  const cliTok = await readCopilotCliRawToken();
+  if (cliTok) yield cliTok;
+
+  const ghTok = await readGhAuthRawToken();
+  if (ghTok) yield ghTok;
+}
+
+/* ─── token exchange ──────────────────────────────────────────────────────── */
+
+interface ExchangeResult {
+  token: string;
+  expiresAt: number;
+  integrationId: string;
+}
+
+async function exchangeRawToken(rawToken: string): Promise<ExchangeResult> {
   const res = await fetch(TOKEN_EXCHANGE_URL, {
     method: "GET",
     headers: {
       Accept: "application/json",
-      Authorization: `Bearer ${githubToken}`,
+      Authorization: `Bearer ${rawToken}`,
       ...COPILOT_HEADERS,
       "X-Github-Api-Version": "2025-04-01",
     },
   });
   if (!res.ok) {
-    throw new Error(
-      `Copilot token exchange failed: HTTP ${res.status} ${await res.text().catch(() => "")}`,
-    );
+    const body = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} ${body.slice(0, 200)}`);
   }
   const j = (await res.json()) as { token?: string; expires_at?: number };
   if (!j.token || typeof j.expires_at !== "number") {
-    throw new Error(`Copilot token response missing fields: ${JSON.stringify(j).slice(0, 200)}`);
+    throw new Error(`response missing required fields: ${JSON.stringify(j).slice(0, 200)}`);
   }
   return {
     token: j.token,
@@ -113,49 +346,96 @@ async function exchangeOauthToken(githubToken: string): Promise<CachedToken> {
   };
 }
 
+/* ─── top-level resolve ──────────────────────────────────────────────────── */
+
+/**
+ * Resolve a Copilot session token, refreshing in the background when it
+ * nears expiry. The returned `expiresAt` is the GitHub-stated expiry
+ * (≈30 min after issue); callers may but need not use it.
+ *
+ * See module docstring for the resolution order and lifecycle. Throws when
+ * every source fails, with a message that lists what was tried so the user
+ * can pick a recovery path.
+ */
 export async function resolveCopilotToken(): Promise<ResolvedToken> {
-  // 1) explicit env override (e.g. CI / sandboxed shell)
-  const envToken = process.env.COPILOT_TOKEN?.trim();
-  if (envToken) {
+  // (1) Explicit session-token override.
+  const sessionOverride = process.env.COPILOT_TOKEN?.trim();
+  if (sessionOverride) {
     return {
-      token: envToken,
-      baseUrl: deriveBaseUrl(envToken),
-      expiresAt: Date.now() + 30 * 60_000, // unknown; assume 30 min
+      token: sessionOverride,
+      baseUrl: deriveBaseUrl(sessionOverride),
+      expiresAt: Date.now() + 30 * 60_000,
     };
   }
 
-  // 2) OpenClaw cache (most common on machines that run OpenClaw)
-  const cache = await loadJsonRelaxed<CachedToken>(OPENCLAW_TOKEN_CACHE);
-  if (cache && isUsable(cache)) {
-    return { token: cache.token, baseUrl: deriveBaseUrl(cache.token), expiresAt: cache.expiresAt };
+  // (2) Walk raw-token sources, return the first successful exchange.
+  const attemptedSources: { source: string; error: string }[] = [];
+  for await (const { token: rawToken, source } of iterRawTokenSources()) {
+    const fp = tokenFingerprint(rawToken);
+
+    // In-memory cache check — avoids re-exchanging while the previous session
+    // token is still safely valid.
+    const cached = _sessionCache.get(fp);
+    if (cached && isSessionCacheUsable(cached)) {
+      return cached;
+    }
+
+    try {
+      const fresh = await exchangeRawToken(rawToken);
+      const resolved: ResolvedToken = {
+        token: fresh.token,
+        baseUrl: deriveBaseUrl(fresh.token),
+        expiresAt: fresh.expiresAt,
+      };
+      _sessionCache.set(fp, resolved);
+      // Persist for cross-process reuse (best-effort).
+      await saveDiskCache(fresh);
+      return resolved;
+    } catch (err) {
+      attemptedSources.push({
+        source,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // fall through to the next source
+    }
   }
 
-  // 3) Exchange a fresh session token using the GitHub OAuth credential.
-  //    ~/.copilot/config.json is JSON-with-comments and stores entries like:
-  //      copilotTokens: { "https://github.com:<login>": "gho_..." }
-  const cfg = await loadJsonRelaxed<{
-    copilotTokens?: Record<string, string>;
-    lastLoggedInUser?: { host?: string; login?: string };
-  }>(COPILOT_CONFIG_PATH);
-
-  const lastUser = cfg?.lastLoggedInUser;
-  const tokens = cfg?.copilotTokens ?? {};
-  const tokenEntries = Object.entries(tokens);
-  if (tokenEntries.length === 0) {
-    throw new Error(
-      "no Copilot session token found.\n" +
-        `  - tried env COPILOT_TOKEN\n` +
-        `  - tried OpenClaw cache: ${OPENCLAW_TOKEN_CACHE}\n` +
-        `  - tried gh-copilot CLI config: ${COPILOT_CONFIG_PATH}\n` +
-        `Run \`gh auth login\` + Copilot login (or set COPILOT_TOKEN) and retry.`,
-    );
+  // (3) Disk-cache fallback — every raw source failed or none were present.
+  //     Useful when a previous process exchanged a token and exited.
+  const disk = await loadJsonRelaxed<CachedToken>(openclawTokenCachePath());
+  if (disk && isDiskCacheUsable(disk)) {
+    return {
+      token: disk.token,
+      baseUrl: deriveBaseUrl(disk.token),
+      expiresAt: disk.expiresAt,
+    };
   }
-  const preferKey = lastUser ? `${lastUser.host}:${lastUser.login}` : "";
-  const oauth = tokens[preferKey] ?? tokenEntries[0][1];
 
-  const fresh = await exchangeOauthToken(oauth);
-  await saveCacheToken(fresh);
-  return { token: fresh.token, baseUrl: deriveBaseUrl(fresh.token), expiresAt: fresh.expiresAt };
+  const attemptedSummary =
+    attemptedSources.length === 0
+      ? "  - no raw OAuth token found in any known source"
+      : attemptedSources.map((s) => `  - ${s.source}: ${s.error}`).join("\n");
+  throw new Error(
+    "Could not resolve a Copilot session token.\n" +
+      "Tried (in order):\n" +
+      "  - env COPILOT_TOKEN (not set)\n" +
+      attemptedSummary +
+      "\n" +
+      `  - disk cache: ${openclawTokenCachePath()} (missing or stale)\n` +
+      "Fix: either\n" +
+      "  - set COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN to a " +
+      "ghu_* / gho_* / github_pat_* token with Copilot Requests scope, or\n" +
+      "  - run `openclaw models auth login-github-copilot` (writes a " +
+      "ghu_* token mathran can read from the OpenClaw sqlite store).",
+  );
+}
+
+/**
+ * Clear the in-memory session-token cache. Test-only helper; production code
+ * does not need to call this because cached entries naturally expire.
+ */
+export function _clearSessionCacheForTests(): void {
+  _sessionCache.clear();
 }
 
 // ─── Request/response abstraction ─────────────────────────────────────────
@@ -212,6 +492,8 @@ export interface CopilotToolCall {
 
 export interface CopilotChatResponse {
   text: string;
+  /** Reasoning / chain-of-thought text (UX gap B), empty when none. */
+  reasoning: string;
   toolCalls: CopilotToolCall[];
   finishReason: FinishReason;
   usage: { input: number; output: number };
@@ -253,10 +535,22 @@ async function postJson(
 }
 
 // Extract text from /responses output[].content[]
-function extractResponsesText(raw: any): { text: string; input: number; output: number } {
+function extractResponsesText(raw: any): { text: string; reasoning: string; input: number; output: number } {
   let text = "";
+  let reasoning = "";
   if (Array.isArray(raw?.output)) {
     for (const o of raw.output) {
+      // Reasoning items carry a `summary[]` of `{type:"summary_text", text}`
+      // (and sometimes a `content[]` of `{type:"reasoning_text", text}`).
+      if (o?.type === "reasoning") {
+        for (const s of o.summary ?? []) {
+          if (typeof s?.text === "string") reasoning += s.text;
+        }
+        for (const c of o.content ?? []) {
+          if (typeof c?.text === "string") reasoning += c.text;
+        }
+        continue;
+      }
       if (o?.type !== "message") continue;
       if (!Array.isArray(o.content)) continue;
       for (const c of o.content) {
@@ -270,21 +564,26 @@ function extractResponsesText(raw: any): { text: string; input: number; output: 
   const usage = raw?.usage ?? {};
   return {
     text,
+    reasoning,
     input: usage.input_tokens ?? usage.prompt_tokens ?? 0,
     output: usage.output_tokens ?? usage.completion_tokens ?? 0,
   };
 }
 
-function extractMessagesText(raw: any): { text: string; input: number; output: number } {
+function extractMessagesText(raw: any): { text: string; reasoning: string; input: number; output: number } {
   let text = "";
+  let reasoning = "";
   if (Array.isArray(raw?.content)) {
     for (const c of raw.content) {
       if (c?.type === "text" && typeof c.text === "string") text += c.text;
+      // Extended-thinking blocks carry the chain-of-thought in `thinking`.
+      else if (c?.type === "thinking" && typeof c.thinking === "string") reasoning += c.thinking;
     }
   }
   const usage = raw?.usage ?? {};
   return {
     text,
+    reasoning,
     input: usage.input_tokens ?? 0,
     output: usage.output_tokens ?? 0,
   };
@@ -524,10 +823,11 @@ export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatR
       token,
       req.signal,
     );
-    const { text, input: inT, output: outT } = extractResponsesText(raw);
+    const { text, reasoning, input: inT, output: outT } = extractResponsesText(raw);
     const toolCalls = extractResponsesToolCalls(raw);
     return {
       text,
+      reasoning,
       toolCalls,
       finishReason: toolCalls.length > 0 ? "tool_calls" : "stop",
       usage: { input: inT, output: outT },
@@ -548,10 +848,11 @@ export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatR
       token,
       req.signal,
     );
-    const { text, input: inT, output: outT } = extractMessagesText(raw);
+    const { text, reasoning, input: inT, output: outT } = extractMessagesText(raw);
     const toolCalls = extractMessagesToolCalls(raw);
     return {
       text,
+      reasoning,
       toolCalls,
       finishReason: mapClaudeStopReason(raw?.stop_reason, toolCalls.length > 0),
       usage: { input: inT, output: outT },
@@ -578,9 +879,11 @@ export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatR
     req.signal,
   ) as any;
   const text = raw?.choices?.[0]?.message?.content ?? "";
+  const reasoning = raw?.choices?.[0]?.message?.reasoning_content ?? "";
   const usage = raw?.usage ?? {};
   return {
     text,
+    reasoning,
     toolCalls: [],
     finishReason: "stop",
     usage: { input: usage.prompt_tokens ?? 0, output: usage.completion_tokens ?? 0 },

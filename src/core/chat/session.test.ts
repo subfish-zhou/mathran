@@ -84,12 +84,54 @@ describe("ChatSession", () => {
     expect(events).toEqual([
       { type: "text", delta: "hello" },
       { type: "text", delta: " world" },
+      { type: "usage" },
       { type: "done", finishReason: "stop" },
     ]);
 
     const history = session.history();
     expect(history.at(-2)).toMatchObject({ role: "user", content: "hi" });
     expect(history.at(-1)).toMatchObject({ role: "assistant", content: "hello world" });
+  });
+
+  it("passes reasoning deltas through and persists them on the assistant turn (UX gap B)", async () => {
+    const llm = new ScriptedLLM([
+      [
+        { type: "reasoning", delta: "Let me " },
+        { type: "reasoning", delta: "think." },
+        { type: "text", delta: "Answer." },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const session = new ChatSession({ llm, model: "m" });
+
+    const events = await collect(session.send("hi"));
+    expect(events).toEqual([
+      { type: "reasoning", delta: "Let me " },
+      { type: "reasoning", delta: "think." },
+      { type: "text", delta: "Answer." },
+      { type: "usage" },
+      { type: "done", finishReason: "stop" },
+    ]);
+
+    // The reasoning is accumulated onto the persisted assistant message so a
+    // reload (history → jsonl) can re-render the collapsed panel.
+    expect(session.history().at(-1)).toMatchObject({
+      role: "assistant",
+      content: "Answer.",
+      reasoning: "Let me think.",
+    });
+  });
+
+  it("omits the reasoning field when no reasoning streamed", async () => {
+    const llm = new ScriptedLLM([
+      [
+        { type: "text", delta: "plain" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const session = new ChatSession({ llm, model: "m" });
+    await collect(session.send("hi"));
+    expect(session.history().at(-1)).not.toHaveProperty("reasoning");
   });
 
   it("executes a lean_check tool call, feeds the result back, and continues", async () => {
@@ -121,9 +163,11 @@ describe("ChatSession", () => {
     const types = events.map((e) => e.type);
     expect(types).toEqual([
       "text", // "Let me verify."
+      "usage",
       "tool-call",
       "tool-result",
       "text", // "It compiles."
+      "usage",
       "done",
     ]);
 

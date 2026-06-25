@@ -164,6 +164,28 @@ export const MathranSettingsSchema = z
     /** Approval Policy 矩阵 — see {@link ApprovalSettingsSchema}. */
     approval: ApprovalSettingsSchema.optional(),
     /**
+     * Goal-mode (long-running autonomous loop) settings.
+     *
+     * `markDoneReview` — Layer 2 content-review hook that gates `mark_done`
+     * (DESIGN-REFERENCE.md §8). Default `mode: "off"` for backward compat;
+     * `"deterministic"` is the recommended low-cost setting (scans the
+     * goal's `.plan.md` for unchecked items, no LLM call).
+     */
+    goal: z
+      .object({
+        markDoneReview: z
+          .object({
+            mode: z
+              .enum(["off", "deterministic", "llm", "both"])
+              .optional(),
+            reviewerModel: z.string().optional(),
+          })
+          .passthrough()
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
+    /**
      * Permission Profiles (#2) — default profile name applied when no
      * `--profile` flag is given (dev | ci | review | custom). The CLI `--profile`
      * flag overrides this.

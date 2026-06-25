@@ -29,11 +29,25 @@ import type { ReasoningEffortLevel } from "../reasoning-effort/index.js";
 import { capToolOutput } from "./tool-output-cap.js";
 import {
   compactRunner,
+  LocalCompactionStrategy,
   type CompactRunnerInput,
   type CompactedArtifact,
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_KEEP_RECENT_ROUNDS,
 } from "../subagent/runners/compact.js";
+import {
+  ensureBuiltInsRegistered,
+  pickStrategy,
+} from "../subagent/runners/compact-strategies.js";
+import { injectionPolicyForPhase } from "../subagent/runners/compact-injection.js";
+import type {
+  CompactionHooks,
+  CompactionOutcome,
+  CompactionPhase,
+  CompactionReason,
+  CompactionRequest,
+  CompactionTrigger,
+} from "../subagent/runners/compact-types.js";
 import { readSummarizeRunner } from "../subagent/runners/read-summarize.js";
 import { searchRunner } from "../subagent/runners/search.js";
 import { SubagentRegistry } from "../subagent/registry.js";
@@ -117,7 +131,13 @@ import { createGitTools } from "./tools/git-tools.js";
 import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
+import { formatHookBlock } from "../hooks/executor.js";
 import type { RiskClass, ApprovalRequest, ApprovalDecision, ApprovalResolver } from "../approval/types.js";
+import {
+  buildWriteProposal,
+  type WriteProposal,
+  type WriteProposalDecision,
+} from "../approval/diff-preview.js";
 import type { Outcome } from "../outcomes/schema.js";
 import type { BackgroundSubagentRegistry } from "../subagent/background.js";
 import type { ProfileEffects } from "../profiles/types.js";
@@ -241,6 +261,17 @@ export interface SubagentResultLite {
  */
 export type ChatEvent =
   | { type: "text"; delta: string }
+  | {
+      /** UX gap B — reasoning / chain-of-thought delta. Mirrors the
+       *  provider `reasoning` stream chunk (Anthropic `thinking_delta`,
+       *  OpenAI / Copilot `reasoning_content`). The host SSE layer passes
+       *  it straight through so the SPA can render a collapsed "💭 reasoning"
+       *  panel. Accumulated onto the assistant message's `reasoning` field
+       *  for jsonl persistence; disposable (first dropped on compaction) and
+       *  never replayed back to the provider. */
+      type: "reasoning";
+      delta: string;
+    }
   | { type: "tool-call"; id: string; name: string; args: string }
   | { type: "tool-result"; id: string; name: string; ok: boolean; content: string }
   | {
@@ -258,6 +289,27 @@ export type ChatEvent =
       type: "approval_resolved";
       id: string;
       decision: ApprovalDecision;
+    }
+  | {
+      /** UX gap A — Diff preview before file write. Emitted just before an
+       *  already-authorised write_file / edit_file call executes, when its
+       *  matching `allow` rule carries `requireDiffPreview: true`. Carries the
+       *  unified diff + truncated old/new content so the SPA renders a
+       *  `DiffPreviewModal`; the session then BLOCKS on the
+       *  {@link writeProposalResolver} until the user accepts / declines / edits.
+       *  CLI / goal hosts without a resolver never see this — the write just
+       *  runs. */
+      type: "propose-write";
+      proposal: WriteProposal;
+    }
+  | {
+      /** UX gap A — emitted right after a `propose-write` is resolved, carrying
+       *  the user's verdict so the SPA can dismiss the modal and observers can
+       *  audit it. `accept` (optionally with edited content) runs the write;
+       *  `decline` reports a rejection to the model. */
+      type: "propose-write-resolved";
+      toolCallId: string;
+      decision: WriteProposalDecision;
     }
   | {
       /** v0.16 §11 — the model called `ask_user`; the host (serve) will
@@ -333,6 +385,55 @@ export type ChatEvent =
       result?: SubagentResultLite;
     }
   | {
+      /** Defect #1 — token accounting. Emitted once per LLM round-trip
+       *  inside `send()` (i.e. once per `llm.chat()` call), carrying the
+       *  provider-reported usage so the goal runner can sum REAL token
+       *  consumption (system prompt + full history + tool calls + output)
+       *  instead of re-estimating only the (user, final-assistant) pair.
+       *  `inputTokens` / `outputTokens` are undefined when the provider
+       *  didn't return a `usage` block; the count of these events still
+       *  equals the number of assistant turns / LLM calls this `send()`
+       *  made, so the runner can populate `assistantTurnsTotal` /
+       *  `llmCallsTotal` regardless of token availability. */
+      type: "usage";
+      inputTokens?: number;
+      outputTokens?: number;
+    }
+  | {
+      /** TODO-2 §3.2 / C8 — compaction lifecycle event. Emitted by
+       *  compactV2() when a compaction attempt completes (success OR
+       *  failure). Carries the full telemetry so the goal runner can
+       *  bump compactionRuns / compactionTokensDropped and the SSE
+       *  layer can push a real-time badge to the SPA. NOT emitted
+       *  for noop (droppedRoundCount=0) compactions — those are
+       *  silent. */
+      type: "compaction";
+      outcome: "ok" | "skipped" | "cancelled" | "failed";
+      reason: string;
+      phase: string;
+      trigger: string;
+      policy: string;
+      originalTokens: number;
+      newTokens: number;
+      droppedRoundCount: number;
+      durationMs: number;
+      summaryTokens?: number;
+    }
+  | {
+      /** Layer 1 — token budget continuation. Emitted by the goal runner
+       *  (NOT the chat session) when a `mark_done` is blocked because the
+       *  goal hasn't yet spent 90% of `budget.tokensMax`. The runner injects
+       *  a nudge user message into history and reschedules the next
+       *  iteration; this event lets the daemon log + SSE layer surface a
+       *  "💰 N continuation(s)" badge. */
+      type: "budget-continuation";
+      goalId: string;
+      pct: number;
+      continuationCount: number;
+      tokensUsed: number;
+      budget: number;
+    }
+  | {
       type: "done";
       finishReason: Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
     };
@@ -375,18 +476,32 @@ export interface ChatSessionOptions {
    */
   toolOutputCap?: { maxInlineBytes?: number; workspace?: string | null };
   /**
-   * Auto-compact (v0.2 §5). When `enabled: true`, every `send()` call checks
-   * the token count of `this.messages` against `contextWindow * thresholdPct`
-   * and runs `compact()` first if we'd overflow. Requires the wrapped
-   * LLMProvider to implement `countTokens`; falls back to a silent no-op
-   * when the provider can't count tokens. Defaults: thresholdPct=0.75,
-   * keepRecentRounds=5, contextWindow=200000.
+   * Auto-compact (v0.2 §5 + TODO-2 §3.2). When `enabled: true`, every
+   * `send()` call checks the token count of `this.messages` against
+   * `contextWindow * thresholdPct` and runs `compactV2({ phase: "pre_turn" })`
+   * first if we'd overflow. Requires the wrapped LLMProvider to implement
+   * `countTokens`; falls back to a silent no-op when the provider can't
+   * count tokens. Defaults: thresholdPct=0.75, keepRecentRounds=5,
+   * contextWindow=200000.
+   *
+   * TODO-2 §3.2 mid-turn precheck (opt-in): when `enableMidTurnPrecheck`
+   * is true, every LLM round-trip inside a `send()` loop also tallies the
+   * provider-reported input token count and runs an extra mid-turn
+   * compaction when the cumulative tally exceeds
+   * `midTurnThresholdPct * contextWindow` (default = thresholdPct + 0.05).
+   * This is the codex InitialContextInjection::BeforeLastUserMessage path:
+   * summary is spliced INSIDE the tail just above the last real user
+   * message so the model stays in-distribution.
    */
   autoCompact?: {
     enabled?: boolean;
     thresholdPct?: number;
     keepRecentRounds?: number;
     contextWindow?: number;
+    /** TODO-2 §3.2 — opt in to mid-turn precheck (default false). */
+    enableMidTurnPrecheck?: boolean;
+    /** TODO-2 §3.2 — mid-turn trigger threshold (default thresholdPct + 0.05). */
+    midTurnThresholdPct?: number;
   };
   /**
    * Workspace root for subagent artifacts (v0.2 §5). Required for `compact()`
@@ -394,6 +509,18 @@ export interface ChatSessionOptions {
    * back to a per-session temp dir.
    */
   workspace?: string;
+  /**
+   * TODO-2 §3.2 / C8 — observer for compaction lifecycle events. Invoked
+   * synchronously after every compactV2() attempt (success OR failure)
+   * with a `{ type: "compaction", ... }` ChatEvent. Goal-mode runner
+   * wires this to its `emit()` so SSE clients see compaction in real
+   * time and `updateGoalStats` can bump `compactionRuns`. Listener
+   * exceptions are caught — never block the send loop.
+   *
+   * Noop compactions (droppedRoundCount=0) are NOT reported here to
+   * avoid noise.
+   */
+  onCompactionEvent?: (ev: ChatEvent & { type: "compaction" }) => void;
   /**
    * Optional injected subagent scheduler. Tests pass a custom one; production
    * code lets ChatSession build its own (with the compact runner registered)
@@ -627,6 +754,19 @@ export interface ChatSessionOptions {
    */
   approvalResolver?: ApprovalResolver;
   /**
+   * UX gap A — Diff preview before file write. Session-level resolver the
+   * broker consults AFTER it has authorised a write-style call whose matching
+   * `allow` rule carries `requireDiffPreview: true`. The session yields a
+   * `propose-write` event (unified diff + truncated contents), awaits this
+   * resolver, yields `propose-write-resolved`, then either runs the write
+   * (optionally with the user's edited content) or reports a rejection back to
+   * the model. When unset, `requireDiffPreview` rules degrade gracefully to the
+   * legacy behaviour: the authorised write runs immediately with no preview.
+   */
+  writeProposalResolver?: (
+    proposal: WriteProposal,
+  ) => Promise<WriteProposalDecision>;
+  /**
    * Permission Profile (#2). When set, a HARD reject is applied at the tool
    * dispatch entry point (before the approval broker, so the user cannot
    * override it) for mutating tool calls under a read-only / review profile,
@@ -835,6 +975,8 @@ export class ChatSession {
   readonly sessionId: string;
   private readonly toolOutputCap?: { maxInlineBytes?: number; workspace?: string | null };
   private readonly autoCompactCfg?: ChatSessionOptions["autoCompact"];
+  /** TODO-2 §3.2 / C8 — compaction event observer (goal-mode wires emit). */
+  private readonly onCompactionEvent?: ChatSessionOptions["onCompactionEvent"];
   private readonly workspace?: string;
   private readonly subagentScheduler?: SubagentScheduler;
   /**
@@ -855,6 +997,10 @@ export class ChatSession {
   private readonly hookInvoker?: HookInvoker;
   /** Session-level approval resolver (yield-based prompt driver). */
   private readonly approvalResolver?: ApprovalResolver;
+  /** UX gap A — diff-preview resolver (yield-based write-proposal driver). */
+  private readonly writeProposalResolver?: (
+    proposal: WriteProposal,
+  ) => Promise<WriteProposalDecision>;
   /** Permission Profile (#2) — drives the dispatch-level hard reject. */
   private readonly profile?: ProfileEffects;
   /**
@@ -873,6 +1019,10 @@ export class ChatSession {
   private planMode: boolean = false;
   /** Promise of an in-flight compact() — second concurrent caller awaits it. */
   private compactInFlight: Promise<CompactStats> | null = null;
+  /** TODO-2 §3.2 — promise of an in-flight compactV2() — second caller awaits it. */
+  private compactInFlightV2: Promise<CompactionOutcome> | null = null;
+  /** TODO-2 §3.2 — cumulative provider-reported input tokens for the current send() turn. */
+  private cumulativeInputTokens = 0;
   private messages: LLMMessage[] = [];
   /**
    * Skills/Plugins 二层: skills carrying a `trigger` (keyword / regex). These
@@ -907,6 +1057,7 @@ export class ChatSession {
     this.toolOutputCap = opts.toolOutputCap;
     this.autoCompactCfg = opts.autoCompact;
     this.workspace = opts.workspace;
+    this.onCompactionEvent = opts.onCompactionEvent;
     this.subagentScheduler = opts.subagentScheduler;
     // v0.5 wire-up: prefer `opts.scheduler` for the dispatch tool, but fall
     // back to `opts.subagentScheduler` so production callers that already
@@ -916,6 +1067,7 @@ export class ChatSession {
     this.checkpointsCfg = opts.checkpoints;
     this.approvalBroker = opts.approvalBroker;
     this.approvalResolver = opts.approvalResolver;
+    this.writeProposalResolver = opts.writeProposalResolver;
     this.hookInvoker = opts.hooks;
     this.profile = opts.profile;
     // Mix in built-in tools (v0.2 §9+). Order: built-ins first, then caller's
@@ -1562,7 +1714,7 @@ export class ChatSession {
         };
       }
       if (auth.kind === "allow") {
-        return await tool.execute(parsed, callCtx);
+        return yield* this.maybePreviewThenExecute(tool, call, parsed, callCtx);
       }
       return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, null);
     }
@@ -1577,7 +1729,7 @@ export class ChatSession {
       };
     }
     if (pre.kind === "allow") {
-      return await tool.execute(parsed, callCtx);
+      return yield* this.maybePreviewThenExecute(tool, call, parsed, callCtx);
     }
     if (pre.kind === "defer-on-failure") {
       return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, resolver);
@@ -1596,7 +1748,163 @@ export class ChatSession {
     if (verdict.kind === "defer-on-failure") {
       return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, resolver);
     }
+    return yield* this.maybePreviewThenExecute(tool, call, parsed, callCtx);
+  }
+
+  /**
+   * UX gap A — Diff preview gate around an already-AUTHORISED write. Called at
+   * every `allow` exit of {@link executeWithApproval}. When the call is a
+   * write-style tool whose matching `allow` rule set `requireDiffPreview` AND a
+   * {@link writeProposalResolver} is wired, it:
+   *
+   *   1. reads the existing file content (if any),
+   *   2. builds a {@link WriteProposal} (unified diff + truncated contents),
+   *   3. yields a `propose-write` event and BLOCKS on the resolver,
+   *   4. yields `propose-write-resolved`, then either runs the write (optionally
+   *      with the user's edited whole-file content) or returns a rejection.
+   *
+   * In every other case (no resolver, rule doesn't require preview, non-write
+   * tool, or a proposal that can't be derived) it is a thin pass-through to
+   * `tool.execute` — preserving the legacy behaviour exactly.
+   */
+  private async *maybePreviewThenExecute(
+    tool: ToolSpec,
+    call: { id: string; name: string },
+    parsed: Record<string, unknown>,
+    callCtx: ToolExecuteContext,
+  ): AsyncGenerator<ChatEvent, { ok: boolean; content: string }, void> {
+    const broker = this.approvalBroker;
+    if (
+      !this.writeProposalResolver ||
+      !broker ||
+      tool.riskClass !== "write" ||
+      typeof parsed.path !== "string" ||
+      !parsed.path
+    ) {
+      return await tool.execute(parsed, callCtx);
+    }
+    const needPreview = await broker.requiresDiffPreview({
+      tool: call.name,
+      args: parsed,
+    });
+    if (!needPreview) {
+      return await tool.execute(parsed, callCtx);
+    }
+
+    const rawPath = parsed.path;
+    const workspace = callCtx.workspace ?? this.workspace ?? null;
+    const resolved = path.isAbsolute(rawPath)
+      ? rawPath
+      : path.resolve(workspace ?? process.cwd(), rawPath);
+
+    // Workspace-escape boundary: mirror the write tools' own containment check
+    // (write-file.ts / edit-file.ts `resolvePath`). A path that escapes the
+    // workspace must NOT be previewed-then-written directly here — fall through
+    // to `tool.execute`, which rejects it with the canonical "escapes
+    // workspace" error. This keeps the boundary intact on the
+    // accept-with-edited-content path (which writes `resolved` directly).
+    if (workspace) {
+      const rel = path.relative(workspace, resolved);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) {
+        return await tool.execute(parsed, callCtx);
+      }
+    }
+
+    const fs = await import("node:fs/promises");
+    let oldContent: string | null = null;
+    let exists = false;
+    try {
+      oldContent = await fs.readFile(resolved, "utf-8");
+      exists = true;
+    } catch {
+      oldContent = null;
+      exists = false;
+    }
+
+    const proposal = buildWriteProposal({
+      toolCallId: call.id,
+      tool: call.name,
+      args: parsed,
+      path: rawPath,
+      oldContent,
+      exists,
+    });
+    // No derivable preview (unknown tool / ambiguous edit match) — let the tool
+    // run and fail loudly on its own terms rather than silently swallow it.
+    if (!proposal) {
+      return await tool.execute(parsed, callCtx);
+    }
+
+    yield { type: "propose-write", proposal };
+    const decision = await this.writeProposalResolver(proposal);
+    yield { type: "propose-write-resolved", toolCallId: call.id, decision };
+
+    if (decision.outcome === "decline") {
+      return {
+        ok: false,
+        content:
+          "⛔ write rejected by user (diff preview declined) — revise the change or pick a different approach",
+      };
+    }
+
+    // Accept. When the user edited the content in the modal, that edited string
+    // is the FULL new file. For write_file we just swap the `content` arg and
+    // reuse the tool (keeping its hooks / read-tracking). For other write tools
+    // (edit_file) the edited whole-file content can't round-trip through the
+    // tool's own diff-apply, so we write it directly.
+    if (typeof decision.editedContent === "string") {
+      if (call.name === "write_file") {
+        return await tool.execute(
+          { ...parsed, content: decision.editedContent },
+          callCtx,
+        );
+      }
+      return await this.applyEditedWrite(
+        resolved,
+        rawPath,
+        decision.editedContent,
+        callCtx,
+      );
+    }
+
     return await tool.execute(parsed, callCtx);
+  }
+
+  /**
+   * Write `content` directly to `resolved`, honouring pre/post-edit hooks and
+   * read-tracking. Used only on a diff-preview "accept with edits" for a tool
+   * (edit_file) whose own execute path can't take a whole-file replacement.
+   */
+  private async applyEditedWrite(
+    resolved: string,
+    rawPath: string,
+    content: string,
+    callCtx: ToolExecuteContext,
+  ): Promise<{ ok: boolean; content: string }> {
+    const fs = await import("node:fs/promises");
+    try {
+      if (callCtx.hooks) {
+        const pre = await callCtx.hooks.run("pre-edit", { filePath: resolved });
+        if (pre.blocked) {
+          return { ok: false, content: formatHookBlock("edit_file", pre) };
+        }
+      }
+      await fs.mkdir(path.dirname(resolved), { recursive: true });
+      await fs.writeFile(resolved, content, "utf-8");
+    } catch (err: any) {
+      return {
+        ok: false,
+        content: `edit_file error: ${err?.message ?? String(err)}`,
+      };
+    }
+    callCtx.recordRead?.(resolved);
+    const bytes = Buffer.byteLength(content, "utf-8");
+    let result = `wrote ${bytes} bytes to ${rawPath} (user-edited via diff preview)`;
+    if (callCtx.hooks) {
+      const post = await callCtx.hooks.run("post-edit", { filePath: resolved });
+      if (post.summary) result += `\n\n${post.summary}`;
+    }
+    return { ok: true, content: result };
   }
 
   /**
@@ -1876,11 +2184,13 @@ export class ChatSession {
   }
 
   /**
-   * Auto-compact pre-check (v0.2 §5). Called once at the start of {@link send}
-   * when `autoCompact.enabled` is true. Silent no-op when the provider can't
-   * count tokens, or when the count is under the configured threshold.
+   * Auto-compact pre-turn check (v0.2 §5 + TODO-2 §3.2). Called once at
+   * the start of {@link send} when `autoCompact.enabled` is true. Silent
+   * no-op when the provider can't count tokens, or when the count is
+   * under the configured threshold. Routes through `compactV2({
+   * phase: "pre_turn", policy: "do_not_inject" })`.
    */
-  private async maybeAutoCompact(): Promise<void> {
+  private async maybeAutoCompactPreTurn(): Promise<void> {
     const cfg = this.autoCompactCfg;
     if (!cfg?.enabled) return;
     const llm = this.llm as LLMProvider & { countTokens?: (m: LLMMessage[]) => number };
@@ -1896,9 +2206,214 @@ export class ChatSession {
     const threshold = window * (cfg.thresholdPct ?? 0.75);
     if (count <= threshold) return;
     try {
-      await this.compact();
+      // Reset mid-turn accumulator on every pre-turn boundary — the
+      // counter restarts cleanly each user-initiated send.
+      this.cumulativeInputTokens = 0;
+      const out = await this.compactV2({
+        reason: "budget_exceeded",
+        phase: "pre_turn",
+        trigger: "auto",
+      });
+      // After a successful compact, the mid-turn precheck shouldn't
+      // immediately re-trigger off pre-compaction token measurements.
+      if (out.ok) this.cumulativeInputTokens = 0;
     } catch {
       // Swallow: auto-compact must never block the user's send.
+    }
+  }
+
+  /**
+   * TODO-2 §3.2 — Auto-compact mid-turn check. Invoked from the inner
+   * LLM round-trip loop AFTER each provider-reported `usage` event.
+   * Tallies the cumulative input tokens spent inside this send() and
+   * triggers `compactV2({ phase: "mid_turn", policy: "before_last_user_message" })`
+   * when the cumulative tally exceeds `midTurnThresholdPct * contextWindow`.
+   *
+   * The default `midTurnThresholdPct = thresholdPct + 0.05` is slightly
+   * above the pre-turn threshold so a single high-usage round inside a
+   * conversation that's already close to the limit doesn't double-fire
+   * pre-turn + mid-turn compaction back-to-back.
+   *
+   * Mid-turn compaction is OPT-IN via `autoCompact.enableMidTurnPrecheck`.
+   * For the default chat-mode case (off), this is a zero-cost no-op.
+   */
+  private async maybeAutoCompactMidTurn(args: {
+    realPromptTokens?: number;
+  }): Promise<void> {
+    const cfg = this.autoCompactCfg;
+    if (!cfg?.enabled || !cfg.enableMidTurnPrecheck) return;
+    if (typeof args.realPromptTokens !== "number" || !Number.isFinite(args.realPromptTokens)) return;
+    // Accumulate. mid-turn precheck uses *provider-reported* tokens
+    // rather than countTokens — the provider's count IS the truth.
+    this.cumulativeInputTokens += args.realPromptTokens;
+    const window = cfg.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+    const midPct = cfg.midTurnThresholdPct ?? ((cfg.thresholdPct ?? 0.75) + 0.05);
+    const threshold = window * midPct;
+    if (this.cumulativeInputTokens <= threshold) return;
+    try {
+      const out = await this.compactV2({
+        reason: "token_limit",
+        phase: "mid_turn",
+        trigger: "auto",
+      });
+      // Successful mid-turn compaction → reset accumulator so the next
+      // few rounds don't immediately re-trigger.
+      if (out.ok) this.cumulativeInputTokens = 0;
+    } catch {
+      // Swallow — mid-turn compaction must NEVER break the send loop.
+    }
+  }
+
+  /**
+   * TODO-2 §3.2 — V2 compaction entry. Routes through the multi-strategy
+   * dispatcher (compact-strategies.ts) so plugins can register alternate
+   * strategies. The built-in `LocalCompactionStrategy` is lazily
+   * registered on first call.
+   *
+   * Concurrent calls are deduped (second caller awaits the first).
+   *
+   * Callers pass only the request-specific fields (reason, phase, trigger,
+   * optional hooks); this method fills in messages / llm / model /
+   * contextWindow / keepRecentRounds from the session state and resolves
+   * the appropriate SummaryInjectionPolicy via injectionPolicyForPhase().
+   *
+   * On ok=true the new history is swapped into `this.messages`. On
+   * ok=false (cancelled / skipped / failed), `this.messages` is left
+   * untouched — the original prompt will be sent to the LLM unchanged,
+   * which may then throw context-overflow itself. Compaction is a
+   * best-effort optimization, NOT a correctness invariant.
+   */
+  async compactV2(req: {
+    reason: CompactionReason;
+    phase: CompactionPhase;
+    trigger: CompactionTrigger;
+    policy?: import("../subagent/runners/compact-types.js").SummaryInjectionPolicy;
+    hooks?: CompactionHooks;
+    signal?: AbortSignal;
+  }): Promise<CompactionOutcome> {
+    if (this.compactInFlightV2) return this.compactInFlightV2;
+    this.compactInFlightV2 = this.compactV2Impl(req).finally(() => {
+      this.compactInFlightV2 = null;
+    });
+    return this.compactInFlightV2;
+  }
+
+  private async compactV2Impl(req: {
+    reason: CompactionReason;
+    phase: CompactionPhase;
+    trigger: CompactionTrigger;
+    policy?: import("../subagent/runners/compact-types.js").SummaryInjectionPolicy;
+    hooks?: CompactionHooks;
+    signal?: AbortSignal;
+  }): Promise<CompactionOutcome> {
+    // Lazy register built-in strategies on first call.
+    ensureBuiltInsRegistered(() => new LocalCompactionStrategy());
+
+    const cfg = this.autoCompactCfg;
+    const fullReq: CompactionRequest = {
+      messages: this.messages.map((m) => ({ ...m })),
+      reason: req.reason,
+      phase: req.phase,
+      trigger: req.trigger,
+      policy: req.policy ?? injectionPolicyForPhase(req.phase),
+      keepRecentRounds: cfg?.keepRecentRounds ?? DEFAULT_KEEP_RECENT_ROUNDS,
+      contextWindow: cfg?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+      modelHint: this.model,
+      llm: this.llm,
+      signal: req.signal,
+      hooks: req.hooks,
+    };
+
+    // Optional PreCompact hook: caller can veto.
+    if (fullReq.hooks?.pre) {
+      try {
+        const pre = await fullReq.hooks.pre(fullReq);
+        if (pre.kind === "stopped") {
+          const now = Date.now();
+          const skipped: CompactionOutcome = {
+            ok: false,
+            status: "skipped",
+            error: pre.reason,
+            telemetry: {
+              reason: fullReq.reason,
+              phase: fullReq.phase,
+              trigger: fullReq.trigger,
+              policy: fullReq.policy,
+              strategy: "local",
+              startedAtMs: now,
+              endedAtMs: now,
+              durationMs: 0,
+              status: "skipped",
+              originalTokens: 0,
+              newTokens: 0,
+              droppedRoundCount: 0,
+              retryAttempts: 0,
+              hookOutcomes: { pre: "stopped" },
+            },
+          };
+          this.emitCompactionToObserver(skipped);
+          return skipped;
+        }
+      } catch {
+        // Hook crashes are non-fatal — proceed with compaction.
+      }
+    }
+
+    const strategy = pickStrategy(fullReq);
+    const outcome = await strategy.run(fullReq);
+
+    // Swap messages on success ONLY. Failure / cancel / skip leaves
+    // this.messages intact (best-effort contract).
+    if (outcome.ok && outcome.newMessages) {
+      this.messages = outcome.newMessages.map((m) => ({ ...m }));
+    }
+
+    // Optional PostCompact hook.
+    if (outcome.ok && fullReq.hooks?.post) {
+      try {
+        await fullReq.hooks.post(outcome.telemetry);
+      } catch {
+        // Hook crashes are non-fatal.
+      }
+    }
+
+    // TODO-2 §3.2 / C8 — emit a 'compaction' ChatEvent to the configured
+    // observer (goal-mode runner forwards this to SSE + bumps Goal.stats).
+    // Skip the noop case (droppedRoundCount=0) to avoid noise; only
+    // actual compactions OR explicit failures are surfaced.
+    this.emitCompactionToObserver(outcome);
+
+    return outcome;
+  }
+
+  /**
+   * TODO-2 §3.2 / C8 — push a compaction outcome to the optional
+   * onCompactionEvent observer. Filters noop (status=ok with no rounds
+   * dropped); reports actual compactions AND failure/cancel/skip
+   * statuses. Listener exceptions are swallowed.
+   */
+  private emitCompactionToObserver(outcome: CompactionOutcome): void {
+    if (!this.onCompactionEvent) return;
+    const isNoop = outcome.ok && outcome.telemetry.droppedRoundCount === 0;
+    if (isNoop) return;
+    try {
+      this.onCompactionEvent({
+        type: "compaction",
+        outcome: outcome.status,
+        reason: outcome.telemetry.reason,
+        phase: outcome.telemetry.phase,
+        trigger: outcome.telemetry.trigger,
+        policy: outcome.telemetry.policy,
+        originalTokens: outcome.telemetry.originalTokens,
+        newTokens: outcome.telemetry.newTokens,
+        droppedRoundCount: outcome.telemetry.droppedRoundCount,
+        durationMs: outcome.telemetry.durationMs,
+        ...(outcome.telemetry.summaryTokens !== undefined
+          ? { summaryTokens: outcome.telemetry.summaryTokens }
+          : {}),
+      });
+    } catch {
+      // Listener crashes never escape compactV2.
     }
   }
 
@@ -1914,9 +2429,13 @@ export class ChatSession {
     // Abort before we touch history: leave `messages` untouched and bail.
     if (signal?.aborted) throw abortError();
 
-    // Auto-compact pre-check (v0.2 §5): compact BEFORE we push the new user
-    // message, so we don't immediately discard it. Silent on failure.
-    await this.maybeAutoCompact();
+    // Reset mid-turn token accumulator for this fresh user-initiated send().
+    this.cumulativeInputTokens = 0;
+
+    // Auto-compact pre-check (v0.2 §5 + TODO-2 §3.2): compact BEFORE we
+    // push the new user message, so we don't immediately discard it.
+    // Silent on failure.
+    await this.maybeAutoCompactPreTurn();
 
     // Skills/Plugins 二层 §B.2: match trigger-bearing skills against this
     // message and inject their rendered prompt as a TRANSIENT system message
@@ -2070,7 +2589,9 @@ export class ChatSession {
       const response = await this.llm.chat(req);
 
       let text = "";
+      let reasoning = "";
       let finishReason: Extract<LLMStreamChunk, { type: "done" }>["finishReason"] = "stop";
+      let usage: { promptTokens: number; completionTokens: number } | undefined;
       const callOrder: string[] = [];
       const calls = new Map<string, PendingToolCall>();
 
@@ -2079,6 +2600,11 @@ export class ChatSession {
           if (chunk.type === "text") {
             text += chunk.delta;
             yield { type: "text", delta: chunk.delta };
+          } else if (chunk.type === "reasoning") {
+            // UX gap B — accumulate the chain-of-thought for persistence and
+            // pass each delta through so the SPA can stream the panel live.
+            reasoning += chunk.delta;
+            yield { type: "reasoning", delta: chunk.delta };
           } else if (chunk.type === "tool-call") {
             const key = chunk.id || chunk.name || `call_${callOrder.length}`;
             let pending = calls.get(key);
@@ -2092,6 +2618,7 @@ export class ChatSession {
             pending.args += chunk.argsDelta;
           } else if (chunk.type === "done") {
             finishReason = chunk.finishReason;
+            if (chunk.usage) usage = chunk.usage;
           }
         }
       } catch (err) {
@@ -2100,10 +2627,14 @@ export class ChatSession {
           // we got. We deliberately drop any half-streamed tool calls: the
           // assistant message carries no `toolCalls`, so history stays
           // well-formed (no dangling tool_call awaiting a tool result).
-          this.messages.push({
+          const aborted: LLMMessage = {
             role: "assistant",
             content: text.length > 0 ? `${text} [aborted]` : "[aborted]",
-          });
+          };
+          // UX gap B — preserve whatever reasoning streamed before the abort
+          // so the partial chain-of-thought stays visible on reload.
+          if (reasoning.length > 0) aborted.reasoning = reasoning;
+          this.messages.push(aborted);
         }
         throw err;
       }
@@ -2118,6 +2649,11 @@ export class ChatSession {
       // …). Without this the assistant message paired with the tool result
       // looks malformed and OpenAI / Anthropic / Azure will reject it.
       const assistantMessage: LLMMessage = { role: "assistant", content: text };
+      if (reasoning.length > 0) {
+        // UX gap B — persist the chain-of-thought on the assistant turn so the
+        // jsonl carries it and the SPA can re-render the panel after reload.
+        assistantMessage.reasoning = reasoning;
+      }
       if (toolCalls.length > 0) {
         assistantMessage.toolCalls = toolCalls.map((c) => ({
           id: c.id,
@@ -2126,6 +2662,25 @@ export class ChatSession {
         }));
       }
       this.messages.push(assistantMessage);
+
+      // Defect #1 — surface this round's real token usage (and the fact
+      // that an LLM call happened) so the goal runner can sum actual
+      // consumption + count assistant turns. Emitted once per `llm.chat()`
+      // call regardless of whether the provider reported a `usage` block.
+      yield {
+        type: "usage",
+        ...(usage ? { inputTokens: usage.promptTokens, outputTokens: usage.completionTokens } : {}),
+      };
+
+      // TODO-2 §3.2 — mid-turn auto-compact precheck. Opt-in via
+      // autoCompact.enableMidTurnPrecheck. Uses the provider-reported
+      // promptTokens (truth, not estimate) and accumulates across rounds.
+      // Triggers an extra compactV2({ phase: "mid_turn", ... }) when
+      // cumulative tally exceeds midTurnThresholdPct * contextWindow.
+      // Silent no-op when feature is off OR provider didn't report usage.
+      if (this.autoCompactCfg?.enableMidTurnPrecheck && usage) {
+        await this.maybeAutoCompactMidTurn({ realPromptTokens: usage.promptTokens });
+      }
 
       if (toolCalls.length === 0) {
         // on-goal-complete hooks — the model finished the user's request this

@@ -33,9 +33,11 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { ChatSession, type ToolExecuteContext, type ToolSpec } from "../chat/session.js";
+import { contextWindowForModel } from "../../providers/llm/copilot-models-cache.js";
 import { ASK_USER_GOAL_AUTO_REPLY } from "../chat/tools/ask-user.js";
 import { createTodoWriteTool } from "../chat/tools/todo-write.js";
 import type { LLMMessage, LLMProvider } from "../providers/llm.js";
+import { contentToString } from "../providers/llm.js";
 import type { ChatEvent } from "../chat/index.js";
 import {
   conversationFilePath,
@@ -69,6 +71,13 @@ import {
   type Goal,
 } from "./store.js";
 import { buildGoalTools, createGoalToolHandler } from "./tools.js";
+import { checkGoalBudget } from "./budget-continuation.js";
+import {
+  reviewMarkDone,
+  MARK_DONE_REJECT_CAP,
+  DEFAULT_REVIEWER_MODEL,
+  type MarkDoneReviewMode,
+} from "./mark-done-review.js";
 import {
   resolutionFromCompletion,
   triggerSelfGrade,
@@ -125,8 +134,17 @@ export function buildGoalSystemPrompt(input: {
    * (the `balanced` default) is silently skipped.
    */
   autonomyFragment?: string;
+  /**
+   * NEW-F2 (audit 2026-06-24): pre-rendered "past lessons" block built
+   * by the caller from `retrieveSimilarOutcomes`. Spliced AFTER the
+   * autonomy/plan fragments and BEFORE the effort fragment so the
+   * model reads it as standing context (low-recency to avoid blunting
+   * the loop policy on the first round). Empty string = no relevant
+   * past outcomes, silently skipped.
+   */
+  lessonsFragment?: string;
 }): string {
-  const { goal, systemPromptBase, effortFragment, memoryFragment, planFragment, autonomyFragment } = input;
+  const { goal, systemPromptBase, effortFragment, memoryFragment, planFragment, autonomyFragment, lessonsFragment } = input;
   const scopeLabel =
     goal.scope.kind === "global"
       ? "global"
@@ -159,6 +177,9 @@ export function buildGoalSystemPrompt(input: {
   if (planFragment && planFragment.trim().length > 0) {
     parts.push("", planFragment);
   }
+  if (lessonsFragment && lessonsFragment.trim().length > 0) {
+    parts.push("", lessonsFragment);
+  }
   if (effortFragment && effortFragment.trim().length > 0) {
     parts.push("", effortFragment);
   }
@@ -184,8 +205,31 @@ export function buildGoalSystemPrompt(input: {
 export interface RunRoundOptions {
   workspace: string;
   goalId: string;
-  /** Build the per-round prompt the assistant is going to receive. */
-  userMessage: string;
+  /**
+   * Build the per-round prompt the assistant is going to receive.
+   *
+   * **C2 (daemon-mode):** may be `undefined` when the goal daemon is
+   * self-driving the loop (no human-typed message for this turn). The
+   * thin `runGoalRound` wrapper still defaults `undefined` to the
+   * historical `"Continue with the current objective."` sentinel so
+   * existing CLI / SPA callers keep their behavior; the lower-level
+   * `runOneIteration` instead emits a synthetic `[continue]` nudge
+   * (or steer text, when supplied) so the daemon path no longer
+   * pollutes conversation history with dozens of fake "Continue…"
+   * messages on every iteration.
+   */
+  userMessage: string | undefined;
+  /**
+   * **C2 (daemon-mode):** pre-iteration steer text drained from the
+   * daemon's per-goal pending-steer queue. When set, the runner
+   * prepends a `[Steer from user: <text>]` line in front of
+   * `userMessage` (or uses it as the user message when none was
+   * provided), so the model sees the steer immediately on the next
+   * API call instead of waiting for the in-flight `steerProbe` to
+   * fire mid-round. Plain `runGoalRound` callers omit this — the
+   * existing `steerProbe` mechanism still works for live-stream steers.
+   */
+  steerText?: string;
   /** The LLM provider (already configured with the right model). */
   llm: LLMProvider;
   /** Tools available in this round (typically the same set the REST server exposes). */
@@ -295,6 +339,30 @@ export interface RunRoundOptions {
    * opt in explicitly.
    */
   selfGrade?: boolean;
+  /**
+   * Layer 2 (mark_done review) — content-level gate that runs the moment
+   * the model calls `mark_done`, BEFORE Layer 1's token-budget check. When
+   * the configured mode rejects (e.g. the `.plan.md` still has unchecked
+   * items, or the LLM reviewer says the work is incomplete), the mark_done
+   * is blocked, the rejection feedback is injected into the conversation,
+   * `goal.stats.markDoneReviewRejectionCount` is incremented, and the goal
+   * stays active for the daemon to reschedule.
+   *
+   * Default `mode: "off"` — backward-compatible: the goal flow is then
+   * identical to before Layer 2 (only Layer 1 + endGoal). See
+   * DESIGN-REFERENCE.md §8.
+   */
+  markDoneReview?: {
+    mode?: MarkDoneReviewMode;
+    reviewerModel?: string;
+  };
+  /**
+   * Layer 2 — optional dedicated LLM provider for the Mode B ("llm" /
+   * "both") reviewer pass. Defaults to the main `llm` (the reviewer model
+   * id selects the cheap model via the router). Omit for `"off"` /
+   * `"deterministic"` modes.
+   */
+  reviewerLlm?: LLMProvider;
 }
 
 export interface RunRoundResult {
@@ -314,6 +382,16 @@ export interface RunRoundResult {
   aborted: boolean;
   /** End reason, only set when status changed. */
   endReason?: string;
+  /**
+   * **C2 (daemon-mode):** true when the model finished the turn
+   * voluntarily — produced final assistant text with NO tool calls and
+   * no completion/abort/exhaustion. The goal daemon uses this as the
+   * "wait for next user message or external notify" signal so its
+   * loop doesn't spin trying to drive a model that's already said
+   * "I'm done for now". Plain HTTP `/run/stream` callers ignore this
+   * field (one round per request, no looping).
+   */
+  naturalTurnEnd?: boolean;
 }
 
 /**
@@ -339,7 +417,8 @@ function formatSummaryHeader(goal: Goal, outcome: "done" | "give_up", reason: st
     `- **endReason**: ${reason}`,
     `- **started**: ${goal.createdAt}`,
     `- **completed**: ${new Date().toISOString()}`,
-    `- **rounds**: ${goal.stats.roundsRun}`,
+    `- **iterations**: ${goal.stats.iterationsRun}`,
+    `- **assistant turns**: ${goal.stats.assistantTurnsTotal}`,
     `- **tokens**: ${goal.stats.tokensUsed}`,
   ];
   if (goal.scope.kind === "effort") {
@@ -588,8 +667,270 @@ async function maybeBootstrapGoalPlan(input: {
  * Run exactly one round (one `ChatSession.send` call). Persists the round's
  * events to the goal's audit log and re-evaluates status + budget on exit.
  */
+/**
+ * **Thin backward-compatible wrapper** around `runOneIteration` (C2).
+ *
+ * Existing HTTP / CLI / test callers pass `userMessage: string` and get one
+ * round per call. The wrapper normalises an empty / missing `userMessage`
+ * to the historical `"Continue with the current objective."` sentinel so
+ * its on-the-wire behaviour is byte-identical to the v0.17 implementation.
+ *
+ * **NEW callers (the goal daemon, C3+) should call `runOneIteration`
+ * directly** with `userMessage: undefined` so it can synthesise a
+ * lower-noise `[daemon: continue]` nudge that does NOT pollute the
+ * conversation history on every self-driven iteration.
+ */
 export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResult> {
+  // Preserve the v0.17 wire contract: an unset / blank `userMessage`
+  // falls back to the literal "Continue with the current objective."
+  // string the HTTP `/run` + `/run/stream` endpoints used to inject.
+  // This keeps the 47 existing runner.test.ts tests + every CLI / SPA
+  // caller working unchanged. Daemon-mode callers (C3+) bypass this
+  // wrapper and call `runOneIteration` with `userMessage: undefined`
+  // directly.
+  const normalisedUserMessage =
+    typeof opts.userMessage === "string" && opts.userMessage.trim().length > 0
+      ? opts.userMessage
+      : "Continue with the current objective.";
+  return runOneIteration({ ...opts, userMessage: normalisedUserMessage });
+}
+
+/**
+ * Run exactly one round (one `ChatSession.send` call). Persists the round's
+ * events to the goal's audit log and re-evaluates status + budget on exit.
+ *
+ * **C2 (daemon-mode) extensions over the v0.17 `runGoalRound`:**
+ *
+ *   1. `userMessage` may be `undefined`. When the caller (typically the
+ *      goal daemon's `GoalTurnRunner`) is self-driving the loop, this
+ *      function synthesises an internal `[daemon: continue]` nudge
+ *      instead of injecting a fake `"Continue with the current
+ *      objective."` user turn. The nudge is intentionally short and
+ *      labelled so post-hoc conversation inspection can tell
+ *      daemon-driven turns apart from human-typed ones.
+ *
+ *   2. `steerText` (optional): the daemon drains its per-goal pending
+ *      steer queue right before calling us, and forwards the result
+ *      here. We splice it into the user-turn body as a
+ *      `[Steer from user: …]` prefix so the steer is visible on the
+ *      VERY NEXT API call. Live mid-round steers still flow through
+ *      the existing `steerProbe` callback (forwarded into
+ *      `ChatSession.send`).
+ *
+ *   3. Returns `naturalTurnEnd: true` when the round produced final
+ *      assistant text with zero tool calls and zero completion / abort
+ *      / exhaustion. The daemon uses this as the "wait for next user
+ *      message or external notify" signal so its outer loop doesn't
+ *      spin trying to drive a model that has already said "I'm done
+ *      for now".
+ *
+ * The persistence, audit-log, plan-bootstrap, sub-goal-tool, summary, and
+ * self-grade logic is the same as v0.17 — the function is intentionally a
+ * 1:1 rename of the previous `runGoalRound` body with the three deltas
+ * above. The v0.17 wrapper above (`runGoalRound`) preserves the old
+ * contract for non-daemon callers.
+ */
+/**
+ * Hard safety cap on continuations, independent of the diminishing-returns
+ * guard inside {@link checkGoalBudget}. Defence-in-depth: even if the delta
+ * math somehow keeps voting "continue" forever, we never nudge a single goal
+ * more than this many times. (See DESIGN-REFERENCE.md §7.8 risk table.)
+ */
+const BUDGET_CONTINUATION_HARD_CAP = 10;
+
+/**
+ * Layer 1 — token budget continuation. Called the moment the model calls
+ * `mark_done`, BEFORE the goal is truly ended. Decides (deterministically,
+ * via {@link checkGoalBudget}) whether the goal has spent enough of its token
+ * budget to honour the mark_done, or whether it should be nudged to keep
+ * working.
+ *
+ * When the decision is `continue` it mutates + persists the goal's
+ * `budget*` tracker fields and appends a `budget-continuation` audit step,
+ * then returns `{ continued: true, ... }`. The caller is responsible for
+ * injecting the nudge into conversation history + emitting the SSE event and
+ * NOT ending the goal — the daemon sees the goal still active and reschedules
+ * the next iteration.
+ *
+ * Returns `{ continued: false }` for sub-goals, goals without a token budget,
+ * goals already past 90% of budget, the diminishing-returns case, and the
+ * hard safety cap — i.e. the normal end-of-goal path runs.
+ *
+ * Ported from claude-code's `src/query/tokenBudget.ts`, adapted to mathran's
+ * per-goal lifetime semantics (tracker persisted in goal.stats rather than an
+ * in-memory turn loop). See DESIGN-REFERENCE.md §7.
+ */
+async function maybeContinueByBudget(
+  workspace: string,
+  goal: Goal,
+): Promise<{
+  continued: boolean;
+  pct?: number;
+  continuationCount?: number;
+  tokensUsed?: number;
+  budget?: number;
+  nudgeMessage?: string;
+}> {
+  // Defence-in-depth hard cap, beyond the diminishing-returns guard.
+  if ((goal.stats.budgetContinuationCount ?? 0) >= BUDGET_CONTINUATION_HARD_CAP) {
+    return { continued: false };
+  }
+
+  const isSubGoal = !!goal.parentGoalId;
+  const decision = checkGoalBudget(
+    {
+      continuationCount: goal.stats.budgetContinuationCount ?? 0,
+      lastDeltaTokens: goal.stats.budgetLastDeltaTokens ?? 0,
+      lastCheckTokens: goal.stats.budgetLastCheckTokens ?? 0,
+    },
+    goal.budget.tokensMax,
+    goal.stats.tokensUsed,
+    isSubGoal,
+  );
+
+  if (decision.action !== "continue") {
+    return { continued: false };
+  }
+
+  // Persist the tracker. Order matters: compute the delta against the
+  // PREVIOUS check snapshot before overwriting it.
+  goal.stats.budgetContinuationCount = decision.continuationCount;
+  goal.stats.budgetLastDeltaTokens =
+    goal.stats.tokensUsed - (goal.stats.budgetLastCheckTokens ?? 0);
+  goal.stats.budgetLastCheckTokens = goal.stats.tokensUsed;
+  goal.steps.push({
+    at: new Date().toISOString(),
+    kind: "budget-continuation",
+    payload: {
+      pct: decision.pct,
+      continuationCount: decision.continuationCount,
+      tokensUsed: goal.stats.tokensUsed,
+      budget: goal.budget.tokensMax,
+    },
+  });
+  await writeGoal(workspace, goal);
+
+  return {
+    continued: true,
+    pct: decision.pct,
+    continuationCount: decision.continuationCount,
+    tokensUsed: goal.stats.tokensUsed,
+    budget: decision.budget,
+    nudgeMessage: decision.nudgeMessage,
+  };
+}
+
+/**
+ * Layer 2 — mark_done content review. Called the moment the model calls
+ * `mark_done`, BEFORE Layer 1's token-budget check (content gate first,
+ * token-volume gate second — DESIGN-REFERENCE.md §8.5).
+ *
+ * Delegates the actual verdict to {@link reviewMarkDone} (deterministic
+ * plan-checkbox scan and/or a cheap LLM reviewer). On rejection it:
+ *   - increments + persists `goal.stats.markDoneReviewRejectionCount`,
+ *   - appends a `mark-done-review-rejected` audit step,
+ * and returns `{ blocked: true, ... }` so the caller injects the feedback
+ * into conversation history and returns WITHOUT ending the goal.
+ *
+ * Force-accept cap: {@link reviewMarkDone} short-circuits to accept once
+ * the goal has already been rejected {@link MARK_DONE_REJECT_CAP} times, so
+ * the model can never be trapped in an unbreakable nudge loop. We emit a
+ * warn log here when that cap is in effect.
+ *
+ * Returns `{ blocked: false }` for `mode === "off"` (the default) so the
+ * normal Layer 1 + endGoal path runs unchanged.
+ */
+async function maybeBlockByReview(
+  workspace: string,
+  goal: Goal,
+  conversation: import("../providers/llm.js").LLMMessage[],
+  opts: {
+    mode: MarkDoneReviewMode;
+    reviewerModel?: string;
+    llm?: LLMProvider;
+  },
+): Promise<{ blocked: boolean; blockingError?: string; hint?: string[] }> {
+  if (opts.mode === "off") return { blocked: false };
+
+  const atCap =
+    (goal.stats.markDoneReviewRejectionCount ?? 0) >= MARK_DONE_REJECT_CAP;
+  if (atCap) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[mathran] goal ${goal.id}: mark_done review force-accepted after ` +
+        `${goal.stats.markDoneReviewRejectionCount} rejections (cap reached).`,
+    );
+  }
+
+  const result = await reviewMarkDone({
+    workspace,
+    goal,
+    mode: opts.mode,
+    conversation,
+    reviewerModel: opts.reviewerModel,
+    llm: opts.llm,
+  });
+
+  if (result.accept) return { blocked: false };
+
+  goal.stats.markDoneReviewRejectionCount =
+    (goal.stats.markDoneReviewRejectionCount ?? 0) + 1;
+  goal.steps.push({
+    at: new Date().toISOString(),
+    kind: "mark-done-review-rejected",
+    payload: {
+      rejectionCount: goal.stats.markDoneReviewRejectionCount,
+      mode: opts.mode,
+      blockingError: result.blockingError ?? "",
+    },
+  });
+  await writeGoal(workspace, goal);
+
+  return {
+    blocked: true,
+    blockingError: result.blockingError,
+    hint: result.suggestedNextSteps,
+  };
+}
+
+export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundResult> {
   const { workspace, goalId, userMessage, llm, tools, toolContext, systemPromptBase, signal } = opts;
+  // ── C2 (daemon-mode): synthesise the *effective* user message ────
+  //
+  //   1. If the caller supplied a `userMessage` AND a `steerText`, the
+  //      steer wins on visibility — splice it as a `[Steer from user:
+  //      …]` prefix so the model can't miss it, then the original user
+  //      message follows. (Mirrors the `steer-received` ChatEvent the
+  //      in-flight `steerProbe` injects on later rounds.)
+  //
+  //   2. If only `steerText` is set (daemon kicked the goal with no
+  //      user text), use the steer line as the entire user message.
+  //
+  //   3. If only `userMessage` is set, pass it through unchanged.
+  //
+  //   4. If both are unset (daemon self-continuation), emit a
+  //      `[daemon: continue]` marker. The marker is intentionally
+  //      short + labelled so post-hoc inspection can tell
+  //      daemon-driven turns apart from human-typed ones. We do NOT
+  //      reuse the historical `"Continue with the current
+  //      objective."` string because that's the polluting fake-user
+  //      turn the daemon was built to eliminate.
+  const steerText =
+    typeof opts.steerText === "string" && opts.steerText.trim().length > 0
+      ? opts.steerText.trim()
+      : undefined;
+  const trimmedUserMessage =
+    typeof userMessage === "string" && userMessage.trim().length > 0
+      ? userMessage
+      : undefined;
+  const effectiveUserMessage = (() => {
+    if (steerText && trimmedUserMessage) {
+      return `[Steer from user: ${steerText}]\n\n${trimmedUserMessage}`;
+    }
+    if (steerText) return `[Steer from user: ${steerText}]`;
+    if (trimmedUserMessage) return trimmedUserMessage;
+    return "[daemon: continue]";
+  })();
   // Recursion depth (v0.3 §15). Default 0 = top-level. Only depth 0 gets
   // `spawn_sub_goal`; depth >= 1 omits it so sub-goals cannot recurse.
   const depth = opts.depth ?? 0;
@@ -766,6 +1107,19 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     ? formatPlanFragment(planBootstrapResult.planBody)
     : "";
 
+  // NEW-F2 (audit 2026-06-24): retrieve relevant past lessons and
+  // splice them into the system prompt. Pure read; failure is
+  // silently absorbed (returns "") so a missing outcomes index doesn't
+  // block goal start. Awaited inline rather than promise-chained so
+  // the resulting prompt is deterministic across runs.
+  let lessonsFragment = "";
+  try {
+    const { buildLessonsFragmentForGoal } = await import("./lessons-injection.js");
+    lessonsFragment = await buildLessonsFragmentForGoal({ workspace, goal });
+  } catch {
+    // best-effort
+  }
+
   const systemPrompt = buildGoalSystemPrompt({
     goal,
     systemPromptBase: systemPromptBase ?? buildBaseSystemPrompt(),
@@ -773,6 +1127,7 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     memoryFragment,
     planFragment,
     autonomyFragment,
+    lessonsFragment,
   });
   const handler = createGoalToolHandler();
   // Compose the per-round tool list:
@@ -864,11 +1219,75 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
       },
     },
     ...(opts.scheduler ? { subagentScheduler: opts.scheduler, scheduler: opts.scheduler } : {}),
+    // TODO-2 §3.2 / C8 — opt goal-mode INTO the V2 auto-compaction
+    // pipeline. Long-running goals (24h+, dozens of rounds, 1MB+
+    // conversations) need both pre-turn and mid-turn precheck or they
+    // silently outgrow the model context window.
+    //
+    // contextWindow comes from copilot's /models endpoint (real cap,
+    // cached for 30 min), with a hardcoded fallback snapshot. See
+    // src/providers/llm/copilot-models-cache.ts for the table.
+    autoCompact: {
+      enabled: true,
+      thresholdPct: 0.75,
+      midTurnThresholdPct: 0.80,        // 5pp above pre-turn → no double-fire
+      keepRecentRounds: 6,              // yachiyo 6/17 patch — tool-heavy workflows need 6
+      contextWindow: contextWindowForModel(goal.model),
+      enableMidTurnPrecheck: true,
+    },
+    // TODO-2 §3.2 / C8 — forward every compaction lifecycle event to:
+    //   1. emit() → SSE clients (real-time SPA compaction badge),
+    //   2. updateGoalStats → compactionRuns / compactionTokensDropped /
+    //      lastCompactionReason / lastCompactionAt durable bump,
+    //   3. appendStep(kind="compaction") → audit log on disk.
+    // emit() is defined a few lines below — defer access via closure.
+    // The stats + audit calls are async; fire-and-forget so they never
+    // delay the send loop. Errors are swallowed (compaction event
+    // observability is best-effort, never blocks compute).
+    onCompactionEvent: (ev) => {
+      try { emit(ev); } catch { /* never fatal */ }
+      // Successful compactions bump durable stats; failures / cancels /
+      // skips only log to the audit step. droppedRoundCount > 0 in this
+      // event already (noops are filtered upstream in ChatSession).
+      void (async () => {
+        const nowIso = new Date().toISOString();
+        try {
+          if (ev.outcome === "ok") {
+            await updateGoalStats(workspace, goalId, {
+              compactionRuns: 1,
+              compactionTokensDropped: Math.max(0, ev.originalTokens - ev.newTokens),
+              lastCompactionReason: ev.reason,
+              lastCompactionAt: nowIso,
+            });
+          }
+          await appendStep(workspace, goalId, {
+            kind: "compaction",
+            payload: {
+              outcome: ev.outcome,
+              reason: ev.reason,
+              phase: ev.phase,
+              trigger: ev.trigger,
+              policy: ev.policy,
+              originalTokens: ev.originalTokens,
+              newTokens: ev.newTokens,
+              droppedRoundCount: ev.droppedRoundCount,
+              durationMs: ev.durationMs,
+              ...(ev.summaryTokens !== undefined ? { summaryTokens: ev.summaryTokens } : {}),
+            },
+          });
+        } catch (err) {
+          console.warn(
+            `[mathran] compaction observer side-effect failed for goal ${goalId}:`,
+            err,
+          );
+        }
+      })();
+    },
   });
   if (history.length > 0) session.replaceHistory(history);
 
   // Audit the user's prompt for this round before driving the LLM.
-  await appendStep(workspace, goalId, { kind: "plan", payload: { userMessage } });
+  await appendStep(workspace, goalId, { kind: "plan", payload: { userMessage: effectiveUserMessage } });
 
   // v0.17 mathub parity W7: emit `round-start` BEFORE we open the inner
   // chat stream so SSE consumers (AgentStatusPanel) can show
@@ -887,7 +1306,7 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     }
   };
   {
-    const roundNum = goal.stats.roundsRun + 1;
+    const roundNum = goal.stats.iterationsRun + 1;
     const maxRounds = goal.budget.roundsMax;
     emit({
       type: "round-start",
@@ -898,14 +1317,32 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
 
   let textBuf = "";
   let toolCallCount = 0;
+  // Defect #1 — real token accounting. Sum provider-reported usage across
+  // every LLM round-trip in this iteration (an iteration can make many
+  // `llm.chat()` calls when the assistant chains tool calls). `usageReported`
+  // tracks whether ANY round returned a usage block; when false we fall back
+  // to counting the WHOLE message list below. `llmCallCount` counts every
+  // usage event (one per `llm.chat()` call) and doubles as the assistant-turn
+  // count (1:1 — each round pushes exactly one assistant message).
+  let usageInputTokens = 0;
+  let usageOutputTokens = 0;
+  let usageReported = false;
+  let llmCallCount = 0;
   try {
-    for await (const ev of session.send(userMessage, {
+    for await (const ev of session.send(effectiveUserMessage, {
       signal,
       ...(opts.steerProbe ? { steerProbe: opts.steerProbe } : {}),
     }) as AsyncIterable<ChatEvent>) {
       emit(ev);
       if (ev.type === "text") {
         textBuf += ev.delta;
+      } else if (ev.type === "usage") {
+        llmCallCount++;
+        if (typeof ev.inputTokens === "number" || typeof ev.outputTokens === "number") {
+          usageReported = true;
+          usageInputTokens += ev.inputTokens ?? 0;
+          usageOutputTokens += ev.outputTokens ?? 0;
+        }
       } else if (ev.type === "tool-call") {
         toolCallCount++;
         await appendStep(workspace, goalId, {
@@ -958,23 +1395,123 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     await appendStep(workspace, goalId, { kind: "text", payload: textBuf });
   }
 
-  // Per-round token count via llm.countTokens when available; cumulative goal
-  // stats sum across rounds (store.updateGoalStats).
+  // Defect #1 — token accounting. Prefer the REAL token usage reported by
+  // the provider for every LLM round-trip this iteration made (covers system
+  // prompt + full history + tool calls + output). Fall back to
+  // `llm.countTokens` over the WHOLE final message list (not just the
+  // user/assistant pair) when the provider reported no usage. Defect #3 —
+  // record iteration + assistant-turn + LLM-call counters.
+  const fullHistory = session.history();
+  const fallbackTokens = llm.countTokens
+    ? llm.countTokens(fullHistory)
+    : Math.ceil(fullHistory.reduce((n, m) => n + contentToString(m.content).length, 0) / 4);
   await updateGoalStats(workspace, goalId, {
-    roundsRun: 1,
+    iterationsRun: 1,
+    assistantTurnsTotal: llmCallCount,
+    llmCallsTotal: llmCallCount,
     toolCallCount,
-    tokensUsed: llm.countTokens
-      ? llm.countTokens([
-          { role: "user", content: userMessage },
-          { role: "assistant", content: textBuf },
-        ])
-      : Math.ceil((userMessage.length + textBuf.length) / 4),
+    tokensUsed: usageReported ? usageInputTokens + usageOutputTokens : fallbackTokens,
+    // Phase ζ (cost meter) — persist the provider-reported input/output split
+    // so per-model $ cost is exact (pricing differs in vs out). We ONLY record
+    // a split when the provider actually reported usage; the `countTokens`
+    // fallback can't distinguish prompt from completion, so we leave the split
+    // at 0 for that iteration rather than guess (the combined `tokensUsed`
+    // still counts it). DESIGN-REFERENCE.md §5.E.
+    inputTokensUsed: usageReported ? usageInputTokens : 0,
+    outputTokensUsed: usageReported ? usageOutputTokens : 0,
   });
 
   // mark_done / give_up tool calls wrap the goal (recorded on the handler
   // during session.send above — see ./tools.ts for why we can't throw).
   if (handler.completion?.outcome === "done") {
     const reason = handler.completion.reason;
+    // Re-read the goal first so both review layers see the FRESH
+    // `stats.tokensUsed` / rejection counters just persisted by
+    // `updateGoalStats` above (the in-memory `goal` is stale).
+    goal = (await readGoal(workspace, goalId)) ?? goal;
+
+    // Layer 2 — mark_done content review (DESIGN-REFERENCE.md §8). Runs
+    // BEFORE Layer 1: a content-level gate (plan checkboxes / LLM reviewer)
+    // is cheaper + more meaningful than the token-volume gate, so we reject
+    // an obviously-incomplete completion before even consulting the budget.
+    // On rejection we inject the reviewer's blockingError + hint into the
+    // conversation as a user message (mirroring CC's TaskCompleted
+    // `success:false` → "retry the tool" signal) and return WITHOUT ending
+    // the goal so the daemon reschedules. Default mode "off" → no-op.
+    const reviewMode: MarkDoneReviewMode = opts.markDoneReview?.mode ?? "off";
+    if (reviewMode !== "off") {
+      const review = await maybeBlockByReview(
+        workspace,
+        goal,
+        session.history(),
+        {
+          mode: reviewMode,
+          reviewerModel:
+            opts.markDoneReview?.reviewerModel ?? DEFAULT_REVIEWER_MODEL,
+          llm: opts.reviewerLlm ?? llm,
+        },
+      );
+      if (review.blocked) {
+        const hintBlock =
+          review.hint && review.hint.length > 0
+            ? `\n\nSuggested next steps:\n${review.hint
+                .map((h) => `  - ${h}`)
+                .join("\n")}`
+            : "";
+        const feedback =
+          `[mark_done blocked by review] ${review.blockingError ?? ""}` +
+          hintBlock +
+          `\n\nKeep working to address this, then call mark_done again.`;
+        const nudged = [
+          ...session.history(),
+          { role: "user" as const, content: feedback },
+        ];
+        await flushConversationHistory(workspace, goal.scope, conversationId, nudged, {
+          title: `goal ${goal.id}`,
+        });
+        return {
+          goal,
+          text: textBuf,
+          completed: false,
+          exhausted: false,
+          failed: false,
+          aborted: false,
+        };
+      }
+    }
+
+    // Layer 1 — token budget continuation. If the goal still has > 10% of
+    // its token budget unspent (and isn't a sub-goal, and hasn't hit
+    // diminishing returns), block the mark_done: inject a nudge user
+    // message into history, emit a `budget-continuation` event, and return
+    // WITHOUT ending the goal so the daemon reschedules. See
+    // DESIGN-REFERENCE.md §7.
+    const cont = await maybeContinueByBudget(workspace, goal);
+    if (cont.continued) {
+      const nudged = [
+        ...session.history(),
+        { role: "user" as const, content: cont.nudgeMessage! },
+      ];
+      await flushConversationHistory(workspace, goal.scope, conversationId, nudged, {
+        title: `goal ${goal.id}`,
+      });
+      emit({
+        type: "budget-continuation",
+        goalId,
+        pct: cont.pct!,
+        continuationCount: cont.continuationCount!,
+        tokensUsed: cont.tokensUsed!,
+        budget: cont.budget!,
+      });
+      return {
+        goal,
+        text: textBuf,
+        completed: false,
+        exhausted: false,
+        failed: false,
+        aborted: false,
+      };
+    }
     const ended = await endGoal(workspace, goalId, "complete", reason);
     const finalGoal = await finalizeWithSummary({
       workspace,
@@ -1042,5 +1579,26 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
     return { goal: ended ?? goal, text: textBuf, completed: false, exhausted: true, failed: false, aborted: false, endReason: after.reason };
   }
 
-  return { goal, text: textBuf, completed: false, exhausted: false, failed: false, aborted: false };
+  // C2 (daemon-mode): detect natural turn end. When the round
+  // produced final assistant text AND made zero tool calls AND no
+  // terminal condition was hit (mark_done / give_up / abort /
+  // exhaustion are returned above before this point), the model has
+  // voluntarily said "I'm done for this turn". The daemon uses this
+  // signal to halt its inner loop and wait for the next user message
+  // or external notify, instead of spinning a fake `[daemon: continue]`
+  // every iterIdleMs.
+  //
+  // Plain HTTP `/run/stream` callers (one round per request) ignore
+  // this field, so the historical contract is preserved.
+  const naturalTurnEnd =
+    toolCallCount === 0 && textBuf.trim().length > 0;
+  return {
+    goal,
+    text: textBuf,
+    completed: false,
+    exhausted: false,
+    failed: false,
+    aborted: false,
+    ...(naturalTurnEnd ? { naturalTurnEnd: true } : {}),
+  };
 }

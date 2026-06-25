@@ -58,6 +58,26 @@ export interface AgentStatusPanelProps {
    * the goal has no `roundsMax` budget cap.
    */
   round: { current: number; max?: number } | null;
+  /**
+   * TODO-2 §3.2 / C9 — compaction summary. `null` when no compaction
+   * has fired yet for this turn; otherwise carries the cumulative count
+   * of compactions and the most-recent reason / dropped tokens for the
+   * tooltip. The badge appears next to the round counter (or, for plain
+   * chat, after the elapsed display) so the user knows the agent
+   * shrunk its working memory mid-turn.
+   */
+  compaction?: {
+    /** Total successful compactions on this stream so far. */
+    runs: number;
+    /** Most-recent compaction's CompactionReason. */
+    lastReason?: string;
+    /** Most-recent compaction's CompactionPhase. */
+    lastPhase?: string;
+    /** Sum of (originalTokens - newTokens) across all compactions, best-effort. */
+    tokensSaved: number;
+    /** ISO timestamp string of the most recent compaction. */
+    lastAt?: string;
+  } | null;
 }
 
 /** The subset of `ChatEvent.type` we use to label the agent's phase. */
@@ -124,7 +144,7 @@ export function AgentStatusPanel(props: AgentStatusPanelProps): JSX.Element | nu
 
   if (!props.busy) return null;
 
-  const { latestEventType, activeTools, subAgentActive, elapsedMs, round } = props;
+  const { latestEventType, activeTools, subAgentActive, elapsedMs, round, compaction } = props;
   const hasActiveTools = activeTools.length > 0;
   const { emoji, label } = phaseLabel(latestEventType, hasActiveTools, subAgentActive);
 
@@ -151,11 +171,11 @@ export function AgentStatusPanel(props: AgentStatusPanelProps): JSX.Element | nu
       {round && (
         <span
           className="inline-flex items-center gap-1 rounded-full bg-white px-2 py-0.5 ring-1 ring-slate-200"
-          title="Goal round counter"
+          title="Goal iteration counter"
         >
           <span aria-hidden="true">🔄</span>
           <span>
-            Step {round.current}
+            iter {round.current}
             {typeof round.max === "number" && round.max > 0 ? `/${round.max}` : ""}
           </span>
         </span>
@@ -171,6 +191,24 @@ export function AgentStatusPanel(props: AgentStatusPanelProps): JSX.Element | nu
         <span aria-hidden="true">⏱</span>
         <span>{formatElapsed(elapsedMs)}</span>
       </span>
+
+      {/* TODO-2 §3.2 / C9 — compaction badge. Visible iff any compaction
+          has fired on this stream. Tooltip carries reason/phase/tokens
+          saved so power users can see what triggered the shrink without
+          opening the audit log. */}
+      {compaction && compaction.runs > 0 && (
+        <span
+          className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-amber-800 ring-1 ring-amber-200"
+          title={`${compaction.runs} compaction${compaction.runs === 1 ? "" : "s"} on this turn${
+            compaction.lastReason ? ` (last: ${compaction.lastPhase ?? "?"}/${compaction.lastReason})` : ""
+          } — ~${compaction.tokensSaved.toLocaleString()} tokens saved`}
+        >
+          <span aria-hidden="true">🧹</span>
+          <span>
+            {compaction.runs} compact{compaction.runs === 1 ? "" : "s"}
+          </span>
+        </span>
+      )}
 
       {/* Active tool chips. Each chip is the tool's `name` from the
           SSE `tool-call` event, deduped — if the model fires three

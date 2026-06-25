@@ -17,9 +17,17 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { Link } from "react-router-dom";
+// TODO-3 UI #4.B: removed `Link` import (was only used by the deleted
+// "See also" footer; the SettingsLayout tab bar now handles peer-route
+// navigation).
 
 import { api, type ProjectSummary } from "../lib/api.ts";
+import {
+  loadCommandStyle as loadCommandStyleSetting,
+  saveCommandStyle as saveCommandStyleSetting,
+  subscribeCommandStyle as subscribeCommandStyleSetting,
+  type CommandStyle as CommandStyleSetting,
+} from "../lib/composer-prefs.ts";
 import {
   APPROVAL_POLICIES,
   THEMES,
@@ -345,12 +353,19 @@ export default function SettingsPanel() {
           </div>
         )}
 
-        <div className="mt-8 border-t border-slate-200 pt-4 text-sm">
-          See also:{" "}
-          <Link to="/settings/providers" className="font-medium text-slate-700 underline">
-            LLM Providers →
-          </Link>
+        {/* TODO-3 UI #2 — Composer command style toggle (localStorage-backed,
+            no layered settings.json round-trip needed because it's pure SPA UX
+            preference). Default 'selector' matches the existing Discord/copilot
+            popup; 'slash' suppresses the popup so power users can type full
+            `/cmd args` openclaw-style without distraction. */}
+        <div className="mt-8 border-t border-slate-200 pt-4">
+          <h3 className="mb-2 text-sm font-semibold text-slate-800">Composer</h3>
+          <ComposerCommandStyleToggle />
         </div>
+
+        {/* TODO-3 UI #4.B — 'See also' footer links removed; the top
+            SettingsLayout tab bar now exposes Providers / MCP / MCP Config
+            as first-class peers, so the footer is redundant. */}
       </div>
 
       {/* Sticky save bar */}
@@ -558,5 +573,67 @@ function ApprovalSection({
         />
       </Field>
     </Section>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ComposerCommandStyleToggle — TODO-3 UI #2.
+// Two-radio toggle persisted in localStorage. Live-updates across tabs
+// via the storage event + a custom 'mathran:commandStyle' event.
+// ──────────────────────────────────────────────────────────────────────
+function ComposerCommandStyleToggle() {
+  const [style, setStyle] = useState<CommandStyleSetting>(loadCommandStyleSetting);
+  useEffect(() => subscribeCommandStyleSetting(setStyle), []);
+  const update = (next: CommandStyleSetting) => {
+    setStyle(next);
+    saveCommandStyleSetting(next);
+  };
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-slate-500">
+        How slash commands surface in the chat composer. Both styles execute the
+        same commands — only the discoverability differs. Stored locally per
+        browser; sync across tabs is automatic.
+      </p>
+      <div className="flex flex-col gap-1.5">
+        <label className="flex items-start gap-2 text-sm">
+          <input
+            type="radio"
+            name="composer-command-style"
+            value="selector"
+            checked={style === "selector"}
+            onChange={() => update("selector")}
+            className="mt-0.5"
+          />
+          <span>
+            <span className="font-medium text-slate-800">Selector</span>{" "}
+            <span className="text-xs text-slate-500">(default — Discord / Copilot CLI style)</span>
+            <span className="mt-0.5 block text-xs text-slate-500">
+              Typing <code className="rounded bg-slate-100 px-1">/</code> opens a popup with all matching commands.
+              Arrow keys + Enter / Tab to choose.
+            </span>
+          </span>
+        </label>
+        <label className="flex items-start gap-2 text-sm">
+          <input
+            type="radio"
+            name="composer-command-style"
+            value="slash"
+            checked={style === "slash"}
+            onChange={() => update("slash")}
+            className="mt-0.5"
+          />
+          <span>
+            <span className="font-medium text-slate-800">Slash</span>{" "}
+            <span className="text-xs text-slate-500">(OpenClaw / Claude Code CLI style)</span>
+            <span className="mt-0.5 block text-xs text-slate-500">
+              Popup is suppressed. Type the full command (e.g.{" "}
+              <code className="rounded bg-slate-100 px-1">/goal write tests for foo</code>) and press Enter.
+              Non-intrusive while typing.
+            </span>
+          </span>
+        </label>
+      </div>
+    </div>
   );
 }

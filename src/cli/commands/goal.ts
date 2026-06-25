@@ -28,11 +28,13 @@ import {
   writeGoal,
   type Goal,
 } from "../../core/goal/store.js";
-import { runGoalRound } from "../../core/goal/runner.js";
+import { runOneIteration } from "../../core/goal/runner.js";
 import type { ChatScope } from "../../core/chat/store.js";
 import type { ToolExecuteContext } from "../../core/chat/session.js";
 import { resolveScopeRoot } from "./scope-paths.js";
 import { loadConfig } from "../../core/config.js";
+import { loadLayeredSettings } from "../../core/config/layered-settings.js";
+import type { MarkDoneReviewMode } from "../../core/goal/mark-done-review.js";
 import { ModelRouter, LocalLeanProvider } from "../../providers/index.js";
 import {
   SubagentScheduler,
@@ -168,20 +170,37 @@ export async function runGoalResume(goalId: string, opts: GoalResumeOptions): Pr
     console.error(`mathran goal resume: goal is ${g.status} (${g.endReason ?? "no reason"}); cannot resume`);
     return 1;
   }
-  const userMessage = opts.message ?? "Continue with the current objective.";
+  // C9: when `mathran goal resume` is invoked without --message, pass
+  // undefined down so `runOneIteration` synthesises a `[daemon: continue]`
+  // nudge instead of forcing a fake-continue user turn into the
+  // conversation. Symmetric with the HTTP /run endpoints.
+  // See todo1-design.md §6.2.
+  const userMessage: string | undefined = opts.message ?? undefined;
   return await driveOneRound(workspace, resolved, userMessage, opts);
 }
 
 async function driveOneRound(
   workspace: string,
   goalId: string,
-  userMessage: string,
+  userMessage: string | undefined,
   opts: { configPath?: string },
 ): Promise<number> {
   const config = loadConfig(opts.configPath);
   const router = new ModelRouter(config);
   const lean = new LocalLeanProvider();
   const tools = [createLeanCheckTool(lean)];
+
+  // Layer 2 (mark_done review) — resolve the opt-in setting from layered
+  // config. Default "off" keeps the goal flow identical to pre-Layer-2.
+  let markDoneReview: { mode?: MarkDoneReviewMode; reviewerModel?: string } | undefined;
+  try {
+    const { settings } = loadLayeredSettings({ workspace });
+    const cfg = (settings as { goal?: { markDoneReview?: { mode?: MarkDoneReviewMode; reviewerModel?: string } } }).goal
+      ?.markDoneReview;
+    if (cfg) markDoneReview = { mode: cfg.mode, reviewerModel: cfg.reviewerModel };
+  } catch {
+    // No layered settings (or malformed) → leave review off.
+  }
 
   // v0.4 §1.1 (post-smoke fix): narrow ctx.workspace to the goal's scope so
   // bash/read_file/write_file/edit_file resolve paths relative to the project
@@ -203,7 +222,11 @@ async function driveOneRound(
     : { workspace };
 
   try {
-    const r = await runGoalRound({
+    // C9: call runOneIteration directly so an undefined userMessage
+    // does NOT get rewritten to the fake-continue sentinel inside the
+    // runGoalRound wrapper. Matches /api/goals/:id/run + /run/stream
+    // behaviour. See todo1-design.md §6.2.
+    const r = await runOneIteration({
       workspace,
       goalId,
       userMessage,
@@ -237,6 +260,8 @@ async function driveOneRound(
       // extra LLM round on an upfront checklist is a good trade for the
       // grounding it gives every subsequent round.
       bootstrapPlan: "auto",
+      // Layer 2 — mark_done content review (off unless opted in via config).
+      markDoneReview,
     });
     if (r.text.trim().length > 0) {
       console.log("");
@@ -255,7 +280,7 @@ async function driveOneRound(
       console.log(`mathran: goal EXHAUSTED — ${r.endReason}`);
       return 0;
     }
-    console.log(`mathran: round done. Stats: ${r.goal.stats.roundsRun} rounds, ${r.goal.stats.tokensUsed} tokens, ${r.goal.stats.toolCallCount} tool calls.`);
+    console.log(`mathran: iteration done. Stats: ${r.goal.stats.iterationsRun} iter (turns: ${r.goal.stats.assistantTurnsTotal}), ${r.goal.stats.tokensUsed} tokens, ${r.goal.stats.toolCallCount} tool calls.`);
     console.log(`mathran: resume with 'mathran goal resume ${goalId}'.`);
     return 0;
   } catch (err: any) {
@@ -314,7 +339,7 @@ export async function runGoalList(opts: GoalListOptions): Promise<number> {
   for (const g of filtered) {
     const shortId = g.id.slice(0, 8);
     const objLine = g.objective.split("\n")[0].slice(0, 80);
-    console.log(`  ${shortId}  [${g.status.padEnd(9)}] r=${g.stats.roundsRun} t=${g.stats.tokensUsed}  ${objLine}`);
+    console.log(`  ${shortId}  [${g.status.padEnd(9)}] iter=${g.stats.iterationsRun} turns=${g.stats.assistantTurnsTotal} t=${g.stats.tokensUsed}  ${objLine}`);
   }
   return 0;
 }
@@ -461,8 +486,8 @@ function printGoalSummary(g: Goal): void {
   console.log(`  objective:  ${g.objective}`);
   console.log(`  scope:      ${formatScope(g.scope)}`);
   console.log(`  model:      ${g.model}`);
-  console.log(`  budget:     tokens=${g.budget.tokensMax ?? "∞"}  rounds=${g.budget.roundsMax ?? "∞"}`);
-  console.log(`  spent:      ${g.stats.tokensUsed} tokens, ${g.stats.roundsRun} rounds, ${g.stats.toolCallCount} tool calls`);
+  console.log(`  budget:     tokens=${g.budget.tokensMax ?? "∞"}  iterations=${g.budget.roundsMax ?? "∞"}`);
+  console.log(`  spent:      ${g.stats.tokensUsed} tokens, ${g.stats.iterationsRun} iterations (turns: ${g.stats.assistantTurnsTotal}, llm calls: ${g.stats.llmCallsTotal}), ${g.stats.toolCallCount} tool calls`);
   console.log(`  createdAt:  ${g.createdAt}`);
   if (g.endedAt) {
     console.log(`  endedAt:    ${g.endedAt}`);

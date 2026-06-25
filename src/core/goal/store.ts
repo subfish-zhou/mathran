@@ -52,8 +52,12 @@ export interface Goal {
    * "failed"     unrecoverable error during the run
    * "cancelled"  user cancelled via \`mathran goal cancel\`
    * "exhausted"  budget hit before completion
+   * "stalled"    auto-flagged by scripts/audit-stale-goals.ts: was
+   *              "active" with no live daemon runner past a threshold
+   *              (likely a pre-daemon SPA-driver zombie). endReason
+   *              records when/why it was flagged.
    */
-  status: "active" | "paused" | "complete" | "failed" | "cancelled" | "exhausted";
+  status: "active" | "paused" | "complete" | "failed" | "cancelled" | "exhausted" | "stalled";
   /** Budgets and the model used for this run. `null` = no budget set. */
   budget: { tokensMax: number | null; roundsMax: number | null };
   model: string;
@@ -62,8 +66,99 @@ export interface Goal {
   endReason?: string;
   stats: {
     tokensUsed: number;
-    roundsRun: number;
+    /**
+     * Phase ζ (cost meter) — input (prompt) tokens, split out of the
+     * combined `tokensUsed` so per-model $ cost can be computed
+     * (pricing differs input vs output). Sums provider-reported
+     * `usage.input_tokens` across every LLM round-trip. Defaults to 0
+     * for goals created before Phase ζ; `tokensUsed` stays the source
+     * of truth for total volume (no breaking change).
+     */
+    inputTokensUsed: number;
+    /**
+     * Phase ζ (cost meter) — output (completion) tokens, split out of
+     * `tokensUsed`. Sums provider-reported `usage.output_tokens` across
+     * every LLM round-trip. Defaults to 0 for pre-Phase-ζ goals.
+     */
+    outputTokensUsed: number;
+    /**
+     * Number of daemon iterations run (each `runOneIteration` /
+     * `ChatSession.send`). This is what the user's `--max-rounds` /
+     * `budget.roundsMax` controls. Renamed from `roundsRun` (defect #3)
+     * because a single iteration can contain many assistant turns.
+     */
+    iterationsRun: number;
+    /**
+     * Total distinct assistant turns across all iterations — i.e. every
+     * LLM call result that produced text and/or tool calls. In a
+     * daemon-driven iteration this can be far larger than `iterationsRun`.
+     */
+    assistantTurnsTotal: number;
+    /**
+     * Total distinct chat-completions calls. Equal to `assistantTurnsTotal`
+     * unless the infrastructure tracks retries separately (it currently
+     * doesn't, so they match).
+     */
+    llmCallsTotal: number;
     toolCallCount: number;
+    /**
+     * @deprecated Alias for {@link iterationsRun}, kept for backward
+     * compatibility with on-disk goal records and existing API/SPA
+     * consumers. Always serialized equal to `iterationsRun`.
+     */
+    roundsRun: number;
+    /**
+     * TODO-2 §3.2 / C7 — total number of successful compactV2 swaps in
+     * this goal's lifetime. Incremented from runner.ts each time a
+     * compaction `iteration-end` event is received from the chat
+     * session. Defaults to 0 for goals created before TODO-2.
+     */
+    compactionRuns: number;
+    /**
+     * TODO-2 §3.2 / C7 — cumulative `originalTokens - newTokens` across
+     * all successful compactions. Approximates how many tokens were
+     * "saved" by compaction (best-effort, depends on the model-specific
+     * token counter). Defaults to 0 for goals created before TODO-2.
+     */
+    compactionTokensDropped: number;
+    /**
+     * TODO-2 §3.2 / C7 — reason on the most-recent successful compaction
+     * (budget_exceeded / token_limit / user_requested / ...). null when
+     * no compaction has run yet.
+     */
+    lastCompactionReason: string | null;
+    /**
+     * TODO-2 §3.2 / C7 — ISO timestamp of the most-recent successful
+     * compaction. null when no compaction has run yet.
+     */
+    lastCompactionAt: string | null;
+    /**
+     * Layer 1 (token budget continuation) — number of times `mark_done`
+     * was blocked and the model was nudged to keep working because the
+     * goal hadn't yet spent 90% of `budget.tokensMax`. Persisted across
+     * iterations so the diminishing-returns guard (count >= 3) survives
+     * daemon reschedules. Defaults to 0 for goals created before Layer 1.
+     */
+    budgetContinuationCount: number;
+    /**
+     * Layer 1 — Δtokens between the two most-recent budget checks. Feeds
+     * the diminishing-returns guard (a continuation is "stalled" when
+     * both this and the current delta are < 500). Defaults to 0.
+     */
+    budgetLastDeltaTokens: number;
+    /**
+     * Layer 1 — `stats.tokensUsed` snapshot at the most-recent budget
+     * check, used to compute the next delta. Defaults to 0.
+     */
+    budgetLastCheckTokens: number;
+    /**
+     * Layer 2 (mark_done review) — number of times a `mark_done` was
+     * blocked by the content-review hook (deterministic plan check or LLM
+     * reviewer) and the model was nudged to keep working. Persisted across
+     * iterations so the force-accept cap (count >= 3) survives daemon
+     * reschedules. Defaults to 0 for goals created before Layer 2.
+     */
+    markDoneReviewRejectionCount: number;
   };
   /** Chat conversation ids this goal spawned. The first one is the primary. */
   conversationIds: string[];
@@ -149,7 +244,16 @@ export interface GoalStep {
     | "plan"
     | "reflect"
     | "status"
-    | "ask-user-auto-resolved";
+    | "ask-user-auto-resolved"
+    /** TODO-2 §3.2 / C8 — compaction lifecycle event durable record. */
+    | "compaction"
+    /** Layer 1 — token budget continuation: mark_done was blocked and the
+     *  model nudged to keep working. Payload carries
+     *  {pct, continuationCount, tokensUsed, budget}. */
+    | "budget-continuation"
+    /** Layer 2 — mark_done content review blocked the completion. Payload
+     *  carries {rejectionCount, mode, blockingError}. */
+    | "mark-done-review-rejected";
   payload: Record<string, unknown> | string;
 }
 
@@ -171,11 +275,48 @@ export function goalsDirFor(workspace: string): string {
 export async function readGoal(workspace: string, goalId: string): Promise<Goal | null> {
   try {
     const raw = await fs.readFile(goalFileFor(workspace, goalId), "utf-8");
-    return JSON.parse(raw) as Goal;
+    const goal = JSON.parse(raw) as Goal;
+    goal.stats = migrateGoalStats((goal as { stats?: unknown }).stats);
+    return goal;
   } catch (err: any) {
     if (err?.code === "ENOENT") return null;
     throw err;
   }
+}
+
+/**
+ * Defect #3 migration shim. Older goal records (and sub-goal stubs) only
+ * carried `roundsRun`; newer code reads `iterationsRun` plus turn counters.
+ * Map `roundsRun → iterationsRun` when the newer field is absent, default the
+ * turn counters to 0, and keep `roundsRun` aliased to `iterationsRun` so the
+ * on-disk format never loses the deprecated field.
+ */
+export function migrateGoalStats(raw: unknown): Goal["stats"] {
+  const s = (raw ?? {}) as Partial<Goal["stats"]> & { roundsRun?: number };
+  const iterationsRun = s.iterationsRun ?? s.roundsRun ?? 0;
+  return {
+    tokensUsed: s.tokensUsed ?? 0,
+    // Phase ζ — input/output split. Pre-Phase-ζ goals default to 0; their
+    // combined `tokensUsed` is preserved so historical totals stay correct.
+    inputTokensUsed: s.inputTokensUsed ?? 0,
+    outputTokensUsed: s.outputTokensUsed ?? 0,
+    iterationsRun,
+    assistantTurnsTotal: s.assistantTurnsTotal ?? 0,
+    llmCallsTotal: s.llmCallsTotal ?? 0,
+    toolCallCount: s.toolCallCount ?? 0,
+    roundsRun: iterationsRun,
+    // TODO-2 §3.2 / C7 — compaction stats (default for pre-TODO-2 goals).
+    compactionRuns: s.compactionRuns ?? 0,
+    compactionTokensDropped: s.compactionTokensDropped ?? 0,
+    lastCompactionReason: s.lastCompactionReason ?? null,
+    lastCompactionAt: s.lastCompactionAt ?? null,
+    // Layer 1 — token budget continuation (default for pre-Layer-1 goals).
+    budgetContinuationCount: s.budgetContinuationCount ?? 0,
+    budgetLastDeltaTokens: s.budgetLastDeltaTokens ?? 0,
+    budgetLastCheckTokens: s.budgetLastCheckTokens ?? 0,
+    // Layer 2 — mark_done review (default for pre-Layer-2 goals).
+    markDoneReviewRejectionCount: s.markDoneReviewRejectionCount ?? 0,
+  };
 }
 
 /** Write one goal to disk, creating the goals/ directory if needed. */
@@ -200,6 +341,7 @@ export async function listGoals(workspace: string): Promise<Goal[]> {
     try {
       const raw = await fs.readFile(path.join(dir, name), "utf-8");
       const g = JSON.parse(raw) as Goal;
+      g.stats = migrateGoalStats((g as { stats?: unknown }).stats);
       goals.push(g);
     } catch {
       /* skip malformed */
@@ -250,7 +392,24 @@ export async function createGoal(
     },
     model: input.model,
     createdAt: now,
-    stats: { tokensUsed: 0, roundsRun: 0, toolCallCount: 0 },
+    stats: {
+      tokensUsed: 0,
+      inputTokensUsed: 0,
+      outputTokensUsed: 0,
+      iterationsRun: 0,
+      assistantTurnsTotal: 0,
+      llmCallsTotal: 0,
+      toolCallCount: 0,
+      roundsRun: 0,
+      compactionRuns: 0,
+      compactionTokensDropped: 0,
+      lastCompactionReason: null,
+      lastCompactionAt: null,
+      budgetContinuationCount: 0,
+      budgetLastDeltaTokens: 0,
+      budgetLastCheckTokens: 0,
+      markDoneReviewRejectionCount: 0,
+    },
     conversationIds: [],
     parentGoalId: input.parentGoalId ?? null,
     subGoalIds: [],
@@ -295,10 +454,35 @@ export async function updateGoalStats(
 ): Promise<void> {
   const g = await readGoal(workspace, goalId);
   if (!g) return;
+  const iterationsRun = g.stats.iterationsRun + (delta.iterationsRun ?? delta.roundsRun ?? 0);
   g.stats = {
     tokensUsed: g.stats.tokensUsed + (delta.tokensUsed ?? 0),
-    roundsRun: g.stats.roundsRun + (delta.roundsRun ?? 0),
+    inputTokensUsed: g.stats.inputTokensUsed + (delta.inputTokensUsed ?? 0),
+    outputTokensUsed: g.stats.outputTokensUsed + (delta.outputTokensUsed ?? 0),
+    iterationsRun,
+    assistantTurnsTotal: g.stats.assistantTurnsTotal + (delta.assistantTurnsTotal ?? 0),
+    llmCallsTotal: g.stats.llmCallsTotal + (delta.llmCallsTotal ?? 0),
     toolCallCount: g.stats.toolCallCount + (delta.toolCallCount ?? 0),
+    roundsRun: iterationsRun,
+    // TODO-2 §3.2 / C7 — compaction stats: deltas can carry new values,
+    // otherwise carry forward. lastCompactionReason / lastCompactionAt
+    // are SET (not added) by callers — pass-through delta values.
+    compactionRuns: g.stats.compactionRuns + (delta.compactionRuns ?? 0),
+    compactionTokensDropped: g.stats.compactionTokensDropped + (delta.compactionTokensDropped ?? 0),
+    lastCompactionReason: delta.lastCompactionReason ?? g.stats.lastCompactionReason,
+    lastCompactionAt: delta.lastCompactionAt ?? g.stats.lastCompactionAt,
+    // Layer 1 — budget continuation tracker: carried forward (callers SET
+    // these directly via writeGoal, not through updateGoalStats deltas).
+    budgetContinuationCount:
+      delta.budgetContinuationCount ?? g.stats.budgetContinuationCount,
+    budgetLastDeltaTokens:
+      delta.budgetLastDeltaTokens ?? g.stats.budgetLastDeltaTokens,
+    budgetLastCheckTokens:
+      delta.budgetLastCheckTokens ?? g.stats.budgetLastCheckTokens,
+    // Layer 2 — mark_done review rejection counter: carried forward
+    // (the runner SETs this directly via writeGoal, not via deltas).
+    markDoneReviewRejectionCount:
+      delta.markDoneReviewRejectionCount ?? g.stats.markDoneReviewRejectionCount,
   };
   await writeGoal(workspace, g);
 }
@@ -319,6 +503,32 @@ export async function endGoal(
     at: g.endedAt,
     kind: "status",
     payload: { to: status, reason },
+  });
+  await writeGoal(workspace, g);
+  return g;
+}
+
+/**
+ * NEW-F1 — flip a non-terminal goal status (e.g. active → paused) without
+ * setting endedAt / endReason (those are reserved for terminal flips).
+ * Appends a `status` audit step so the history shows the transition.
+ * Returns the updated goal, or null if it doesn't exist.
+ */
+export async function flipGoalStatus(
+  workspace: string,
+  goalId: string,
+  to: Goal["status"],
+  reason: string,
+): Promise<Goal | null> {
+  const g = await readGoal(workspace, goalId);
+  if (!g) return null;
+  if (g.status === to) return g;
+  const from = g.status;
+  g.status = to;
+  g.steps.push({
+    at: new Date().toISOString(),
+    kind: "status",
+    payload: { from, to, reason },
   });
   await writeGoal(workspace, g);
   return g;
@@ -390,8 +600,8 @@ export function withinBudget(g: Goal): { ok: true } | { ok: false; reason: strin
   if (g.budget.tokensMax !== null && g.stats.tokensUsed >= g.budget.tokensMax) {
     return { ok: false, reason: `token budget exhausted (${g.stats.tokensUsed}/${g.budget.tokensMax})` };
   }
-  if (g.budget.roundsMax !== null && g.stats.roundsRun >= g.budget.roundsMax) {
-    return { ok: false, reason: `round budget exhausted (${g.stats.roundsRun}/${g.budget.roundsMax})` };
+  if (g.budget.roundsMax !== null && g.stats.iterationsRun >= g.budget.roundsMax) {
+    return { ok: false, reason: `iteration budget exhausted (${g.stats.iterationsRun}/${g.budget.roundsMax})` };
   }
   return { ok: true };
 }

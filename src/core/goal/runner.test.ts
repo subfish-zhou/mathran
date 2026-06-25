@@ -11,7 +11,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import { runGoalRound, buildGoalSystemPrompt, GOAL_SUMMARY_PROMPT_DONE, GOAL_SUMMARY_PROMPT_GIVE_UP } from "./runner.js";
+import { runGoalRound, runOneIteration, buildGoalSystemPrompt, GOAL_SUMMARY_PROMPT_DONE, GOAL_SUMMARY_PROMPT_GIVE_UP } from "./runner.js";
 import { createGoal, readGoal } from "./store.js";
 import { ScopedChatSessionStore, conversationFilePath } from "../chat/store.js";
 import { ChatSession } from "../chat/session.js";
@@ -157,6 +157,179 @@ describe("runGoalRound", () => {
     expect(round?.endedAt).toBeTruthy();
   });
 
+  it("Layer 1: mark_done is BLOCKED by token budget continuation when under 90%", async () => {
+    // Budget high enough that the tiny fake conversation's token usage is
+    // well under 90% → the mark_done is intercepted and the goal keeps
+    // running instead of completing.
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+      budgetTokensMax: 1_000_000,
+    });
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "done early" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+    ]);
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    // Blocked: not completed, goal still active for the daemon to reschedule.
+    expect(r.completed).toBe(false);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("active");
+    expect(round?.stats.budgetContinuationCount).toBe(1);
+    // Audit step + persisted snapshot of where we were.
+    const step = round?.steps.find((s) => s.kind === "budget-continuation");
+    expect(step).toBeTruthy();
+    expect(round?.stats.budgetLastCheckTokens).toBe(round?.stats.tokensUsed);
+  });
+
+  it("Layer 1: mark_done still completes a goal with NO token budget", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+      // budgetTokensMax omitted → null → continuation never engages.
+    });
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "no budget done" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "wrap up" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    expect(r.completed).toBe(true);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("complete");
+    expect(round?.stats.budgetContinuationCount).toBe(0);
+  });
+
+  it("Layer 2: mark_done BLOCKED by deterministic review with unchecked plan items", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+      // No token budget → Layer 1 never blocks; isolate Layer 2.
+    });
+    await writeGoalPlan(workspace, g.id, "- [x] step one\n- [ ] step two\n- [ ] step three\n");
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "claims done" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      markDoneReview: { mode: "deterministic" },
+    });
+    // Blocked: not completed, goal stays active, rejection counted.
+    expect(r.completed).toBe(false);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("active");
+    expect(round?.stats.markDoneReviewRejectionCount).toBe(1);
+    const step = round?.steps.find((s) => s.kind === "mark-done-review-rejected");
+    expect(step).toBeTruthy();
+  });
+
+  it("Layer 2: mark_done with 0 unchecked items passes review → falls through to completion", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    await writeGoalPlan(workspace, g.id, "- [x] step one\n- [x] step two\n");
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "all checked" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "wrap up" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      markDoneReview: { mode: "deterministic" },
+    });
+    expect(r.completed).toBe(true);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("complete");
+    expect(round?.stats.markDoneReviewRejectionCount).toBe(0);
+  });
+
+  it("Layer 2: mode 'off' (default) is identical to pre-Layer-2 even with unchecked items", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    await writeGoalPlan(workspace, g.id, "- [ ] still pending\n");
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "done anyway" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "wrap" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    // No markDoneReview option → default "off".
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    expect(r.completed).toBe(true);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("complete");
+    expect(round?.stats.markDoneReviewRejectionCount).toBe(0);
+  });
+
+  it("Layer 2: force-accepts mark_done once the rejection cap is reached", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    await writeGoalPlan(workspace, g.id, "- [ ] still pending\n");
+    // Pre-seed the goal at the rejection cap so the next mark_done is forced.
+    const seeded = (await readGoal(workspace, g.id))!;
+    seeded.stats.markDoneReviewRejectionCount = 3;
+    await (await import("./store.js")).writeGoal(workspace, seeded);
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "capped" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "wrap" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      markDoneReview: { mode: "deterministic" },
+    });
+    expect(r.completed).toBe(true);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("complete");
+  });
+
   it("give_up tool flips status to failed", async () => {
     const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
     const llm = fakeLLM([
@@ -210,7 +383,7 @@ describe("runGoalRound", () => {
     ]);
     const r1 = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
     expect(r1.exhausted).toBe(true);
-    expect(r1.endReason).toMatch(/round budget/);
+    expect(r1.endReason).toMatch(/iteration budget/);
     // A second call must short-circuit on the inactive status
     // (the goal already ended; runner returns the original end reason).
     const r2 = await runGoalRound({ workspace, goalId: g.id, userMessage: "go again", llm, tools: [] });
@@ -689,7 +862,10 @@ describe("runGoalRound summary on completion", () => {
     expect(r.completed).toBe(true);
 
     // Self-grade is fire-and-forget (deferred via setImmediate) — let it settle.
-    await new Promise((res) => setTimeout(res, 30));
+    // Bumped from 30ms to 200ms because under parallel vitest forks + IO load
+    // 30ms occasionally starves and the outcome record isn't on disk yet (audit
+    // 2026-06-24).
+    await new Promise((res) => setTimeout(res, 200));
     const outcome = await readOutcome(workspace, g.id);
     expect(outcome).not.toBeNull();
     expect(outcome!.resolution).toBe("complete");
@@ -716,7 +892,7 @@ describe("runGoalRound summary on completion", () => {
     ]);
     const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
     expect(r.completed).toBe(true);
-    await new Promise((res) => setTimeout(res, 30));
+    await new Promise((res) => setTimeout(res, 200));
     expect(await readOutcome(workspace, g.id)).toBeNull();
   });
 
@@ -1905,5 +2081,245 @@ describe("runGoalRound update_plan_item registration (v0.16 §9 audit #4)", () =
     expect(toolStep).toBeDefined();
     expect(toolStep.payload.ok).toBe(false);
     expect(String(toolStep.payload.content)).toMatch(/unknown tool|not registered/i);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// C2 (daemon-mode): runOneIteration extensions.
+//
+// The thin runGoalRound wrapper above defaults `undefined` userMessage
+// to the historical "Continue with the current objective." string so
+// every existing test in this file keeps passing without churn. The
+// new behaviours (synthesised `[daemon: continue]` nudge, `steerText`
+// drain, `naturalTurnEnd` flag) live on the lower-level runOneIteration
+// surface and are exercised exclusively in this block.
+// ────────────────────────────────────────────────────────────────────────
+describe("runOneIteration (C2 daemon-mode extensions)", () => {
+  it("synthesises `[daemon: continue]` when userMessage is undefined", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const llm = fakeLLM([
+      [
+        { type: "text", delta: "daemon-driven turn" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runOneIteration({
+      workspace,
+      goalId: g.id,
+      userMessage: undefined,
+      llm,
+      tools: [],
+    });
+    expect(r.text).toBe("daemon-driven turn");
+    // Conversation jsonl should record the synthesised daemon nudge as
+    // the user turn — NOT the legacy "Continue with the current
+    // objective." string the v0.17 wrapper still defaults to.
+    const round = await readGoal(workspace, g.id);
+    const convFile = path.join(
+      workspace,
+      ".mathran",
+      "global-chat",
+      `${round!.conversationIds[0]}.jsonl`,
+    );
+    const raw = await fs.readFile(convFile, "utf-8");
+    expect(raw).toContain("[daemon: continue]");
+    expect(raw).not.toContain("Continue with the current objective.");
+    // And the `plan` audit step records the same synthesised body.
+    const planStep = round?.steps.find((s) => s.kind === "plan") as any;
+    expect(planStep?.payload?.userMessage).toBe("[daemon: continue]");
+  });
+
+  it("runGoalRound wrapper still defaults blank userMessage to the v0.17 sentinel", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const llm = fakeLLM([
+      [
+        { type: "text", delta: "legacy wrapper" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    // Pass an empty string — the wrapper's normalisation should still
+    // hand the runner the historical "Continue with the current
+    // objective." string so existing CLI / SPA / non-daemon callers
+    // keep their behaviour byte-for-byte.
+    await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "",
+      llm,
+      tools: [],
+    });
+    const round = await readGoal(workspace, g.id);
+    const convFile = path.join(
+      workspace,
+      ".mathran",
+      "global-chat",
+      `${round!.conversationIds[0]}.jsonl`,
+    );
+    const raw = await fs.readFile(convFile, "utf-8");
+    expect(raw).toContain("Continue with the current objective.");
+    expect(raw).not.toContain("[daemon: continue]");
+  });
+
+  it("steerText is prepended as `[Steer from user: …]` in front of userMessage", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const llm = fakeLLM([
+      [
+        { type: "text", delta: "got the steer" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    await runOneIteration({
+      workspace,
+      goalId: g.id,
+      userMessage: "do thing X",
+      steerText: "actually focus on Y instead",
+      llm,
+      tools: [],
+    });
+    const round = await readGoal(workspace, g.id);
+    const convFile = path.join(
+      workspace,
+      ".mathran",
+      "global-chat",
+      `${round!.conversationIds[0]}.jsonl`,
+    );
+    const raw = await fs.readFile(convFile, "utf-8");
+    // Both the steer prefix and the original userMessage should be in
+    // the persisted user turn, in that order.
+    expect(raw).toContain("[Steer from user: actually focus on Y instead]");
+    expect(raw).toContain("do thing X");
+    const idxSteer = raw.indexOf("[Steer from user:");
+    const idxOrig = raw.indexOf("do thing X");
+    expect(idxSteer).toBeGreaterThan(-1);
+    expect(idxOrig).toBeGreaterThan(idxSteer);
+    // And the audit log records the spliced body.
+    const planStep = round?.steps.find((s) => s.kind === "plan") as any;
+    expect(planStep.payload.userMessage).toMatch(/^\[Steer from user: /);
+    expect(planStep.payload.userMessage).toContain("do thing X");
+  });
+
+  it("steerText alone (no userMessage) becomes the user turn", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const llm = fakeLLM([
+      [
+        { type: "text", delta: "acknowledged" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    await runOneIteration({
+      workspace,
+      goalId: g.id,
+      userMessage: undefined,
+      steerText: "please pivot to lemma 3",
+      llm,
+      tools: [],
+    });
+    const round = await readGoal(workspace, g.id);
+    const planStep = round?.steps.find((s) => s.kind === "plan") as any;
+    expect(planStep.payload.userMessage).toBe(
+      "[Steer from user: please pivot to lemma 3]",
+    );
+  });
+
+  it("naturalTurnEnd=true when round produces text and zero tool calls", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    const llm = fakeLLM([
+      [
+        { type: "text", delta: "I'm done for this turn." },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runOneIteration({
+      workspace,
+      goalId: g.id,
+      userMessage: "say something then stop",
+      llm,
+      tools: [],
+    });
+    expect(r.completed).toBe(false);
+    expect(r.failed).toBe(false);
+    expect(r.aborted).toBe(false);
+    expect(r.exhausted).toBe(false);
+    expect(r.naturalTurnEnd).toBe(true);
+  });
+
+  it("naturalTurnEnd is NOT set when the round made tool calls", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    // Round 1: model calls update_plan_item (a tool the runner does not
+    // register on this goal — the chat session returns the "unknown
+    // tool" branch — but the call still increments toolCallCount).
+    // Round 2: model emits text + stop. We only assert on round 1's
+    // result here.
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "u1", name: "update_plan_item", argsDelta: JSON.stringify({ index: 0, status: "done" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "acknowledged the bad tool result" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runOneIteration({
+      workspace,
+      goalId: g.id,
+      userMessage: "do work",
+      llm,
+      tools: [],
+    });
+    // A tool call was made → naturalTurnEnd should be absent (or false).
+    expect(r.naturalTurnEnd).toBeUndefined();
+    expect(r.completed).toBe(false);
+    expect(r.failed).toBe(false);
+  });
+
+  it("naturalTurnEnd is NOT set when the round produces no text", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    // The model just hangs up with no text and no tool call — pathological
+    // but worth pinning: zero text → no "the model just spoke" signal,
+    // so naturalTurnEnd must NOT be true (a meaningless empty round
+    // shouldn't park the daemon).
+    const llm = fakeLLM([
+      [
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runOneIteration({
+      workspace,
+      goalId: g.id,
+      userMessage: "",
+      llm,
+      tools: [],
+    });
+    expect(r.text).toBe("");
+    expect(r.naturalTurnEnd).toBeUndefined();
   });
 });

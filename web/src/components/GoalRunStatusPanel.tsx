@@ -63,8 +63,18 @@ interface GoalRunStatusPanelProps {
   onStatus?: (status: GoalStatus) => void;
 }
 
-const POLL_INTERVAL_MS = 3000;
-const STALE_THRESHOLD_MS = 30_000;
+const POLL_INTERVAL_MS = 10_000;
+const STALE_THRESHOLD_MS = 60_000;
+
+/** Phase ζ (cost meter) — format an estimated USD cost for the badge.
+ *  `null`/undefined → "—" (model has no public price). Sub-cent costs
+ *  render "$ <0.01" so the user knows it's nonzero but tiny. Otherwise
+ *  two decimals, e.g. "$ 0.34". DESIGN-REFERENCE.md §5.E. */
+function formatCostUsd(cost: number | null | undefined): string {
+  if (cost === null || cost === undefined) return "—";
+  if (cost > 0 && cost < 0.01) return "$ <0.01";
+  return `$ ${cost.toFixed(2)}`;
+}
 
 /** Render-time mapping from (status, abortRequested) → human badge.
  *  Kept exhaustive so a future Goal["status"] addition lights up an
@@ -264,14 +274,16 @@ export default function GoalRunStatusPanel({
           {badge}
         </span>
 
-        {/* Round counter — only when the goal has a roundsMax cap. */}
+        {/* Iteration counter — only when the goal has a roundsMax cap.
+            Defect #3: a daemon "iteration" can contain many assistant
+            turns, so we surface turns alongside the iteration count. */}
         {status.roundsMax !== null ? (
-          <span className="font-mono text-slate-700" title="goal rounds spent / cap">
-            Step {status.round}/{status.roundsMax}
+          <span className="font-mono text-slate-700" title="goal iterations spent / cap (assistant turns in parens)">
+            iter {status.round}/{status.roundsMax} (turns: {status.assistantTurnsTotal})
           </span>
         ) : (
-          <span className="font-mono text-slate-700" title="goal rounds spent">
-            Step {status.round}
+          <span className="font-mono text-slate-700" title="goal iterations spent (assistant turns in parens)">
+            iter {status.round} (turns: {status.assistantTurnsTotal})
           </span>
         )}
 
@@ -288,6 +300,39 @@ export default function GoalRunStatusPanel({
         {/* Tool-call count. */}
         <span className="text-slate-600" title="tool calls executed across all rounds">
           🔧 {status.toolCount}
+        </span>
+
+        {/* TODO-2 §3.2 / C9 — Compaction badge. Only renders when at
+         *  least one compaction has fired. Tooltip exposes reason +
+         *  tokens saved so the user can see what triggered the shrink
+         *  without opening the goal record. Persistent across rounds
+         *  unlike the per-turn AgentStatusPanel badge. */}
+        {typeof status.compactionRuns === "number" && status.compactionRuns > 0 && (
+          <span
+            className="text-amber-700"
+            title={`${status.compactionRuns} compaction${status.compactionRuns === 1 ? "" : "s"}${
+              status.lastCompactionReason ? ` (last: ${status.lastCompactionReason})` : ""
+            } — ~${(status.compactionTokensDropped ?? 0).toLocaleString()} tokens saved`}
+          >
+            🧹 {status.compactionRuns}
+          </span>
+        )}
+
+        {/* Phase ζ (cost meter) — estimated $ cost badge, adjacent to the
+         *  compaction badge per DESIGN-REFERENCE.md §5.E. Renders "—" when
+         *  the model has no public price (costUsd === null). Tooltip breaks
+         *  down the input/output token split that drove the figure. The
+         *  approximation note matches the server's Option-B fallback for
+         *  goals lacking a provider-reported split. */}
+        <span
+          className="font-mono text-emerald-700"
+          title={
+            status.costUsd === null || status.costUsd === undefined
+              ? `${status.model ?? "model"}: no public price available`
+              : `${status.model ?? "model"}: ${(status.inputTokensUsed ?? 0).toLocaleString()} in + ${(status.outputTokensUsed ?? 0).toLocaleString()} out tokens ≈ ${formatCostUsd(status.costUsd)} (estimate)`
+          }
+        >
+          {formatCostUsd(status.costUsd)}
         </span>
 
         {/* Heartbeat freshness. We only show the dot when a heartbeat
@@ -385,7 +430,7 @@ export default function GoalRunStatusPanel({
           {roundsPct !== null && (
             <div
               className="h-1 flex-1 overflow-hidden rounded bg-slate-100"
-              title={`rounds: ${status.round}/${status.roundsMax}`}
+              title={`iterations: ${status.round}/${status.roundsMax} (turns: ${status.assistantTurnsTotal})`}
             >
               <div
                 className={`h-full ${roundsPct >= 90 ? "bg-red-500" : roundsPct >= 70 ? "bg-amber-500" : "bg-emerald-500"}`}

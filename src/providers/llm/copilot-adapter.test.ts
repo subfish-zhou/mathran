@@ -11,6 +11,7 @@ function fakeChat(
     if (sink) sink.req = req;
     return {
       text: res.text ?? "",
+      reasoning: res.reasoning ?? "",
       toolCalls: res.toolCalls ?? [],
       finishReason: res.finishReason ?? "stop",
       usage: res.usage ?? { input: 1, output: 2 },
@@ -93,6 +94,31 @@ describe("CopilotAdapter tool wiring", () => {
       { type: "tool-call", id: "c", name: "lean_check", argsDelta: "{}" },
       { type: "done", finishReason: "tool_calls", usage: { promptTokens: 1, completionTokens: 2 } },
     ]);
+  });
+
+  it("emits a reasoning chunk before text when the response carries reasoning (UX gap B)", async () => {
+    const adapter = new CopilotAdapter({
+      chatFn: fakeChat({
+        text: "The answer is 42.",
+        reasoning: "First I compute 6 × 7.",
+        finishReason: "stop",
+        usage: { input: 2, output: 9 },
+      }) as never,
+    });
+    const chunks = await collect((await adapter.chat({ model: "gpt-5.5", messages: [] })).stream());
+    expect(chunks).toEqual([
+      { type: "reasoning", delta: "First I compute 6 × 7." },
+      { type: "text", delta: "The answer is 42." },
+      { type: "done", finishReason: "stop", usage: { promptTokens: 2, completionTokens: 9 } },
+    ]);
+  });
+
+  it("omits the reasoning chunk when no reasoning is present", async () => {
+    const adapter = new CopilotAdapter({
+      chatFn: fakeChat({ text: "hi", finishReason: "stop" }) as never,
+    });
+    const chunks = await collect((await adapter.chat({ model: "gpt-5.5", messages: [] })).stream());
+    expect(chunks.some((c) => c.type === "reasoning")).toBe(false);
   });
 
   it("omits tools when none are provided", async () => {

@@ -366,6 +366,68 @@ goalCmd
     process.exit(await runGoalStop(goalId, { workspace: opts.workspace }));
   });
 
+goalCmd
+  .command("watch")
+  .description("Live-tail a goal's progress from a running 'mathran serve' (read-only)")
+  .argument("<goalId>", "Goal id (or its 8-char prefix)")
+  .option("--server <url>", "mathran serve base URL", "http://127.0.0.1:7878")
+  .option("--no-color", "Disable ANSI colors (CI mode)")
+  .option("--no-follow", "Print the current status once and exit (no streaming)")
+  .option("--workspace <dir>", "Workspace root (accepted for consistency; resolution is server-side)")
+  .action(async (goalId: string, opts: any) => {
+    const { runGoalWatch } = await import("./commands/goal-watch.js");
+    process.exit(
+      await runGoalWatch(goalId, {
+        server: opts.server,
+        color: opts.color,
+        follow: opts.follow,
+      }),
+    );
+  });
+
+// ─── F6: goal template ──────────────────────────────────────────────────
+const goalTemplateCmd = goalCmd
+  .command("template")
+  .description("Reusable goal-objective templates with {var} placeholders");
+
+goalTemplateCmd
+  .command("list")
+  .description("List goal templates in <workspace>/.mathran/goal-templates/")
+  .option("--workspace <dir>", "Workspace root", process.cwd())
+  .action(async (opts: { workspace: string }) => {
+    const { runGoalTemplateList } = await import("./commands/goal-template.js");
+    process.exit(await runGoalTemplateList({ workspace: opts.workspace }));
+  });
+
+goalTemplateCmd
+  .command("show")
+  .description("Print a template's frontmatter + body")
+  .argument("<name>", "Template name (filename without .md)")
+  .option("--workspace <dir>", "Workspace root", process.cwd())
+  .action(async (name: string, opts: { workspace: string }) => {
+    const { runGoalTemplateShow } = await import("./commands/goal-template.js");
+    process.exit(await runGoalTemplateShow({ workspace: opts.workspace, name }));
+  });
+
+goalTemplateCmd
+  .command("use")
+  .description("Expand a template against --var name=value args, print the result")
+  .argument("<name>", "Template name (filename without .md)")
+  .option("--workspace <dir>", "Workspace root", process.cwd())
+  .option("--var <kv...>", "Repeated: --var name=value", [])
+  .action(async (name: string, opts: { workspace: string; var: string[] }) => {
+    const { runGoalTemplateUse, parseVarFlags } = await import("./commands/goal-template.js");
+    let vars: Record<string, string> = {};
+    try {
+      vars = parseVarFlags(opts.var ?? []);
+    } catch (e: any) {
+      // eslint-disable-next-line no-console
+      console.error(String(e?.message ?? e));
+      process.exit(2);
+    }
+    process.exit(await runGoalTemplateUse({ workspace: opts.workspace, name, vars }));
+  });
+
 const planCmd = program
   .command("plan")
   .description("Read-only planning ChatSession (v0.3 §13). Drafts an effort outline before any write happens.");
@@ -670,6 +732,28 @@ program
   .action(async (opts: { probe?: boolean }) => {
     const { runDoctor } = await import("./commands/doctor.js");
     process.exit(await runDoctor({ probe: opts.probe }));
+  });
+
+// ─── workspace gc — NEW-F4 ──────────────────────────────────────────────
+const workspaceCmd = program
+  .command("workspace")
+  .description("Workspace maintenance commands");
+
+workspaceCmd
+  .command("gc")
+  .description("Garbage-collect stale workspace state (failed goals + .bak files + orphan index entries)")
+  .option("--workspace <dir>", "Workspace root", process.cwd())
+  .option("--apply", "Actually delete (default: dry-run)", false)
+  .option("--keep-days <n>", "Retention window for terminal goals + empty chats", (v) => parseInt(v, 10), 30)
+  .option("--bak-keep-days <n>", "Retention window for *.bak.* backup files", (v) => parseInt(v, 10), 7)
+  .action(async (opts: { workspace: string; apply: boolean; keepDays: number; bakKeepDays: number }) => {
+    const { runWorkspaceGc } = await import("./commands/workspace-gc.js");
+    await runWorkspaceGc({
+      workspace: opts.workspace,
+      apply: opts.apply,
+      keepDays: opts.keepDays,
+      bakKeepDays: opts.bakKeepDays,
+    });
   });
 
 // `bun build --compile` produces an argv that matches Node's convention:

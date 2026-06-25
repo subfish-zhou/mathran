@@ -100,7 +100,7 @@ describe("ask_user tool", () => {
     // Synchronous resolver: no `ask_user` event is emitted because we
     // never bailed out of the loop (only the throw branch yields one).
     // The model just sees a normal tool-call → tool-result.
-    expect(types).toEqual(["tool-call", "tool-result", "text", "done"]);
+    expect(types).toEqual(["usage", "tool-call", "tool-result", "text", "usage", "done"]);
 
     // The resolver received the question text and the provider's tool-call id.
     expect(seenQuestion).toBe("What range?");
@@ -287,7 +287,7 @@ describe("ask_user tool", () => {
 
     // Resume — should NOT push a new user message, should continue the loop.
     const resumeEvents = await collect(session.resume());
-    expect(resumeEvents.map((e) => e.type)).toEqual(["text", "done"]);
+    expect(resumeEvents.map((e) => e.type)).toEqual(["text", "usage", "done"]);
     const text = resumeEvents.find((e) => e.type === "text") as Extract<
       ChatEvent,
       { type: "text" }

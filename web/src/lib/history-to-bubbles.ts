@@ -74,6 +74,14 @@ export interface TextBubble {
   kind: "user" | "assistant";
   text: string;
   /**
+   * Reasoning / chain-of-thought text for an assistant bubble (UX gap B).
+   * Populated either live (accumulated from `reasoning` SSE deltas) or on
+   * history load from the persisted `LLMMessage.reasoning` field. ChatPanel
+   * renders it as a collapsed `<ReasoningBlock>` above the answer. Absent on
+   * user bubbles and on assistant turns the model answered without thinking.
+   */
+  reasoning?: string;
+  /**
    * Attachment chips to render under a user bubble (v0.17 mathub parity).
    * Populated only on `kind === "user"` rows whose persisted `LLMMessage`
    * carried an `attachments:[…]` array — i.e. messages originally sent
@@ -93,6 +101,8 @@ export interface LLMMessageWire {
   name?: string;
   toolCalls?: Array<{ id: string; name: string; arguments: string }>;
   attachments?: Array<{ path: string; filename: string; mimeType: string }>;
+  /** UX gap B — persisted chain-of-thought for an assistant turn. */
+  reasoning?: string;
 }
 
 function isErrorResult(s: string): boolean {
@@ -114,8 +124,12 @@ export function historyToBubbles(history: LLMMessageWire[]): Bubble[] {
     }
 
     if (m.role === "assistant") {
-      if (m.content && m.content.trim().length > 0) {
-        out.push({ kind: "assistant", text: m.content });
+      const hasText = !!(m.content && m.content.trim().length > 0);
+      const hasReasoning = !!(m.reasoning && m.reasoning.length > 0);
+      if (hasText || hasReasoning) {
+        const bubble: TextBubble = { kind: "assistant", text: hasText ? m.content : "" };
+        if (hasReasoning) bubble.reasoning = m.reasoning;
+        out.push(bubble);
       }
       if (m.toolCalls && m.toolCalls.length > 0) {
         for (const tc of m.toolCalls) {

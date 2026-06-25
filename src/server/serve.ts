@@ -19,6 +19,7 @@
 
 import * as fs from "node:fs/promises";
 import * as fssync from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
@@ -91,11 +92,16 @@ import {
   resolveApprovalConfig,
   historyFor,
 } from "../core/approval/index.js";
+import type { WriteProposal } from "../core/approval/diff-preview.js";
 import {
   ApprovalRegistry,
   sharedApprovalRegistry,
   registerApprovalRoute,
 } from "./approval-routes.js";
+import {
+  sharedWriteProposalRegistry,
+  registerWriteProposalRoute,
+} from "./write-proposal-routes.js";
 import {
   SubagentScheduler,
   defaultSubagentRegistry,
@@ -115,6 +121,7 @@ import {
   createFallbackTokenCounter,
   type TokenCounter,
 } from "../core/chat/token-counter.js";
+import { contextWindowForModel } from "../providers/llm/copilot-models-cache.js";
 import type { LLMMessage, MessageContent } from "../core/providers/llm.js";
 import {
   ScopedChatSessionStore,
@@ -139,7 +146,16 @@ import {
   writeGoal,
   type Goal,
 } from "../core/goal/store.js";
-import { runGoalRound } from "../core/goal/runner.js";
+import { runGoalRound, runOneIteration, type RunRoundResult } from "../core/goal/runner.js";
+import { computeCostUsd } from "../providers/llm/model-pricing.js";
+import {
+  GoalDaemon,
+  GoalTurnRunner,
+  type DaemonEvent,
+  type DaemonIterationResult,
+  type GoalDaemonOptions,
+  type IterationFn,
+} from "../core/goal/daemon.js";
 import {
   DEFAULT_GOAL_AUTONOMY,
   deleteGoalAutonomyLayer,
@@ -204,6 +220,40 @@ const SYSTEM_PROMPT = buildBaseSystemPrompt();
 // the NodeJS.Timeout lets us clear it cleanly; the resolver itself is
 // closure-bound to (scope, conversationId, callId, default).
 const askTimeoutRegistry = new Map<string, NodeJS.Timeout>();
+
+/**
+ * Phase ζ (cost meter) — dollar cost of a goal's lifetime LLM usage.
+ *
+ * Prefers the exact provider-reported input/output split
+ * (`stats.inputTokensUsed` / `stats.outputTokensUsed`, Phase ζ Option A).
+ * When that split is unavailable but a combined `tokensUsed` exists — i.e.
+ * pre-Phase-ζ goals on disk, or iterations where the provider reported no
+ * usage and we fell back to `countTokens` — we APPROXIMATE the split with a
+ * 30% input / 70% output heuristic (Option B). The ratio varies (50/50 to
+ * 90/10 depending on tool-call density); the approximated figure is a rough
+ * indicator only. Returns `null` for unpriced/unknown models so the UI shows
+ * "—" rather than a fake $0.00. DESIGN-REFERENCE.md §5.E.
+ */
+function computeGoalCostUsd(g: Goal): number | null {
+  const inSplit = g.stats.inputTokensUsed ?? 0;
+  const outSplit = g.stats.outputTokensUsed ?? 0;
+  if (inSplit > 0 || outSplit > 0) {
+    return computeCostUsd(g.model, inSplit, outSplit);
+  }
+  const total = g.stats.tokensUsed ?? 0;
+  if (total > 0) {
+    // Option B fallback: approximate 30% input / 70% output.
+    return computeCostUsd(g.model, total * 0.3, total * 0.7);
+  }
+  return computeCostUsd(g.model, 0, 0);
+}
+
+/** Escape a Prometheus label value per the text exposition spec
+ *  (backslash, double-quote, newline). Phase ζ — used for the `model`
+ *  label on mathran_cost_usd_total. */
+function promLabel(v: string): string {
+  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+}
 
 function cancelAskTimeout(callId: string): void {
   const t = askTimeoutRegistry.get(callId);
@@ -1187,11 +1237,20 @@ export function defaultSessionFactory(
       ? (request: Parameters<typeof approvalRegistry.register>[1]) =>
           approvalRegistry.register(conversationId, request)
       : undefined;
+    // UX gap A — diff-preview resolver: park each write proposal in the shared
+    // registry; the SPA's DiffPreviewModal POST resolves it (see
+    // write-proposal-routes). Only wired when we have a conversation id to key
+    // the parked promise on.
+    const writeProposalResolver = conversationId
+      ? (proposal: WriteProposal) =>
+          sharedWriteProposalRegistry.register(conversationId, proposal)
+      : undefined;
     return new ChatSession({
       llm: router,
       model: resolvedModel,
       approvalBroker,
       ...(approvalResolver ? { approvalResolver } : {}),
+      ...(writeProposalResolver ? { writeProposalResolver } : {}),
       // C-1: when a profile is active, thread it into the session so the
       // dispatch-level hard reject (readOnlyMode / hardRejectMutations /
       // denylistTools) fires BEFORE the broker is consulted — i.e. even a
@@ -1430,18 +1489,13 @@ const PLACEHOLDER_HTML = `<!doctype html>
  */
 // Helper functions for the usage endpoint (Task 19).
 // We reuse the Task 4 token counters and the Task 5 default context window.
-// Per-model context-window table — keep in sync with provider docs.
+// Per-model context-window resolution (TODO-2 §5.6 / C7): delegate to the
+// copilot models cache so we use REAL caps from the /models endpoint
+// (refreshed each session token cycle) instead of guessed values.
+// Hardcoded snapshot fallback for cold start. Unknown models → 200K default.
 function resolveContextWindow(model: string | undefined): number {
   if (!model) return 200_000;
-  const m = model.toLowerCase();
-  // Strip any "<provider>/" prefix (e.g. "copilot/gpt-5.5" → "gpt-5.5").
-  const bare = m.includes("/") ? m.split("/").pop() ?? m : m;
-  if (bare.startsWith("gpt-4o") || bare.includes("4o-")) return 128_000;
-  if (bare.startsWith("gpt-5")) return 128_000;
-  if (bare.startsWith("claude-3-5-sonnet")) return 200_000;
-  if (bare.startsWith("claude-opus-4") || bare.startsWith("claude-sonnet-4")) return 200_000;
-  if (bare.startsWith("o1") || bare.startsWith("o3") || bare.startsWith("o4")) return 200_000;
-  return 200_000;
+  return contextWindowForModel(model);
 }
 
 /** Pick the right token counter for a model name (matches Task 4 conventions). */
@@ -1510,6 +1564,7 @@ function registerChatScope(
   // Approval Policy 矩阵 — POST <base>/:cid/approval/:id resolves a parked
   // prompt; GET lists pending prompts for recovery after a page reload.
   registerApprovalRoute(app, basePath, approvalRegistry);
+  registerWriteProposalRoute(app, basePath, sharedWriteProposalRegistry);
   // POST <base>  — send a message (SSE)
   app.post(basePath, async (c) => {
     const resolved = getScope(c);
@@ -1779,6 +1834,7 @@ function registerChatScope(
         // decision (browser closed mid-approval) as a deny so the session never
         // hangs on a dead Promise.
         approvalRegistry.rejectPending(conversationId);
+        sharedWriteProposalRegistry.rejectPending(conversationId);
       }
     });
   });
@@ -2149,6 +2205,7 @@ function registerChatScope(
         releaseSteerSlot();
         releaseGoalGraded();
         approvalRegistry.rejectPending(id);
+        sharedWriteProposalRegistry.rejectPending(id);
       }
     });
   });
@@ -2547,6 +2604,7 @@ function registerChatScope(
         // Approval Policy 矩阵 — fail-safe: a resumed round can raise a fresh
         // approval prompt too; settle any still pending if the stream dies.
         approvalRegistry.rejectPending(id);
+        sharedWriteProposalRegistry.rejectPending(id);
       }
     });
   });
@@ -2861,7 +2919,37 @@ function buildApp(
   factory: ChatSessionFactory,
   goalLlmFactory?: GoalLLMFactory,
   mcpRegistry?: import("../core/mcp/registry.js").McpRegistry,
-): Hono {
+): { app: Hono; daemon: GoalDaemon | null } {
+  // ── C3: Goal-daemon backend switch. ────────────────────────────────────
+  //
+  // Setting MATHRAN_DISABLE_GOAL_DAEMON=1 makes every goal HTTP endpoint
+  // route through the v0.17 inline-runGoalRound code path that's lived
+  // here for months — the daemon is constructed `null`, all
+  // `daemon?.kickGoal(…)` branches short-circuit, and observable
+  // behaviour is byte-identical to pre-C3 (this is the explicit opt-out
+  // for production goals that were running mid-deploy).
+  //
+  // Unset / any other value enables the daemon path: each
+  // /api/goals/:id/run* endpoint asks the daemon to manage the loop and
+  // subscribes to its eventBus to forward frames onto SSE. The legacy
+  // `inflightGoals` map is STILL maintained inside the runner factory
+  // so /interrupt + /abort continue to work transparently regardless of
+  // which path drove the round.
+  const daemonDisabled = process.env.MATHRAN_DISABLE_GOAL_DAEMON === "1";
+  // The actual GoalDaemon is constructed BELOW (after `inflightGoals`
+  // exists and `buildProductionRunnerFactory` is defined) so the factory
+  // can capture the closure. We hoist a typed `let` here so endpoint
+  // handlers can reference `goalDaemon` symmetrically with the
+  // daemonDisabled flag. When disabled, `goalDaemon` stays null and
+  // every endpoint short-circuits to its v0.17 inline-runner path.
+  let goalDaemon: GoalDaemon | null = null;
+  if (daemonDisabled) {
+    // eslint-disable-next-line no-console
+    console.log("[mathran] goal daemon disabled via MATHRAN_DISABLE_GOAL_DAEMON=1");
+  } else {
+    // eslint-disable-next-line no-console
+    console.log("[mathran] goal daemon enabled (set MATHRAN_DISABLE_GOAL_DAEMON=1 to opt out)");
+  }
   const app = new Hono();
   // Adapt the test-friendly `ChatSessionFactory(opts)` to the store's
   // `ScopedChatSessionFactory({ scope, model })` signature. We pre-bind
@@ -2875,6 +2963,242 @@ function buildApp(
   // matching controller. Single-process only — a multi-process deployment would
   // need IPC (or the `<id>.stop` file-marker poll) to reach the right worker.
   const inflightGoals = new Map<string, AbortController>();
+
+  // ── C3: Production GoalTurnRunner factory ──────────────────────────
+  //
+  // Called by `goalDaemon.kickGoal()` when a goal isn't yet running.
+  // Constructs a fully-wired GoalTurnRunner whose iterationFn is
+  // runOneIteration plus the same LLM / tools / abort / steerProbe /
+  // todos-frame plumbing the v0.17 inline endpoints used. Every event
+  // emitted by runOneIteration's `onEvent` is forwarded onto
+  // `goalDaemon.eventBus` under `goal:<goalId>` so the SSE endpoint can
+  // subscribe and pipe frames to the SPA in the legacy wire format.
+  //
+  // We deliberately re-build the LLM + tools per iteration (matches the
+  // inline code path): the LLM provider holds streaming state, and the
+  // current production providers are cheap to instantiate. If that
+  // changes we'll memoise here.
+  const buildProductionRunnerFactory = (): NonNullable<GoalDaemonOptions["runnerFactory"]> => {
+    return (goalId, kickOpts) => {
+      // Read the goal record once up-front so we know its budget +
+      // scope + model. The runner re-reads inside each iteration
+      // (runOneIteration does its own readGoal) so a status flip
+      // between kick and first iteration is handled gracefully.
+      // We swallow async errors here — the runner's pre-iteration
+      // `isGoalStillActive` check will short-circuit if the goal
+      // disappeared.
+      const initialUserMessage =
+        typeof kickOpts.userMessage === "string" && kickOpts.userMessage.trim().length > 0
+          ? kickOpts.userMessage
+          : undefined;
+
+      const iterationFn: IterationFn = async ({ userMessage, steerText, signal, emit }) => {
+        // Fresh goal read inside each iteration so budget caps + status
+        // flips are honoured. Runner exits via isGoalStillActive below
+        // if the goal disappeared between iterations.
+        const g = await readGoal(workspace, goalId);
+        if (!g) {
+          // Goal vanished mid-loop — mark aborted so daemon exits.
+          return {
+            completed: false,
+            failed: false,
+            exhausted: false,
+            aborted: true,
+            endReason: "goal disappeared mid-loop",
+          };
+        }
+
+        const cfg = loadConfig(configPathFor(workspace));
+        const llm: LLMProvider = goalLlmFactory
+          ? goalLlmFactory({ model: g.model })
+          : new ModelRouter(cfg);
+        const lean = new LocalLeanProvider();
+        const tools = [createLeanCheckTool(lean)];
+
+        // Per-iteration AbortController. Composed with the daemon's
+        // signal (interrupt / abort / forceStop all flow through
+        // `signal` already — see GoalTurnRunner.currentAbort). We
+        // ALSO register the controller in `inflightGoals` so the
+        // existing /interrupt + /abort endpoints can find it through
+        // the legacy code path. The signal we pass to runOneIteration
+        // is the daemon-supplied one; aborting `inflightGoals` entry
+        // ALSO triggers it via the listener below.
+        const iterController = new AbortController();
+        const onParentAbort = () => iterController.abort();
+        if (signal.aborted) iterController.abort();
+        else signal.addEventListener("abort", onParentAbort, { once: true });
+        inflightGoals.set(goalId, iterController);
+
+        // Steer-probe wiring: register the per-iteration slot so
+        // POST /api/goals/:id/steer (legacy chat-side
+        // setPendingSteer) keeps working in-flight. Released in the
+        // `finally` below.
+        const steerConversationId = g.conversationIds[0] ?? null;
+        const releaseSteerSlot = steerConversationId
+          ? markStreamActive(steerConversationId)
+          : () => undefined;
+
+        try {
+          // Re-read post-runner so the result reflects the latest
+          // budget / status, mirroring the inline path.
+          const r = await runOneIteration({
+            workspace,
+            goalId,
+            userMessage,
+            ...(steerText ? { steerText } : {}),
+            llm,
+            tools,
+            builtinTools: GOAL_MODE_BUILTIN_TOOLS,
+            toolContext: { workspace, scope: g.scope },
+            signal: iterController.signal,
+            bootstrapPlan: "auto",
+            selfGrade: true,
+            onEvent: (ev) => {
+              // TODO-3 #4.H — feed inner ChatEvent into the daemon's
+              // own emit (). That path:
+              //   1. updates currentProgress (so the iteration-end
+              //      snapshot has non-zero counts — was always 0,0,0,0
+              //      before this fix because the eventBus side-channel
+              //      skipped daemon.updateProgress entirely),
+              //   2. calls daemon.opts.onEvent → eventBus → SSE clients.
+              // We deliberately do NOT double-push to the eventBus
+              // here; daemon.opts.onEvent already does that, and a
+              // direct eventBus.emit would deliver each frame twice.
+              emit(ev as DaemonEvent);
+              // v0.17 W12: synthesise a `todos` frame after a
+              // successful todo_write so the SPA's ActivePlanPanel
+              // stays in sync. Same logic as the inline endpoint.
+              if (
+                (ev as { type?: string }).type === "tool-result" &&
+                (ev as { name?: string }).name === "todo_write" &&
+                (ev as { ok?: boolean }).ok
+              ) {
+                void (async () => {
+                  try {
+                    const fresh = await readGoal(workspace, goalId);
+                    const cid =
+                      fresh?.conversationIds[0] ?? steerConversationId ?? undefined;
+                    if (!cid) return;
+                    const list = await loadTodos(workspace, g.scope, cid);
+                    if (goalDaemon) {
+                      goalDaemon.eventBus.emit(`goal:${goalId}`, {
+                        type: "todos",
+                        list,
+                      });
+                    }
+                  } catch {
+                    /* best-effort */
+                  }
+                })();
+              }
+            },
+            ...(steerConversationId
+              ? { steerProbe: () => consumePendingSteer(steerConversationId) }
+              : {}),
+          });
+
+          return {
+            completed: r.completed,
+            failed: r.failed,
+            exhausted: r.exhausted,
+            aborted: r.aborted,
+            ...(r.naturalTurnEnd ? { naturalTurnEnd: true as const } : {}),
+            ...(r.endReason ? { endReason: r.endReason } : {}),
+          };
+        } catch (err: unknown) {
+          if (isAskUserPending(err)) {
+            // Goal-mode auto-resolves ask_user inside the runner; if
+            // we still see it surface here something's wrong with the
+            // resolver wiring. Emit the legacy `ask_user` frame and
+            // treat the iteration as aborted so the daemon parks.
+            const e = err as { callId?: string; question?: string };
+            if (goalDaemon) {
+              goalDaemon.eventBus.emit(`goal:${goalId}`, {
+                type: "ask_user",
+                id: e.callId,
+                name: "ask_user",
+                question: e.question,
+              });
+            }
+            return { completed: false, failed: false, exhausted: false, aborted: true, endReason: "ask_user surfaced (unexpected)" };
+          }
+          // Real error — mark goal failed (matches v0.17 inline) and
+          // emit error frame on the eventBus.
+          try {
+            await endGoal(workspace, goalId, "failed", String((err as { message?: unknown })?.message ?? err));
+          } catch {
+            /* swallow */
+          }
+          if (goalDaemon) {
+            goalDaemon.eventBus.emit(`goal:${goalId}`, {
+              type: "error",
+              message: String((err as { message?: unknown })?.message ?? err),
+            });
+          }
+          return { completed: false, failed: true, exhausted: false, aborted: false, endReason: String((err as { message?: unknown })?.message ?? err) };
+        } finally {
+          signal.removeEventListener("abort", onParentAbort);
+          // Only delete the inflight entry if it's still ours (a
+          // concurrent kick may have replaced it on a new iteration).
+          if (inflightGoals.get(goalId) === iterController) {
+            inflightGoals.delete(goalId);
+          }
+          releaseSteerSlot();
+        }
+      };
+
+      const runner = new GoalTurnRunner({
+        goalId,
+        // Iteration budget = goal.budget.roundsMax when known; the
+        // runner re-reads goal each iteration so a CLI hand-edit of
+        // budget.roundsMax also takes effect. We hand a generous
+        // upper bound here for the daemon's own iteration counter
+        // (it's a defence-in-depth against bugs that prevent
+        // runOneIteration from ever returning a terminal flag);
+        // 1024 is well above the largest production roundsMax.
+        iterationBudget: 1024,
+        iterIdleMs: 5_000,
+        ...(initialUserMessage ? { initialUserMessage } : {}),
+        iterationFn,
+        onEvent: (ev: DaemonEvent) => {
+          if (goalDaemon) {
+            goalDaemon.eventBus.emit(`goal:${goalId}`, ev);
+          }
+        },
+        isGoalStillActive: async () => {
+          const g = await readGoal(workspace, goalId);
+          return !!g && g.status === "active";
+        },
+      });
+      return runner;
+    };
+  };
+
+  // Construct the daemon now that the factory closure is ready.
+  if (!daemonDisabled) {
+    // **C6:** route iteration-level observability into
+    // `~/.mathran/logs/daemon.log` (append-mode JSONL). Tests / CI can
+    // opt out via MATHRAN_DAEMON_LOG=0 (or any falsy non-empty value);
+    // a custom path is honoured via MATHRAN_DAEMON_LOG=/abs/path. The
+    // file is opened lazily on the first iteration event so we don't
+    // create directories during unit tests that never kick a goal.
+    const daemonLogEnv = process.env.MATHRAN_DAEMON_LOG;
+    const daemonLogDisabled =
+      daemonLogEnv === "0" ||
+      daemonLogEnv === "false" ||
+      daemonLogEnv === "off" ||
+      daemonLogEnv === "";
+    const iterationLogPath = daemonLogDisabled
+      ? undefined
+      : daemonLogEnv && daemonLogEnv !== "1"
+        ? daemonLogEnv
+        : path.join(os.homedir(), ".mathran", "logs", "daemon.log");
+    goalDaemon = new GoalDaemon({
+      workspace,
+      runnerFactory: buildProductionRunnerFactory(),
+      ...(iterationLogPath ? { iterationLogPath } : {}),
+    });
+  }
 
   /**
    * v0.17 P2 — forward to the same `runGoalRound` machinery POST
@@ -3629,6 +3953,144 @@ function buildApp(
     return c.json({ goal }, 201);
   });
 
+  /**
+   * **C6:** GET /api/goals/daemon/status — ops/observability endpoint.
+   *
+   * Returns a structured snapshot of the GoalDaemon's current state:
+   *   - enabled / stopped flags
+   *   - configured maxConcurrent + iterIdleMs
+   *   - runnerCount + queueLength (queue length is reserved — the
+   *     current daemon doesn't enforce a hard concurrency cap, see
+   *     design doc §7 risk #9)
+   *   - per-runner rows: goalId, startedAt, iterations, lastEventAt,
+   *     state, source (when known)
+   *   - iterationLogPath (when iteration JSONL log is wired)
+   *
+   * When the daemon is disabled (MATHRAN_DAEMON=0 in tests/CI) returns
+   * a stub with enabled=false so callers can still detect liveness.
+   *
+   * Design doc: ~/.openclaw/workspace/_tasks/todo1-design.md §8 C6.
+   */
+  app.get("/api/goals/daemon/status", (c) => {
+    if (!goalDaemon) {
+      return c.json({
+        enabled: false,
+        stopped: true,
+        maxConcurrent: 0,
+        iterIdleMs: 0,
+        runnerCount: 0,
+        queueLength: 0,
+        runners: [],
+        running: [],
+        iterations: {},
+      });
+    }
+    return c.json(goalDaemon.status());
+  });
+
+  // ─── NEW-F5: /healthz + /metrics (audit 2026-06-24) ───────────────────
+  // /healthz: cheap liveness probe — returns 200 + JSON body always (even
+  // when the daemon is disabled), so a supervisor (systemd, k8s, etc.)
+  // can ping every few seconds without a daemon dependency.
+  // /metrics: Prometheus-formatted snapshot of useful counters/gauges so
+  // a separate `prometheus + grafana` stack can build dashboards.
+  const serveBootMs = Date.now();
+  app.get("/healthz", async (c) => {
+    let activeGoals = 0;
+    try {
+      const all = await listGoals(workspace);
+      activeGoals = all.filter((g) => g.status === "active").length;
+    } catch {
+      // listGoals failure is non-fatal for /healthz — keep returning 200.
+    }
+    return c.json({
+      ok: true,
+      daemon: goalDaemon ? { enabled: true, stopped: false } : { enabled: false },
+      activeGoals,
+      uptimeMs: Date.now() - serveBootMs,
+      ts: new Date().toISOString(),
+    });
+  });
+
+  app.get("/metrics", async (c) => {
+    // Prometheus text exposition format 0.0.4. Keep cardinality LOW —
+    // labels with goal IDs would explode storage. We only emit per-status
+    // gauges + a few process-wide counters.
+    let goals: Goal[] = [];
+    try {
+      goals = await listGoals(workspace);
+    } catch {
+      // empty
+    }
+    const byStatus: Record<string, number> = {};
+    for (const g of goals) {
+      byStatus[g.status] = (byStatus[g.status] ?? 0) + 1;
+    }
+    const lines: string[] = [];
+    lines.push("# HELP mathran_goals_total Number of goals in the workspace, by status.");
+    lines.push("# TYPE mathran_goals_total gauge");
+    for (const s of ["active", "paused", "complete", "failed", "cancelled", "exhausted"]) {
+      lines.push(`mathran_goals_total{status="${s}"} ${byStatus[s] ?? 0}`);
+    }
+    lines.push("# HELP mathran_daemon_enabled 1 if the goal daemon is running, 0 otherwise.");
+    lines.push("# TYPE mathran_daemon_enabled gauge");
+    lines.push(`mathran_daemon_enabled ${goalDaemon ? 1 : 0}`);
+    lines.push("# HELP mathran_uptime_ms Milliseconds since `mathran serve` started.");
+    lines.push("# TYPE mathran_uptime_ms gauge");
+    lines.push(`mathran_uptime_ms ${Date.now() - serveBootMs}`);
+    if (goalDaemon) {
+      const st = goalDaemon.status();
+      lines.push("# HELP mathran_daemon_runners Active runner count in the goal daemon.");
+      lines.push("# TYPE mathran_daemon_runners gauge");
+      lines.push(`mathran_daemon_runners ${st.runnerCount ?? 0}`);
+      lines.push("# HELP mathran_daemon_queue_length Queued (waiting) goal kick count.");
+      lines.push("# TYPE mathran_daemon_queue_length gauge");
+      lines.push(`mathran_daemon_queue_length ${st.queueLength ?? 0}`);
+    }
+    // Total tokens spent across active+complete goals — useful for cost.
+    let totalTokens = 0;
+    let totalIterations = 0;
+    let totalCompactionRuns = 0;
+    for (const g of goals) {
+      totalTokens += g.stats.tokensUsed ?? 0;
+      totalIterations += g.stats.iterationsRun ?? 0;
+      totalCompactionRuns += g.stats.compactionRuns ?? 0;
+    }
+    lines.push("# HELP mathran_tokens_total Sum of stats.tokensUsed across all goals.");
+    lines.push("# TYPE mathran_tokens_total counter");
+    lines.push(`mathran_tokens_total ${totalTokens}`);
+    lines.push("# HELP mathran_iterations_total Sum of stats.iterationsRun across all goals.");
+    lines.push("# TYPE mathran_iterations_total counter");
+    lines.push(`mathran_iterations_total ${totalIterations}`);
+    lines.push("# HELP mathran_compaction_runs_total Sum of stats.compactionRuns across all goals.");
+    lines.push("# TYPE mathran_compaction_runs_total counter");
+    lines.push(`mathran_compaction_runs_total ${totalCompactionRuns}`);
+    // Phase ζ (cost meter) — per-model dollar cost summed across all goals.
+    // Keyed by model slug (LOW cardinality: a workspace uses a handful of
+    // models). We SKIP any goal whose model has no verifiable public price
+    // (computeGoalCostUsd → null) rather than emit a fake $0.00 under
+    // model="unknown". When no priced model is present the series is omitted
+    // entirely. DESIGN-REFERENCE.md §5.E.
+    const costByModel: Record<string, number> = {};
+    for (const g of goals) {
+      const cost = computeGoalCostUsd(g);
+      if (cost === null) continue;
+      costByModel[g.model] = (costByModel[g.model] ?? 0) + cost;
+    }
+    const costModels = Object.keys(costByModel).sort();
+    if (costModels.length > 0) {
+      lines.push("# HELP mathran_cost_usd_total Estimated USD cost summed across all goals, by model.");
+      lines.push("# TYPE mathran_cost_usd_total counter");
+      for (const m of costModels) {
+        lines.push(`mathran_cost_usd_total{model="${promLabel(m)}"} ${costByModel[m]}`);
+      }
+    }
+    return new Response(lines.join("\n") + "\n", {
+      status: 200,
+      headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" },
+    });
+  });
+
   /** GET /api/goals?all=1 — default lists active+paused only. */
   app.get("/api/goals", async (c) => {
     const all = c.req.query("all") === "1" || c.req.query("all") === "true";
@@ -3711,6 +4173,8 @@ function buildApp(
       endReason: string | null;
       conversationId: string | null;
       roundsRun: number;
+      iterationsRun: number;
+      assistantTurnsTotal: number;
       tokensUsed: number;
     }> = [];
     for (const subId of subGoalIds) {
@@ -3724,6 +4188,8 @@ function buildApp(
         endReason: sg.endReason ?? null,
         conversationId: sg.conversationIds[0] ?? null,
         roundsRun: sg.stats.roundsRun,
+        iterationsRun: sg.stats.iterationsRun,
+        assistantTurnsTotal: sg.stats.assistantTurnsTotal,
         tokensUsed: sg.stats.tokensUsed,
       });
     }
@@ -3790,8 +4256,8 @@ function buildApp(
       switch (g.status) {
         case "active":
           // A freshly-created goal that's never run a round is rendered
-          // as `pending`; once any round records stats it's `running`.
-          return g.stats.roundsRun === 0 ? "pending" : "running";
+          // as `pending`; once any iteration records stats it's `running`.
+          return g.stats.iterationsRun === 0 ? "pending" : "running";
         case "paused":
           return "pending";
         case "complete":
@@ -3881,6 +4347,85 @@ function buildApp(
     });
   });
 
+  // ─── F8: GET /api/goals/:id/files-changed ────────────────────────────
+  // Returns a deduplicated list of files this goal has written/edited,
+  // newest-first. Pure read of goal.steps[]; cheap to poll alongside
+  // /status. Empty list (and 200) for a goal that exists but has no
+  // write tool calls yet, so the SPA can render an empty state without
+  // distinguishing 404 from "no writes".
+  app.get("/api/goals/:goalId/files-changed", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const goal = await readGoal(workspace, goalId);
+    if (!goal) return c.json({ error: "not found" }, 404);
+    const { extractFilesChanged } = await import("../core/goal/files-changed.js");
+    const entries = extractFilesChanged(goal);
+    return c.json({ goalId, count: entries.length, entries });
+  });
+
+  // ─── F7: POST /api/goals/:id/ask ─────────────────────────────────────
+  // Natural-language status query against a goal. Body: {question}.
+  // Builds a read-only context bundle (id, status, stats, plan body,
+  // files-changed, last 25 audit steps) and asks the goal's model a
+  // one-shot question. Streams text back to the caller as a plain text
+  // response (Server-Sent Events would be overkill for a one-shot Q&A
+  // — the SPA can show a loading state then render the answer when
+  // the response finishes).
+  //
+  // Does NOT mutate goal state, does NOT push to conversation history,
+  // does NOT spawn a runner. Pure read + one LLM call.
+  app.post("/api/goals/:goalId/ask", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const goal = await readGoal(workspace, goalId);
+    if (!goal) return c.json({ error: "not found" }, 404);
+    let body: { question?: string } = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid json body; expected {question: string}" }, 400);
+    }
+    const question = (body.question ?? "").trim();
+    if (!question) return c.json({ error: "question is required" }, 400);
+    if (question.length > 4000) return c.json({ error: "question too long (>4000 chars)" }, 400);
+
+    // Best-effort plan body load (silently skipped on miss).
+    let planBody = "";
+    try {
+      const loaded = await readGoalPlan(workspace, goalId);
+      if (loaded) planBody = loaded;
+    } catch {
+      // skip
+    }
+
+    const { buildGoalAskContext } = await import("../core/goal/ask.js");
+    const context = buildGoalAskContext(goal, { planBody });
+
+    // Resolve LLM + model the same way other endpoints do — defer to
+    // the router so the goal's model selection is honoured.
+    const config = loadConfig(configPathFor(workspace));
+    const llm = new ModelRouter(config);
+    const messages = [
+      { role: "system" as const, content: context },
+      { role: "user" as const, content: question },
+    ];
+    try {
+      const res = await llm.chat({ model: goal.model, messages });
+      let answer = "";
+      for await (const chunk of res.stream()) {
+        if (chunk.type === "text" && typeof chunk.delta === "string") answer += chunk.delta;
+      }
+      return c.json({
+        goalId,
+        question,
+        answer: answer.trim(),
+        model: goal.model,
+      });
+    } catch (err: any) {
+      return c.json({ error: String(err?.message ?? err) }, 500);
+    }
+  });
+
   /**
    * POST /api/goals/:id/run
    *   body: { message?: string }
@@ -3900,10 +4445,14 @@ function buildApp(
     }
     let body: any = {};
     try { body = await c.req.json(); } catch { /* empty body is fine */ }
-    const userMessage =
+    // C9: empty / blank body → undefined userMessage. Symmetric with
+    // /run/stream below; lets `runOneIteration` emit a `[daemon: continue]`
+    // nudge instead of materialising a fake user turn in the
+    // conversation. See todo1-design.md §6.2.
+    const userMessage: string | undefined =
       typeof body?.message === "string" && body.message.trim().length > 0
         ? body.message
-        : "Continue with the current objective.";
+        : undefined;
 
     // v0.17 W8: clear any stale abortRequested flag from a previous round
     // (e.g. the user clicked Abort then Resume / Run). The runner checks
@@ -3923,7 +4472,12 @@ function buildApp(
     const controller = new AbortController();
     inflightGoals.set(goalId, controller);
     try {
-      const r = await runGoalRound({
+      // C9: call runOneIteration directly (not runGoalRound) so an
+      // `undefined` userMessage stays undefined instead of falling back
+      // to the legacy fake-continue sentinel inside the wrapper.
+      // `/run/stream` already takes this path through the daemon; we
+      // keep the two endpoints symmetric.
+      const r = await runOneIteration({
         workspace,
         goalId,
         userMessage,
@@ -3987,13 +4541,193 @@ function buildApp(
     }
     let body: any = {};
     try { body = await c.req.json(); } catch { /* empty body is fine */ }
-    const userMessage =
+    // C9: when the SPA / CLI client sends an empty / blank message body,
+    // hand `undefined` to the runner. `runOneIteration` (see runner.ts
+    // §C2-1) then synthesises a minimal internal `[daemon: continue]`
+    // nudge instead of injecting the historical fake
+    // `"Continue with the current objective."` user turn — completing
+    // todo1-design.md §6.2 (the C7 script migrated existing on-disk
+    // fake-continue rows; this stops new ones from being generated).
+    // Real user messages (non-empty trimmed string) flow through
+    // unchanged.
+    const userMessage: string | undefined =
       typeof body?.message === "string" && body.message.trim().length > 0
         ? body.message
-        : "Continue with the current objective.";
+        : undefined;
 
     await clearGoalAbortRequest(workspace, goalId);
 
+    // ── C3: Daemon-mode branch ────────────────────────────────────
+    //
+    // When MATHRAN_DISABLE_GOAL_DAEMON is unset, this request opens an
+    // SSE stream subscribed to `goalDaemon.eventBus.on('goal:<id>')` and
+    // asks the daemon to kick the loop. The daemon owns the runner
+    // lifetime now — the SSE handler just slices off this request's
+    // portion of the loop. When the first `iteration-end` arrives we
+    // emit the legacy `result:` frame (so the SPA's existing
+    // `runGoalRound` HTTP client sees identical wire bytes) and close
+    // the stream; the daemon continues iterating in the background.
+    //
+    // When MATHRAN_DISABLE_GOAL_DAEMON=1 we fall through to the v0.17
+    // inline-runner code path below and behaviour is byte-identical to
+    // pre-C3. This is the explicit opt-out for production goals that
+    // were running mid-deploy.
+    if (goalDaemon) {
+      const daemon = goalDaemon;
+      return streamSSE(c, async (stream) => {
+        const queue: { event: string; data: string }[] = [];
+        let done = false;
+        let wake: (() => void) | null = null;
+        const wakePump = () => {
+          const w = wake;
+          wake = null;
+          if (w) w();
+        };
+        const pump = (async () => {
+          while (!done || queue.length > 0) {
+            while (queue.length > 0) {
+              const frame = queue.shift()!;
+              await stream.writeSSE(frame);
+            }
+            if (done) return;
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        })();
+
+        // Bridge daemon events into the SSE queue. The factory in
+        // buildProductionRunnerFactory forwards inner ChatEvents AND
+        // daemon-shape events through `goal:<id>` so the same
+        // subscriber sees both. We translate iteration-end into the
+        // legacy `result:` frame and close on iteration-end OR
+        // turn-end (whichever comes first). Subscribed for the
+        // lifetime of THIS request only.
+        //
+        // Wire-contract pin: the SPA's parser expects the `result:`
+        // frame to be the FINAL frame in the stream (see
+        // src/server/sse-round-start.test.ts). The legacy inline path
+        // emits result-then-close synchronously; the daemon path has
+        // to read the goal record back from disk first (async). We
+        // use `iterationEndSeen` + a pending `resultReady` promise so
+        // turn-end / pump-exit waits for the async result push to
+        // complete, preserving the contract.
+        let iterationEndSeen = false;
+        let resultReady: Promise<void> = Promise.resolve();
+        const listener = (ev: any) => {
+          if (!ev || typeof ev !== "object") return;
+          const type = String((ev as { type?: unknown }).type ?? "");
+          // Pass-through frames that match the legacy wire format.
+          if (
+            type === "round-start" ||
+            type === "text" ||
+            type === "tool-call" ||
+            type === "tool-result" ||
+            type === "ask_user" ||
+            type === "todos" ||
+            type === "steer-received" ||
+            // TODO-2 §3.2 / C8 — compaction lifecycle event. SPA's
+            // chat.ts adds a handler that flips a 🧹 badge + updates
+            // the cumulative compactionRuns counter shown in
+            // AgentStatusPanel.
+            type === "compaction" ||
+            // Layer 1 — token budget continuation. SPA flips a 💰 badge +
+            // shows how often mark_done was blocked en route to the goal's
+            // token target.
+            type === "budget-continuation" ||
+            type === "done"
+          ) {
+            queue.push({ event: type, data: JSON.stringify(ev) });
+            wakePump();
+            return;
+          }
+          // Daemon-shape iteration-end: synthesise the legacy `result:`
+          // frame and end this request's stream slice. The daemon
+          // continues iterating in the background.
+          if (type === "iteration-end") {
+            iterationEndSeen = true;
+            const r = (ev as { result?: DaemonIterationResult }).result ?? {
+              completed: false,
+              failed: false,
+              exhausted: false,
+              aborted: false,
+            };
+            // We need to reload the goal so the `result:` frame
+            // carries the post-iteration goal record (mirrors the
+            // legacy contract). Hold the pump open until this push
+            // completes by tracking the promise; turn-end / finally
+            // both await it before setting done = true so the result
+            // frame is guaranteed to be the FINAL frame in the SSE
+            // stream.
+            resultReady = (async () => {
+              const fresh = (await readGoal(workspace, goalId)) ?? g;
+              queue.push({
+                event: "result",
+                data: JSON.stringify({
+                  goal: fresh,
+                  text: "", // wire compat: legacy text was a per-call buffer; daemon path streams chunks via `text` events
+                  completed: r.completed,
+                  failed: r.failed,
+                  exhausted: r.exhausted,
+                  aborted: r.aborted,
+                  ...(r.endReason ? { endReason: r.endReason } : {}),
+                }),
+              });
+              done = true;
+              wakePump();
+            })();
+            return;
+          }
+          if (type === "error") {
+            queue.push({ event: "error", data: JSON.stringify(ev) });
+            wakePump();
+            return;
+          }
+          // turn-end without preceding iteration-end (e.g. naturalEnd /
+          // status-flipped / interrupted before iter started). End the
+          // stream without a `result:` frame so the client falls back
+          // to its no-result handler.
+          //
+          // If we already saw iteration-end, ignore: the async
+          // `resultReady` promise will set `done = true` itself once
+          // the result frame is queued.
+          if (type === "turn-end") {
+            if (iterationEndSeen) return;
+            done = true;
+            wakePump();
+            return;
+          }
+          // Iteration-start + any future daemon-shape events: ignore.
+          // (Legacy wire never had iteration-start so SPA wouldn't know
+          // what to do with it.)
+        };
+        daemon.eventBus.on(`goal:${goalId}`, listener);
+
+        try {
+          // Kick the daemon. If a runner already exists for this goal,
+          // kickGoal is a no-op (or enqueues the userMessage). The
+          // daemon will emit events on `goal:<goalId>` which our
+          // listener pushes onto the queue.
+          daemon.kickGoal(goalId, { userMessage });
+          // Pump runs until `done = true` (set by listener on
+          // iteration-end / turn-end / error).
+          await pump;
+          // Belt-and-braces: make sure the async `result:` push from an
+          // iteration-end listener has fully flushed before we tear
+          // down the subscription. The pump already awaits it via
+          // resultReady's wakePump(), but if pump exited via
+          // forceStop / cancellation we want to surface the same
+          // promise rejection rather than swallow it.
+          await resultReady;
+        } finally {
+          daemon.eventBus.off(`goal:${goalId}`, listener);
+          done = true;
+          wakePump();
+        }
+      });
+    }
+
+    // ── Legacy v0.17 inline-runner code path ────────────────────────
     const cfg = loadConfig(configPathFor(workspace));
     const llm: LLMProvider = goalLlmFactory
       ? goalLlmFactory({ model: g.model })
@@ -4203,7 +4937,24 @@ function buildApp(
         409,
       );
     }
+    // C3: dual-write the steer.
+    //  - setPendingSteer(conversationId, text) is the legacy in-flight
+    //    `steerProbe` mechanism; the runner's ChatSession.send() polls
+    //    it mid-stream so this delivers the steer to the model on the
+    //    CURRENT round's next probe.
+    //  - goalDaemon.enqueueSteer(goalId, text) drains pre-iteration via
+    //    runOneIteration's `steerText` parameter so the steer also lands
+    //    on the very NEXT iteration if the current one ends naturally.
+    //  - goalDaemon.kickGoal(goalId) wakes a parked-on-naturalTurnEnd
+    //    runner so the steer is acted on immediately.
+    //
+    // Both writes are idempotent + cheap; running them in sequence is
+    // the belt-and-braces approach the design doc §3.4 calls for.
     setPendingSteer(conversationId, text);
+    if (goalDaemon) {
+      goalDaemon.enqueueSteer(goalId, text);
+      goalDaemon.kickGoal(goalId, { source: "steer" });
+    }
     return c.json({ ok: true, queued: true, goalId, conversationId });
   });
 
@@ -4294,9 +5045,19 @@ function buildApp(
       status: g.status,
       endReason: g.endReason ?? null,
       round: g.stats.roundsRun,
+      iterationsRun: g.stats.iterationsRun,
+      assistantTurnsTotal: g.stats.assistantTurnsTotal,
+      llmCallsTotal: g.stats.llmCallsTotal,
       roundsMax: g.budget.roundsMax,
       tokensUsed: g.stats.tokensUsed,
       tokensMax: g.budget.tokensMax,
+      // Phase ζ (cost meter) — denormalised $ cost so the SPA renders the
+      // badge without re-deriving pricing. null => model has no public
+      // price (UI shows "—"). DESIGN-REFERENCE.md §5.E.
+      costUsd: computeGoalCostUsd(g),
+      inputTokensUsed: g.stats.inputTokensUsed ?? 0,
+      outputTokensUsed: g.stats.outputTokensUsed ?? 0,
+      model: g.model,
       toolCount: g.stats.toolCallCount,
       resumeCount,
       heartbeatAt: g.heartbeatAt ?? null,
@@ -4308,6 +5069,145 @@ function buildApp(
       planPath: g.planPath ?? null,
       parentGoalId: g.parentGoalId ?? null,
       subGoalCount: (g.subGoalIds ?? []).length,
+      // TODO-2 §3.2 / C9 — surface compaction stats to the SPA badge.
+      compactionRuns: g.stats.compactionRuns ?? 0,
+      compactionTokensDropped: g.stats.compactionTokensDropped ?? 0,
+      lastCompactionReason: g.stats.lastCompactionReason ?? null,
+      lastCompactionAt: g.stats.lastCompactionAt ?? null,
+    });
+  });
+
+  /**
+   * GET /api/goals/:id/events — read-only live tail (UX gap D).
+   *
+   * Subscribes to the goal daemon's `goal:<id>` eventBus and forwards every
+   * frame onto an SSE stream WITHOUT kicking a run (contrast with
+   * POST /run/stream, which both kicks the loop and streams). This is the
+   * endpoint `mathran goal watch <id>` connects to: a remote operator can
+   * ssh in and `tail` a goal that some other process (SPA / daemon) is
+   * driving, with zero side effects on the run loop.
+   *
+   * Wire contract:
+   *   - leading `snapshot:` frame carries a small status projection so the
+   *     watcher can print a header before any live event arrives.
+   *   - daemon-shape frames are forwarded verbatim under their own `type`
+   *     (iteration-start / iteration-end / text / tool-call / tool-result /
+   *     compaction / budget-continuation / round-start / done / turn-end /
+   *     error / ask_user / todos / steer-received).
+   *   - periodic `ping:` keep-alive frames.
+   *   - a terminal `status:` frame ({status, endReason, terminal:true}) is
+   *     emitted (and the stream closed) the moment the goal record reaches a
+   *     terminal status. Terminal detection is driven by a cheap disk poll so
+   *     it works even when the daemon is disabled or the goal is idle.
+   */
+  app.get("/api/goals/:goalId/events", async (c) => {
+    const goalId = c.req.param("goalId");
+    if (!isSafeGoalId(goalId)) return c.json({ error: "invalid goalId" }, 400);
+    const g0 = await readGoal(workspace, goalId);
+    if (!g0) return c.json({ error: "not found" }, 404);
+
+    const TERMINAL = new Set(["complete", "failed", "cancelled", "exhausted"]);
+    const snapshotOf = (g: Goal) => ({
+      id: g.id,
+      objective: g.objective,
+      status: g.status,
+      model: g.model,
+      iterationsRun: g.stats.iterationsRun,
+      assistantTurnsTotal: g.stats.assistantTurnsTotal,
+      toolCount: g.stats.toolCallCount,
+      tokensUsed: g.stats.tokensUsed,
+      tokensMax: g.budget.tokensMax,
+      roundsMax: g.budget.roundsMax,
+      costUsd: computeGoalCostUsd(g),
+      endReason: g.endReason ?? null,
+      createdAt: g.createdAt,
+    });
+
+    return streamSSE(c, async (stream) => {
+      await stream.writeSSE({ event: "snapshot", data: JSON.stringify(snapshotOf(g0)) });
+
+      // Already terminal: emit the closing status frame and we're done.
+      if (TERMINAL.has(g0.status)) {
+        await stream.writeSSE({
+          event: "status",
+          data: JSON.stringify({ status: g0.status, endReason: g0.endReason ?? null, terminal: true }),
+        });
+        return;
+      }
+
+      const queue: { event: string; data: string }[] = [];
+      let done = false;
+      let wake: (() => void) | null = null;
+      const wakePump = () => {
+        const w = wake;
+        wake = null;
+        if (w) w();
+      };
+      const pump = (async () => {
+        while (!done || queue.length > 0) {
+          while (queue.length > 0) {
+            await stream.writeSSE(queue.shift()!);
+          }
+          if (done) return;
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+        }
+      })();
+
+      // Forward every daemon frame verbatim. Read-only: we never call
+      // kickGoal, so this subscription is a pure side-channel.
+      const listener = (ev: unknown) => {
+        if (!ev || typeof ev !== "object") return;
+        const type = String((ev as { type?: unknown }).type ?? "");
+        if (!type) return;
+        queue.push({ event: type, data: JSON.stringify(ev) });
+        wakePump();
+      };
+      if (goalDaemon) goalDaemon.eventBus.on(`goal:${goalId}`, listener);
+
+      // Terminal authority + keep-alive: poll the goal record on disk. This
+      // closes the stream on terminal even when the daemon is disabled or the
+      // goal is idle (no live frames). A `ping` every ~16s keeps proxies open.
+      let tick = 0;
+      const poll = setInterval(() => {
+        void (async () => {
+          tick++;
+          const fresh = await readGoal(workspace, goalId);
+          if (!fresh || TERMINAL.has(fresh.status)) {
+            queue.push({
+              event: "status",
+              data: JSON.stringify({
+                status: fresh?.status ?? "missing",
+                endReason: fresh?.endReason ?? null,
+                terminal: true,
+              }),
+            });
+            done = true;
+            wakePump();
+            return;
+          }
+          if (tick % 8 === 0) {
+            queue.push({ event: "ping", data: JSON.stringify({ at: Date.now() }) });
+            wakePump();
+          }
+        })();
+      }, 2000);
+
+      // Client disconnect (CLI Ctrl-C / stream close) → unwind the pump.
+      stream.onAbort(() => {
+        done = true;
+        wakePump();
+      });
+
+      try {
+        await pump;
+      } finally {
+        clearInterval(poll);
+        if (goalDaemon) goalDaemon.eventBus.off(`goal:${goalId}`, listener);
+        done = true;
+        wakePump();
+      }
     });
   });
 
@@ -4842,7 +5742,7 @@ function buildApp(
     }
   }
 
-  return app;
+  return { app, daemon: goalDaemon };
 }
 
 /**
@@ -4888,7 +5788,24 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
     opts.chatSessionFactory ??
     defaultSessionFactory(workspace, sharedApprovalRegistry, resolvedProfile, mcpRegistry);
 
-  const app = buildApp(workspace, factory, opts.goalLlmFactory, mcpRegistry);
+  const { app, daemon: goalDaemon } = buildApp(workspace, factory, opts.goalLlmFactory, mcpRegistry);
+
+  // C5: kick off the daemon (no-op when MATHRAN_DISABLE_GOAL_DAEMON=1
+  // or daemon construction was skipped). Boot-resume of active goals
+  // lives inside daemon.start() (added in the C5 commit later this
+  // series) — right now this is the dependency-free start hook so the
+  // serve.ts wiring is already in place when C5 lands.
+  if (goalDaemon) {
+    try {
+      await goalDaemon.start();
+    } catch (err) {
+      // Don't tear down the whole HTTP server if boot-resume hits a
+      // transient disk error — log it and let the operator decide
+      // whether to restart with the daemon disabled.
+      // eslint-disable-next-line no-console
+      console.error("[mathran] goalDaemon.start() failed:", err);
+    }
+  }
 
   const server = await new Promise<ReturnType<typeof serve>>((resolve) => {
     const s = serve({ fetch: app.fetch, hostname: host, port }, () => resolve(s));
@@ -4901,9 +5818,28 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
 
   const close = () =>
     new Promise<void>((resolve, reject) => {
-      void mcpRegistry.shutdown().finally(() => {
+      // C5: graceful daemon shutdown. Order matters:
+      //   1. daemon.stop(30_000) — interrupts every running
+      //      GoalTurnRunner, waits for them to finish their CURRENT
+      //      iteration (or 30s, whichever comes first), then
+      //      force-stops anything still alive. This lets a runner's
+      //      in-flight LLM call drain cleanly and its result/iteration
+      //      step persist to disk, so a subsequent boot-resume sees
+      //      consistent state.
+      //   2. mcpRegistry.shutdown() — tears down MCP server processes.
+      //   3. server.close() — closes the HTTP listener.
+      void (async () => {
+        if (goalDaemon) {
+          try {
+            await goalDaemon.stop(30_000);
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.error("[mathran] goalDaemon.stop(30_000) error:", err);
+          }
+        }
+        await mcpRegistry.shutdown();
         server.close((err?: unknown) => (err ? reject(err) : resolve()));
-      });
+      })();
     });
 
   return {

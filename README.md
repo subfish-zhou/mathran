@@ -93,6 +93,33 @@ A four-panel SPA at `http://127.0.0.1:7878`:
 All artifacts land in `~/mathran-workspace/projects/<slug>/` (no database).
 The server only ever binds to `127.0.0.1`.
 
+### Goal mode (daemon-driven)
+
+Long-running *goals* run inside a backend **goal daemon** that owns the
+iteration loop in-process on the `mathran serve` server. Closing the SPA
+tab no longer stops a goal — the daemon keeps grinding, and the SPA
+reconnects as a passive SSE observer. Server restarts are also safe:
+every `active` goal is automatically resumed at boot, and dangling tool
+calls left behind by an interrupted iteration are repaired before the
+conversation is re-submitted to the model.
+
+Long sessions also stay within the model's context window automatically.
+Each `send()` runs **two-phase auto-compaction**: a pre-turn check at
+75 % of the model's real context cap (resolved from Copilot's `/models`
+endpoint, not a hardcoded guess), and a mid-turn check at 80 % using
+provider-reported token usage. When triggered, the middle of the
+history is replaced with a 9-section structured summary while the
+system block and most-recent 6 rounds are preserved verbatim. The SPA
+shows a 🧹 chip when a compaction fires, and `/api/goals/:id/status`
+echoes durable `compactionRuns` / `compactionTokensDropped` counters
+that survive tab reloads.
+
+Set `MATHRAN_DISABLE_GOAL_DAEMON=1` in the server environment to fall
+back to the pre-`0.13.0` SPA-driven inline-runner path. This is intended
+as a release safety-net for one-restart rollback; see
+[`docs/goal-mode.md`](docs/goal-mode.md) for the full architecture,
+rollout, rollback, and compaction notes.
+
 ### Filesystem project layout
 
 ```
