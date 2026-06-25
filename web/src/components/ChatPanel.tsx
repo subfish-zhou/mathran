@@ -68,6 +68,7 @@ import {
   historyToBubbles,
   type Bubble,
   type ToolBubble,
+  type TextBubble,
 } from "../lib/history-to-bubbles.ts";
 import { shouldRenderAskPending } from "../lib/ask-pending-guard.ts";
 import {
@@ -103,6 +104,7 @@ import {
 } from "../lib/composer-prefs.ts";
 import { useCopilotModels } from "../lib/copilot-models.ts";
 import ModelComboBox from "./ModelComboBox.tsx";
+import { stripAttachmentMarkers } from "../lib/strip-attachment-markers.ts";
 import {
   parseSlashInput,
   activeSlashPrefix,
@@ -693,6 +695,12 @@ export default function ChatPanel({
       }
     | { id: string; status: "error"; filename: string; error: string };
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  // 2026-06-25 bug 2 — edit mode mirrors the composer: existing
+  // attachments from the bubble are pre-populated (so they survive the
+  // resend), and the user can add new ones via a mini attach button.
+  // All entries are PendingAttachment shape — historic ones are
+  // synthesised as { status: "ready", path, filename, mimeType, size: 0 }.
+  const [editAttachments, setEditAttachments] = useState<PendingAttachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
 
   // ─── Slash commands (SPA Slash Commands task) ──────────────────────────
@@ -708,7 +716,30 @@ export default function ChatPanel({
   const [lightbox, setLightbox] = useState<ChatAttachmentRef | null>(null);
   // Hidden <input type="file"> the 📎 button triggers. Kept off-screen so
   // we can style the button freely.
+  // 2026-06-25 — bug 5 (cross-channel event leak): every setBubbles /
+  // setUsage / setX inside the SSE handler used to mutate "the current"
+  // state, which after a channel switch is the wrong channel's state.
+  // The runChatStream closure captures the conversationId we started
+  // the stream for, then every event handler compares against this ref
+  // before applying. On switch, abort the in-flight stream so the
+  // backend can release its resources too.
+  const conversationIdRef = useRef<string | null>(conversationId);
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // 2026-06-25 bug 2 — separate hidden input for the edit-mode 📎
+  // button so the existing composer file input keeps its lifecycle.
+  const editFileInputRef = useRef<HTMLInputElement>(null);
+  // Ref to the composer <form> so handleSteer can submit it as a fallback
+  // when the user types a steer but the stream has just ended.
+  const formRef = useRef<HTMLFormElement>(null);
+  // 2026-06-25 — When the streaming `session` event mints a fresh
+  // conversation id we don't want the selection-change effect to
+  // immediately re-query history (races the flush + clobbers the
+  // optimistic user bubble). The ref carries the id forward so the
+  // effect can recognise + skip the reload.
+  const justMintedConvIdRef = useRef<string | null>(null);
   // Stable id minter for PendingAttachment.id. crypto.randomUUID is
   // available in every browser the SPA targets (no IE fallback).
   const nextAttachId = useCallback(() => {
@@ -734,8 +765,28 @@ export default function ChatPanel({
   const uploadFiles = useCallback(
     async (files: File[]) => {
       if (files.length === 0) return;
+      await uploadFilesInto(files, setAttachments);
+    },
+    [],
+  );
+
+  // 2026-06-25 bug 2 — same upload pipeline, target the edit-mode list.
+  const uploadFilesForEdit = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return;
+      await uploadFilesInto(files, setEditAttachments);
+    },
+    [],
+  );
+
+  // Shared upload pipeline; both composer + edit mode use it.
+  const uploadFilesInto = useCallback(
+    async (
+      files: File[],
+      setList: React.Dispatch<React.SetStateAction<PendingAttachment[]>>,
+    ) => {
       const entries = files.map((f) => ({ id: nextAttachId(), file: f }));
-      setAttachments((prev) => [
+      setList((prev) => [
         ...prev,
         ...entries.map(
           (e): PendingAttachment => ({
@@ -757,7 +808,7 @@ export default function ChatPanel({
                 const data = await res.json();
                 if (data?.error) msg = String(data.error);
               } catch { /* ignore */ }
-              setAttachments((prev) =>
+              setList((prev) =>
                 prev.map((a) =>
                   a.id === id
                     ? { id, status: "error", filename: file.name, error: msg }
@@ -772,7 +823,7 @@ export default function ChatPanel({
               mimeType: string;
               size: number;
             };
-            setAttachments((prev) =>
+            setList((prev) =>
               prev.map((a) =>
                 a.id === id
                   ? {
@@ -789,7 +840,7 @@ export default function ChatPanel({
               ),
             );
           } catch (err: unknown) {
-            setAttachments((prev) =>
+            setList((prev) =>
               prev.map((a) =>
                 a.id === id
                   ? {
@@ -842,6 +893,14 @@ export default function ChatPanel({
 
   // ─── Selection change (URL?c=…): hydrate history if not blank ──────────
   useEffect(() => {
+    // 2026-06-25 bug 5 — do NOT abort the in-flight stream on channel
+    // switch. The user expects the previous channel's round to keep
+    // running (so they can come back to a completed reply). Instead
+    // every SSE event handler (above in runChatStream) gates on
+    // `streamConvId === conversationIdRef.current`, dropping events
+    // that don't match the channel currently on screen. The stream
+    // still runs server-side, flushes to disk normally, and reload
+    // of the original channel shows the full conversation.
     if (!conversationId) {
       setBubbles([]);
       setUsage(null);
@@ -858,6 +917,16 @@ export default function ChatPanel({
       // v0.17 P2 — scope/conversation reset also clears the banner.
       setGoalProposed(null);
       setPlanProposed(null);
+      return;
+    }
+    // 2026-06-25 — skip the reload when this id was just minted by a
+    // freshly-sent message that's still streaming. The SSE handler has
+    // already pushed the user + assistant bubbles optimistically; a GET
+    // here races the flush and (on miss) silently wipes the bubbles.
+    // The reloadTick trigger still hits the load path, so any later
+    // re-hydration (e.g. after a goal nested round) goes through normal.
+    if (justMintedConvIdRef.current === conversationId) {
+      justMintedConvIdRef.current = null;
       return;
     }
     let cancelled = false;
@@ -1149,11 +1218,37 @@ export default function ChatPanel({
       // TODO-2 §3.2 / C9 — reset compaction summary at every turn boundary.
       setCompaction(null);
 
+      // 2026-06-25 bug 5 — capture the conversationId this stream is
+      // *for*. Each event handler returns early when the user has
+      // since switched away, preventing the leak that would otherwise
+      // dump tool calls / text deltas into the channel they switched to.
+      // The `session` event below updates this when a fresh conv id is
+      // minted server-side (since that's the id the stream is "really
+      // for" — the URL changes accordingly).
+      let streamConvId: string | null = conversationIdRef.current;
+
       const onEvent = (ev: ChatEvent) => {
-        if (ev.type === "session") {
-          setConversationId(ev.conversationId);
-          return;
-        }
+          if (ev.type === "session") {
+            // Stream's true target id is the server-minted one. Update
+            // the guard so subsequent events still flow through. Also
+            // pre-pop justMintedConvIdRef so the selection-change
+            // effect skips its reload (see Bug 4 fix).
+            streamConvId = ev.conversationId;
+            justMintedConvIdRef.current = ev.conversationId;
+            setConversationId(ev.conversationId);
+            return;
+          }
+          // 2026-06-25 bug 5 — drop every other event when the user has
+          // switched away from this stream's channel. Backend keeps
+          // running (until the SSE pipe breaks or the abort below
+          // lands), but the SPA stops mutating the wrong channel's
+          // state. The very rare valid case where streamConvId is null
+          // is the brief window before `session` arrived; allow those
+          // through since we're optimistically rendering on the
+          // (still-current) channel.
+          if (streamConvId !== null && streamConvId !== conversationIdRef.current) {
+            return;
+          }
 
         // v0.17 mathub parity W7: feed AgentStatusPanel state from the
         // SAME event tape that drives the bubble list. We do this
@@ -1602,7 +1697,22 @@ export default function ChatPanel({
   // an error bubble — steering is best-effort.
   async function handleSteer() {
     const text = input.trim();
-    if (!text || !busy || !conversationId) return;
+    // 2026-06-25 — surface the silent-drop cases that subfish hit so
+    // the user knows WHY their steer didn't go out. Previously every
+    // unmet precondition `return`d silently and the input stayed put,
+    // looking like a hung send. Now we explain + fall through.
+    if (!text) return; // empty steer is a no-op, no message needed
+    if (!conversationId) {
+      setError("Can't steer — no conversation yet. Send a first message first.");
+      return;
+    }
+    if (!busy) {
+      // The agent finished between the user typing and hitting Enter.
+      // Falling back to a normal send is the right intent — the textarea
+      // is the composer, not a separate steer box.
+      formRef.current?.requestSubmit();
+      return;
+    }
     // Show toast immediately for snappy feedback; clear on receipt.
     setSteerToast(text);
     setInput("");
@@ -1610,11 +1720,16 @@ export default function ChatPanel({
       await steerChatConversation(scope, conversationId, text);
     } catch (err: any) {
       if (err?.status === 409) {
-        // The agent finished after we clicked; just drop the toast.
-        setSteerToast(null);
+        // Stream ended after we entered handleSteer but before the POST
+        // landed. Restore the typed text so the user can resend, and
+        // explain (no silent drop).
+        setInput(text);
+        setSteerToast("⚠ The stream ended; your text wasn't queued. Hit Enter again to send it as a new message.");
+        window.setTimeout(() => setSteerToast(null), 5000);
       } else {
+        setInput(text); // restore so user can retry
         setSteerToast(`⚠ Could not queue steer: ${err?.message ?? String(err)}`);
-        window.setTimeout(() => setSteerToast(null), 4000);
+        window.setTimeout(() => setSteerToast(null), 5000);
       }
     }
   }
@@ -2535,19 +2650,45 @@ export default function ChatPanel({
     const bubble = bubbles[bubbleIdx];
     if (!bubble || bubble.kind !== "user") return;
     setEditingBubbleIdx(bubbleIdx);
-    setEditDraft(bubble.text);
+    // Use stripped text so the user doesn't have to re-edit the
+    // server-injected attachment marker block when they want to tweak
+    // their actual prose.
+    setEditDraft(stripAttachmentMarkers(bubble.text));
+    // Pre-populate existing attachments so they survive resend. We
+    // synthesise PendingAttachment shape for historic ones; size is
+    // unknown post-hoc so leave it 0 (only used for chip display).
+    const existing = (bubble as TextBubble).attachments ?? [];
+    setEditAttachments(
+      existing.map((a, i) => ({
+        id: `existing-${bubbleIdx}-${i}-${a.filename}`,
+        status: "ready",
+        filename: a.filename,
+        path: a.path,
+        mimeType: a.mimeType,
+        size: 0,
+      })),
+    );
   }
 
   function cancelEditBubble() {
     setEditingBubbleIdx(null);
     setEditDraft("");
+    setEditAttachments([]);
   }
 
   async function commitEditBubble() {
     if (editingBubbleIdx === null) return;
     const bubbleIdx = editingBubbleIdx;
     const newText = editDraft.trim();
-    if (!newText) return; // empty edit = no-op; user should hit Cancel
+    // 2026-06-25 bug 2 — edit can be text-only, attachment-only, or both.
+    // Block if both are empty AND if any attachment is still uploading.
+    const readyEditAttachments = editAttachments.filter(
+      (a): a is Extract<PendingAttachment, { status: "ready" }> =>
+        a.status === "ready",
+    );
+    const hasUploading = editAttachments.some((a) => a.status === "uploading");
+    if (hasUploading) return;
+    if (!newText && readyEditAttachments.length === 0) return;
     const bubble = bubbles[bubbleIdx];
     if (!bubble || bubble.kind !== "user") {
       cancelEditBubble();
@@ -2572,6 +2713,13 @@ export default function ChatPanel({
       if (bubbles[i].kind === "user") userMessageIndex++;
     }
 
+    // Build the wire shape attachments — same as new-message send.
+    const wireEditAttachments: ChatAttachmentRef[] = readyEditAttachments.map((a) => ({
+      path: a.path,
+      filename: a.filename,
+      mimeType: a.mimeType,
+    }));
+
     setError(null);
     setBusy(true);
     cancelEditBubble();
@@ -2580,7 +2728,13 @@ export default function ChatPanel({
     // history when session.send fires, so on-disk and on-screen agree.
     setBubbles((prev) => [
       ...prev.slice(0, bubbleIdx),
-      { kind: "user", text: newText },
+      {
+        kind: "user",
+        text: newText,
+        ...(wireEditAttachments.length > 0
+          ? { attachments: wireEditAttachments }
+          : {}),
+      },
       { kind: "assistant", text: "" },
     ]);
     // Same annotation cleanup as deleteFromHere: bubbles >= bubbleIdx are
@@ -2602,8 +2756,12 @@ export default function ChatPanel({
         model || undefined,
         onEvent,
         signal,
-        newText,
+        newText || undefined,
         bubbleIdx,
+        // 2026-06-25 bug 2 — always send the explicit list (even empty,
+        // meaning "drop all attachments"). The server distinguishes
+        // omitted vs empty: omitted = preserve historic, empty = drop.
+        wireEditAttachments,
       ),
     );
   }
@@ -3267,7 +3425,7 @@ export default function ChatPanel({
                   })()}
 
                   {editingBubbleIdx === row.bubbleIdx && row.bubble.kind === "user" ? (
-                    // ─── Inline editor (v0.16 §1) ────────────────────────
+                    // ─── Inline editor (v0.16 §1, attachments added 2026-06-25 bug 2) ──
                     <div className="w-[36rem] max-w-[80vw] rounded-lg border border-slate-300 bg-white p-2">
                       <textarea
                         autoFocus
@@ -3285,8 +3443,52 @@ export default function ChatPanel({
                         rows={Math.min(12, Math.max(2, editDraft.split("\n").length))}
                         className="w-full resize-y rounded border border-slate-200 p-2 text-sm text-slate-900 outline-none focus:border-slate-500"
                       />
+                      {/* ─── Edit-mode attachment chip strip ─────────────────
+                          Pre-populated with the bubble's existing
+                          attachments (so re-run preserves them) +
+                          accepts new uploads via the 📎 button. */}
+                      {editAttachments.length > 0 && (
+                        <div className="mt-1 flex flex-wrap items-center gap-1">
+                          {editAttachments.map((a) => (
+                            <span
+                              key={a.id}
+                              className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] ${
+                                a.status === "ready"
+                                  ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                                  : a.status === "uploading"
+                                    ? "border-amber-200 bg-amber-50 text-amber-700"
+                                    : "border-rose-200 bg-rose-50 text-rose-700"
+                              }`}
+                              title={a.status === "ready" ? a.path : a.status}
+                            >
+                              <span>📎</span>
+                              <span className="max-w-[12rem] truncate">{a.filename}</span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setEditAttachments((prev) => prev.filter((p) => p.id !== a.id))
+                                }
+                                className="ml-0.5 text-slate-400 hover:text-slate-700"
+                                aria-label={`Remove ${a.filename}`}
+                              >
+                                ✕
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
                       <div className="mt-1 flex items-center justify-between text-[10px] text-slate-500">
-                        <span>⌘/Ctrl + Enter to save · Esc to cancel</span>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => editFileInputRef.current?.click()}
+                            className="rounded px-2 py-0.5 hover:bg-slate-100"
+                            title="Attach files"
+                          >
+                            📎 Attach
+                          </button>
+                          <span>⌘/Ctrl + Enter to save · Esc to cancel</span>
+                        </div>
                         <div className="flex gap-1">
                           <button
                             type="button"
@@ -3297,7 +3499,12 @@ export default function ChatPanel({
                           </button>
                           <button
                             type="button"
-                            disabled={!editDraft.trim() || busy}
+                            disabled={
+                              (!editDraft.trim() &&
+                                editAttachments.filter((a) => a.status === "ready").length === 0) ||
+                              busy ||
+                              editAttachments.some((a) => a.status === "uploading")
+                            }
                             onClick={() => void commitEditBubble()}
                             className="rounded bg-slate-900 px-2 py-0.5 text-white disabled:opacity-50"
                           >
@@ -3433,7 +3640,17 @@ export default function ChatPanel({
                           />
                         </>
                       ) : (
-                        <span className="whitespace-pre-wrap">{row.bubble.text}</span>
+                        // 2026-06-25 bug 6 — strip the `[Attachment: …]
+                        //   path: …\n  size: …\n  peek: …\n  → Use read_file …`
+                        // multi-line block that chat-attachments.ts injects
+                        // into the user message text for the LLM. The
+                        // attachment chips strip below already shows the
+                        // file UX-correctly; rendering the same metadata
+                        // as a giant prose block in the bubble body
+                        // duplicates info and looks broken.
+                        <span className="whitespace-pre-wrap">
+                          {stripAttachmentMarkers(row.bubble.text)}
+                        </span>
                       )}
                     </div>
                   )}
@@ -3959,8 +4176,22 @@ export default function ChatPanel({
               e.target.value = "";
             }}
           />
+          {/* 2026-06-25 bug 2 — hidden file input for the edit-mode 📎
+              button. Separate from the composer's so the lifecycle
+              stays isolated (composer keeps its picked state during edit). */}
+          <input
+            ref={editFileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              const picked = Array.from(e.target.files ?? []);
+              if (picked.length > 0) void uploadFilesForEdit(picked);
+              e.target.value = "";
+            }}
+          />
 
-          <form onSubmit={send} className="flex items-end gap-2 p-4">
+          <form ref={formRef} onSubmit={send} className="flex items-end gap-2 p-4">
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}

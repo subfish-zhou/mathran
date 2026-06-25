@@ -2012,6 +2012,22 @@ function registerChatScope(
     }
     const id = c.req.param("conversationId");
     if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+    // 2026-06-25 — prefer live in-memory history over disk so a GET that
+    // races a still-streaming SSE turn (the SPA's selection-change effect
+    // fires the moment we emit `session` with a fresh conversationId)
+    // sees the user message + any partial assistant content, not an
+    // empty file or a 404. Disk only sees a flush AFTER the stream ends
+    // (serve.ts ~line 1855); before that, `store.peekLiveHistory` is
+    // the only source of truth for the new turn.
+    //
+    // This was the root cause of "the first message disappears after I
+    // hit refresh" — subfish would type and send before mathran had a
+    // chance to flush, then the selection-change effect re-queried GET
+    // and silently cleared the bubbles on 404.
+    const live = store.peekLiveHistory(resolved.scope!, id);
+    if (live !== null && live.length > 0) {
+      return c.json({ conversationId: id, history: live });
+    }
     const history = await store.readHistory(resolved.scope!, id);
     if (history === null) return c.json({ error: "conversation not found" }, 404);
     return c.json({ conversationId: id, history });
@@ -2116,6 +2132,20 @@ function registerChatScope(
       return c.json({ error: "overrideText must be non-empty when provided" }, 400);
     }
 
+    // 2026-06-25 bug 2 — edit + resend with attachments.
+    // When the SPA edits a user message that originally had file
+    // attachments (or adds new ones during edit), it forwards the
+    // attachments array exactly like the new-message POST. We accept
+    // them here, run them through the same buildUserMessageWithAttachments
+    // path, and pass the augmented MessageContent to session.send().
+    //
+    // When `overrideAttachments` is omitted, the server uses whatever
+    // attachments the historic message carried (preserving the
+    // attachment chips on simple re-run with no edit).
+    const overrideAttachments = Array.isArray(body?.attachments)
+      ? (body.attachments as AttachmentRef[])
+      : undefined;
+
     // Prefer the live in-memory history (mirrors /usage) so re-running right
     // after a stream ends sees the latest turn, even before the LRU flush.
     const live = store.peekLiveHistory(scope, id);
@@ -2136,6 +2166,17 @@ function registerChatScope(
     }
     const promptText = overrideText ?? history[targetIdx].content;
     if (!promptText) return c.json({ error: "target user message is empty" }, 400);
+
+    // 2026-06-25 bug 2 — determine which attachments to pipe through the
+    // augment + send path. Priority:
+    //   1. overrideAttachments from the body (SPA edited the message)
+    //   2. attachments on the historic message (plain rerun preserves them)
+    //   3. none
+    const effectiveAttachments: AttachmentRef[] | undefined =
+      overrideAttachments ??
+      (Array.isArray((history[targetIdx] as any).attachments)
+        ? ((history[targetIdx] as any).attachments as AttachmentRef[])
+        : undefined);
 
     // Truncate to everything strictly before the target user message. The
     // kernel's `session.send(text)` will push the user message back in, so we
@@ -2164,6 +2205,28 @@ function registerChatScope(
     // never loses memory/persona injections from /context.
     session.replaceHistory(truncated);
 
+    // 2026-06-25 bug 2 — augment the prompt with attachments before send,
+    // mirroring the new-message POST path. Done AFTER getOrCreate because
+    // we need the session to know whether the provider supports vision.
+    let augmentedMessage: MessageContent;
+    if (effectiveAttachments && effectiveAttachments.length > 0) {
+      try {
+        augmentedMessage = await buildUserMessageWithAttachments(
+          store.getWorkspace(),
+          typeof promptText === "string" ? promptText : "",
+          effectiveAttachments,
+          { enableVision: session.providerSupportsVision() },
+        );
+      } catch (err: unknown) {
+        if (err instanceof BadAttachmentError) {
+          return c.json({ error: err.message }, 400);
+        }
+        return c.json({ error: (err as Error)?.message ?? String(err) }, 500);
+      }
+    } else {
+      augmentedMessage = promptText;
+    }
+
     return streamSSE(c, async (stream) => {
       // v0.17 mathub parity W9 — same active-stream tracking as POST <base>
       // so the user can steer a rerun mid-flight.
@@ -2176,7 +2239,8 @@ function registerChatScope(
           event: "session",
           data: JSON.stringify({ sessionId: id, conversationId: id, scope }),
         });
-        for await (const ev of session.send(promptText, {
+        for await (const ev of session.send(augmentedMessage, {
+          attachments: effectiveAttachments && effectiveAttachments.length > 0 ? effectiveAttachments : undefined,
           steerProbe: () => consumePendingSteer(id),
         }) as AsyncIterable<ChatEvent>) {
           await stream.writeSSE({ event: ev.type, data: JSON.stringify(ev) });

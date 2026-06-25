@@ -305,10 +305,16 @@ export async function rerunChat(
   signal?: AbortSignal,
   overrideText?: string,
   pruneFromBubbleIdx?: number,
+  // 2026-06-25 bug 2 — edit + resend with attachments. When provided
+  // (even as empty array), the server REPLACES the historic message's
+  // attachments with this list. When omitted, the server preserves
+  // whatever attachments the historic message carried.
+  overrideAttachments?: ChatAttachmentRef[],
 ): Promise<void> {
   const body: Record<string, unknown> = { userMessageIndex };
   if (model) body.model = model;
   if (overrideText !== undefined) body.overrideText = overrideText;
+  if (overrideAttachments !== undefined) body.attachments = overrideAttachments;
   // Tell the server how far to wipe the annotations sidecar. Without this,
   // re-running an old prompt would leave reactions/pins from the now-stale
   // assistant reply attached to whatever takes its slot.
