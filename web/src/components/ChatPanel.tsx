@@ -362,7 +362,37 @@ export default function ChatPanel({
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(urlConvId);
   const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
+  // 2026-06-25 — busy is now per-conversationId. With the multi-channel
+  // streaming model, "is mathran working?" is a property of A conversation,
+  // not the SPA as a whole. Without this, sending from channel B while
+  // channel A streams would be blocked by a shared `busy` flag.
+  //
+  // The display value `busy` derives from `busyConvIds.has(currentConv)`
+  // so the composer + Stop button reflect the *current channel's* state.
+  // setBusy() helpers below add/remove the current conversationId from
+  // the set; that way the per-call API stays intuitive while the
+  // underlying state is correctly partitioned.
+  const [busyConvIds, setBusyConvIds] = useState<Set<string>>(() => new Set());
+  // When sending from a brand-new (un-minted) channel, we can't yet
+  // mark a real conv id as busy. Track it as a transient flag so the
+  // composer + Stop button still reflect "we're sending" until session
+  // event arrives + migrates this into busyConvIds.
+  const [preMintBusy, setPreMintBusy] = useState(false);
+  const busy =
+    (conversationId !== null && busyConvIds.has(conversationId)) ||
+    (conversationId === null && preMintBusy);
+  const markBusy = useCallback((convId: string | null, on: boolean) => {
+    if (!convId) return;
+    setBusyConvIds((prev) => {
+      const has = prev.has(convId);
+      if (on && has) return prev;
+      if (!on && !has) return prev;
+      const next = new Set(prev);
+      if (on) next.add(convId);
+      else next.delete(convId);
+      return next;
+    });
+  }, []);
   // v0.17 mathub parity W9 — Live Steering. `steerToast` holds the most
   // recently queued steer text while the SPA waits for the server's
   // `steer-received` SSE frame; it clears on receipt. `steerLastReceived`
@@ -476,7 +506,13 @@ export default function ChatPanel({
   // Abort controller for the in-flight chat stream. `send` / `reRun` set it
   // before kicking off pumpSSE; the Stop button calls `.abort()` to interrupt.
   // Cleared in `runChatStream`'s finally block so the next turn starts fresh.
-  const abortRef = useRef<AbortController | null>(null);
+  // 2026-06-25 — per-conversation abort tracking. With multi-channel
+  // streaming, the user might Stop on channel B while channel A is also
+  // streaming; the old single-slot ref let the most recent send clobber
+  // the prior controller and made A unstoppable. Map keyed by the
+  // streamConvId the controller was started for (or "__pre_mint__"
+  // before the session event arrives).
+  const abortByConvIdRef = useRef<Map<string, AbortController>>(new Map());
 
   // ─── AgentStatusPanel state (v0.17 mathub parity W7) ─────────────────
   //
@@ -1201,7 +1237,12 @@ export default function ChatPanel({
       // something to .abort(). Stash on a ref so React state churn doesn't
       // invalidate it mid-stream.
       const controller = new AbortController();
-      abortRef.current = controller;
+      // 2026-06-25 — keyed registration so a future Stop click on any
+      // channel hits its own controller, not the most-recent send.
+      // We initially register against "__pre_mint__"; the session event
+      // handler below re-keys to the server-minted id.
+      const PRE_MINT = "__pre_mint__";
+      abortByConvIdRef.current.set(PRE_MINT, controller);
 
       // v0.17 mathub parity W7: reset AgentStatusPanel state for the new
       // turn. We pin the start timestamp on a ref AND in state because
@@ -1235,6 +1276,19 @@ export default function ChatPanel({
             // effect skips its reload (see Bug 4 fix).
             streamConvId = ev.conversationId;
             justMintedConvIdRef.current = ev.conversationId;
+            // 2026-06-25 — migrate the transient preMintBusy flag into
+            // the per-conv busyConvIds set. We mark busy=true here so
+            // the busy-derive reads true continuously across the
+            // setConversationId transition (no flicker).
+            markBusy(ev.conversationId, true);
+            setPreMintBusy(false);
+            // Re-key the abort controller from __pre_mint__ to the
+            // minted id so Stop on this channel hits the right one.
+            const stash = abortByConvIdRef.current.get(PRE_MINT);
+            if (stash) {
+              abortByConvIdRef.current.delete(PRE_MINT);
+              abortByConvIdRef.current.set(ev.conversationId, stash);
+            }
             setConversationId(ev.conversationId);
             return;
           }
@@ -1585,38 +1639,60 @@ export default function ChatPanel({
         const e = err as Error;
         if (e?.name !== "AbortError") setError(e.message);
       } finally {
-        if (abortRef.current === controller) abortRef.current = null;
-        setBusy(false);
-        // v0.17 mathub parity W7: clear AgentStatusPanel state once the
-        // stream is over. The panel itself returns `null` when
-        // `busy === false`, but we still reset so a subsequent turn
-        // doesn't briefly flash `Step 3/8` from the prior round before
-        // its own `round-start` lands.
-        setLatestEventType(null);
-        setActiveToolCalls({});
-        setSubAgentActive(false);
-        setRound(null);
-        // Approval Policy 矩阵 — if the stream ended while a prompt was still
-        // open (Stop pressed, or the server settled it as a fail-safe deny),
-        // drop the modal so it doesn't dangle over a dead stream.
-        setPendingApproval(null);
-        setApprovalSubmitting(false);
-        // Trim a trailing empty assistant bubble that can linger when the
-        // stream errors out (or is stopped) before any tokens land. Without
-        // this the user sees an ellipsis-only "…" bubble that they can't
-        // get rid of.
-        setBubbles((prev) => {
-          const last = prev[prev.length - 1];
-          if (
-            last &&
-            last.kind === "assistant" &&
-            last.text === "" &&
-            !last.reasoning
-          )
-            return prev.slice(0, -1);
-          return prev;
-        });
-        void refreshUsage();
+        // 2026-06-25 — clean up the abort registration for this stream's
+        // channel. Both pre-mint and post-mint cases handled.
+        const key = streamConvId ?? PRE_MINT;
+        if (abortByConvIdRef.current.get(key) === controller) {
+          abortByConvIdRef.current.delete(key);
+        }
+        // 2026-06-25 bug 5 followup — always clear the stream's
+        // conv-specific busy bit (so other channels' state is unaffected)
+        // and reset stream-owned UI ONLY when the user is still viewing
+        // this stream's channel. The new channel has its own busy / round
+        // / status; clearing them here would clobber a turn the user might
+        // still be reading in the original channel as soon as they switch
+        // back.
+        markBusy(streamConvId, false);
+        // If the stream errored before the `session` event arrived (so
+        // we never minted a conv id), drop the transient pre-mint busy
+        // flag so the user can retry. Safe to call unconditionally.
+        setPreMintBusy(false);
+        const onOriginalChannel = streamConvId === null || streamConvId === conversationIdRef.current;
+        if (onOriginalChannel) {
+          // v0.17 mathub parity W7: clear AgentStatusPanel state once the
+          // stream is over. The panel itself returns `null` when
+          // `busy === false`, but we still reset so a subsequent turn
+          // doesn't briefly flash `Step 3/8` from the prior round before
+          // its own `round-start` lands.
+          setLatestEventType(null);
+          setActiveToolCalls({});
+          setSubAgentActive(false);
+          setRound(null);
+          // Approval Policy 矩阵 — if the stream ended while a prompt was still
+          // open (Stop pressed, or the server settled it as a fail-safe deny),
+          // drop the modal so it doesn't dangle over a dead stream.
+          setPendingApproval(null);
+          setApprovalSubmitting(false);
+          // Trim a trailing empty assistant bubble that can linger when the
+          // stream errors out (or is stopped) before any tokens land. Without
+          // this the user sees an ellipsis-only "…" bubble that they can't
+          // get rid of.
+          setBubbles((prev) => {
+            const last = prev[prev.length - 1];
+            if (
+              last &&
+              last.kind === "assistant" &&
+              last.text === "" &&
+              !last.reasoning
+            )
+              return prev.slice(0, -1);
+            return prev;
+          });
+          void refreshUsage();
+        }
+        // refreshList is fine to call regardless — it just enumerates
+        // conversations for the sidebar, independent of which channel
+        // is currently displayed.
         void refreshList(); // pick up the brand-new conv in the sidebar
       }
     },
@@ -1675,9 +1751,17 @@ export default function ChatPanel({
   // bubble list survives; the server-side flush still runs because the SSE
   // handler's `finally` calls store.flush() before returning.
   function stop() {
-    if (abortRef.current) {
-      abortRef.current.abort();
+    // 2026-06-25 — stop the stream associated with the channel currently
+    // on screen. Other channels' streams keep running (see bug 5: user
+    // expects to come back to their completed answer).
+    if (!conversationId) {
+      // pre-mint case: there's at most one __pre_mint__ entry; abort it.
+      const c = abortByConvIdRef.current.get("__pre_mint__");
+      if (c) c.abort();
+      return;
     }
+    const c = abortByConvIdRef.current.get(conversationId);
+    if (c) c.abort();
   }
 
   // ─── Send a Live Steer (v0.17 mathub parity W9) ────────────────────
@@ -2105,7 +2189,12 @@ export default function ChatPanel({
 
     setInput("");
     setError(null);
-    setBusy(true);
+    // 2026-06-25 — per-channel busy. If we haven't minted a conv yet,
+    // flip the transient preMintBusy flag; once the session event
+    // arrives in onEvent it'll migrate into busyConvIds for the
+    // server-minted id.
+    if (conversationId) markBusy(conversationId, true);
+    else setPreMintBusy(true);
 
     // ─── Reply quoting (v0.16 §2) ────────────────────────────────────
     // When replying, we prepend a markdown blockquote so the LLM sees the
@@ -2249,6 +2338,9 @@ export default function ChatPanel({
     setError(null);
     setUsage(null);
     setUsageHistory([]);
+    // 2026-06-25 — don't carry a transient pre-mint busy flag from a
+    // prior fresh-channel send into the new blank slate.
+    setPreMintBusy(false);
   }
 
   function selectConv(id: string) {
@@ -2619,7 +2711,7 @@ export default function ChatPanel({
     }
 
     setError(null);
-    setBusy(true);
+    markBusy(conversationId, true);
     // Keep the clicked prompt visible; drop everything after it (the
     // stale assistant reply, follow-up tool calls, later turns). Append
     // a fresh empty assistant bubble that the stream will hydrate.
@@ -2721,7 +2813,7 @@ export default function ChatPanel({
     }));
 
     setError(null);
-    setBusy(true);
+    markBusy(conversationId, true);
     cancelEditBubble();
     // Replace the clicked bubble's text optimistically + drop everything
     // after it. The server will push the new (override) prompt back into
@@ -2789,7 +2881,7 @@ export default function ChatPanel({
     }
 
     setError(null);
-    setBusy(true);
+    markBusy(conversationId, true);
     try {
       await truncateChat(
         scope,
@@ -2815,7 +2907,7 @@ export default function ChatPanel({
     } catch (err) {
       setError((err as Error).message);
     } finally {
-      setBusy(false);
+      markBusy(conversationId, false);
       void refreshUsage();
       void refreshList();
     }

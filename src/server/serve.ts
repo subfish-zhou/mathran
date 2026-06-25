@@ -2055,8 +2055,11 @@ function registerChatScope(
     const id = c.req.param("conversationId");
     if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
 
-    // 404 unless the conversation is already on disk (we don't lazy-create here).
-    const history = await store.readHistory(scope, id);
+    // 2026-06-25 — prefer live in-memory history over disk (consistent
+    // with /usage, /rerun, and the main GET endpoint). Without this, a
+    // compact request that races a still-streaming first turn would 404.
+    const live = store.peekLiveHistory(scope, id);
+    const history = live ?? (await store.readHistory(scope, id));
     if (history === null) return c.json({ error: "conversation not found" }, 404);
 
     let body: any = {};
@@ -3499,13 +3502,25 @@ function buildApp(
     if (!abs.startsWith(wsAbs + path.sep) && abs !== wsAbs) {
       return c.json({ error: "path escapes workspace" }, 403);
     }
+    // 2026-06-25 security audit — also check the realpath (resolves
+    // symlinks) so a symlink inside the workspace pointing to /etc/passwd
+    // can't be used to exfiltrate arbitrary files. We do this AFTER the
+    // existence check so non-existent paths still return 404 rather than
+    // a confusing 403.
+    let realAbs: string;
+    let stat: import("node:fs").Stats;
     try {
-      const stat = await fs.stat(abs);
+      stat = await fs.stat(abs);
       if (!stat.isFile()) {
         return c.json({ error: "not a regular file" }, 400);
       }
+      realAbs = await fs.realpath(abs);
     } catch {
       return c.json({ error: "file not found" }, 404);
+    }
+    const wsRealAbs = await fs.realpath(wsAbs).catch(() => wsAbs);
+    if (!realAbs.startsWith(wsRealAbs + path.sep) && realAbs !== wsRealAbs) {
+      return c.json({ error: "path escapes workspace (via symlink)" }, 403);
     }
     // Stream the file as a download. Browser-friendly: include both
     // Content-Length and Content-Disposition so the chip click triggers
@@ -3523,6 +3538,16 @@ function buildApp(
       : ext === ".tex" ? "application/x-tex"
       : ext === ".csv" ? "text/csv; charset=utf-8"
       : "application/octet-stream";
+    // 2026-06-25 security audit — cap response size at 50 MB so a huge
+    // file (or a path the model wrote that grew without bound) can't
+    // exhaust server memory via fs.readFile loading the whole buffer.
+    const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
+    if (stat.size > MAX_DOWNLOAD_BYTES) {
+      return c.json(
+        { error: `file too large to serve via /api/file (${stat.size} bytes > ${MAX_DOWNLOAD_BYTES} cap)` },
+        413,
+      );
+    }
     const buf = await fs.readFile(abs);
     c.header("Content-Type", downloadMime);
     c.header(

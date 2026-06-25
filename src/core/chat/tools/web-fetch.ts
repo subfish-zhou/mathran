@@ -50,6 +50,7 @@ export function createWebFetchTool(opts: WebFetchToolOptions = {}): ToolSpec {
       "Fetch a single URL (http/https) and return the response body as text. " +
       "Hard limits: 1 MB response cap, 30s timeout (configurable up to 60s). " +
       "SSRF-guarded: rejects localhost and private IP ranges. " +
+      "Redirects (3xx) are surfaced but NOT auto-followed; re-call with the Location URL to follow. " +
       "Use `format=headers` for header-only inspection.",
     parameters: {
       type: "object",
@@ -115,7 +116,13 @@ export function createWebFetchTool(opts: WebFetchToolOptions = {}): ToolSpec {
           method: "GET",
           headers: { "User-Agent": ua, Accept: "*/*" },
           signal: ac.signal,
-          redirect: "follow",
+          // 2026-06-25 security audit — DON'T auto-follow redirects.
+          // A 302 from a public host to http://127.0.0.1 / a private
+          // address would bypass the SSRF guard (we only checked the
+          // initial hostname). Surface the redirect to the model; if
+          // it wants to follow, it can re-call web_fetch with the
+          // Location URL (which will go through SSRF guard again).
+          redirect: "manual",
         });
       } catch (err: any) {
         clearTimeout(timer);
@@ -127,6 +134,17 @@ export function createWebFetchTool(opts: WebFetchToolOptions = {}): ToolSpec {
         };
       }
       clearTimeout(timer);
+
+      // 2026-06-25 security audit — surface redirects as structured info
+      // so the model can decide whether to follow. We do NOT auto-follow
+      // (see redirect:"manual" above). Status codes 300-308 are redirects.
+      if (res.status >= 300 && res.status < 400 && res.status !== 304) {
+        const loc = res.headers.get("location") ?? "(no Location header)";
+        return {
+          ok: false,
+          content: `web_fetch: HTTP ${res.status} redirect → ${loc}\n\nFor safety, redirects are NOT auto-followed (an open redirect could bypass the SSRF guard). If you want to follow, re-call web_fetch with url=<the Location target> — the SSRF guard will re-validate.`,
+        };
+      }
 
       if (format === "headers") {
         const hdrs: string[] = [];
@@ -193,6 +211,19 @@ async function checkSsrfGuard(hostname: string): Promise<string | null> {
   if (/^169\.254\./.test(hostname)) return "169.254/16 link-local";
   if (hostname === "::1") return "loopback (v6)";
   if (/^f[cd]/.test(lower)) return "fc00::/7 private (v6)";
+  // 2026-06-25 security audit — broader IPv6 coverage:
+  //   fe80::/10  link-local
+  //   ::ffff:    IPv4-mapped IPv6 (could mask private IPv4)
+  //   ::/96      IPv4-compatible IPv6 (deprecated but rejected for safety)
+  if (/^fe[89ab]/.test(lower)) return "fe80::/10 link-local (v6)";
+  if (lower.startsWith("::ffff:")) {
+    const v4 = lower.slice(7);
+    if (/^127\./.test(v4)) return "v6-mapped loopback";
+    if (/^10\./.test(v4)) return "v6-mapped private";
+    if (/^192\.168\./.test(v4)) return "v6-mapped private";
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(v4)) return "v6-mapped private";
+    if (/^169\.254\./.test(v4)) return "v6-mapped link-local";
+  }
 
   // DNS resolve and check resulting addresses.
   try {
@@ -205,6 +236,18 @@ async function checkSsrfGuard(hostname: string): Promise<string | null> {
       if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return `resolves to private (${ip})`;
       if (/^169\.254\./.test(ip)) return `resolves to link-local (${ip})`;
       if (ip === "::1") return `resolves to loopback (v6)`;
+      // v6 link-local & IPv4-mapped (same defensive set as the literal
+      // checks above — DNS records can return these too).
+      const lowerIp = ip.toLowerCase();
+      if (/^fe[89ab]/.test(lowerIp)) return `resolves to link-local (v6) (${ip})`;
+      if (/^f[cd]/.test(lowerIp)) return `resolves to private (v6) (${ip})`;
+      if (lowerIp.startsWith("::ffff:")) {
+        const v4 = lowerIp.slice(7);
+        if (/^127\./.test(v4) || /^10\./.test(v4) || /^192\.168\./.test(v4)
+          || /^172\.(1[6-9]|2\d|3[01])\./.test(v4) || /^169\.254\./.test(v4)) {
+          return `resolves to v6-mapped private (${ip})`;
+        }
+      }
     }
   } catch {
     // DNS failure — let fetch surface its own error.
