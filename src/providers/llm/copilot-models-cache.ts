@@ -180,3 +180,14 @@ export function _peekCopilotModelsCacheForTest(): Record<string, { contextWindow
   if (Date.now() - _liveCacheAt >= LIVE_CACHE_TTL_MS) return null;
   return { ..._liveCache };
 }
+
+/**
+ * The hardcoded fallback model-name list — used by `/api/copilot/models`
+ * when the live cache is cold and we couldn't warm it (offline / copilot
+ * down / no token). Exposed as a separate named export so the server can
+ * surface "we don't know what models you actually have, here's our best
+ * snapshot" without exposing the contextWindow / maxOutput numbers.
+ */
+export const HARDCODED_FALLBACK_MODEL_NAMES: readonly string[] = Object.freeze(
+  Object.keys(HARDCODED_FALLBACK).sort(),
+);

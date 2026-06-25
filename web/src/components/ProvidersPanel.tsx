@@ -19,6 +19,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, type ProvidersResponse } from "../lib/api.ts";
+import { useCopilotModels } from "../lib/copilot-models.ts";
 
 interface DraftRow {
   kind: string;
@@ -50,6 +51,9 @@ export default function ProvidersPanel() {
   const [defaultModel, setDefaultModel] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
+
+  // 2026-06-25 — real Copilot model list for the default-model datalist.
+  const copilotModels = useCopilotModels();
 
   // "Add provider" form state. Toggled from a button below the rows.
   const [newKey, setNewKey] = useState("");
@@ -184,21 +188,10 @@ export default function ProvidersPanel() {
             className="w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-sm outline-none focus:border-slate-500"
           />
           <datalist id="mathran-providers-model-suggestions">
-            <option value="copilot/gpt-5.6" />
-            <option value="copilot/gpt-5.5" />
-            <option value="copilot/gpt-5.4" />
-            <option value="copilot/gpt-5" />
-            <option value="copilot/claude-opus-4.8" />
-            <option value="copilot/claude-opus-4.7" />
-            <option value="copilot/claude-opus-4.6" />
-            <option value="copilot/claude-opus-4.5" />
-            <option value="copilot/claude-sonnet-4.6" />
-            <option value="copilot/claude-sonnet-4.5" />
-            <option value="copilot/o1" />
-            <option value="copilot/o1-mini" />
-            <option value="copilot/o3-mini" />
-            <option value="copilot/gpt-4o" />
-            <option value="copilot/gpt-4o-mini" />
+            {/* 2026-06-25 — live list from /api/copilot/models. */}
+            {copilotModels.models.map((m) => (
+              <option key={m} value={`copilot/${m}`} />
+            ))}
           </datalist>
           <p className="mt-1 text-xs text-slate-400">
             Format: <code>provider/model</code> (e.g. <code>copilot/gpt-5.5</code>,{" "}

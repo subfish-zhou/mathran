@@ -101,6 +101,7 @@ import {
   subscribeReasoningDisplay,
   type ReasoningDisplay,
 } from "../lib/composer-prefs.ts";
+import { useCopilotModels } from "../lib/copilot-models.ts";
 import {
   parseSlashInput,
   activeSlashPrefix,
@@ -1637,6 +1638,12 @@ export default function ChatPanel({
   useEffect(() => subscribeReasoningDisplay(setReasoningDisplay), []);
   const showReasoning = reasoningDisplay !== "hidden";
 
+  // 2026-06-25 — real-list copilot models from /api/copilot/models. Used to
+  // populate the model picker datalist below. Cached per-mount (no refetch
+  // on each keystroke). Falls back to the hardcoded snapshot when /models
+  // is unreachable (handled server-side in the endpoint).
+  const copilotModels = useCopilotModels();
+
   // Clamp the highlight whenever the filtered list shrinks/changes.
   useEffect(() => {
     setSlashSelected((s) => (s >= slashFiltered.length ? 0 : s));
@@ -2873,28 +2880,13 @@ export default function ChatPanel({
             className="w-64 rounded-md border border-slate-300 px-2 py-1 text-xs font-mono outline-none focus:border-slate-500"
           />
           <datalist id="mathran-model-suggestions">
-            {/* Common model strings the LLM router accepts. Free-form input
-                remains allowed — this is a datalist (suggestions), not a
-                <select> (exhaustive). v0.14 §3. */}
-            {/* GPT-5.x family (OpenAI via GitHub Copilot) */}
-            <option value="copilot/gpt-5.6" />
-            <option value="copilot/gpt-5.5" />
-            <option value="copilot/gpt-5.4" />
-            <option value="copilot/gpt-5" />
-            {/* Claude Opus family (Anthropic via GitHub Copilot) */}
-            <option value="copilot/claude-opus-4.8" />
-            <option value="copilot/claude-opus-4.7" />
-            <option value="copilot/claude-opus-4.6" />
-            <option value="copilot/claude-opus-4.5" />
-            {/* Claude Sonnet family — cheaper alternative for routine work */}
-            <option value="copilot/claude-sonnet-4.6" />
-            <option value="copilot/claude-sonnet-4.5" />
-            {/* Reasoning-specialized OpenAI lines */}
-            <option value="copilot/o1" />
-            <option value="copilot/o1-mini" />
-            <option value="copilot/o3-mini" />
-            <option value="copilot/gpt-4o" />
-            <option value="copilot/gpt-4o-mini" />
+            {/* 2026-06-25: actual list from /api/copilot/models, no more
+                hardcoded guesses. Falls back to the snapshot embedded in
+                copilot-models-cache.ts when the live cache is cold (no
+                token / offline / copilot down) — never empty. */}
+            {copilotModels.models.map((m) => (
+              <option key={m} value={`copilot/${m}`} />
+            ))}
           </datalist>
           {/* ─── Pinned-only toggle (v0.16 §2) ────────────────────────
               Compact button in the chat header; flips the rows filter

@@ -121,7 +121,13 @@ import {
   createFallbackTokenCounter,
   type TokenCounter,
 } from "../core/chat/token-counter.js";
-import { contextWindowForModel } from "../providers/llm/copilot-models-cache.js";
+import {
+  contextWindowForModel,
+  refreshCopilotModelsCacheFromBaseUrl,
+  _peekCopilotModelsCacheForTest,
+  HARDCODED_FALLBACK_MODEL_NAMES,
+} from "../providers/llm/copilot-models-cache.js";
+import { resolveCopilotToken } from "../providers/llm/copilot.js";
 import type { LLMMessage, MessageContent } from "../core/providers/llm.js";
 import {
   ScopedChatSessionStore,
@@ -3322,6 +3328,40 @@ function buildApp(
 
   app.get("/api/health", async (c) => {
     return c.json({ ok: true, version: await readPackageVersion(), workspace });
+  });
+
+  // 2026-06-25: real-list endpoint for the SPA model picker. Returns the
+  // live /models cache when warm; otherwise triggers a token-refresh path
+  // (which now also primes the models cache) and returns whatever the
+  // refresh produced. Falls back to the hardcoded snapshot list when
+  // the live cache is still empty (offline, copilot down, etc.) so the
+  // UI never shows an empty list. Never throws.
+  app.get("/api/copilot/models", async (c) => {
+    const peek = _peekCopilotModelsCacheForTest();
+    if (peek && Object.keys(peek).length > 0) {
+      return c.json({
+        source: "live",
+        models: Object.keys(peek).sort(),
+      });
+    }
+    // Live cache cold — try a token resolve to warm it.
+    try {
+      const { token, baseUrl } = await resolveCopilotToken();
+      await refreshCopilotModelsCacheFromBaseUrl(baseUrl, token);
+    } catch {
+      // ignore — fall back to hardcoded
+    }
+    const after = _peekCopilotModelsCacheForTest();
+    if (after && Object.keys(after).length > 0) {
+      return c.json({
+        source: "live",
+        models: Object.keys(after).sort(),
+      });
+    }
+    return c.json({
+      source: "fallback",
+      models: HARDCODED_FALLBACK_MODEL_NAMES,
+    });
   });
 
   // MCP (#4): server status for the SPA "MCP Servers" panel (minimal — list +

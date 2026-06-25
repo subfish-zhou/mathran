@@ -32,6 +32,7 @@ import {
   subscribeReasoningDisplay as subscribeReasoningDisplaySetting,
   type ReasoningDisplay as ReasoningDisplaySetting,
 } from "../lib/composer-prefs.ts";
+import { useCopilotModels } from "../lib/copilot-models.ts";
 import {
   APPROVAL_POLICIES,
   THEMES,
@@ -64,6 +65,10 @@ export default function SettingsPanel() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
+
+  // 2026-06-25 — populates the model-default datalist with subfish's actual
+  // Copilot model list (or the hardcoded fallback when /models is offline).
+  const copilotModels = useCopilotModels();
 
   // Load the available projects once (for the PROJECT tab dropdown).
   useEffect(() => {
@@ -266,25 +271,13 @@ export default function SettingsPanel() {
                   placeholder="copilot/gpt-5.5"
                   className="w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-sm outline-none focus:border-slate-500 disabled:bg-slate-100"
                 />
-                {/* Same datalist as ChatPanel's so the settings input
-                    autocompletes against the full curated model list
-                    instead of forcing the user to remember the slug. */}
+                {/* 2026-06-25 — list now comes from /api/copilot/models so
+                    the autocomplete reflects subfish's actual Copilot
+                    subscription, not a hardcoded guess. */}
                 <datalist id="mathran-settings-model-suggestions">
-                  <option value="copilot/gpt-5.6" />
-                  <option value="copilot/gpt-5.5" />
-                  <option value="copilot/gpt-5.4" />
-                  <option value="copilot/gpt-5" />
-                  <option value="copilot/claude-opus-4.8" />
-                  <option value="copilot/claude-opus-4.7" />
-                  <option value="copilot/claude-opus-4.6" />
-                  <option value="copilot/claude-opus-4.5" />
-                  <option value="copilot/claude-sonnet-4.6" />
-                  <option value="copilot/claude-sonnet-4.5" />
-                  <option value="copilot/o1" />
-                  <option value="copilot/o1-mini" />
-                  <option value="copilot/o3-mini" />
-                  <option value="copilot/gpt-4o" />
-                  <option value="copilot/gpt-4o-mini" />
+                  {copilotModels.models.map((m) => (
+                    <option key={m} value={`copilot/${m}`} />
+                  ))}
                 </datalist>
               </Field>
             </Section>

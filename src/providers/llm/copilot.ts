@@ -51,7 +51,7 @@ import { promisify } from "node:util";
 
 import type { LLMStreamChunk, MessageContent, ContentPart } from "../../core/providers/llm.js";
 import { contentToString } from "../../core/providers/llm.js";
-import { maxOutputTokensForModel } from "./copilot-models-cache.js";
+import { maxOutputTokensForModel, refreshCopilotModelsCacheFromBaseUrl } from "./copilot-models-cache.js";
 
 const execFile = promisify(_execFile);
 
@@ -391,6 +391,12 @@ export async function resolveCopilotToken(): Promise<ResolvedToken> {
       _sessionCache.set(fp, resolved);
       // Persist for cross-process reuse (best-effort).
       await saveDiskCache(fresh);
+      // Refresh the models cache from /models — same baseUrl, same token.
+      // Best-effort: we ignore the return value. The cache layer swallows
+      // every error and falls back to HARDCODED_FALLBACK on lookup. Doc in
+      // copilot-models-cache.ts always claimed this was wired up at token
+      // refresh time, but the call was never written. Fixed 2026-06-25.
+      void refreshCopilotModelsCacheFromBaseUrl(resolved.baseUrl, resolved.token);
       return resolved;
     } catch (err) {
       attemptedSources.push({
