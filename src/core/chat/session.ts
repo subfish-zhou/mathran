@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
 import type {
   LLMProvider,
   LLMMessage,
@@ -277,6 +278,31 @@ export type ChatEvent =
     }
   | { type: "tool-call"; id: string; name: string; args: string }
   | { type: "tool-result"; id: string; name: string; ok: boolean; content: string }
+  | {
+      /** 2026-06-25 — emitted right after a successful `write_file` /
+       *  `edit_file` tool call so the SPA can render a structured
+       *  download chip (filename + size + Download / Copy-path buttons).
+       *
+       *  Why a side-channel event instead of stuffing fields into
+       *  `tool-result`: the existing ToolResult shape is `{ok, content:
+       *  string}` and every adapter / persistence path treats `content`
+       *  as opaque text. Adding a structured payload there would ripple
+       *  through six call sites. A separate event leaves the existing
+       *  invariant intact and lets the SPA opt-in cleanly.
+       *
+       *  Both `path` and `relPath` are emitted so the SPA can show the
+       *  short name and the absolute path tooltip without re-parsing.
+       *  `bytes` is post-write file size; `mime` is best-effort from
+       *  the file extension. The SPA renders the FileBubble below
+       *  the corresponding tool-result bubble. */
+      type: "file-written";
+      toolCallId: string;
+      path: string;
+      relPath: string;
+      filename: string;
+      bytes: number;
+      mime: string;
+    }
   | {
       /** Approval Policy 矩阵 — emitted just before the host prompts the user
        *  to approve a high-risk tool call. Lets the SPA render its
@@ -2913,6 +2939,29 @@ export class ChatSession {
           content: result.content,
         };
 
+        // 2026-06-25 — file-written side-channel event for write_file /
+        // edit_file. Only fires on success. We re-parse the original
+        // call args here because `parsed` from the dispatch block is
+        // already out of scope. The `path` field is required by both
+        // tools' schemas; we re-stat the file to get authoritative bytes.
+        if (
+          result.ok &&
+          (call.name === "write_file" || call.name === "edit_file") &&
+          this.workspace
+        ) {
+          let argPath = "";
+          try {
+            const argsObj = JSON.parse(call.args || "{}") as Record<string, unknown>;
+            if (typeof argsObj.path === "string") argPath = argsObj.path;
+          } catch {
+            // ignore parse errors; tool already succeeded with these args
+          }
+          if (argPath) {
+            const ev = await this.buildFileWrittenEvent(call.id, argPath);
+            if (ev) yield ev;
+          }
+        }
+
         // post-tool hooks — fire after every tool call (non-blocking). Their
         // output is injected as a system message so the model sees what the
         // hook did without polluting the tool_call/tool_result pairing.
@@ -2927,5 +2976,71 @@ export class ChatSession {
       }
       // Loop again so the model can react to the tool results.
     }
+  }
+
+  /**
+   * Build a `file-written` ChatEvent for a successful write_file / edit_file
+   * call. Returns null if the path can't be resolved or stat'd (in which
+   * case we silently skip the side-channel event — the tool-result text
+   * still tells the model + user what happened).
+   *
+   * The MIME hint comes from a small extension lookup; the SPA uses it
+   * for icon selection and the Download Content-Disposition shape.
+   */
+  private async buildFileWrittenEvent(
+    toolCallId: string,
+    argPath: string,
+  ): Promise<{
+    type: "file-written";
+    toolCallId: string;
+    path: string;
+    relPath: string;
+    filename: string;
+    bytes: number;
+    mime: string;
+  } | null> {
+    const ws = this.workspace;
+    if (!ws) return null;
+    const abs = path.isAbsolute(argPath) ? argPath : path.resolve(ws, argPath);
+    // Stay inside workspace — never emit a chip for a path the model
+    // somehow wrote outside it. (write_file already has its own escape
+    // check, but defence in depth.)
+    const rel = path.relative(ws, abs);
+    if (rel.startsWith("..") || path.isAbsolute(rel)) return null;
+    let bytes = 0;
+    try {
+      const st = await fs.stat(abs);
+      bytes = st.size;
+    } catch {
+      return null;
+    }
+    const filename = path.basename(abs);
+    const ext = path.extname(filename).toLowerCase();
+    const mime =
+      ext === ".md" ? "text/markdown"
+      : ext === ".txt" ? "text/plain"
+      : ext === ".json" ? "application/json"
+      : ext === ".pdf" ? "application/pdf"
+      : ext === ".tex" ? "application/x-tex"
+      : ext === ".csv" ? "text/csv"
+      : ext === ".html" ? "text/html"
+      : ext === ".xml" ? "application/xml"
+      : ext === ".yaml" || ext === ".yml" ? "application/x-yaml"
+      : ext === ".toml" ? "application/toml"
+      : ext === ".py" ? "text/x-python"
+      : ext === ".ts" || ext === ".tsx" ? "application/typescript"
+      : ext === ".js" || ext === ".jsx" ? "application/javascript"
+      : ext === ".bib" ? "application/x-bibtex"
+      : ext === ".lean" ? "text/plain"
+      : "application/octet-stream";
+    return {
+      type: "file-written",
+      toolCallId,
+      path: abs,
+      relPath: rel,
+      filename,
+      bytes,
+      mime,
+    };
   }
 }

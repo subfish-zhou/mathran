@@ -1407,7 +1407,29 @@ export default function ChatPanel({
             // for reasoning models that fire many tools per turn). The text
             // handler above already auto-creates an assistant bubble when
             // it sees a text delta without one, so this placeholder was
-            // unnecessary AND visually disruptive. Removed 2026-06-25.
+            // both unnecessary and visually distracting.
+          } else if (ev.type === "file-written") {
+            // 2026-06-25 — attach structured fileWritten payload to the
+            // matching tool bubble so ChatPanel renders a <FileBubble>
+            // download chip. Fires only on successful write_file /
+            // edit_file. Defensive: if we somehow get the event without
+            // the tool bubble first, ignore.
+            const idx = next.findIndex(
+              (x) => x.kind === "tool" && (x as ToolBubble).id === ev.toolCallId,
+            );
+            if (idx !== -1) {
+              const prevTool = next[idx] as ToolBubble;
+              next[idx] = {
+                ...prevTool,
+                fileWritten: {
+                  path: ev.path,
+                  relPath: ev.relPath,
+                  filename: ev.filename,
+                  bytes: ev.bytes,
+                  mime: ev.mime,
+                },
+              };
+            }
           } else if (ev.type === "ask_user") {
             // v0.16 §11: the round is paused waiting for the user's
             // reply. Mark the matching tool bubble (which arrived as a

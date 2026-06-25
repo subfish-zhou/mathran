@@ -63,6 +63,18 @@ export type ChatEvent =
   | { type: "tool-call"; id: string; name: string; args: string }
   | { type: "tool-result"; id: string; name: string; ok: boolean; content: string }
   | {
+      /** 2026-06-25 — fires right after a successful write_file / edit_file
+       *  tool-result. SPA renders a download chip below the corresponding
+       *  tool bubble. See ChatSession.ChatEvent for full rationale. */
+      type: "file-written";
+      toolCallId: string;
+      path: string;
+      relPath: string;
+      filename: string;
+      bytes: number;
+      mime: string;
+    }
+  | {
       /** v0.16 §11 — the model called `ask_user`. The serve stream emits
        *  this just before closing; the SPA renders an inline answer box
        *  on the matching tool bubble. Resume the round via

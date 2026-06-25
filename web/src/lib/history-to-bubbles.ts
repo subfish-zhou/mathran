@@ -40,6 +40,25 @@ export interface ToolBubble {
   args?: string;
   result?: string;
   ok?: boolean;
+  /** 2026-06-25 — populated when the backend emits a `file-written`
+   *  side-channel event for this tool call (write_file / edit_file
+   *  success). The SPA renders a <FileBubble> chip below the tool
+   *  output with Download + Copy-path buttons.
+   *
+   *  NOTE: this field is transient — `file-written` is a live SSE
+   *  event with no jsonl persistence, so a reloaded conversation
+   *  will show the tool bubble without the chip. The absolute path
+   *  is still present in the assistant's reply text, so users can
+   *  hit /api/file?path=<path> manually. Re-hydrating on reload
+   *  would require an extra server lookup per write_file tool call;
+   *  out of scope for this commit. */
+  fileWritten?: {
+    path: string;
+    relPath: string;
+    filename: string;
+    bytes: number;
+    mime: string;
+  };
   /** v0.16 §11: this tool call is `ask_user` and is paused waiting for
    *  the user's reply. Set when the SSE stream emits `ask_user` or when
    *  the conversation loads with a `pendingAsk` sidecar slot. Cleared

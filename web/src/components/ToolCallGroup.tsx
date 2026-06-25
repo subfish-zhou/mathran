@@ -24,6 +24,7 @@
  */
 import { useState } from "react";
 import { ToolCallDisplay } from "./ToolCallDisplay.tsx";
+import FileBubble from "./FileBubble.tsx";
 import type { ToolBubble } from "../lib/history-to-bubbles.ts";
 
 interface ToolCallGroupProps {
@@ -52,28 +53,34 @@ export default function ToolCallGroup({
   const [collapsed, setCollapsed] = useState(false);
 
   const renderOne = (t: ToolBubble) => (
-    <ToolCallDisplay
-      key={t.id}
-      toolCall={t}
-      subGoalIdForThisCall={subGoalIdByToolId?.[t.id] ?? null}
-      onOpenThread={onOpenThread}
-      onAnswerAsk={onAnswerAsk}
-      onCheckpointAction={onCheckpointAction}
-    />
+    <div key={t.id}>
+      <ToolCallDisplay
+        toolCall={t}
+        subGoalIdForThisCall={subGoalIdByToolId?.[t.id] ?? null}
+        onOpenThread={onOpenThread}
+        onAnswerAsk={onAnswerAsk}
+        onCheckpointAction={onCheckpointAction}
+      />
+      {/* 2026-06-25 — when the backend emitted a file-written side-channel
+          event for this tool, render the download chip right below it. */}
+      {t.fileWritten && (
+        <FileBubble
+          path={t.fileWritten.path}
+          filename={t.fileWritten.filename}
+          bytes={t.fileWritten.bytes}
+          mime={t.fileWritten.mime}
+        />
+      )}
+    </div>
   );
 
   if (tools.length === 0) return null;
   if (tools.length === 1) {
-    // Single tool: skip the wrapper entirely, render the card raw so the UX
-    // is identical to v0.13 for the common case.
-    return (
-      <ToolCallDisplay
-        toolCall={tools[0]!}
-        subGoalIdForThisCall={subGoalIdByToolId?.[tools[0]!.id] ?? null}
-        onOpenThread={onOpenThread}
-        onAnswerAsk={onAnswerAsk}
-      />
-    );
+    // Single tool: render via the same renderOne helper so a FileBubble
+    // can attach below when the call was a successful write_file /
+    // edit_file. (Previously this branch skipped the file chip because
+    // it inlined ToolCallDisplay directly.)
+    return renderOne(tools[0]!);
   }
 
   const pending = tools.filter((t) => t.ok === undefined);
