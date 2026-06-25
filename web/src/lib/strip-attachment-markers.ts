@@ -28,8 +28,16 @@
  * the augment join used to separate them.
  */
 
+// Match the multi-line `[Attachment: name]` block produced by
+// chat-attachments.ts. The block has a fixed leader (`[Attachment: …]`
+// followed by `  path: …`) and a variable tail of indented lines
+// (`  size`, `  mimeType`, `  peek`, `  → …`, `  NOTE: …`). We consume
+// the leader greedily and then any number of 2-space-indented
+// continuation lines, stopping at the first un-indented line (or EOF).
+// This generalises across the text/image/pdf variants without needing
+// per-variant regexes.
 const ATTACHMENT_BLOCK_RE =
-  /\n?\n?\[Attachment: [^\]]+\]\n(?:  path: [^\n]+\n)?(?:  size: [^\n]+\n)?(?:  peek: [^\n]+\n)?(?:  → Use `read_file path=[^\n]+\n?)?/g;
+  /\n?\n?\[Attachment: [^\]]+\]\n(?:  [^\n]*(?:\n|$))+/g;
 
 const IMAGE_LINE_RE = /\n?\n?\[Image: [^\]]+\](?:\n|$)/g;
 

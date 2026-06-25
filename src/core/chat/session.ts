@@ -127,6 +127,7 @@ import { createSearchArxivTool } from "./tools/search-arxiv.js";
 import { createGlobTool } from "./tools/glob.js";
 import { createGrepTool } from "./tools/grep.js";
 import { createWebFetchTool } from "./tools/web-fetch.js";
+import { createPdfExtractTool } from "./tools/pdf-extract.js";
 import {
   createCompletePlanTool,
   createEnterPlanModeTool,
@@ -734,6 +735,13 @@ export interface ChatSessionOptions {
     glob?: boolean;
     grep?: boolean;
     web_fetch?: boolean | { allowPrivateNetwork?: boolean; userAgent?: string };
+    /**
+     * 2026-06-25 — `pdf_extract` tool. Spawns a Python helper in a
+     * stable per-user venv at ~/.mathran/python-venv/pdf-extract/ to
+     * convert PDFs to markdown with optional math-LaTeX preservation
+     * (Marker backend). See src/core/chat/tools/pdf-extract.ts.
+     */
+    pdf_extract?: boolean;
     /**
      * Part B1 — chat-level plan mode tools (`enter_plan_mode` /
      * `complete_plan`). Default ON when the host explicitly enables them.
@@ -1667,6 +1675,12 @@ export class ChatSession {
           ...(wfCfg.userAgent ? { userAgent: wfCfg.userAgent } : {}),
         }),
       );
+    }
+    // 2026-06-25 — PDF extraction tool. Replaces the model's old
+    // "shell out to pdftotext" workaround which destroyed math
+    // formulas. Two modes (fast / math); see pdf-extract.ts.
+    if (cfg.pdf_extract) {
+      out.push(createPdfExtractTool());
     }
     // Part B1 — chat-level plan mode tools. Both tools are readOnly so the
     // model can always *exit* plan mode after entering it. We bind to

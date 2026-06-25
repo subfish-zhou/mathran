@@ -32,6 +32,28 @@ function copyMarkdown(from: string, to: string): number {
   return count;
 }
 
+/**
+ * 2026-06-25 — copy `.py` helper scripts that live next to a `.ts` tool
+ * (the tool spawns them at runtime via spawn(python, [path])). Used by
+ * tools/pdf-extract.ts → python-helpers/pdf_extract.py and similar.
+ */
+function copyPythonHelpers(from: string, to: string): number {
+  let count = 0;
+  for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+    const src = path.join(from, entry.name);
+    const dst = path.join(to, entry.name);
+    if (entry.isDirectory()) {
+      fs.mkdirSync(dst, { recursive: true });
+      count += copyPythonHelpers(src, dst);
+    } else if (entry.name.endsWith(".py")) {
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.copyFileSync(src, dst);
+      count++;
+    }
+  }
+  return count;
+}
+
 function copyAssetDir(label: string, rel: string): void {
   const srcDir = path.join(root, "src", ...rel.split("/"));
   const distDir = path.join(root, "dist", ...rel.split("/"));
@@ -48,3 +70,16 @@ function copyAssetDir(label: string, rel: string): void {
 
 copyAssetDir("SKILL.md", "core/chat/builtin-skills");
 copyAssetDir("goal-template", "core/goal/builtin-templates");
+
+// 2026-06-25 — Python helpers used by spawn() from .ts tools live in
+// per-tool python-helpers/ subdirs. Copy them alongside the .js into
+// dist/ so `new URL("./python-helpers/X.py", import.meta.url)` resolves.
+{
+  const srcDir = path.join(root, "src", "core", "chat", "tools", "python-helpers");
+  const distDir = path.join(root, "dist", "core", "chat", "tools", "python-helpers");
+  if (fs.existsSync(srcDir)) {
+    fs.mkdirSync(distDir, { recursive: true });
+    const n = copyPythonHelpers(srcDir, distDir);
+    console.log(`[copy-builtin-skills] copied ${n} Python helper file(s) into dist/`);
+  }
+}

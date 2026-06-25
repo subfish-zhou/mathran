@@ -255,7 +255,32 @@ export async function renderAttachment(
     return `[Image: ${ref.filename} @ ${realPath}]`;
   }
 
-  // Binary fallback (pdf / zip / etc). We surface size so the model can
+  // 2026-06-25 — special-case PDFs: emit a structured Attachment block
+  // (consistent with text uploads) that explicitly nudges the model toward
+  // the new pdf_extract tool. Previously PDFs fell through to the generic
+  // [Binary: ...] marker, which left the model to invent its own approach
+  // (usually `bash pdftotext`, which destroys math formulas).
+  if (ref.mimeType === "application/pdf") {
+    let size: number;
+    try {
+      const stat = await fs.stat(realPath);
+      size = stat.size;
+    } catch {
+      throw new BadAttachmentError(`failed to stat attachment: ${ref.filename}`);
+    }
+    return [
+      `[Attachment: ${ref.filename}]`,
+      `  path: ${realPath}`,
+      `  size: ${size} bytes`,
+      `  mimeType: application/pdf`,
+      `  → For text-only PDFs:  pdf_extract(path=${realPath})`,
+      `  → For math-heavy PDFs: pdf_extract(path=${realPath}, mode='math')`,
+      `  Output is a .md file; then read_file the result.`,
+      `  NOTE: do NOT use \`bash pdftotext\` — it destroys formulas.`,
+    ].join("\n");
+  }
+
+  // Binary fallback (zip / other non-pdf binary). We surface size so the model can
   // reason about "is this a 4 KB CSV or a 20 MB log?".
   let size: number;
   try {

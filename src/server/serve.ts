@@ -1346,6 +1346,10 @@ export function defaultSessionFactory(
         glob: true,
         grep: true,
         web_fetch: true,
+        // 2026-06-25 — pdf_extract replaces the model's "shell out to
+        // pdftotext" workaround (which destroyed math formulas) with a
+        // proper Python pipeline (PyMuPDF4LLM fast / Marker math).
+        pdf_extract: true,
 
         // git: inspect tools (status / diff / log / show) always on;
         // commit requires explicit opt-in via the cfg block.
@@ -1486,6 +1490,7 @@ export const GOAL_MODE_BUILTIN_TOOLS = {
   glob: true,
   grep: true,
   web_fetch: true,
+  pdf_extract: true,
 } as const;
 
 /** Append a short scope hint to the system prompt so the model knows where it is. */
