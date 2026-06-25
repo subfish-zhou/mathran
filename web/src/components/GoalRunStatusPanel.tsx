@@ -66,6 +66,16 @@ interface GoalRunStatusPanelProps {
 const POLL_INTERVAL_MS = 10_000;
 const STALE_THRESHOLD_MS = 60_000;
 
+/** Phase ζ (cost meter) — format an estimated USD cost for the badge.
+ *  `null`/undefined → "—" (model has no public price). Sub-cent costs
+ *  render "$ <0.01" so the user knows it's nonzero but tiny. Otherwise
+ *  two decimals, e.g. "$ 0.34". DESIGN-REFERENCE.md §5.E. */
+function formatCostUsd(cost: number | null | undefined): string {
+  if (cost === null || cost === undefined) return "—";
+  if (cost > 0 && cost < 0.01) return "$ <0.01";
+  return `$ ${cost.toFixed(2)}`;
+}
+
 /** Render-time mapping from (status, abortRequested) → human badge.
  *  Kept exhaustive so a future Goal["status"] addition lights up an
  *  obvious "unknown" fallback instead of silently rendering blank. */
@@ -307,6 +317,23 @@ export default function GoalRunStatusPanel({
             🧹 {status.compactionRuns}
           </span>
         )}
+
+        {/* Phase ζ (cost meter) — estimated $ cost badge, adjacent to the
+         *  compaction badge per DESIGN-REFERENCE.md §5.E. Renders "—" when
+         *  the model has no public price (costUsd === null). Tooltip breaks
+         *  down the input/output token split that drove the figure. The
+         *  approximation note matches the server's Option-B fallback for
+         *  goals lacking a provider-reported split. */}
+        <span
+          className="font-mono text-emerald-700"
+          title={
+            status.costUsd === null || status.costUsd === undefined
+              ? `${status.model ?? "model"}: no public price available`
+              : `${status.model ?? "model"}: ${(status.inputTokensUsed ?? 0).toLocaleString()} in + ${(status.outputTokensUsed ?? 0).toLocaleString()} out tokens ≈ ${formatCostUsd(status.costUsd)} (estimate)`
+          }
+        >
+          {formatCostUsd(status.costUsd)}
+        </span>
 
         {/* Heartbeat freshness. We only show the dot when a heartbeat
          *  exists AND the goal isn't terminal — a finished goal's

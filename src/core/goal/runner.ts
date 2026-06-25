@@ -1217,6 +1217,14 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
     llmCallsTotal: llmCallCount,
     toolCallCount,
     tokensUsed: usageReported ? usageInputTokens + usageOutputTokens : fallbackTokens,
+    // Phase ζ (cost meter) — persist the provider-reported input/output split
+    // so per-model $ cost is exact (pricing differs in vs out). We ONLY record
+    // a split when the provider actually reported usage; the `countTokens`
+    // fallback can't distinguish prompt from completion, so we leave the split
+    // at 0 for that iteration rather than guess (the combined `tokensUsed`
+    // still counts it). DESIGN-REFERENCE.md §5.E.
+    inputTokensUsed: usageReported ? usageInputTokens : 0,
+    outputTokensUsed: usageReported ? usageOutputTokens : 0,
   });
 
   // mark_done / give_up tool calls wrap the goal (recorded on the handler

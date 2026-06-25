@@ -909,6 +909,15 @@ export interface GoalStatus {
   roundsMax: number | null;
   tokensUsed: number;
   tokensMax: number | null;
+  /** Phase ζ (cost meter) — estimated USD cost for this goal's lifetime LLM
+   *  usage, or null when the model has no public price (UI shows "—"). */
+  costUsd?: number | null;
+  /** Phase ζ — provider-reported input (prompt) tokens (0 for pre-ζ goals). */
+  inputTokensUsed?: number;
+  /** Phase ζ — provider-reported output (completion) tokens (0 for pre-ζ goals). */
+  outputTokensUsed?: number;
+  /** Phase ζ — model slug used for this goal (for the cost tooltip). */
+  model?: string;
   toolCount: number;
   resumeCount: number;
   heartbeatAt: number | null;

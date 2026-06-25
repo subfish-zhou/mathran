@@ -67,6 +67,21 @@ export interface Goal {
   stats: {
     tokensUsed: number;
     /**
+     * Phase ζ (cost meter) — input (prompt) tokens, split out of the
+     * combined `tokensUsed` so per-model $ cost can be computed
+     * (pricing differs input vs output). Sums provider-reported
+     * `usage.input_tokens` across every LLM round-trip. Defaults to 0
+     * for goals created before Phase ζ; `tokensUsed` stays the source
+     * of truth for total volume (no breaking change).
+     */
+    inputTokensUsed: number;
+    /**
+     * Phase ζ (cost meter) — output (completion) tokens, split out of
+     * `tokensUsed`. Sums provider-reported `usage.output_tokens` across
+     * every LLM round-trip. Defaults to 0 for pre-Phase-ζ goals.
+     */
+    outputTokensUsed: number;
+    /**
      * Number of daemon iterations run (each `runOneIteration` /
      * `ChatSession.send`). This is what the user's `--max-rounds` /
      * `budget.roundsMax` controls. Renamed from `roundsRun` (defect #3)
@@ -247,6 +262,10 @@ export function migrateGoalStats(raw: unknown): Goal["stats"] {
   const iterationsRun = s.iterationsRun ?? s.roundsRun ?? 0;
   return {
     tokensUsed: s.tokensUsed ?? 0,
+    // Phase ζ — input/output split. Pre-Phase-ζ goals default to 0; their
+    // combined `tokensUsed` is preserved so historical totals stay correct.
+    inputTokensUsed: s.inputTokensUsed ?? 0,
+    outputTokensUsed: s.outputTokensUsed ?? 0,
     iterationsRun,
     assistantTurnsTotal: s.assistantTurnsTotal ?? 0,
     llmCallsTotal: s.llmCallsTotal ?? 0,
@@ -335,6 +354,8 @@ export async function createGoal(
     createdAt: now,
     stats: {
       tokensUsed: 0,
+      inputTokensUsed: 0,
+      outputTokensUsed: 0,
       iterationsRun: 0,
       assistantTurnsTotal: 0,
       llmCallsTotal: 0,
@@ -392,6 +413,8 @@ export async function updateGoalStats(
   const iterationsRun = g.stats.iterationsRun + (delta.iterationsRun ?? delta.roundsRun ?? 0);
   g.stats = {
     tokensUsed: g.stats.tokensUsed + (delta.tokensUsed ?? 0),
+    inputTokensUsed: g.stats.inputTokensUsed + (delta.inputTokensUsed ?? 0),
+    outputTokensUsed: g.stats.outputTokensUsed + (delta.outputTokensUsed ?? 0),
     iterationsRun,
     assistantTurnsTotal: g.stats.assistantTurnsTotal + (delta.assistantTurnsTotal ?? 0),
     llmCallsTotal: g.stats.llmCallsTotal + (delta.llmCallsTotal ?? 0),
