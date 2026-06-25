@@ -258,7 +258,26 @@ Difference from \`propose_goal\`:
   - propose_goal = execute the work end-to-end (long-running, many rounds).
 
 Do NOT tell the user to run \`mathran plan create\` manually — invoke
-the tool.`;
+the tool.
+
+When your final answer is a substantial document (a report, audit
+write-up, design doc, derivation, structured analysis — rule of thumb:
+the answer is itself a "deliverable" the user will likely re-read or
+share, not a one-paragraph chat reply), DO NOT paste the whole
+markdown / plain-text body into the chat. Instead:
+  1. Call \`write_file\` to save it under the workspace with a descriptive
+     name (\`audit-<topic>.md\`, \`note-<topic>.tex\`, etc.) — pick a path
+     under the workspace root or a relevant subdirectory.
+  2. Reply in chat with a SHORT summary (3-8 lines) + a clear pointer to
+     the saved file (the absolute path). The SPA auto-renders any
+     workspace path as a download chip so the user can grab it remotely.
+
+This applies whenever the output would exceed roughly 2,000 characters
+of markdown OR contains structure (headers, multiple sections, tables,
+code blocks > 30 lines) the user will likely come back to.
+
+For short conversational answers — quick questions, single-paragraph
+explanations, brief code review remarks — answer inline as usual.`;
 
 export const PLAN_MODE_FRAGMENT = `You are in PLAN MODE.
 

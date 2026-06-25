@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { marked } from "marked";
+import { augmentHtmlWithFileChips } from "../lib/file-chips.ts";
 // v0.17 follow-up: KaTeX + LLM-math-delimiter preprocess registration
 // has moved to `lib/markdown.ts` which is imported once from `main.tsx`.
 // This component no longer needs to register it (was a duplicate /
@@ -538,7 +539,7 @@ export default function ChatPanel({
   });
   // Which message we're replying to (the next send carries it forward).
   const [replyTarget, setReplyTarget] = useState<
-    | { bubbleIdx: number; snippet: string }
+    | { bubbleIdx: number; snippet: string; fullText: string }
     | null
   >(null);
   // Open emoji picker: bubbleIdx of the message currently showing the
@@ -1974,10 +1975,12 @@ export default function ChatPanel({
     // When replying, we prepend a markdown blockquote so the LLM sees the
     // context inline. We *also* drop a replyTo annotation on the new user
     // bubble so the SPA renders an "↩ replying to… [jump]" badge that's
-    // separate from the prompt body.
+    // always actionable. 2026-06-25: use the FULL target text (not the
+    // 120-char nub) so the LLM has actual context. The SPA chip + badge
+    // still render `snippet` for UI compactness.
     const reply = replyTarget;
     const promptText = reply
-      ? `> ${reply.snippet.replace(/\n/g, "\n> ")}\n\n${rawText}`
+      ? `> ${reply.fullText.replace(/\n/g, "\n> ")}\n\n${rawText}`
       : rawText;
     setReplyTarget(null);
 
@@ -2747,13 +2750,25 @@ export default function ChatPanel({
 
   // Start a reply: set the target so the next composer send picks it up.
   // The actual quote prepend happens in `send`.
+  //
+  // 2026-06-25 — Codex/OpenClaw parity (subfish feedback):
+  // Previously we truncated `text.slice(0, 120) + "…"`, then the send()
+  // path used that 120-char nub as a `> blockquote` injected into the
+  // outgoing user message. The LLM saw maybe 4 lines of the parent
+  // message and had to guess at the rest. Replies became context-free.
+  //
+  // Fix: capture the FULL text on `replyTarget`. send() now passes the
+  // full text through to the LLM as a structured "reply context" block
+  // (no 120-char chop), while the SPA still renders a short snippet on
+  // the composer chip and the "↩ replying to…" badge so the user UI
+  // stays compact.
   function beginReply(bubbleIdx: number) {
     const bubble = bubbles[bubbleIdx];
     if (!bubble) return;
     const text =
       bubble.kind === "user" || bubble.kind === "assistant" ? bubble.text : "";
     const snippet = text.slice(0, 120) + (text.length > 120 ? "…" : "");
-    setReplyTarget({ bubbleIdx, snippet });
+    setReplyTarget({ bubbleIdx, snippet, fullText: text });
   }
 
   function clearReply() {
@@ -3392,7 +3407,9 @@ export default function ChatPanel({
                           <div
                             className="md"
                             dangerouslySetInnerHTML={{
-                              __html: marked.parse(row.bubble.text) as string,
+                              __html: augmentHtmlWithFileChips(
+                                marked.parse(row.bubble.text) as string,
+                              ),
                             }}
                           />
                         </>

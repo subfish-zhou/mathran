@@ -3330,6 +3330,57 @@ function buildApp(
     return c.json({ ok: true, version: await readPackageVersion(), workspace });
   });
 
+  // 2026-06-25 — file download endpoint for remote (ssh-tunneled) users.
+  // Sandbox: only paths under the workspace root or
+  // <workspace>/.mathran/uploads/ are served. Anything else returns 403.
+  // Used by the SPA's "save assistant text → file" follow-up + by the
+  // FilePathChip component that auto-renders workspace paths in
+  // assistant messages as clickable download links.
+  app.get("/api/file", async (c) => {
+    const rawPath = c.req.query("path");
+    if (!rawPath || typeof rawPath !== "string") {
+      return c.json({ error: "missing ?path" }, 400);
+    }
+    // Resolve to absolute, then verify it stays under workspace root.
+    const abs = path.isAbsolute(rawPath) ? rawPath : path.resolve(workspace, rawPath);
+    const wsAbs = path.resolve(workspace);
+    if (!abs.startsWith(wsAbs + path.sep) && abs !== wsAbs) {
+      return c.json({ error: "path escapes workspace" }, 403);
+    }
+    try {
+      const stat = await fs.stat(abs);
+      if (!stat.isFile()) {
+        return c.json({ error: "not a regular file" }, 400);
+      }
+    } catch {
+      return c.json({ error: "file not found" }, 404);
+    }
+    // Stream the file as a download. Browser-friendly: include both
+    // Content-Length and Content-Disposition so the chip click triggers
+    // "save as <filename>" rather than rendering in-place.
+    const filename = path.basename(abs);
+    const ext = path.extname(filename).toLowerCase();
+    // Force a download via octet-stream by default; .md / .txt / .json
+    // get their proper MIME so the browser can render them inline if
+    // the user opens the link in a new tab.
+    const downloadMime =
+      ext === ".md" ? "text/markdown; charset=utf-8"
+      : ext === ".txt" ? "text/plain; charset=utf-8"
+      : ext === ".json" ? "application/json"
+      : ext === ".pdf" ? "application/pdf"
+      : ext === ".tex" ? "application/x-tex"
+      : ext === ".csv" ? "text/csv; charset=utf-8"
+      : "application/octet-stream";
+    const buf = await fs.readFile(abs);
+    c.header("Content-Type", downloadMime);
+    c.header(
+      "Content-Disposition",
+      `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    );
+    c.header("Content-Length", String(buf.byteLength));
+    return c.body(buf);
+  });
+
   // 2026-06-25: real-list endpoint for the SPA model picker. Returns the
   // live /models cache when warm; otherwise triggers a token-refresh path
   // (which now also primes the models cache) and returns whatever the

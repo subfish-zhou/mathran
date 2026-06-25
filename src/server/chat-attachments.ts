@@ -47,6 +47,7 @@
  */
 
 import * as fs from "node:fs/promises";
+import type { Stats } from "node:fs";
 import * as path from "node:path";
 
 import type { MessageContent, ContentPart } from "../core/providers/llm.js";
@@ -175,17 +176,50 @@ export async function renderAttachment(
   const realPath = await resolveAttachmentPath(workspace, ref.path);
 
   if (isTextMime(ref.mimeType)) {
-    let buf: Buffer;
+    // 2026-06-25 — Codex/OpenClaw parity (subfish feedback):
+    // text attachments USED to be inlined into the user message
+    // verbatim. That meant a 20K-char .tex paste blew up the input
+    // turn and risked overflowing the model's context AT THE FIRST
+    // TURN. Worse, the model couldn't selectively re-read parts of
+    // the file the way it can with native filesystem files.
+    //
+    // New behaviour: emit a path-only reference. The file is already
+    // on disk under <workspace>/.mathran/uploads/ (from POST
+    // /api/uploads); the marker tells the model the absolute path
+    // and that it should pull bytes with `read_file` when actually
+    // needed. We also include a one-line size hint and a 200-char
+    // peek so the model can decide whether the file is even worth
+    // opening (e.g. "this is a 30-byte CSV, just inline it" vs
+    // "this is a 200KB .tex — open with read_file and pick sections").
+    let stat: Stats | null = null;
     try {
-      buf = await fs.readFile(realPath);
+      stat = await fs.stat(realPath);
     } catch {
-      throw new BadAttachmentError(`failed to read attachment: ${ref.filename}`);
+      // best-effort; fall through with no stat
     }
-    const truncated = buf.byteLength > MAX_TEXT_ATTACHMENT_BYTES;
-    const text = truncated
-      ? buf.subarray(0, MAX_TEXT_ATTACHMENT_BYTES).toString("utf8") + "\n… [truncated]"
-      : buf.toString("utf8");
-    return `[Attachment: ${ref.filename}]\n${text}`;
+    const sizeStr = stat ? `${stat.size} bytes` : "size unknown";
+
+    let peek = "";
+    try {
+      const head = await fs.readFile(realPath, { encoding: "utf8", flag: "r" });
+      peek = head.slice(0, 200).replace(/\n/g, " ");
+      if (head.length > 200) peek += "…";
+    } catch {
+      // best-effort
+    }
+
+    const lines = [
+      `[Attachment: ${ref.filename}]`,
+      `  path: ${realPath}`,
+      `  size: ${sizeStr}`,
+    ];
+    if (peek.length > 0) {
+      lines.push(`  peek: ${peek}`);
+    }
+    lines.push(
+      `  → Use \`read_file path=${realPath}\` to load contents (with offset / limit for large files).`,
+    );
+    return lines.join("\n");
   }
 
   if (isImageMime(ref.mimeType)) {
