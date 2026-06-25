@@ -209,6 +209,127 @@ describe("runGoalRound", () => {
     expect(round?.stats.budgetContinuationCount).toBe(0);
   });
 
+  it("Layer 2: mark_done BLOCKED by deterministic review with unchecked plan items", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+      // No token budget → Layer 1 never blocks; isolate Layer 2.
+    });
+    await writeGoalPlan(workspace, g.id, "- [x] step one\n- [ ] step two\n- [ ] step three\n");
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "claims done" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      markDoneReview: { mode: "deterministic" },
+    });
+    // Blocked: not completed, goal stays active, rejection counted.
+    expect(r.completed).toBe(false);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("active");
+    expect(round?.stats.markDoneReviewRejectionCount).toBe(1);
+    const step = round?.steps.find((s) => s.kind === "mark-done-review-rejected");
+    expect(step).toBeTruthy();
+  });
+
+  it("Layer 2: mark_done with 0 unchecked items passes review → falls through to completion", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    await writeGoalPlan(workspace, g.id, "- [x] step one\n- [x] step two\n");
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "all checked" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "wrap up" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      markDoneReview: { mode: "deterministic" },
+    });
+    expect(r.completed).toBe(true);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("complete");
+    expect(round?.stats.markDoneReviewRejectionCount).toBe(0);
+  });
+
+  it("Layer 2: mode 'off' (default) is identical to pre-Layer-2 even with unchecked items", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    await writeGoalPlan(workspace, g.id, "- [ ] still pending\n");
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "done anyway" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "wrap" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    // No markDoneReview option → default "off".
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    expect(r.completed).toBe(true);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("complete");
+    expect(round?.stats.markDoneReviewRejectionCount).toBe(0);
+  });
+
+  it("Layer 2: force-accepts mark_done once the rejection cap is reached", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+    });
+    await writeGoalPlan(workspace, g.id, "- [ ] still pending\n");
+    // Pre-seed the goal at the rejection cap so the next mark_done is forced.
+    const seeded = (await readGoal(workspace, g.id))!;
+    seeded.stats.markDoneReviewRejectionCount = 3;
+    await (await import("./store.js")).writeGoal(workspace, seeded);
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "capped" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "wrap" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({
+      workspace,
+      goalId: g.id,
+      userMessage: "go",
+      llm,
+      tools: [],
+      markDoneReview: { mode: "deterministic" },
+    });
+    expect(r.completed).toBe(true);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("complete");
+  });
+
   it("give_up tool flips status to failed", async () => {
     const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
     const llm = fakeLLM([

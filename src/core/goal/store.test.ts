@@ -176,6 +176,8 @@ describe("updateGoalStats", () => {
       budgetContinuationCount: 0,
       budgetLastDeltaTokens: 0,
       budgetLastCheckTokens: 0,
+      // Layer 2 — mark_done review rejection counter default.
+      markDoneReviewRejectionCount: 0,
     });
   });
 

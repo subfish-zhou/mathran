@@ -33,6 +33,8 @@ import type { ChatScope } from "../../core/chat/store.js";
 import type { ToolExecuteContext } from "../../core/chat/session.js";
 import { resolveScopeRoot } from "./scope-paths.js";
 import { loadConfig } from "../../core/config.js";
+import { loadLayeredSettings } from "../../core/config/layered-settings.js";
+import type { MarkDoneReviewMode } from "../../core/goal/mark-done-review.js";
 import { ModelRouter, LocalLeanProvider } from "../../providers/index.js";
 import {
   SubagentScheduler,
@@ -188,6 +190,18 @@ async function driveOneRound(
   const lean = new LocalLeanProvider();
   const tools = [createLeanCheckTool(lean)];
 
+  // Layer 2 (mark_done review) — resolve the opt-in setting from layered
+  // config. Default "off" keeps the goal flow identical to pre-Layer-2.
+  let markDoneReview: { mode?: MarkDoneReviewMode; reviewerModel?: string } | undefined;
+  try {
+    const { settings } = loadLayeredSettings({ workspace });
+    const cfg = (settings as { goal?: { markDoneReview?: { mode?: MarkDoneReviewMode; reviewerModel?: string } } }).goal
+      ?.markDoneReview;
+    if (cfg) markDoneReview = { mode: cfg.mode, reviewerModel: cfg.reviewerModel };
+  } catch {
+    // No layered settings (or malformed) → leave review off.
+  }
+
   // v0.4 §1.1 (post-smoke fix): narrow ctx.workspace to the goal's scope so
   // bash/read_file/write_file/edit_file resolve paths relative to the project
   // or effort dir — not the mathran workspace root. Without this, an agent
@@ -246,6 +260,8 @@ async function driveOneRound(
       // extra LLM round on an upfront checklist is a good trade for the
       // grounding it gives every subsequent round.
       bootstrapPlan: "auto",
+      // Layer 2 — mark_done content review (off unless opted in via config).
+      markDoneReview,
     });
     if (r.text.trim().length > 0) {
       console.log("");

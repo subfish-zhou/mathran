@@ -478,7 +478,50 @@ immediately if `ok: true`.
 
 ---
 
-## 10. Pointers into the code
+## 10. Layer 2 — mark_done content review hook
+
+When the model calls `mark_done`, the runner runs an opt-in **content
+review** gate *before* Layer 1's token-budget check (content first, token
+volume second). It is modelled on claude-code's `TaskCompleted` hook:
+instead of silently honouring the completion, mathran can reject it and
+nudge the model to keep working. Two independent modes, both **off by
+default**:
+
+| Mode            | Cost  | What it does |
+|-----------------|-------|--------------|
+| `deterministic` | free  | Scans the goal's `.mathran/goals/<id>.plan.md` for unchecked `- [ ]` items. Any remaining → reject with a listing. |
+| `llm`           | $     | A cheap reviewer model reads objective + plan + a work summary and returns `{accept, reason?, missing?}`. |
+| `both`          | $     | `deterministic` first (free); only if it passes does the `llm` pass run. |
+| `off` (default) | —     | No-op — behaviour identical to before Layer 2. |
+
+On rejection the runner injects the reviewer feedback into the
+conversation as a user message, increments
+`goal.stats.markDoneReviewRejectionCount`, records a
+`mark-done-review-rejected` audit step, and leaves the goal **active** so
+the daemon reschedules. After **3** rejections the next `mark_done` is
+**force-accepted** (warn-logged) to break any nudge loop.
+
+### Configuration (layered `settings.json`)
+
+```jsonc
+{
+  "goal": {
+    "markDoneReview": {
+      // "off" | "deterministic" | "llm" | "both"
+      "mode": "deterministic",        // recommended low-cost default
+      "reviewerModel": "gpt-4o-mini"  // only used by "llm" / "both"
+    }
+  }
+}
+```
+
+**Recommendation:** enable `"deterministic"` — it is free, catches the
+common "model declares victory with half the plan unchecked" failure, and
+never blocks a goal that has no plan file or no unchecked items.
+
+---
+
+## 11. Pointers into the code
 
 | Concern                                | File                                     |
 |----------------------------------------|------------------------------------------|
@@ -491,4 +534,5 @@ immediately if `ok: true`.
 | End-to-end endpoint manual smoke       | `scripts/manual-test-daemon-c3.sh`       |
 | Daemon unit tests                      | `src/core/goal/daemon.test.ts` (25 tests)|
 | Runner unit tests                      | `src/core/goal/runner.test.ts` (54 tests)|
+| Layer 2 mark_done review               | `src/core/goal/mark-done-review.ts` + `.test.ts` |
 | Original design doc (~1 250 lines)     | `_tasks/todo1-design.md`                 |
