@@ -157,6 +157,58 @@ describe("runGoalRound", () => {
     expect(round?.endedAt).toBeTruthy();
   });
 
+  it("Layer 1: mark_done is BLOCKED by token budget continuation when under 90%", async () => {
+    // Budget high enough that the tiny fake conversation's token usage is
+    // well under 90% → the mark_done is intercepted and the goal keeps
+    // running instead of completing.
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+      budgetTokensMax: 1_000_000,
+    });
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "done early" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+    ]);
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    // Blocked: not completed, goal still active for the daemon to reschedule.
+    expect(r.completed).toBe(false);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("active");
+    expect(round?.stats.budgetContinuationCount).toBe(1);
+    // Audit step + persisted snapshot of where we were.
+    const step = round?.steps.find((s) => s.kind === "budget-continuation");
+    expect(step).toBeTruthy();
+    expect(round?.stats.budgetLastCheckTokens).toBe(round?.stats.tokensUsed);
+  });
+
+  it("Layer 1: mark_done still completes a goal with NO token budget", async () => {
+    const g = await createGoal(workspace, {
+      objective: "x",
+      scope: { kind: "global" },
+      model: "fake",
+      // budgetTokensMax omitted → null → continuation never engages.
+    });
+    const llm = fakeLLM([
+      [
+        { type: "tool-call", id: "d1", name: "mark_done", argsDelta: JSON.stringify({ reason: "no budget done" }) },
+        { type: "done", finishReason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "wrap up" },
+        { type: "done", finishReason: "stop" },
+      ],
+    ]);
+    const r = await runGoalRound({ workspace, goalId: g.id, userMessage: "go", llm, tools: [] });
+    expect(r.completed).toBe(true);
+    const round = await readGoal(workspace, g.id);
+    expect(round?.status).toBe("complete");
+    expect(round?.stats.budgetContinuationCount).toBe(0);
+  });
+
   it("give_up tool flips status to failed", async () => {
     const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "fake" });
     const llm = fakeLLM([

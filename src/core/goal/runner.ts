@@ -71,6 +71,7 @@ import {
   type Goal,
 } from "./store.js";
 import { buildGoalTools, createGoalToolHandler } from "./tools.js";
+import { checkGoalBudget } from "./budget-continuation.js";
 import {
   resolutionFromCompletion,
   triggerSelfGrade,
@@ -699,6 +700,96 @@ export async function runGoalRound(opts: RunRoundOptions): Promise<RunRoundResul
  * above. The v0.17 wrapper above (`runGoalRound`) preserves the old
  * contract for non-daemon callers.
  */
+/**
+ * Hard safety cap on continuations, independent of the diminishing-returns
+ * guard inside {@link checkGoalBudget}. Defence-in-depth: even if the delta
+ * math somehow keeps voting "continue" forever, we never nudge a single goal
+ * more than this many times. (See DESIGN-REFERENCE.md §7.8 risk table.)
+ */
+const BUDGET_CONTINUATION_HARD_CAP = 10;
+
+/**
+ * Layer 1 — token budget continuation. Called the moment the model calls
+ * `mark_done`, BEFORE the goal is truly ended. Decides (deterministically,
+ * via {@link checkGoalBudget}) whether the goal has spent enough of its token
+ * budget to honour the mark_done, or whether it should be nudged to keep
+ * working.
+ *
+ * When the decision is `continue` it mutates + persists the goal's
+ * `budget*` tracker fields and appends a `budget-continuation` audit step,
+ * then returns `{ continued: true, ... }`. The caller is responsible for
+ * injecting the nudge into conversation history + emitting the SSE event and
+ * NOT ending the goal — the daemon sees the goal still active and reschedules
+ * the next iteration.
+ *
+ * Returns `{ continued: false }` for sub-goals, goals without a token budget,
+ * goals already past 90% of budget, the diminishing-returns case, and the
+ * hard safety cap — i.e. the normal end-of-goal path runs.
+ *
+ * Ported from claude-code's `src/query/tokenBudget.ts`, adapted to mathran's
+ * per-goal lifetime semantics (tracker persisted in goal.stats rather than an
+ * in-memory turn loop). See DESIGN-REFERENCE.md §7.
+ */
+async function maybeContinueByBudget(
+  workspace: string,
+  goal: Goal,
+): Promise<{
+  continued: boolean;
+  pct?: number;
+  continuationCount?: number;
+  tokensUsed?: number;
+  budget?: number;
+  nudgeMessage?: string;
+}> {
+  // Defence-in-depth hard cap, beyond the diminishing-returns guard.
+  if ((goal.stats.budgetContinuationCount ?? 0) >= BUDGET_CONTINUATION_HARD_CAP) {
+    return { continued: false };
+  }
+
+  const isSubGoal = !!goal.parentGoalId;
+  const decision = checkGoalBudget(
+    {
+      continuationCount: goal.stats.budgetContinuationCount ?? 0,
+      lastDeltaTokens: goal.stats.budgetLastDeltaTokens ?? 0,
+      lastCheckTokens: goal.stats.budgetLastCheckTokens ?? 0,
+    },
+    goal.budget.tokensMax,
+    goal.stats.tokensUsed,
+    isSubGoal,
+  );
+
+  if (decision.action !== "continue") {
+    return { continued: false };
+  }
+
+  // Persist the tracker. Order matters: compute the delta against the
+  // PREVIOUS check snapshot before overwriting it.
+  goal.stats.budgetContinuationCount = decision.continuationCount;
+  goal.stats.budgetLastDeltaTokens =
+    goal.stats.tokensUsed - (goal.stats.budgetLastCheckTokens ?? 0);
+  goal.stats.budgetLastCheckTokens = goal.stats.tokensUsed;
+  goal.steps.push({
+    at: new Date().toISOString(),
+    kind: "budget-continuation",
+    payload: {
+      pct: decision.pct,
+      continuationCount: decision.continuationCount,
+      tokensUsed: goal.stats.tokensUsed,
+      budget: goal.budget.tokensMax,
+    },
+  });
+  await writeGoal(workspace, goal);
+
+  return {
+    continued: true,
+    pct: decision.pct,
+    continuationCount: decision.continuationCount,
+    tokensUsed: goal.stats.tokensUsed,
+    budget: decision.budget,
+    nudgeMessage: decision.nudgeMessage,
+  };
+}
+
 export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundResult> {
   const { workspace, goalId, userMessage, llm, tools, toolContext, systemPromptBase, signal } = opts;
   // ── C2 (daemon-mode): synthesise the *effective* user message ────
@@ -1223,6 +1314,41 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
   // during session.send above — see ./tools.ts for why we can't throw).
   if (handler.completion?.outcome === "done") {
     const reason = handler.completion.reason;
+    // Layer 1 — token budget continuation. Re-read the goal first so the
+    // budget check sees the FRESH `stats.tokensUsed` just persisted by
+    // `updateGoalStats` above (the in-memory `goal` is stale). If the goal
+    // still has > 10% of its token budget unspent (and isn't a sub-goal, and
+    // hasn't hit diminishing returns), block the mark_done: inject a nudge
+    // user message into history, emit a `budget-continuation` event, and
+    // return WITHOUT ending the goal so the daemon reschedules. See
+    // DESIGN-REFERENCE.md §7.
+    goal = (await readGoal(workspace, goalId)) ?? goal;
+    const cont = await maybeContinueByBudget(workspace, goal);
+    if (cont.continued) {
+      const nudged = [
+        ...session.history(),
+        { role: "user" as const, content: cont.nudgeMessage! },
+      ];
+      await flushConversationHistory(workspace, goal.scope, conversationId, nudged, {
+        title: `goal ${goal.id}`,
+      });
+      emit({
+        type: "budget-continuation",
+        goalId,
+        pct: cont.pct!,
+        continuationCount: cont.continuationCount!,
+        tokensUsed: cont.tokensUsed!,
+        budget: cont.budget!,
+      });
+      return {
+        goal,
+        text: textBuf,
+        completed: false,
+        exhausted: false,
+        failed: false,
+        aborted: false,
+      };
+    }
     const ended = await endGoal(workspace, goalId, "complete", reason);
     const finalGoal = await finalizeWithSummary({
       workspace,

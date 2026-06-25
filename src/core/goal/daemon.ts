@@ -181,6 +181,12 @@ export interface DaemonEvent {
      *  to daemon.log AND exposed via SSE so the SPA shows a real-time
      *  🧹 badge. */
     | "compaction"
+    /** Layer 1 — token budget continuation. Emitted by the goal runner
+     *  when a `mark_done` is blocked because the goal hasn't yet spent
+     *  90% of `budget.tokensMax`. Persisted to daemon.log AND exposed via
+     *  SSE so the SPA can show a real-time 💰 badge. Carries
+     *  {goalId, ts, pct, continuationCount, tokensUsed, budget}. */
+    | "budget-continuation"
     | "done"
     | "error";
   [k: string]: unknown;
@@ -633,6 +639,21 @@ export class GoalDaemon {
             ...((ev as { summaryTokens?: unknown }).summaryTokens !== undefined
               ? { summaryTokens: (ev as { summaryTokens?: unknown }).summaryTokens }
               : {}),
+          });
+        } else if (type === "budget-continuation") {
+          // Layer 1 — token budget continuation. Durably record each
+          // nudge so a long-tail observer can audit how often mark_done
+          // was blocked and how close the goal was to its token target.
+          // Mirrors the SSE event shape.
+          this.appendIterationLog({
+            ts: Date.now(),
+            goalId,
+            event: "budget-continuation",
+            pct: (ev as { pct?: unknown }).pct,
+            continuationCount: (ev as { continuationCount?: unknown })
+              .continuationCount,
+            tokensUsed: (ev as { tokensUsed?: unknown }).tokensUsed,
+            budget: (ev as { budget?: unknown }).budget,
           });
         } else if (type === "error") {
           this.appendIterationLog({

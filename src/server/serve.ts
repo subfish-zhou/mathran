@@ -4558,6 +4558,10 @@ function buildApp(
             // the cumulative compactionRuns counter shown in
             // AgentStatusPanel.
             type === "compaction" ||
+            // Layer 1 — token budget continuation. SPA flips a 💰 badge +
+            // shows how often mark_done was blocked en route to the goal's
+            // token target.
+            type === "budget-continuation" ||
             type === "done"
           ) {
             queue.push({ event: type, data: JSON.stringify(ev) });
