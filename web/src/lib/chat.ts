@@ -47,6 +47,15 @@ export interface TodoList {
 export type ChatEvent =
   | { type: "session"; sessionId: string; conversationId: string; resumedFromAsk?: boolean }
   | { type: "text"; delta: string }
+  | {
+      /** UX gap B — reasoning / chain-of-thought delta streamed on a side
+       *  channel by reasoning models (Anthropic `thinking`, OpenAI / Copilot
+       *  `reasoning_content`). The SPA accumulates these onto the in-flight
+       *  assistant bubble and renders a collapsed "💭 N reasoning chars"
+       *  panel. Disposable — dropped first on compaction. */
+      type: "reasoning";
+      delta: string;
+    }
   | { type: "tool-call"; id: string; name: string; args: string }
   | { type: "tool-result"; id: string; name: string; ok: boolean; content: string }
   | {

@@ -100,6 +100,16 @@ export interface LLMMessage {
    * UI hint for history hydration.
    */
   attachments?: Array<{ path: string; filename: string; mimeType: string }>;
+  /**
+   * Reasoning / chain-of-thought text captured for this assistant turn (UX
+   * gap B). Populated only on `role === "assistant"` messages when the
+   * provider streamed `thinking` / `reasoning_content` deltas. Purely a UI
+   * + persistence artifact: it is NEVER replayed back to the provider on the
+   * next request (adapters build the wire payload from `content` / `toolCalls`
+   * only) and is the FIRST field dropped during compaction. Persisted to the
+   * conversation jsonl so historical reasoning survives a reload.
+   */
+  reasoning?: string;
 }
 
 export interface LLMRequest {
@@ -134,6 +144,20 @@ export interface LLMRequest {
 
 export type LLMStreamChunk =
   | { type: "text"; delta: string }
+  | {
+      /**
+       * Reasoning / chain-of-thought delta (UX gap B). Modern reasoning
+       * models stream their "thinking" tokens on a side channel separate from
+       * the user-visible answer: Anthropic emits `thinking_delta` content
+       * blocks; OpenAI / Copilot stream a `reasoning_content` (or
+       * `reasoning`) delta. Adapters map both onto this chunk so the host can
+       * surface a collapsed "💭 reasoning" panel without inflating the actual
+       * answer text. Disposable — never echoed back to the provider and the
+       * first thing dropped during compaction.
+       */
+      type: "reasoning";
+      delta: string;
+    }
   | { type: "tool-call"; id: string; name: string; argsDelta: string }
   | { type: "done"; finishReason: "stop" | "length" | "tool_calls" | "content_filter" | "error"; usage?: { promptTokens: number; completionTokens: number } };
 

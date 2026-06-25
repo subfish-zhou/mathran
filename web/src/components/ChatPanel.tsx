@@ -75,6 +75,7 @@ import {
 import UsageSparkline from "./UsageSparkline.tsx";
 import ContextMeter from "./ContextMeter.tsx";
 import ToolCallGroup from "./ToolCallGroup.tsx";
+import { ReasoningBlock } from "./ReasoningBlock.tsx";
 import { ThreadDrawer } from "./ThreadDrawer.tsx";
 import { SubagentTreePanel } from "./SubagentTreePanel.tsx";
 import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel.tsx";
@@ -1322,6 +1323,20 @@ export default function ChatPanel({
             } else {
               next.push({ kind: "assistant", text: ev.delta });
             }
+          } else if (ev.type === "reasoning") {
+            // UX gap B — fold the reasoning delta onto the active assistant
+            // bubble. Reasoning typically arrives BEFORE the first text token,
+            // so an empty-text assistant bubble (the "Thinking…" slate) is the
+            // natural target; create one if no assistant bubble is open yet.
+            const last = next[next.length - 1];
+            if (last && last.kind === "assistant") {
+              next[next.length - 1] = {
+                ...last,
+                reasoning: (last.reasoning ?? "") + ev.delta,
+              };
+            } else {
+              next.push({ kind: "assistant", text: "", reasoning: ev.delta });
+            }
           } else if (ev.type === "tool-call") {
             next.push({ kind: "tool", id: ev.id, name: ev.name, args: ev.args });
           } else if (ev.type === "tool-result") {
@@ -1426,7 +1441,13 @@ export default function ChatPanel({
         // get rid of.
         setBubbles((prev) => {
           const last = prev[prev.length - 1];
-          if (last && last.kind === "assistant" && last.text === "") return prev.slice(0, -1);
+          if (
+            last &&
+            last.kind === "assistant" &&
+            last.text === "" &&
+            !last.reasoning
+          )
+            return prev.slice(0, -1);
           return prev;
         });
         void refreshUsage();
@@ -3172,7 +3193,9 @@ export default function ChatPanel({
                         </div>
                       </div>
                     </div>
-                  ) : row.bubble.kind === "assistant" && row.bubble.text === "" ? (
+                  ) : row.bubble.kind === "assistant" &&
+                    row.bubble.text === "" &&
+                    !row.bubble.reasoning ? (
                     /* ─── Streaming-thinking pill (v0.16 §10) ──────────────────
                        Before any tokens land we used to render a markdown bubble
                        containing a single horizontal-ellipsis fallback, which
@@ -3202,6 +3225,32 @@ export default function ChatPanel({
                         <span className="inline-block h-1 w-1 animate-bounce rounded-full bg-violet-400 [animation-delay:-0.15s]" />
                         <span className="inline-block h-1 w-1 animate-bounce rounded-full bg-violet-400" />
                       </span>
+                    </div>
+                  ) : row.bubble.kind === "assistant" &&
+                    row.bubble.text === "" &&
+                    row.bubble.reasoning ? (
+                    /* ─── Streaming reasoning (UX gap B) ──────────────────────
+                       Reasoning tokens arrive before the first answer token, so
+                       show the collapsed chain-of-thought panel alongside the
+                       "Thinking…" pill while we wait for the answer to start. */
+                    <div className="flex flex-col gap-1">
+                      <ReasoningBlock reasoning={row.bubble.reasoning} streaming />
+                      <div
+                        role="status"
+                        aria-live="polite"
+                        className="inline-flex w-fit items-center gap-2 rounded-full bg-violet-50/70 px-3 py-1 text-xs text-violet-700"
+                      >
+                        <svg
+                          className="h-3 w-3 animate-spin text-violet-500"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          aria-hidden="true"
+                        >
+                          <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25" />
+                          <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                        </svg>
+                        <span className="font-medium">Thinking</span>
+                      </div>
                     </div>
                   ) : row.bubble.kind === "user" &&
                     row.bubble.text === "" &&
@@ -3242,12 +3291,17 @@ export default function ChatPanel({
                         </span>
                       )}
                       {row.bubble.kind === "assistant" ? (
-                        <div
-                          className="md"
-                          dangerouslySetInnerHTML={{
-                            __html: marked.parse(row.bubble.text) as string,
-                          }}
-                        />
+                        <>
+                          {row.bubble.reasoning ? (
+                            <ReasoningBlock reasoning={row.bubble.reasoning} />
+                          ) : null}
+                          <div
+                            className="md"
+                            dangerouslySetInnerHTML={{
+                              __html: marked.parse(row.bubble.text) as string,
+                            }}
+                          />
+                        </>
                       ) : (
                         <span className="whitespace-pre-wrap">{row.bubble.text}</span>
                       )}

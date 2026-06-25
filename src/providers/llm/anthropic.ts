@@ -252,6 +252,10 @@ async function* streamAnthropic(
           const d = event.delta;
           if (d?.type === "text_delta" && typeof d.text === "string") {
             yield { type: "text", delta: d.text };
+          } else if (d?.type === "thinking_delta" && typeof d.thinking === "string") {
+            // Extended-thinking chain-of-thought (UX gap B). Surfaced on the
+            // reasoning side channel; never folded into the answer text.
+            if (d.thinking.length > 0) yield { type: "reasoning", delta: d.thinking };
           } else if (d?.type === "input_json_delta") {
             const info = blocks[event.index] ?? { id: "", name: "" };
             yield {

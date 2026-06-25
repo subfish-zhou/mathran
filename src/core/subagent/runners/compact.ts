@@ -226,10 +226,20 @@ export async function computeCompacted(
     content: COMPACT_SUMMARY_PREFIX + summaryText,
   };
 
+  // UX gap B — reasoning is the FIRST thing dropped on compaction: it is
+  // helpful while live but disposable once a turn is in the historical tail.
+  // Strip the `reasoning` field from every kept message so the compacted
+  // context never spends tokens replaying old chains-of-thought.
+  const stripReasoning = (m: LLMMessage): LLMMessage => {
+    if (m.reasoning === undefined) return { ...m };
+    const { reasoning: _drop, ...rest } = m;
+    return { ...rest };
+  };
+
   const newMessages: LLMMessage[] = [
-    ...systemBlock.map((m) => ({ ...m })),
+    ...systemBlock.map(stripReasoning),
     summaryMessage,
-    ...tail.map((m) => ({ ...m })),
+    ...tail.map(stripReasoning),
   ];
   const newTokenCount = counter.countMessages(newMessages);
 
