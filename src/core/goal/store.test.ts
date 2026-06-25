@@ -159,6 +159,8 @@ describe("updateGoalStats", () => {
     const round = await readGoal(workspace, g.id);
     expect(round?.stats).toEqual({
       tokensUsed: 150,
+      inputTokensUsed: 0,
+      outputTokensUsed: 0,
       iterationsRun: 2,
       assistantTurnsTotal: 0,
       llmCallsTotal: 0,
@@ -175,6 +177,16 @@ describe("updateGoalStats", () => {
       budgetLastDeltaTokens: 0,
       budgetLastCheckTokens: 0,
     });
+  });
+
+  it("accumulates Phase ζ input/output token split", async () => {
+    const g = await createGoal(workspace, { objective: "x", scope: { kind: "global" }, model: "gpt-4o" });
+    await updateGoalStats(workspace, g.id, { inputTokensUsed: 300, outputTokensUsed: 700, tokensUsed: 1000 });
+    await updateGoalStats(workspace, g.id, { inputTokensUsed: 150, outputTokensUsed: 350, tokensUsed: 500 });
+    const round = await readGoal(workspace, g.id);
+    expect(round?.stats.inputTokensUsed).toBe(450);
+    expect(round?.stats.outputTokensUsed).toBe(1050);
+    expect(round?.stats.tokensUsed).toBe(1500);
   });
 });
 

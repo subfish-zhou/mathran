@@ -142,6 +142,7 @@ import {
   type Goal,
 } from "../core/goal/store.js";
 import { runGoalRound, runOneIteration, type RunRoundResult } from "../core/goal/runner.js";
+import { computeCostUsd } from "../providers/llm/model-pricing.js";
 import {
   GoalDaemon,
   GoalTurnRunner,
@@ -214,6 +215,40 @@ const SYSTEM_PROMPT = buildBaseSystemPrompt();
 // the NodeJS.Timeout lets us clear it cleanly; the resolver itself is
 // closure-bound to (scope, conversationId, callId, default).
 const askTimeoutRegistry = new Map<string, NodeJS.Timeout>();
+
+/**
+ * Phase ζ (cost meter) — dollar cost of a goal's lifetime LLM usage.
+ *
+ * Prefers the exact provider-reported input/output split
+ * (`stats.inputTokensUsed` / `stats.outputTokensUsed`, Phase ζ Option A).
+ * When that split is unavailable but a combined `tokensUsed` exists — i.e.
+ * pre-Phase-ζ goals on disk, or iterations where the provider reported no
+ * usage and we fell back to `countTokens` — we APPROXIMATE the split with a
+ * 30% input / 70% output heuristic (Option B). The ratio varies (50/50 to
+ * 90/10 depending on tool-call density); the approximated figure is a rough
+ * indicator only. Returns `null` for unpriced/unknown models so the UI shows
+ * "—" rather than a fake $0.00. DESIGN-REFERENCE.md §5.E.
+ */
+function computeGoalCostUsd(g: Goal): number | null {
+  const inSplit = g.stats.inputTokensUsed ?? 0;
+  const outSplit = g.stats.outputTokensUsed ?? 0;
+  if (inSplit > 0 || outSplit > 0) {
+    return computeCostUsd(g.model, inSplit, outSplit);
+  }
+  const total = g.stats.tokensUsed ?? 0;
+  if (total > 0) {
+    // Option B fallback: approximate 30% input / 70% output.
+    return computeCostUsd(g.model, total * 0.3, total * 0.7);
+  }
+  return computeCostUsd(g.model, 0, 0);
+}
+
+/** Escape a Prometheus label value per the text exposition spec
+ *  (backslash, double-quote, newline). Phase ζ — used for the `model`
+ *  label on mathran_cost_usd_total. */
+function promLabel(v: string): string {
+  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+}
 
 function cancelAskTimeout(callId: string): void {
   const t = askTimeoutRegistry.get(callId);
@@ -4012,6 +4047,26 @@ function buildApp(
     lines.push("# HELP mathran_compaction_runs_total Sum of stats.compactionRuns across all goals.");
     lines.push("# TYPE mathran_compaction_runs_total counter");
     lines.push(`mathran_compaction_runs_total ${totalCompactionRuns}`);
+    // Phase ζ (cost meter) — per-model dollar cost summed across all goals.
+    // Keyed by model slug (LOW cardinality: a workspace uses a handful of
+    // models). We SKIP any goal whose model has no verifiable public price
+    // (computeGoalCostUsd → null) rather than emit a fake $0.00 under
+    // model="unknown". When no priced model is present the series is omitted
+    // entirely. DESIGN-REFERENCE.md §5.E.
+    const costByModel: Record<string, number> = {};
+    for (const g of goals) {
+      const cost = computeGoalCostUsd(g);
+      if (cost === null) continue;
+      costByModel[g.model] = (costByModel[g.model] ?? 0) + cost;
+    }
+    const costModels = Object.keys(costByModel).sort();
+    if (costModels.length > 0) {
+      lines.push("# HELP mathran_cost_usd_total Estimated USD cost summed across all goals, by model.");
+      lines.push("# TYPE mathran_cost_usd_total counter");
+      for (const m of costModels) {
+        lines.push(`mathran_cost_usd_total{model="${promLabel(m)}"} ${costByModel[m]}`);
+      }
+    }
     return new Response(lines.join("\n") + "\n", {
       status: 200,
       headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" },
@@ -4978,6 +5033,13 @@ function buildApp(
       roundsMax: g.budget.roundsMax,
       tokensUsed: g.stats.tokensUsed,
       tokensMax: g.budget.tokensMax,
+      // Phase ζ (cost meter) — denormalised $ cost so the SPA renders the
+      // badge without re-deriving pricing. null => model has no public
+      // price (UI shows "—"). DESIGN-REFERENCE.md §5.E.
+      costUsd: computeGoalCostUsd(g),
+      inputTokensUsed: g.stats.inputTokensUsed ?? 0,
+      outputTokensUsed: g.stats.outputTokensUsed ?? 0,
+      model: g.model,
       toolCount: g.stats.toolCallCount,
       resumeCount,
       heartbeatAt: g.heartbeatAt ?? null,
