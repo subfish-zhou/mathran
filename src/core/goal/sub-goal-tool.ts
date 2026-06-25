@@ -53,6 +53,7 @@ import type { LLMProvider } from "../providers/llm.js";
 
 import { addSubGoalId, createGoal, readGoal } from "./store.js";
 import type { Goal } from "./store.js";
+import { readGoalTemplate, expandTemplate } from "./templates.js";
 
 /** Inline byte cap on the formatted sub-goal summary returned to the parent. */
 export const SUB_GOAL_RESULT_CAP = 4000;
@@ -142,36 +143,100 @@ export function buildSpawnSubGoalTool(ctx: SpawnSubGoalContext): ToolSpec {
     description:
       "Run a focused sub-goal to completion synchronously and return its summary. " +
       "Use this to decompose the current objective into a smaller, self-contained piece. " +
+      "Optionally pass `template` (e.g. \"awaiter\") to instantiate a built-in or user " +
+      "goal-template as the sub-goal's objective, expanded with `vars`. " +
       "The sub-goal cannot spawn its own sub-goal (depth limit = 1).",
     parameters: {
       type: "object",
       properties: {
         objective: {
           type: "string",
-          description: "Concrete sub-objective the sub-goal must accomplish.",
+          description:
+            "Concrete sub-objective the sub-goal must accomplish. Required unless `template` is given.",
         },
         scope: {
           type: "string",
           description:
             "Brief scope/constraint hint for the sub-goal (what it may or may not touch). Optional.",
         },
+        template: {
+          type: "string",
+          description:
+            "Name of a goal template (built-in or user) whose expanded body becomes the sub-goal's " +
+            "objective. The template may also constrain the sub-goal's tools and budget.",
+        },
+        vars: {
+          type: "object",
+          description:
+            "Variable values used to expand the chosen `template` (e.g. {\"target\": \"build-job\"}). " +
+            "Ignored when `template` is omitted.",
+        },
       },
-      required: ["objective"],
+      required: [],
     },
     async execute(args: Record<string, unknown>): Promise<{ ok: boolean; content: string }> {
+      const hint = typeof args.scope === "string" ? args.scope.trim() : "";
+
+      // 0) If a template is requested, resolve + expand it. The expanded body
+      // becomes the sub-objective, and the template may constrain the
+      // sub-goal's tool list / token budget (Layer 3 awaiter role).
+      const templateName = typeof args.template === "string" ? args.template.trim() : "";
+      let templateTools: ToolSpec[] | null = null;
+      let templateBudgetTokens: number | null | undefined;
+      let templateBody: string | null = null;
+      if (templateName.length > 0) {
+        let tpl;
+        try {
+          tpl = await readGoalTemplate(ctx.workspace, templateName);
+        } catch (err: any) {
+          return {
+            ok: false,
+            content: `spawn_sub_goal error: failed to load template "${templateName}" (${String(err?.message ?? err)})`,
+          };
+        }
+        if (!tpl) {
+          return {
+            ok: false,
+            content: `spawn_sub_goal error: template "${templateName}" not found (built-in or user).`,
+          };
+        }
+        const vars: Record<string, string> = {};
+        if (args.vars && typeof args.vars === "object") {
+          for (const [k, v] of Object.entries(args.vars as Record<string, unknown>)) {
+            vars[k] = typeof v === "string" ? v : String(v);
+          }
+        }
+        try {
+          templateBody = expandTemplate(tpl, vars);
+        } catch (err: any) {
+          return {
+            ok: false,
+            content: `spawn_sub_goal error: ${String(err?.message ?? err)}`,
+          };
+        }
+        if (tpl.allowedTools && tpl.allowedTools.length > 0) {
+          const allow = new Set(tpl.allowedTools);
+          templateTools = ctx.tools.filter((t) => allow.has(t.name));
+        }
+        if (typeof tpl.budgetTokens === "number") {
+          templateBudgetTokens = tpl.budgetTokens;
+        }
+      }
+
       // 1) Validate the assistant's request. We refuse empty objectives —
       // there is nothing the sub-goal could possibly do, and creating a
-      // record on disk just to abort it pollutes the goal directory.
-      const objective = typeof args.objective === "string" ? args.objective.trim() : "";
+      // record on disk just to abort it pollutes the goal directory. A
+      // template's expanded body counts as the objective.
+      const rawObjective = typeof args.objective === "string" ? args.objective.trim() : "";
+      const objective = templateBody !== null ? templateBody.trim() : rawObjective;
       if (objective.length === 0) {
         return {
           ok: false,
           content:
-            'spawn_sub_goal error: "objective" must be a non-empty string. ' +
+            'spawn_sub_goal error: "objective" must be a non-empty string (or pass a non-empty "template"). ' +
             "Provide a concrete sub-objective.",
         };
       }
-      const hint = typeof args.scope === "string" ? args.scope.trim() : "";
 
       // Pre-flight abort check: if the parent is already cancelling, do not
       // create a sub-goal record we'd immediately have to tear down.
@@ -204,7 +269,8 @@ export function buildSpawnSubGoalTool(ctx: SpawnSubGoalContext): ToolSpec {
           // shares the same upstream LLM and accounting will roll up via
           // the audit log. The round cap protects against runaway spend.
           budgetRoundsMax: maxRounds,
-          budgetTokensMax: ctx.parent.budget.tokensMax,
+          budgetTokensMax:
+            templateBudgetTokens !== undefined ? templateBudgetTokens : ctx.parent.budget.tokensMax,
           // v0.16 §3: stamp the parent link so the SPA can navigate up
           // from a sub-goal back to the conversation that spawned it.
           parentGoalId: ctx.parent.id,
@@ -250,7 +316,7 @@ export function buildSpawnSubGoalTool(ctx: SpawnSubGoalContext): ToolSpec {
             goalId: subGoal.id,
             userMessage,
             llm: ctx.llm,
-            tools: ctx.tools,
+            tools: templateTools ?? ctx.tools,
             toolContext: ctx.toolContext,
             systemPromptBase: ctx.systemPromptBase,
             signal: ctx.signal,

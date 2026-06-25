@@ -26,12 +26,13 @@ export async function runGoalTemplateList(opts: { workspace: string }): Promise<
   // eslint-disable-next-line no-console
   console.log("Goal templates:");
   for (const t of templates) {
+    const src = t.source === "builtin" ? " [builtin]" : " [user]";
     const desc = t.description ? ` — ${t.description}` : "";
     const vars = t.variables.length > 0
       ? `  [vars: ${t.variables.map((v) => `${v.name}${v.required ? "*" : ""}`).join(", ")}]`
       : "";
     // eslint-disable-next-line no-console
-    console.log(`  ${t.name}${desc}${vars}`);
+    console.log(`  ${t.name}${src}${desc}${vars}`);
   }
   return 0;
 }
@@ -44,7 +45,7 @@ export async function runGoalTemplateShow(opts: { workspace: string; name: strin
     return 2;
   }
   // eslint-disable-next-line no-console
-  console.log(`# ${t.name}\n`);
+  console.log(`# ${t.name}${t.source ? ` [${t.source}]` : ""}\n`);
   if (t.description) console.log(`Description: ${t.description}\n`);
   if (t.variables.length > 0) {
     // eslint-disable-next-line no-console

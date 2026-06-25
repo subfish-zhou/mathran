@@ -61,20 +61,24 @@ describe("listGoalTemplates / readGoalTemplate", () => {
   let ws: string;
   beforeEach(async () => { ws = await mkWs(); });
 
-  it("returns empty list when directory is missing", async () => {
+  it("returns only built-ins when directory is missing (no user templates)", async () => {
     const ws2 = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-tpl-empty-"));
-    expect(await listGoalTemplates(ws2)).toEqual([]);
+    const userOnly = (await listGoalTemplates(ws2)).filter((t) => t.source === "user");
+    expect(userOnly).toEqual([]);
   });
 
-  it("returns empty list when directory exists but has no .md files", async () => {
-    expect(await listGoalTemplates(ws)).toEqual([]);
+  it("returns only built-ins when directory exists but has no .md files", async () => {
+    const userOnly = (await listGoalTemplates(ws)).filter((t) => t.source === "user");
+    expect(userOnly).toEqual([]);
   });
 
-  it("lists templates sorted by name", async () => {
+  it("lists user templates sorted by name", async () => {
     await writeTemplate(ws, "zeta", "z body");
     await writeTemplate(ws, "alpha", "a body");
     await writeTemplate(ws, "beta", "b body");
-    const names = (await listGoalTemplates(ws)).map((t) => t.name);
+    const names = (await listGoalTemplates(ws))
+      .filter((t) => t.source === "user")
+      .map((t) => t.name);
     expect(names).toEqual(["alpha", "beta", "zeta"]);
   });
 
