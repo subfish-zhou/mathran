@@ -51,6 +51,7 @@ import { promisify } from "node:util";
 
 import type { LLMStreamChunk, MessageContent, ContentPart } from "../../core/providers/llm.js";
 import { contentToString } from "../../core/providers/llm.js";
+import { maxOutputTokensForModel } from "./copilot-models-cache.js";
 
 const execFile = promisify(_execFile);
 
@@ -805,7 +806,10 @@ function mapClaudeStopReason(reason: unknown, hasToolCalls: boolean): FinishReas
 
 export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatResponse> {
   const { token, baseUrl } = await resolveCopilotToken();
-  const maxTokens = req.maxTokens ?? 4096;
+  // Default to the model's actual max output (gpt-5.5 → 128K, opus-4.7/4.8 → 64K,
+  // gpt-4o → 16K, etc.) instead of a 4096 cap that was clipping long replies.
+  // Caller can still override via `req.maxTokens`. Surfaced 2026-06-25.
+  const maxTokens = req.maxTokens ?? maxOutputTokensForModel(req.model);
   const hasTools = !!req.tools && req.tools.length > 0;
 
   if (isGpt(req.model)) {

@@ -18,6 +18,7 @@ import type {
 import { contentToString } from "../../core/providers/llm.js";
 import { buildAnthropicEffortPatch, isReasoningEffortLevel } from "../../core/reasoning-effort/index.js";
 import { createAnthropicTokenCounter, type TokenCounter } from "../../core/chat/token-counter.js";
+import { maxOutputTokensForModel } from "./copilot-models-cache.js";
 
 type FinishReason = Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
 
@@ -168,9 +169,15 @@ export class AnthropicAdapter implements LLMProvider {
     const client = this.client;
     const { system, messages } = toAnthropicMessages(req.messages);
 
+    const modelSlug = req.model || this.defaultModel || "";
     const params: any = {
-      model: req.model || this.defaultModel || "",
-      max_tokens: req.maxTokens ?? DEFAULT_MAX_TOKENS,
+      model: modelSlug,
+      // Default to the model's actual max output (e.g. 64K for opus-4.7/4.8,
+      // 32K for opus-4.5 / sonnet-4.5) instead of the legacy 4096 cap that
+      // was clipping every long response. Caller can still override via
+      // `req.maxTokens`. Surfaced 2026-06-25 by subfish: a long planning
+      // reply was cut off mid-sentence at the 4096 boundary.
+      max_tokens: req.maxTokens ?? maxOutputTokensForModel(modelSlug) ?? DEFAULT_MAX_TOKENS,
       messages,
       stream: true,
     };

@@ -225,7 +225,11 @@ export function ToolCallDisplay({
       ? "border-amber-400 bg-amber-50"
       : isPending
         ? "border-violet-300 bg-violet-50"
-        : "border-amber-200 bg-amber-50";
+        // Successful completed tool → emerald (matches the result-block
+        // color below). Previously this fell through to amber, which was
+        // the same color as askPending, so users couldn't visually
+        // distinguish "still asking the user" from "done, succeeded".
+        : "border-emerald-300 bg-emerald-50";
 
   return (
     <div className={`my-1.5 overflow-hidden rounded-md border text-xs ${containerClass}`}>
@@ -260,13 +264,29 @@ export function ToolCallDisplay({
           <span className="shrink-0">{icon}</span>
         )}
         <span
-          className={`font-medium shrink-0 ${isFailed ? "text-red-700" : "text-amber-900"}`}
+          className={`font-medium shrink-0 ${
+            isFailed
+              ? "text-red-700"
+              : isAskPending
+                ? "text-amber-900"
+                : isPending
+                  ? "text-violet-900"
+                  : "text-emerald-900"
+          }`}
         >
           {label}
         </span>
         {summary && (
           <span
-            className={`truncate flex-1 min-w-0 ${isFailed ? "text-red-600" : "text-amber-800"}`}
+            className={`truncate flex-1 min-w-0 ${
+              isFailed
+                ? "text-red-600"
+                : isAskPending
+                  ? "text-amber-800"
+                  : isPending
+                    ? "text-violet-800"
+                    : "text-emerald-800"
+            }`}
           >
             — {summary}
           </span>

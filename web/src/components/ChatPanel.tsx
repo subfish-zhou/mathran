@@ -1398,7 +1398,14 @@ export default function ChatPanel({
             } else {
               next.push({ kind: "tool", id: ev.id, name: ev.name, result: ev.content, ok: ev.ok });
             }
-            next.push({ kind: "assistant", text: "" });
+            // Note: we used to push an empty `{ kind: "assistant", text: "" }`
+            // here to anticipate the next text chunk. That created a phantom
+            // "Thinking…" / streaming bubble between every tool call when
+            // the next event turned out to be another tool-call (very common
+            // for reasoning models that fire many tools per turn). The text
+            // handler above already auto-creates an assistant bubble when
+            // it sees a text delta without one, so this placeholder was
+            // unnecessary AND visually disruptive. Removed 2026-06-25.
           } else if (ev.type === "ask_user") {
             // v0.16 §11: the round is paused waiting for the user's
             // reply. Mark the matching tool bubble (which arrived as a
@@ -3269,7 +3276,9 @@ export default function ChatPanel({
                     </div>
                   ) : row.bubble.kind === "assistant" &&
                     row.bubble.text === "" &&
-                    !row.bubble.reasoning ? (
+                    !row.bubble.reasoning &&
+                    busy &&
+                    i === rows.length - 1 ? (
                     /* ─── Streaming-thinking pill (v0.16 §10) ──────────────────
                        Before any tokens land we used to render a markdown bubble
                        containing a single horizontal-ellipsis fallback, which
@@ -3278,7 +3287,14 @@ export default function ChatPanel({
                        a spinning loader + a soft "Thinking…" caption in the
                        violet palette. No border, no padding-block, no markdown
                        container — it should feel like a transient status line,
-                       not a chat bubble that demands acknowledgement. */
+                       not a chat bubble that demands acknowledgement.
+
+                       2026-06-25 fix: gated on `busy && i === last` so a stale
+                       empty-text assistant bubble left over from an earlier
+                       finished round (e.g. after a tool-result placeholder)
+                       doesn't keep spinning forever. The pill now ONLY shows
+                       while the current round is live AND this is the trailing
+                       bubble. */
                     <div
                       role="status"
                       aria-live="polite"
@@ -3303,14 +3319,18 @@ export default function ChatPanel({
                   ) : row.bubble.kind === "assistant" &&
                     row.bubble.text === "" &&
                     row.bubble.reasoning &&
-                    showReasoning ? (
+                    showReasoning &&
+                    busy &&
+                    i === rows.length - 1 ? (
                     /* ─── Streaming reasoning (UX gap B) ──────────────────────
                        Reasoning tokens arrive before the first answer token, so
                        show the collapsed chain-of-thought panel alongside the
                        "Thinking…" pill while we wait for the answer to start.
                        Gated on `reasoningDisplay !== "hidden"` (default hidden
                        so long iterations with 30+ tool calls don't render 30
-                       💭 chips). */
+                       💭 chips) AND on `busy && i === last` so a stale empty
+                       reasoning-only bubble from a prior round doesn't keep
+                       spinning. */
                     <div className="flex flex-col gap-1">
                       <ReasoningBlock reasoning={row.bubble.reasoning} streaming />
                       <div
