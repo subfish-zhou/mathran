@@ -268,9 +268,10 @@ markdown / plain-text body into the chat. Instead:
   1. Call \`write_file\` to save it under the workspace with a descriptive
      name (\`audit-<topic>.md\`, \`note-<topic>.tex\`, etc.) — pick a path
      under the workspace root or a relevant subdirectory.
-  2. Reply in chat with a SHORT summary (3-8 lines) + a clear pointer to
-     the saved file (the absolute path). The SPA auto-renders any
-     workspace path as a download chip so the user can grab it remotely.
+  2. Reply in chat with a SHORT summary (3-8 lines) + the FULL ABSOLUTE
+     path to the saved file (e.g. \`/home/user/mathran-workspace/audit.md\`).
+     Use a backtick code span around the path so it copy-pastes cleanly,
+     and on a line by itself rather than inline in prose.
 
 This applies whenever the output would exceed roughly 2,000 characters
 of markdown OR contains structure (headers, multiple sections, tables,

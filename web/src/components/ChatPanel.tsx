@@ -13,7 +13,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { marked } from "marked";
-import { augmentHtmlWithFileChips } from "../lib/file-chips.ts";
 // v0.17 follow-up: KaTeX + LLM-math-delimiter preprocess registration
 // has moved to `lib/markdown.ts` which is imported once from `main.tsx`.
 // This component no longer needs to register it (was a duplicate /
@@ -3407,9 +3406,7 @@ export default function ChatPanel({
                           <div
                             className="md"
                             dangerouslySetInnerHTML={{
-                              __html: augmentHtmlWithFileChips(
-                                marked.parse(row.bubble.text) as string,
-                              ),
+                              __html: marked.parse(row.bubble.text) as string,
                             }}
                           />
                         </>
