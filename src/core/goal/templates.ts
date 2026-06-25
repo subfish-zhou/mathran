@@ -25,6 +25,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface TemplateVariableSpec {
   name: string;
@@ -42,10 +43,45 @@ export interface GoalTemplate {
   body: string;
   /** Absolute path on disk. */
   path: string;
+  /**
+   * Provenance — Layer 3. `"builtin"` templates ship inside the package
+   * (`builtin-templates/`); `"user"` templates live under
+   * `<workspace>/.mathran/goal-templates/`. A user template shadows a
+   * builtin of the same name.
+   */
+  source?: "builtin" | "user";
+  /**
+   * Optional tool allow-list (Layer 3 awaiter role). When set and a caller
+   * (e.g. `spawn_sub_goal`) honours it, the spawned goal is restricted to
+   * these tool names.
+   */
+  allowedTools?: string[];
+  /** Optional reasoning-effort hint (e.g. "low") applied to the spawned goal. */
+  reasoningEffort?: string;
+  /** Optional token budget applied to the spawned goal. */
+  budgetTokens?: number;
 }
 
 function templatesDirFor(workspace: string): string {
   return path.join(workspace, ".mathran", "goal-templates");
+}
+
+/**
+ * Candidate directories holding the bundled built-in templates, in order.
+ * Mirrors `builtin-skills/loader.ts`: resolve relative to this module, and
+ * when running from a compiled `dist/` tree fall back to the sibling `src/`
+ * path so a built tree without the copied `.md` files still works in dev.
+ */
+function builtinTemplateDirs(): string[] {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const primary = path.join(here, "builtin-templates");
+  const dirs = [primary];
+  if (here.includes(`${path.sep}dist${path.sep}`)) {
+    dirs.push(
+      path.join(here.replace(`${path.sep}dist${path.sep}`, `${path.sep}src${path.sep}`), "builtin-templates"),
+    );
+  }
+  return dirs;
 }
 
 /**
@@ -56,6 +92,9 @@ function templatesDirFor(workspace: string): string {
 export function parseTemplateBody(name: string, raw: string, sourcePath: string): GoalTemplate {
   let description: string | undefined;
   const variables: TemplateVariableSpec[] = [];
+  let allowedTools: string[] | undefined;
+  let reasoningEffort: string | undefined;
+  let budgetTokens: number | undefined;
   let body = raw;
 
   const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
@@ -64,21 +103,65 @@ export function parseTemplateBody(name: string, raw: string, sourcePath: string)
     body = rest ?? "";
     const lines = (yaml ?? "").split("\n");
     let inVars = false;
+    let inAllowed = false;
     let cur: Partial<TemplateVariableSpec> | null = null;
+    const flushVar = () => {
+      if (cur && cur.name) variables.push(cur as TemplateVariableSpec);
+      cur = null;
+    };
     for (const raw of lines) {
       const line = raw.replace(/\t/g, "  ");
+      const indented = /^\s/.test(line);
+      // A non-indented, non-empty line that isn't a list item starts a new
+      // top-level key — close any open list/var section first.
+      if (!indented && line.trim().length > 0 && !line.trimStart().startsWith("- ")) {
+        if (!line.startsWith("variables:")) { flushVar(); inVars = false; }
+        if (!line.startsWith("allowedTools:")) inAllowed = false;
+      }
       if (line.startsWith("description:")) {
         description = line.slice("description:".length).trim().replace(/^["']|["']$/g, "");
+        continue;
+      }
+      if (line.startsWith("reasoningEffort:")) {
+        reasoningEffort = line.slice("reasoningEffort:".length).trim().replace(/^["']|["']$/g, "");
+        continue;
+      }
+      if (line.startsWith("budgetTokens:")) {
+        const v = line.slice("budgetTokens:".length).trim().replace(/^["']|["']$/g, "");
+        const n = Number(v);
+        if (Number.isFinite(n)) budgetTokens = n;
+        continue;
+      }
+      if (line.startsWith("allowedTools:")) {
+        inAllowed = true;
+        const inline = line.slice("allowedTools:".length).trim();
+        // Support inline flow list: allowedTools: [a, b, c]
+        if (inline.startsWith("[")) {
+          allowedTools = inline.replace(/^\[|\]$/g, "")
+            .split(",")
+            .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+            .filter((s) => s.length > 0);
+          inAllowed = false;
+        } else {
+          allowedTools = allowedTools ?? [];
+        }
         continue;
       }
       if (line.startsWith("variables:")) {
         inVars = true;
         continue;
       }
+      if (inAllowed) {
+        const trim = line.trimStart();
+        if (trim.startsWith("- ")) {
+          (allowedTools ??= []).push(trim.slice(2).trim().replace(/^["']|["']$/g, ""));
+        }
+        continue;
+      }
       if (!inVars) continue;
       const trim = line.trimStart();
       if (trim.startsWith("- name:")) {
-        if (cur && cur.name) variables.push(cur as TemplateVariableSpec);
+        flushVar();
         cur = { name: trim.slice("- name:".length).trim().replace(/^["']|["']$/g, "") };
         continue;
       }
@@ -95,7 +178,7 @@ export function parseTemplateBody(name: string, raw: string, sourcePath: string)
         }
       }
     }
-    if (cur && cur.name) variables.push(cur as TemplateVariableSpec);
+    flushVar();
   }
 
   return {
@@ -104,43 +187,111 @@ export function parseTemplateBody(name: string, raw: string, sourcePath: string)
     variables,
     path: sourcePath,
     ...(description !== undefined ? { description } : {}),
+    ...(allowedTools !== undefined ? { allowedTools } : {}),
+    ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+    ...(budgetTokens !== undefined ? { budgetTokens } : {}),
   };
 }
 
+/**
+ * Load the bundled built-in goal templates (Layer 3). Best-effort: a missing
+ * directory yields an empty list. Each returned template is stamped
+ * `source: "builtin"`.
+ */
+export async function listBuiltinGoalTemplates(): Promise<GoalTemplate[]> {
+  for (const dir of builtinTemplateDirs()) {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      continue;
+    }
+    const out: GoalTemplate[] = [];
+    for (const f of entries.sort()) {
+      if (!f.endsWith(".md")) continue;
+      const name = f.replace(/\.md$/, "");
+      const full = path.join(dir, f);
+      try {
+        const raw = await fs.readFile(full, "utf-8");
+        const t = parseTemplateBody(name, raw, full);
+        t.source = "builtin";
+        out.push(t);
+      } catch {
+        // skip unreadable
+      }
+    }
+    if (out.length > 0) return out;
+  }
+  return [];
+}
+
+/** Read a single built-in template by name, or null if not bundled. */
+export async function readBuiltinGoalTemplate(name: string): Promise<GoalTemplate | null> {
+  for (const dir of builtinTemplateDirs()) {
+    const full = path.join(dir, `${name}.md`);
+    try {
+      const raw = await fs.readFile(full, "utf-8");
+      const t = parseTemplateBody(name, raw, full);
+      t.source = "builtin";
+      return t;
+    } catch (e: any) {
+      if (e?.code === "ENOENT") continue;
+      throw e;
+    }
+  }
+  return null;
+}
+
+/**
+ * List templates available in `workspace`. Built-in templates come first
+ * (stamped `source: "builtin"`); user templates from the workspace are
+ * stamped `source: "user"`. A user template shadows a built-in of the same
+ * name (the user entry replaces the built-in in the merged list).
+ */
 export async function listGoalTemplates(workspace: string): Promise<GoalTemplate[]> {
+  const builtin = await listBuiltinGoalTemplates();
   const dir = templatesDirFor(workspace);
-  let entries: string[];
+  let entries: string[] = [];
   try {
     entries = await fs.readdir(dir);
   } catch (e: any) {
-    if (e?.code === "ENOENT") return [];
-    throw e;
+    if (e?.code !== "ENOENT") throw e;
   }
-  const out: GoalTemplate[] = [];
+  const user: GoalTemplate[] = [];
   for (const f of entries.sort()) {
     if (!f.endsWith(".md")) continue;
     const name = f.replace(/\.md$/, "");
     const full = path.join(dir, f);
     try {
       const raw = await fs.readFile(full, "utf-8");
-      out.push(parseTemplateBody(name, raw, full));
+      const t = parseTemplateBody(name, raw, full);
+      t.source = "user";
+      user.push(t);
     } catch {
       // skip unreadable
     }
   }
-  return out;
+  const userNames = new Set(user.map((t) => t.name));
+  // Built-in first (minus any shadowed by a user template), then user.
+  return [...builtin.filter((t) => !userNames.has(t.name)), ...user];
 }
 
+/**
+ * Read a template by name. Looks in the user workspace first; if not found
+ * there, falls back to the bundled built-in templates.
+ */
 export async function readGoalTemplate(workspace: string, name: string): Promise<GoalTemplate | null> {
   const dir = templatesDirFor(workspace);
   const full = path.join(dir, `${name}.md`);
   try {
     const raw = await fs.readFile(full, "utf-8");
-    return parseTemplateBody(name, raw, full);
+    const t = parseTemplateBody(name, raw, full);
+    t.source = "user";
+    return t;
   } catch (e: any) {
-    if (e?.code === "ENOENT") return null;
-    throw e;
+    if (e?.code !== "ENOENT") throw e;
   }
+  return readBuiltinGoalTemplate(name);
 }
 
 /**
