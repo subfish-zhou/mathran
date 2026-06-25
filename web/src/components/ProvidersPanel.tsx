@@ -179,12 +179,30 @@ export default function ProvidersPanel() {
           <input
             value={defaultModel}
             onChange={(e) => setDefaultModel(e.target.value)}
+            list="mathran-providers-model-suggestions"
             placeholder="copilot/gpt-5.5"
             className="w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-sm outline-none focus:border-slate-500"
           />
+          <datalist id="mathran-providers-model-suggestions">
+            <option value="copilot/gpt-5.6" />
+            <option value="copilot/gpt-5.5" />
+            <option value="copilot/gpt-5.4" />
+            <option value="copilot/gpt-5" />
+            <option value="copilot/claude-opus-4.8" />
+            <option value="copilot/claude-opus-4.7" />
+            <option value="copilot/claude-opus-4.6" />
+            <option value="copilot/claude-opus-4.5" />
+            <option value="copilot/claude-sonnet-4.6" />
+            <option value="copilot/claude-sonnet-4.5" />
+            <option value="copilot/o1" />
+            <option value="copilot/o1-mini" />
+            <option value="copilot/o3-mini" />
+            <option value="copilot/gpt-4o" />
+            <option value="copilot/gpt-4o-mini" />
+          </datalist>
           <p className="mt-1 text-xs text-slate-400">
             Format: <code>provider/model</code> (e.g. <code>copilot/gpt-5.5</code>,{" "}
-            <code>azure/gpt55</code>, <code>openai/gpt-4o</code>).
+            <code>copilot/claude-opus-4.8</code>, <code>openai/gpt-4o</code>).
           </p>
         </div>
 

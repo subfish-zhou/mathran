@@ -2876,14 +2876,25 @@ export default function ChatPanel({
             {/* Common model strings the LLM router accepts. Free-form input
                 remains allowed — this is a datalist (suggestions), not a
                 <select> (exhaustive). v0.14 §3. */}
-            <option value="copilot/gpt-5.5" />
+            {/* GPT-5.x family (OpenAI via GitHub Copilot) */}
             <option value="copilot/gpt-5.6" />
-            <option value="copilot/claude-opus-4.7" />
+            <option value="copilot/gpt-5.5" />
+            <option value="copilot/gpt-5.4" />
+            <option value="copilot/gpt-5" />
+            {/* Claude Opus family (Anthropic via GitHub Copilot) */}
             <option value="copilot/claude-opus-4.8" />
+            <option value="copilot/claude-opus-4.7" />
+            <option value="copilot/claude-opus-4.6" />
+            <option value="copilot/claude-opus-4.5" />
+            {/* Claude Sonnet family — cheaper alternative for routine work */}
+            <option value="copilot/claude-sonnet-4.6" />
             <option value="copilot/claude-sonnet-4.5" />
+            {/* Reasoning-specialized OpenAI lines */}
             <option value="copilot/o1" />
             <option value="copilot/o1-mini" />
             <option value="copilot/o3-mini" />
+            <option value="copilot/gpt-4o" />
+            <option value="copilot/gpt-4o-mini" />
           </datalist>
           {/* ─── Pinned-only toggle (v0.16 §2) ────────────────────────
               Compact button in the chat header; flips the rows filter

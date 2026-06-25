@@ -262,9 +262,30 @@ export default function SettingsPanel() {
                       d.modelPreference = { ...(d.modelPreference ?? {}), default: e.target.value };
                     })
                   }
+                  list="mathran-settings-model-suggestions"
                   placeholder="copilot/gpt-5.5"
                   className="w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-sm outline-none focus:border-slate-500 disabled:bg-slate-100"
                 />
+                {/* Same datalist as ChatPanel's so the settings input
+                    autocompletes against the full curated model list
+                    instead of forcing the user to remember the slug. */}
+                <datalist id="mathran-settings-model-suggestions">
+                  <option value="copilot/gpt-5.6" />
+                  <option value="copilot/gpt-5.5" />
+                  <option value="copilot/gpt-5.4" />
+                  <option value="copilot/gpt-5" />
+                  <option value="copilot/claude-opus-4.8" />
+                  <option value="copilot/claude-opus-4.7" />
+                  <option value="copilot/claude-opus-4.6" />
+                  <option value="copilot/claude-opus-4.5" />
+                  <option value="copilot/claude-sonnet-4.6" />
+                  <option value="copilot/claude-sonnet-4.5" />
+                  <option value="copilot/o1" />
+                  <option value="copilot/o1-mini" />
+                  <option value="copilot/o3-mini" />
+                  <option value="copilot/gpt-4o" />
+                  <option value="copilot/gpt-4o-mini" />
+                </datalist>
               </Field>
             </Section>
 
