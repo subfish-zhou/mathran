@@ -1903,6 +1903,102 @@ describe("goal status + abort/resume (v0.17 W8)", () => {
     expect(res.status).toBe(400);
   });
 
+  // ── UX gap D — read-only live tail endpoint (GET /api/goals/:id/events) ──
+  describe("GET /api/goals/:id/events (read-only live tail)", () => {
+    /** Read an SSE response to completion, returning parsed {event,data} frames. */
+    async function collectSSE(res: Response): Promise<{ event: string; data: string }[]> {
+      const frames: { event: string; data: string }[] = [];
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let event = "message";
+      const dataLines: string[] = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          let line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.endsWith("\r")) line = line.slice(0, -1);
+          if (line === "") {
+            if (dataLines.length) frames.push({ event, data: dataLines.join("\n") });
+            event = "message";
+            dataLines.length = 0;
+            continue;
+          }
+          const colon = line.indexOf(":");
+          const field = colon < 0 ? line : line.slice(0, colon);
+          let val = colon < 0 ? "" : line.slice(colon + 1);
+          if (val.startsWith(" ")) val = val.slice(1);
+          if (field === "event") event = val;
+          else if (field === "data") dataLines.push(val);
+        }
+      }
+      return frames;
+    }
+
+    it("emits a leading snapshot frame then a terminal status frame for an already-ended goal", async () => {
+      const { goal } = await (await fetch(`${base}/api/goals`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ objective: "watch me end", scope: "global" }),
+      })).json();
+      // Drive it to a terminal status without touching the LLM.
+      const cancel = await fetch(`${base}/api/goals/${goal.id}/cancel`, { method: "POST" });
+      expect(cancel.status).toBe(200);
+
+      const res = await fetch(`${base}/api/goals/${goal.id}/events`, {
+        headers: { accept: "text/event-stream" },
+      });
+      expect(res.status).toBe(200);
+      const frames = await collectSSE(res);
+
+      // First frame is the snapshot header projection.
+      expect(frames[0].event).toBe("snapshot");
+      const snap = JSON.parse(frames[0].data);
+      expect(snap.id).toBe(goal.id);
+      expect(snap.objective).toBe("watch me end");
+      expect(snap.status).toBe("cancelled");
+
+      // Final frame is the terminal status close — the stream then ends.
+      const last = frames[frames.length - 1];
+      expect(last.event).toBe("status");
+      const st = JSON.parse(last.data);
+      expect(st.terminal).toBe(true);
+      expect(st.status).toBe("cancelled");
+    });
+
+    it("does NOT trigger a run (read-only): goal stats stay zero after watching", async () => {
+      const { goal } = await (await fetch(`${base}/api/goals`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ objective: "read only", scope: "global" }),
+      })).json();
+      await fetch(`${base}/api/goals/${goal.id}/cancel`, { method: "POST" });
+      const res = await fetch(`${base}/api/goals/${goal.id}/events`, {
+        headers: { accept: "text/event-stream" },
+      });
+      await collectSSE(res);
+      const status = await (await fetch(`${base}/api/goals/${goal.id}/status`)).json();
+      expect(status.iterationsRun).toBe(0);
+      expect(status.assistantTurnsTotal).toBe(0);
+    });
+
+    it("404s on an unknown goal id", async () => {
+      const res = await fetch(
+        `${base}/api/goals/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/events`,
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it("400s on a path-traversing id", async () => {
+      const res = await fetch(`${base}/api/goals/..%2Fetc/events`);
+      expect(res.status).toBe(400);
+    });
+  });
+
   it("runner stamps heartbeatAt at the top of every round", async () => {
     // Use a dedicated server with a fake LLM so the heartbeat test
     // doesn't depend on the real ModelRouter (which would fail with the

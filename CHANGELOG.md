@@ -14,6 +14,19 @@ rollout/rollback notes. Design lives at `_tasks/todo1-design.md`.
 
 ### Added
 
+- **feat(cli): `mathran goal watch <id>` — live SSE tail (UX gap D).**
+  New read-only streaming follow command that connects to a running
+  `mathran serve` and renders a colored, one-line-per-event view of a
+  goal's progress (`▶ iter start`, `■ iter end`, `🧹 compacted`,
+  `💰 continued`, `✓ complete` / `✗ give up`, plus truncated tool /
+  text summaries). Backed by a new read-only `GET /api/goals/:id/events`
+  SSE endpoint that subscribes to the goal daemon's event side-channel
+  **without** triggering a run, and closes on terminal status. Flags:
+  `--server <url>` (default `http://127.0.0.1:7878`), `--no-color`
+  (CI mode), `--no-follow` (one-shot status print). Exits 0 on terminal
+  status, 130 on Ctrl-C. Remote operators can now `ssh` in and tail a
+  goal without a browser. See DESIGN-REFERENCE.md §5.D.
+
 - **feat(goal/daemon): backend goal-loop driver (C1–C5).** New
   `src/core/goal/daemon.ts` (`GoalDaemon` + `GoalTurnRunner`) takes
   over the goal iteration loop. `runGoalRound()` is split into a
