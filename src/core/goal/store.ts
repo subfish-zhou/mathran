@@ -117,6 +117,25 @@ export interface Goal {
      * compaction. null when no compaction has run yet.
      */
     lastCompactionAt: string | null;
+    /**
+     * Layer 1 (token budget continuation) — number of times `mark_done`
+     * was blocked and the model was nudged to keep working because the
+     * goal hadn't yet spent 90% of `budget.tokensMax`. Persisted across
+     * iterations so the diminishing-returns guard (count >= 3) survives
+     * daemon reschedules. Defaults to 0 for goals created before Layer 1.
+     */
+    budgetContinuationCount: number;
+    /**
+     * Layer 1 — Δtokens between the two most-recent budget checks. Feeds
+     * the diminishing-returns guard (a continuation is "stalled" when
+     * both this and the current delta are < 500). Defaults to 0.
+     */
+    budgetLastDeltaTokens: number;
+    /**
+     * Layer 1 — `stats.tokensUsed` snapshot at the most-recent budget
+     * check, used to compute the next delta. Defaults to 0.
+     */
+    budgetLastCheckTokens: number;
   };
   /** Chat conversation ids this goal spawned. The first one is the primary. */
   conversationIds: string[];
@@ -204,7 +223,11 @@ export interface GoalStep {
     | "status"
     | "ask-user-auto-resolved"
     /** TODO-2 §3.2 / C8 — compaction lifecycle event durable record. */
-    | "compaction";
+    | "compaction"
+    /** Layer 1 — token budget continuation: mark_done was blocked and the
+     *  model nudged to keep working. Payload carries
+     *  {pct, continuationCount, tokensUsed, budget}. */
+    | "budget-continuation";
   payload: Record<string, unknown> | string;
 }
 
@@ -257,6 +280,10 @@ export function migrateGoalStats(raw: unknown): Goal["stats"] {
     compactionTokensDropped: s.compactionTokensDropped ?? 0,
     lastCompactionReason: s.lastCompactionReason ?? null,
     lastCompactionAt: s.lastCompactionAt ?? null,
+    // Layer 1 — token budget continuation (default for pre-Layer-1 goals).
+    budgetContinuationCount: s.budgetContinuationCount ?? 0,
+    budgetLastDeltaTokens: s.budgetLastDeltaTokens ?? 0,
+    budgetLastCheckTokens: s.budgetLastCheckTokens ?? 0,
   };
 }
 
@@ -344,6 +371,9 @@ export async function createGoal(
       compactionTokensDropped: 0,
       lastCompactionReason: null,
       lastCompactionAt: null,
+      budgetContinuationCount: 0,
+      budgetLastDeltaTokens: 0,
+      budgetLastCheckTokens: 0,
     },
     conversationIds: [],
     parentGoalId: input.parentGoalId ?? null,
@@ -404,6 +434,14 @@ export async function updateGoalStats(
     compactionTokensDropped: g.stats.compactionTokensDropped + (delta.compactionTokensDropped ?? 0),
     lastCompactionReason: delta.lastCompactionReason ?? g.stats.lastCompactionReason,
     lastCompactionAt: delta.lastCompactionAt ?? g.stats.lastCompactionAt,
+    // Layer 1 — budget continuation tracker: carried forward (callers SET
+    // these directly via writeGoal, not through updateGoalStats deltas).
+    budgetContinuationCount:
+      delta.budgetContinuationCount ?? g.stats.budgetContinuationCount,
+    budgetLastDeltaTokens:
+      delta.budgetLastDeltaTokens ?? g.stats.budgetLastDeltaTokens,
+    budgetLastCheckTokens:
+      delta.budgetLastCheckTokens ?? g.stats.budgetLastCheckTokens,
   };
   await writeGoal(workspace, g);
 }

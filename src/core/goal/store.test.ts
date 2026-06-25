@@ -170,6 +170,10 @@ describe("updateGoalStats", () => {
       compactionTokensDropped: 0,
       lastCompactionReason: null,
       lastCompactionAt: null,
+      // Layer 1 — token budget continuation tracker defaults.
+      budgetContinuationCount: 0,
+      budgetLastDeltaTokens: 0,
+      budgetLastCheckTokens: 0,
     });
   });
 });

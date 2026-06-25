@@ -382,6 +382,20 @@ export type ChatEvent =
       summaryTokens?: number;
     }
   | {
+      /** Layer 1 — token budget continuation. Emitted by the goal runner
+       *  (NOT the chat session) when a `mark_done` is blocked because the
+       *  goal hasn't yet spent 90% of `budget.tokensMax`. The runner injects
+       *  a nudge user message into history and reschedules the next
+       *  iteration; this event lets the daemon log + SSE layer surface a
+       *  "💰 N continuation(s)" badge. */
+      type: "budget-continuation";
+      goalId: string;
+      pct: number;
+      continuationCount: number;
+      tokensUsed: number;
+      budget: number;
+    }
+  | {
       type: "done";
       finishReason: Extract<LLMStreamChunk, { type: "done" }>["finishReason"];
     };
