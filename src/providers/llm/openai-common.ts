@@ -135,6 +135,17 @@ export async function* streamOpenAI(
       if (typeof delta.content === "string" && delta.content.length > 0) {
         yield { type: "text", delta: delta.content };
       }
+      // Reasoning chain-of-thought (UX gap B). OpenAI o-series / gpt-5.x and
+      // Copilot-proxied models stream their thinking on a side channel. The
+      // field is named `reasoning_content` on chat.completions deltas; some
+      // gateways use `reasoning`. Map either onto the reasoning chunk.
+      const reasoningDelta =
+        (typeof delta.reasoning_content === "string" && delta.reasoning_content) ||
+        (typeof delta.reasoning === "string" && delta.reasoning) ||
+        "";
+      if (reasoningDelta.length > 0) {
+        yield { type: "reasoning", delta: reasoningDelta };
+      }
       if (Array.isArray(delta.tool_calls)) {
         for (const tc of delta.tool_calls) {
           const idx = tc.index ?? 0;

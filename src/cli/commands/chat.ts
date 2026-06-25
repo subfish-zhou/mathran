@@ -578,6 +578,12 @@ async function renderTurn(events: AsyncIterable<ChatEvent>): Promise<void> {
     if (ev.type === "text") {
       process.stdout.write(ev.delta);
       sawText = true;
+    } else if (ev.type === "reasoning") {
+      // UX gap B — surface chain-of-thought dimmed so the CLI isn't silent
+      // during long reasoning stretches. The SPA renders a collapsed panel;
+      // the TUI just streams it in faint text.
+      process.stdout.write(`\x1b[2m${ev.delta}\x1b[0m`);
+      sawText = true;
     } else if (ev.type === "tool-call") {
       if (sawText) {
         process.stdout.write("\n");

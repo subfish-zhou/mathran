@@ -91,6 +91,9 @@ export class CopilotAdapter implements LLMProvider {
     return {
       async *stream(): AsyncIterable<LLMStreamChunk> {
         const res = await chatFn(cReq);
+        if (res.reasoning) {
+          yield { type: "reasoning", delta: res.reasoning };
+        }
         if (res.text) {
           yield { type: "text", delta: res.text };
         }

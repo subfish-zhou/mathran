@@ -152,3 +152,32 @@ describe("historyToBubbles", () => {
     expect((out[0] as any).attachments).toBeUndefined();
   });
 });
+
+describe("historyToBubbles — reasoning (UX gap B)", () => {
+  it("carries persisted reasoning onto the assistant bubble", () => {
+    const hist: LLMMessageWire[] = [
+      { role: "user", content: "why?" },
+      { role: "assistant", content: "Because.", reasoning: "I considered the options." },
+    ];
+    expect(historyToBubbles(hist)).toEqual([
+      { kind: "user", text: "why?" },
+      { kind: "assistant", text: "Because.", reasoning: "I considered the options." },
+    ]);
+  });
+
+  it("emits an assistant bubble for a reasoning-only turn (empty answer)", () => {
+    const hist: LLMMessageWire[] = [
+      { role: "assistant", content: "", reasoning: "thinking out loud" },
+    ];
+    expect(historyToBubbles(hist)).toEqual([
+      { kind: "assistant", text: "", reasoning: "thinking out loud" },
+    ]);
+  });
+
+  it("omits reasoning when the field is absent", () => {
+    const hist: LLMMessageWire[] = [
+      { role: "assistant", content: "plain" },
+    ];
+    expect(historyToBubbles(hist)).toEqual([{ kind: "assistant", text: "plain" }]);
+  });
+});

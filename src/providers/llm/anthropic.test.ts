@@ -115,3 +115,38 @@ describe("AnthropicAdapter supportsVision", () => {
     expect(adapter.supportsVision).toBe(true);
   });
 });
+
+describe("streamAnthropic reasoning parsing (UX gap B)", () => {
+  async function* events(items: unknown[]): AsyncIterable<unknown> {
+    for (const it of items) yield it;
+  }
+
+  it("maps thinking_delta blocks onto reasoning chunks", async () => {
+    const adapter = new AnthropicAdapter({ apiKey: "sk-fake" });
+    // Inject a fake SDK client whose `messages.create` returns our event stream.
+    (adapter as unknown as { client: { messages: { create: unknown } } }).client = {
+      messages: {
+        create: async () =>
+          events([
+            { type: "message_start", message: { usage: { input_tokens: 3, output_tokens: 0 } } },
+            { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "step 1 " } },
+            { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "step 2" } },
+            { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Done." } },
+            { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } },
+          ]),
+      },
+    };
+
+    const res = await adapter.chat({ model: "claude-opus-4-5", messages: [{ role: "user", content: "hi" }] });
+    const chunks = [];
+    for await (const c of res.stream()) chunks.push(c);
+
+    expect(chunks).toContainEqual({ type: "reasoning", delta: "step 1 " });
+    expect(chunks).toContainEqual({ type: "reasoning", delta: "step 2" });
+    expect(chunks).toContainEqual({ type: "text", delta: "Done." });
+    // Reasoning chunks must precede the text chunk.
+    const firstText = chunks.findIndex((c) => c.type === "text");
+    const lastReasoning = chunks.map((c) => c.type).lastIndexOf("reasoning");
+    expect(lastReasoning).toBeLessThan(firstText);
+  });
+});

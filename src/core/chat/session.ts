@@ -255,6 +255,17 @@ export interface SubagentResultLite {
  */
 export type ChatEvent =
   | { type: "text"; delta: string }
+  | {
+      /** UX gap B — reasoning / chain-of-thought delta. Mirrors the
+       *  provider `reasoning` stream chunk (Anthropic `thinking_delta`,
+       *  OpenAI / Copilot `reasoning_content`). The host SSE layer passes
+       *  it straight through so the SPA can render a collapsed "💭 reasoning"
+       *  panel. Accumulated onto the assistant message's `reasoning` field
+       *  for jsonl persistence; disposable (first dropped on compaction) and
+       *  never replayed back to the provider. */
+      type: "reasoning";
+      delta: string;
+    }
   | { type: "tool-call"; id: string; name: string; args: string }
   | { type: "tool-result"; id: string; name: string; ok: boolean; content: string }
   | {
@@ -2377,6 +2388,7 @@ export class ChatSession {
       const response = await this.llm.chat(req);
 
       let text = "";
+      let reasoning = "";
       let finishReason: Extract<LLMStreamChunk, { type: "done" }>["finishReason"] = "stop";
       let usage: { promptTokens: number; completionTokens: number } | undefined;
       const callOrder: string[] = [];
@@ -2387,6 +2399,11 @@ export class ChatSession {
           if (chunk.type === "text") {
             text += chunk.delta;
             yield { type: "text", delta: chunk.delta };
+          } else if (chunk.type === "reasoning") {
+            // UX gap B — accumulate the chain-of-thought for persistence and
+            // pass each delta through so the SPA can stream the panel live.
+            reasoning += chunk.delta;
+            yield { type: "reasoning", delta: chunk.delta };
           } else if (chunk.type === "tool-call") {
             const key = chunk.id || chunk.name || `call_${callOrder.length}`;
             let pending = calls.get(key);
@@ -2409,10 +2426,14 @@ export class ChatSession {
           // we got. We deliberately drop any half-streamed tool calls: the
           // assistant message carries no `toolCalls`, so history stays
           // well-formed (no dangling tool_call awaiting a tool result).
-          this.messages.push({
+          const aborted: LLMMessage = {
             role: "assistant",
             content: text.length > 0 ? `${text} [aborted]` : "[aborted]",
-          });
+          };
+          // UX gap B — preserve whatever reasoning streamed before the abort
+          // so the partial chain-of-thought stays visible on reload.
+          if (reasoning.length > 0) aborted.reasoning = reasoning;
+          this.messages.push(aborted);
         }
         throw err;
       }
@@ -2427,6 +2448,11 @@ export class ChatSession {
       // …). Without this the assistant message paired with the tool result
       // looks malformed and OpenAI / Anthropic / Azure will reject it.
       const assistantMessage: LLMMessage = { role: "assistant", content: text };
+      if (reasoning.length > 0) {
+        // UX gap B — persist the chain-of-thought on the assistant turn so the
+        // jsonl carries it and the SPA can re-render the panel after reload.
+        assistantMessage.reasoning = reasoning;
+      }
       if (toolCalls.length > 0) {
         assistantMessage.toolCalls = toolCalls.map((c) => ({
           id: c.id,

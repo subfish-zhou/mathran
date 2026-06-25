@@ -492,6 +492,8 @@ export interface CopilotToolCall {
 
 export interface CopilotChatResponse {
   text: string;
+  /** Reasoning / chain-of-thought text (UX gap B), empty when none. */
+  reasoning: string;
   toolCalls: CopilotToolCall[];
   finishReason: FinishReason;
   usage: { input: number; output: number };
@@ -533,10 +535,22 @@ async function postJson(
 }
 
 // Extract text from /responses output[].content[]
-function extractResponsesText(raw: any): { text: string; input: number; output: number } {
+function extractResponsesText(raw: any): { text: string; reasoning: string; input: number; output: number } {
   let text = "";
+  let reasoning = "";
   if (Array.isArray(raw?.output)) {
     for (const o of raw.output) {
+      // Reasoning items carry a `summary[]` of `{type:"summary_text", text}`
+      // (and sometimes a `content[]` of `{type:"reasoning_text", text}`).
+      if (o?.type === "reasoning") {
+        for (const s of o.summary ?? []) {
+          if (typeof s?.text === "string") reasoning += s.text;
+        }
+        for (const c of o.content ?? []) {
+          if (typeof c?.text === "string") reasoning += c.text;
+        }
+        continue;
+      }
       if (o?.type !== "message") continue;
       if (!Array.isArray(o.content)) continue;
       for (const c of o.content) {
@@ -550,21 +564,26 @@ function extractResponsesText(raw: any): { text: string; input: number; output: 
   const usage = raw?.usage ?? {};
   return {
     text,
+    reasoning,
     input: usage.input_tokens ?? usage.prompt_tokens ?? 0,
     output: usage.output_tokens ?? usage.completion_tokens ?? 0,
   };
 }
 
-function extractMessagesText(raw: any): { text: string; input: number; output: number } {
+function extractMessagesText(raw: any): { text: string; reasoning: string; input: number; output: number } {
   let text = "";
+  let reasoning = "";
   if (Array.isArray(raw?.content)) {
     for (const c of raw.content) {
       if (c?.type === "text" && typeof c.text === "string") text += c.text;
+      // Extended-thinking blocks carry the chain-of-thought in `thinking`.
+      else if (c?.type === "thinking" && typeof c.thinking === "string") reasoning += c.thinking;
     }
   }
   const usage = raw?.usage ?? {};
   return {
     text,
+    reasoning,
     input: usage.input_tokens ?? 0,
     output: usage.output_tokens ?? 0,
   };
@@ -804,10 +823,11 @@ export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatR
       token,
       req.signal,
     );
-    const { text, input: inT, output: outT } = extractResponsesText(raw);
+    const { text, reasoning, input: inT, output: outT } = extractResponsesText(raw);
     const toolCalls = extractResponsesToolCalls(raw);
     return {
       text,
+      reasoning,
       toolCalls,
       finishReason: toolCalls.length > 0 ? "tool_calls" : "stop",
       usage: { input: inT, output: outT },
@@ -828,10 +848,11 @@ export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatR
       token,
       req.signal,
     );
-    const { text, input: inT, output: outT } = extractMessagesText(raw);
+    const { text, reasoning, input: inT, output: outT } = extractMessagesText(raw);
     const toolCalls = extractMessagesToolCalls(raw);
     return {
       text,
+      reasoning,
       toolCalls,
       finishReason: mapClaudeStopReason(raw?.stop_reason, toolCalls.length > 0),
       usage: { input: inT, output: outT },
@@ -858,9 +879,11 @@ export async function copilotChat(req: CopilotChatRequest): Promise<CopilotChatR
     req.signal,
   ) as any;
   const text = raw?.choices?.[0]?.message?.content ?? "";
+  const reasoning = raw?.choices?.[0]?.message?.reasoning_content ?? "";
   const usage = raw?.usage ?? {};
   return {
     text,
+    reasoning,
     toolCalls: [],
     finishReason: "stop",
     usage: { input: usage.prompt_tokens ?? 0, output: usage.completion_tokens ?? 0 },

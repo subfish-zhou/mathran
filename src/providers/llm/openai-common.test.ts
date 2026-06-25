@@ -6,8 +6,59 @@
  * trailing `role:"tool"` message must include `tool_call_id`.
  */
 import { describe, it, expect } from "vitest";
-import { buildOpenAIParams, toOpenAIContent } from "./openai-common.js";
-import type { LLMRequest } from "../../core/providers/llm.js";
+import { buildOpenAIParams, toOpenAIContent, streamOpenAI } from "./openai-common.js";
+import type { LLMRequest, LLMStreamChunk } from "../../core/providers/llm.js";
+
+async function* fromArray<T>(items: T[]): AsyncIterable<T> {
+  for (const it of items) yield it;
+}
+
+function fakeOpenAIClient(parts: unknown[]): any {
+  return {
+    chat: { completions: { create: async () => fromArray(parts) } },
+  };
+}
+
+async function collectChunks(it: AsyncIterable<LLMStreamChunk>): Promise<LLMStreamChunk[]> {
+  const out: LLMStreamChunk[] = [];
+  for await (const c of it) out.push(c);
+  return out;
+}
+
+describe("streamOpenAI reasoning parsing (UX gap B)", () => {
+  it("maps reasoning_content deltas onto reasoning chunks", async () => {
+    const client = fakeOpenAIClient([
+      { choices: [{ delta: { reasoning_content: "let me " } }] },
+      { choices: [{ delta: { reasoning_content: "think…" } }] },
+      { choices: [{ delta: { content: "Answer." } }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ]);
+    const chunks = await collectChunks(streamOpenAI(client, {}));
+    expect(chunks).toEqual([
+      { type: "reasoning", delta: "let me " },
+      { type: "reasoning", delta: "think…" },
+      { type: "text", delta: "Answer." },
+      { type: "done", finishReason: "stop" },
+    ]);
+  });
+
+  it("also accepts the gateway `reasoning` delta alias", async () => {
+    const client = fakeOpenAIClient([
+      { choices: [{ delta: { reasoning: "hmm" } }] },
+      { choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] },
+    ]);
+    const chunks = await collectChunks(streamOpenAI(client, {}));
+    expect(chunks).toContainEqual({ type: "reasoning", delta: "hmm" });
+  });
+
+  it("emits no reasoning chunk when the stream carries none", async () => {
+    const client = fakeOpenAIClient([
+      { choices: [{ delta: { content: "plain" }, finish_reason: "stop" }] },
+    ]);
+    const chunks = await collectChunks(streamOpenAI(client, {}));
+    expect(chunks.some((c) => c.type === "reasoning")).toBe(false);
+  });
+});
 
 describe("buildOpenAIParams", () => {
   it("preserves a plain user/assistant exchange unchanged", () => {

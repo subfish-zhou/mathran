@@ -155,19 +155,26 @@ describe("compact runner — computeCompacted (normal case)", () => {
     expect(result.originalTokenCount).toBeGreaterThan(result.newTokenCount);
   });
 
-  it("emits a summary even with no system message at all", async () => {
-    const messages: LLMMessage[] = [...buildRounds(8)];
+  it("drops the reasoning field from kept tail messages (UX gap B)", async () => {
+    const messages: LLMMessage[] = [
+      { role: "system", content: "S" },
+      ...buildRounds(10),
+    ];
+    // Tag the assistant turns in the kept tail with reasoning. With
+    // keepRecentRounds=2 the last 2 rounds (4 msgs) are kept verbatim.
+    for (const m of messages) {
+      if (m.role === "assistant") m.reasoning = "disposable chain-of-thought";
+    }
     const result = await computeCompacted({
       messages,
       keepRecentRounds: 2,
       llm: fakeSummarizer("recap"),
     });
     expect(result.noop).toBe(false);
-    // No system at all → first message is the summary system message.
-    expect(result.newMessages[0].role).toBe("system");
-    expect(result.newMessages[0].content).toContain("recap");
-    // Tail = last 2 rounds = 4 msgs.
-    expect(result.newMessages.length).toBe(1 + 4);
+    // Reasoning is the first thing dropped: no kept message retains it.
+    expect(result.newMessages.some((m) => m.reasoning !== undefined)).toBe(false);
+    // The original input is untouched (run() must not mutate).
+    expect(messages.some((m) => m.reasoning === "disposable chain-of-thought")).toBe(true);
   });
 });
 
