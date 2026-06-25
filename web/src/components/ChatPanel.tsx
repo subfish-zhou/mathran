@@ -97,6 +97,9 @@ import {
   loadCommandStyle,
   subscribeCommandStyle,
   type CommandStyle,
+  loadReasoningDisplay,
+  subscribeReasoningDisplay,
+  type ReasoningDisplay,
 } from "../lib/composer-prefs.ts";
 import {
   parseSlashInput,
@@ -1617,6 +1620,15 @@ export default function ChatPanel({
   const [commandStyle, setCommandStyle] = useState<CommandStyle>(loadCommandStyle);
   useEffect(() => subscribeCommandStyle(setCommandStyle), []);
   const slashOpen = !busy && commandStyle === "selector" && slashPrefix !== null && slashFiltered.length > 0;
+
+  // reasoningDisplay — gates whether <ReasoningBlock> chips render. Default
+  // "hidden" (declutter long iterations w/ 30+ tool calls). User can flip in
+  // Settings → Composer to "collapsed" to see the 💭 chip again. The
+  // underlying reasoning text is still persisted to the conversation jsonl
+  // either way, so flipping later resurfaces history.
+  const [reasoningDisplay, setReasoningDisplay] = useState<ReasoningDisplay>(loadReasoningDisplay);
+  useEffect(() => subscribeReasoningDisplay(setReasoningDisplay), []);
+  const showReasoning = reasoningDisplay !== "hidden";
 
   // Clamp the highlight whenever the filtered list shrinks/changes.
   useEffect(() => {
@@ -3290,11 +3302,15 @@ export default function ChatPanel({
                     </div>
                   ) : row.bubble.kind === "assistant" &&
                     row.bubble.text === "" &&
-                    row.bubble.reasoning ? (
+                    row.bubble.reasoning &&
+                    showReasoning ? (
                     /* ─── Streaming reasoning (UX gap B) ──────────────────────
                        Reasoning tokens arrive before the first answer token, so
                        show the collapsed chain-of-thought panel alongside the
-                       "Thinking…" pill while we wait for the answer to start. */
+                       "Thinking…" pill while we wait for the answer to start.
+                       Gated on `reasoningDisplay !== "hidden"` (default hidden
+                       so long iterations with 30+ tool calls don't render 30
+                       💭 chips). */
                     <div className="flex flex-col gap-1">
                       <ReasoningBlock reasoning={row.bubble.reasoning} streaming />
                       <div
@@ -3354,7 +3370,7 @@ export default function ChatPanel({
                       )}
                       {row.bubble.kind === "assistant" ? (
                         <>
-                          {row.bubble.reasoning ? (
+                          {row.bubble.reasoning && showReasoning ? (
                             <ReasoningBlock reasoning={row.bubble.reasoning} />
                           ) : null}
                           <div

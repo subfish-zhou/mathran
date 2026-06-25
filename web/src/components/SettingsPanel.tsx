@@ -27,6 +27,10 @@ import {
   saveCommandStyle as saveCommandStyleSetting,
   subscribeCommandStyle as subscribeCommandStyleSetting,
   type CommandStyle as CommandStyleSetting,
+  loadReasoningDisplay as loadReasoningDisplaySetting,
+  saveReasoningDisplay as saveReasoningDisplaySetting,
+  subscribeReasoningDisplay as subscribeReasoningDisplaySetting,
+  type ReasoningDisplay as ReasoningDisplaySetting,
 } from "../lib/composer-prefs.ts";
 import {
   APPROVAL_POLICIES,
@@ -361,6 +365,7 @@ export default function SettingsPanel() {
         <div className="mt-8 border-t border-slate-200 pt-4">
           <h3 className="mb-2 text-sm font-semibold text-slate-800">Composer</h3>
           <ComposerCommandStyleToggle />
+          <ReasoningDisplayToggle />
         </div>
 
         {/* TODO-3 UI #4.B — 'See also' footer links removed; the top
@@ -630,6 +635,73 @@ function ComposerCommandStyleToggle() {
               Popup is suppressed. Type the full command (e.g.{" "}
               <code className="rounded bg-slate-100 px-1">/goal write tests for foo</code>) and press Enter.
               Non-intrusive while typing.
+            </span>
+          </span>
+        </label>
+      </div>
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ReasoningDisplayToggle — UX gap B follow-up (clutter cleanup 2026-06-25).
+// When a long iteration fires 30+ tool calls each preceded by a reasoning
+// chunk, the original "💭 collapsed chip per tool call" UX flooded the
+// conversation. Default flipped to "hidden" (data still persisted on the
+// server, just not rendered); user can flip back to "collapsed" here.
+// ──────────────────────────────────────────────────────────────────────
+function ReasoningDisplayToggle() {
+  const [value, setValue] = useState<ReasoningDisplaySetting>(loadReasoningDisplaySetting);
+  useEffect(() => subscribeReasoningDisplaySetting(setValue), []);
+  const update = (next: ReasoningDisplaySetting) => {
+    setValue(next);
+    saveReasoningDisplaySetting(next);
+  };
+  return (
+    <div className="mt-6 space-y-2">
+      <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Reasoning display</h4>
+      <p className="text-xs text-slate-500">
+        Some models stream a chain-of-thought (
+        <code className="rounded bg-slate-100 px-1">reasoning</code> /{" "}
+        <code className="rounded bg-slate-100 px-1">thinking</code>
+        ) alongside every tool call. Hidden by default — flip to show
+        when you want to inspect the model's reasoning. Reasoning is always
+        persisted in the conversation log, so flipping later does not lose
+        prior thoughts.
+      </p>
+      <div className="flex flex-col gap-1.5">
+        <label className="flex items-start gap-2 text-sm">
+          <input
+            type="radio"
+            name="composer-reasoning-display"
+            value="hidden"
+            checked={value === "hidden"}
+            onChange={() => update("hidden")}
+            className="mt-0.5"
+          />
+          <span>
+            <span className="font-medium text-slate-800">Hidden</span>{" "}
+            <span className="text-xs text-slate-500">(default — no chips)</span>
+            <span className="mt-0.5 block text-xs text-slate-500">
+              Don't render reasoning chips. Long iterations stay clean.
+            </span>
+          </span>
+        </label>
+        <label className="flex items-start gap-2 text-sm">
+          <input
+            type="radio"
+            name="composer-reasoning-display"
+            value="collapsed"
+            checked={value === "collapsed"}
+            onChange={() => update("collapsed")}
+            className="mt-0.5"
+          />
+          <span>
+            <span className="font-medium text-slate-800">Collapsed chip</span>{" "}
+            <span className="text-xs text-slate-500">(💭 click to expand)</span>
+            <span className="mt-0.5 block text-xs text-slate-500">
+              Show a folded 💭 chip per reasoning block. Click to expand
+              the raw chain-of-thought text.
             </span>
           </span>
         </label>
