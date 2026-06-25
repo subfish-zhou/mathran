@@ -26,6 +26,19 @@ rollout/rollback notes. Design lives at `_tasks/todo1-design.md`.
   (CI mode), `--no-follow` (one-shot status print). Exits 0 on terminal
   status, 130 on Ctrl-C. Remote operators can now `ssh` in and tail a
   goal without a browser. See DESIGN-REFERENCE.md §5.D.
+- **feat(safety): diff preview before file write (UX gap A).** Approval
+  rules gain a per-rule `requireDiffPreview` flag. When an `allow` rule
+  carrying it matches a `write_file` / `edit_file` call, the authorised
+  write now BLOCKS on a user review: the session computes a unified diff
+  (`src/core/approval/diff-preview.ts`), emits a `propose-write` event
+  (`{toolCallId, path, oldContent, newContent, diffText, mode}`, contents
+  truncated to 5 KB), and waits on a `writeProposalResolver` until the SPA's
+  new `<DiffPreviewModal>` returns Accept / Decline / Edit. Accept runs the
+  write (optionally with user-edited whole-file content); Decline reports a
+  rejection back to the model. Serve wiring mirrors the approval flow
+  (`src/server/write-proposal-routes.ts`, `POST …/write-proposal/:id`).
+  Fully backward compatible: rules without `requireDiffPreview`, and hosts
+  with no resolver wired (CLI / goal), behave exactly as before.
 
 - **feat(goal/daemon): backend goal-loop driver (C1–C5).** New
   `src/core/goal/daemon.ts` (`GoalDaemon` + `GoalTurnRunner`) takes

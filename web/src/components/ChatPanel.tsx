@@ -56,6 +56,12 @@ import {
   type ApprovalRequest,
   type ApprovalDecision,
 } from "../lib/approval-client.ts";
+import DiffPreviewModal from "./DiffPreviewModal.tsx";
+import {
+  postWriteProposalDecision,
+  type WriteProposal,
+  type WriteProposalDecision,
+} from "../lib/write-proposal-client.ts";
 import { AgentStatusPanel, type ChatEventPhase } from "./AgentStatusPanel.tsx";
 import { api, chatScopeBase, type ChatScopeSpec, type ConversationSummary, type UsageStats } from "../lib/api.ts";
 import {
@@ -631,6 +637,15 @@ export default function ChatPanel({
   );
   const [approvalSubmitting, setApprovalSubmitting] = useState(false);
   const [approvalError, setApprovalError] = useState<string | null>(null);
+  // UX gap A — Diff preview before file write. `pendingWrites` maps a write
+  // tool-call id to its in-flight proposal; the DiffPreviewModal renders the
+  // head of this map. The server stream parks awaiting our POST. A
+  // `propose-write-resolved` event (or the decision POST success) clears it.
+  const [pendingWrites, setPendingWrites] = useState<
+    Map<string, WriteProposal>
+  >(new Map());
+  const [writeSubmitting, setWriteSubmitting] = useState(false);
+  const [writeError, setWriteError] = useState<string | null>(null);
   const [planSavedToast, setPlanSavedToast] = useState<string | null>(null);
   // outcomes 收尾 C-2 — transient toast surfaced when a background self-grade
   // round lands a `goal-graded` SSE frame ("📊 Goal graded: X/5").
@@ -1213,6 +1228,28 @@ export default function ChatPanel({
           setApprovalSubmitting(false);
           setApprovalError(null);
         }
+        // UX gap A — a write needs review. Stash the proposal so the
+        // DiffPreviewModal renders; the server stream stays open awaiting our
+        // POST. `propose-write-resolved` (or the POST success) clears it.
+        if (ev.type === "propose-write") {
+          setPendingWrites((cur) => {
+            const next = new Map(cur);
+            next.set(ev.proposal.toolCallId, ev.proposal);
+            return next;
+          });
+          setWriteError(null);
+          setWriteSubmitting(false);
+        }
+        if (ev.type === "propose-write-resolved") {
+          setPendingWrites((cur) => {
+            if (!cur.has(ev.toolCallId)) return cur;
+            const next = new Map(cur);
+            next.delete(ev.toolCallId);
+            return next;
+          });
+          setWriteSubmitting(false);
+          setWriteError(null);
+        }
         // v0.17 P2 — propose_goal confirmation produced a real Goal.
         // Show a banner notification, and when the model + user opted
         // for autoRun, navigate the SPA to the goal page so they can
@@ -1475,6 +1512,31 @@ export default function ChatPanel({
       }
     },
     [pendingApproval, conversationId, scope],
+  );
+
+  // UX gap A — POST the user's decision for the head write proposal. Mirrors
+  // the approval flow: keep the modal until `propose-write-resolved` lands; on
+  // failure surface the error inline and re-enable the buttons.
+  const handleWriteDecide = useCallback(
+    async (decision: WriteProposalDecision) => {
+      const first = pendingWrites.values().next();
+      if (first.done || !conversationId) return;
+      const proposal = first.value;
+      setWriteSubmitting(true);
+      setWriteError(null);
+      try {
+        await postWriteProposalDecision(
+          scope,
+          conversationId,
+          proposal.toolCallId,
+          decision,
+        );
+      } catch (err) {
+        setWriteError((err as Error).message);
+        setWriteSubmitting(false);
+      }
+    },
+    [pendingWrites, conversationId, scope],
   );
 
   // ─── Stop the in-flight stream (v0.16 §1) ────────────────────────────────────
@@ -4130,6 +4192,17 @@ export default function ChatPanel({
           onDecide={handleApprovalDecide}
           pending={approvalSubmitting}
           error={approvalError}
+        />
+      )}
+
+      {/* UX gap A — Diff preview before file write. Render the head of the
+          pending-writes map; resolving it advances to the next (rare) one. */}
+      {pendingWrites.size > 0 && (
+        <DiffPreviewModal
+          proposal={pendingWrites.values().next().value as WriteProposal}
+          onDecide={handleWriteDecide}
+          pending={writeSubmitting}
+          error={writeError}
         />
       )}
 

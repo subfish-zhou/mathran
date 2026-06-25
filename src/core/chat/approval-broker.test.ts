@@ -289,4 +289,51 @@ describe("ApprovalBroker.preCheck / resolveDecision (yield-based host)", () => {
       broker.applyFailureDecision({ outcome: "abandon", reason: "stop" }),
     ).toEqual({ kind: "abandon", reason: "stop" });
   });
+
+  describe("requiresDiffPreview (UX gap A)", () => {
+    it("true when the matching allow rule sets requireDiffPreview", async () => {
+      const broker = new ApprovalBroker({
+        policy: "on-request",
+        learning: false,
+        inlineRules: [
+          { tool: "write_file", pathGlob: "**", action: "allow", requireDiffPreview: true },
+        ],
+      });
+      expect(
+        await broker.requiresDiffPreview({ tool: "write_file", args: { path: "a.txt" } }),
+      ).toBe(true);
+    });
+
+    it("false for a plain allow rule (backward compat)", async () => {
+      const broker = new ApprovalBroker({
+        policy: "on-request",
+        learning: false,
+        inlineRules: [{ tool: "write_file", pathGlob: "**", action: "allow" }],
+      });
+      expect(
+        await broker.requiresDiffPreview({ tool: "write_file", args: { path: "a.txt" } }),
+      ).toBe(false);
+    });
+
+    it("false when no rule matches", async () => {
+      const broker = new ApprovalBroker({ policy: "on-request", learning: false });
+      expect(
+        await broker.requiresDiffPreview({ tool: "write_file", args: { path: "a.txt" } }),
+      ).toBe(false);
+    });
+
+    it("false when a denylist entry vetoes the call", async () => {
+      const broker = new ApprovalBroker({
+        policy: "on-request",
+        learning: false,
+        denylist: ["write_file:/etc/*"],
+        inlineRules: [
+          { tool: "write_file", pathGlob: "**", action: "allow", requireDiffPreview: true },
+        ],
+      });
+      expect(
+        await broker.requiresDiffPreview({ tool: "write_file", args: { path: "/etc/passwd" } }),
+      ).toBe(false);
+    });
+  });
 });

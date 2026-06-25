@@ -4,6 +4,10 @@
 
 import { chatScopeBase, type ChatScopeSpec } from "./api.ts";
 import type { ApprovalRequest, ApprovalDecision } from "./approval-client.ts";
+import type {
+  WriteProposal,
+  WriteProposalDecision,
+} from "./write-proposal-client.ts";
 
 /**
  * v0.17 mathub parity W2: attachment ref the composer forwards alongside
@@ -154,6 +158,22 @@ export type ChatEvent =
       type: "approval_resolved";
       id: string;
       decision: ApprovalDecision;
+    }
+  | {
+      /** UX gap A — Diff preview before file write. An authorised write_file /
+       *  edit_file call whose rule set `requireDiffPreview` is about to run; the
+       *  serve stream parks awaiting the user's verdict. The SPA renders a
+       *  DiffPreviewModal and POSTs the decision via
+       *  {@link postWriteProposalDecision}. */
+      type: "propose-write";
+      proposal: WriteProposal;
+    }
+  | {
+      /** UX gap A — emitted right after a write proposal is resolved
+       *  (accept / decline). The SPA uses it to dismiss the modal. */
+      type: "propose-write-resolved";
+      toolCallId: string;
+      decision: WriteProposalDecision;
     }
   | {
       /** outcomes 收尾 C-2 — emitted by the host SSE layer when a background
