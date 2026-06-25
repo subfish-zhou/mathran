@@ -102,6 +102,7 @@ import {
   type ReasoningDisplay,
 } from "../lib/composer-prefs.ts";
 import { useCopilotModels } from "../lib/copilot-models.ts";
+import ModelComboBox from "./ModelComboBox.tsx";
 import {
   parseSlashInput,
   activeSlashPrefix,
@@ -2872,22 +2873,14 @@ export default function ChatPanel({
               );
             })()}
           </div>
-          <input
+          <ModelComboBox
             value={model}
-            onChange={(e) => setModel(e.target.value)}
+            onChange={setModel}
+            options={copilotModels.models}
             placeholder="model (e.g. copilot/gpt-5.5)"
-            list="mathran-model-suggestions"
-            className="w-64 rounded-md border border-slate-300 px-2 py-1 text-xs font-mono outline-none focus:border-slate-500"
+            disabled={busy}
+            className="w-64"
           />
-          <datalist id="mathran-model-suggestions">
-            {/* 2026-06-25: actual list from /api/copilot/models, no more
-                hardcoded guesses. Falls back to the snapshot embedded in
-                copilot-models-cache.ts when the live cache is cold (no
-                token / offline / copilot down) — never empty. */}
-            {copilotModels.models.map((m) => (
-              <option key={m} value={`copilot/${m}`} />
-            ))}
-          </datalist>
           {/* ─── Pinned-only toggle (v0.16 §2) ────────────────────────
               Compact button in the chat header; flips the rows filter
               below to render only pinned bubbles. Useful for jumping

@@ -33,6 +33,7 @@ import {
   type ReasoningDisplay as ReasoningDisplaySetting,
 } from "../lib/composer-prefs.ts";
 import { useCopilotModels } from "../lib/copilot-models.ts";
+import ModelComboBox from "./ModelComboBox.tsx";
 import {
   APPROVAL_POLICIES,
   THEMES,
@@ -259,26 +260,18 @@ export default function SettingsPanel() {
             {/* Model preference */}
             <Section title="Model Preference" editable={editable("modelPreference")}>
               <Field label="Default model" hint={sourceLabel(sources, "modelPreference.default")}>
-                <input
+                <ModelComboBox
                   value={draft.modelPreference?.default ?? ""}
-                  disabled={!editable("modelPreference")}
-                  onChange={(e) =>
+                  onChange={(next) =>
                     patchDraft((d) => {
-                      d.modelPreference = { ...(d.modelPreference ?? {}), default: e.target.value };
+                      d.modelPreference = { ...(d.modelPreference ?? {}), default: next };
                     })
                   }
-                  list="mathran-settings-model-suggestions"
+                  options={copilotModels.models}
                   placeholder="copilot/gpt-5.5"
-                  className="w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-sm outline-none focus:border-slate-500 disabled:bg-slate-100"
+                  disabled={!editable("modelPreference")}
+                  className="w-full"
                 />
-                {/* 2026-06-25 — list now comes from /api/copilot/models so
-                    the autocomplete reflects subfish's actual Copilot
-                    subscription, not a hardcoded guess. */}
-                <datalist id="mathran-settings-model-suggestions">
-                  {copilotModels.models.map((m) => (
-                    <option key={m} value={`copilot/${m}`} />
-                  ))}
-                </datalist>
               </Field>
             </Section>
 

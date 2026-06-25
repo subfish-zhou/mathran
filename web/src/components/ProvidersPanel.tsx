@@ -20,6 +20,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, type ProvidersResponse } from "../lib/api.ts";
 import { useCopilotModels } from "../lib/copilot-models.ts";
+import ModelComboBox from "./ModelComboBox.tsx";
 
 interface DraftRow {
   kind: string;
@@ -180,19 +181,13 @@ export default function ProvidersPanel() {
           <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">
             Default model
           </label>
-          <input
+          <ModelComboBox
             value={defaultModel}
-            onChange={(e) => setDefaultModel(e.target.value)}
-            list="mathran-providers-model-suggestions"
+            onChange={setDefaultModel}
+            options={copilotModels.models}
             placeholder="copilot/gpt-5.5"
-            className="w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-sm outline-none focus:border-slate-500"
+            className="w-full"
           />
-          <datalist id="mathran-providers-model-suggestions">
-            {/* 2026-06-25 — live list from /api/copilot/models. */}
-            {copilotModels.models.map((m) => (
-              <option key={m} value={`copilot/${m}`} />
-            ))}
-          </datalist>
           <p className="mt-1 text-xs text-slate-400">
             Format: <code>provider/model</code> (e.g. <code>copilot/gpt-5.5</code>,{" "}
             <code>copilot/claude-opus-4.8</code>, <code>openai/gpt-4o</code>).
