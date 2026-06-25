@@ -131,7 +131,13 @@ import { createGitTools } from "./tools/git-tools.js";
 import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
+import { formatHookBlock } from "../hooks/executor.js";
 import type { RiskClass, ApprovalRequest, ApprovalDecision, ApprovalResolver } from "../approval/types.js";
+import {
+  buildWriteProposal,
+  type WriteProposal,
+  type WriteProposalDecision,
+} from "../approval/diff-preview.js";
 import type { Outcome } from "../outcomes/schema.js";
 import type { BackgroundSubagentRegistry } from "../subagent/background.js";
 import type { ProfileEffects } from "../profiles/types.js";
@@ -283,6 +289,27 @@ export type ChatEvent =
       type: "approval_resolved";
       id: string;
       decision: ApprovalDecision;
+    }
+  | {
+      /** UX gap A — Diff preview before file write. Emitted just before an
+       *  already-authorised write_file / edit_file call executes, when its
+       *  matching `allow` rule carries `requireDiffPreview: true`. Carries the
+       *  unified diff + truncated old/new content so the SPA renders a
+       *  `DiffPreviewModal`; the session then BLOCKS on the
+       *  {@link writeProposalResolver} until the user accepts / declines / edits.
+       *  CLI / goal hosts without a resolver never see this — the write just
+       *  runs. */
+      type: "propose-write";
+      proposal: WriteProposal;
+    }
+  | {
+      /** UX gap A — emitted right after a `propose-write` is resolved, carrying
+       *  the user's verdict so the SPA can dismiss the modal and observers can
+       *  audit it. `accept` (optionally with edited content) runs the write;
+       *  `decline` reports a rejection to the model. */
+      type: "propose-write-resolved";
+      toolCallId: string;
+      decision: WriteProposalDecision;
     }
   | {
       /** v0.16 §11 — the model called `ask_user`; the host (serve) will
@@ -727,6 +754,19 @@ export interface ChatSessionOptions {
    */
   approvalResolver?: ApprovalResolver;
   /**
+   * UX gap A — Diff preview before file write. Session-level resolver the
+   * broker consults AFTER it has authorised a write-style call whose matching
+   * `allow` rule carries `requireDiffPreview: true`. The session yields a
+   * `propose-write` event (unified diff + truncated contents), awaits this
+   * resolver, yields `propose-write-resolved`, then either runs the write
+   * (optionally with the user's edited content) or reports a rejection back to
+   * the model. When unset, `requireDiffPreview` rules degrade gracefully to the
+   * legacy behaviour: the authorised write runs immediately with no preview.
+   */
+  writeProposalResolver?: (
+    proposal: WriteProposal,
+  ) => Promise<WriteProposalDecision>;
+  /**
    * Permission Profile (#2). When set, a HARD reject is applied at the tool
    * dispatch entry point (before the approval broker, so the user cannot
    * override it) for mutating tool calls under a read-only / review profile,
@@ -957,6 +997,10 @@ export class ChatSession {
   private readonly hookInvoker?: HookInvoker;
   /** Session-level approval resolver (yield-based prompt driver). */
   private readonly approvalResolver?: ApprovalResolver;
+  /** UX gap A — diff-preview resolver (yield-based write-proposal driver). */
+  private readonly writeProposalResolver?: (
+    proposal: WriteProposal,
+  ) => Promise<WriteProposalDecision>;
   /** Permission Profile (#2) — drives the dispatch-level hard reject. */
   private readonly profile?: ProfileEffects;
   /**
@@ -1023,6 +1067,7 @@ export class ChatSession {
     this.checkpointsCfg = opts.checkpoints;
     this.approvalBroker = opts.approvalBroker;
     this.approvalResolver = opts.approvalResolver;
+    this.writeProposalResolver = opts.writeProposalResolver;
     this.hookInvoker = opts.hooks;
     this.profile = opts.profile;
     // Mix in built-in tools (v0.2 §9+). Order: built-ins first, then caller's
@@ -1669,7 +1714,7 @@ export class ChatSession {
         };
       }
       if (auth.kind === "allow") {
-        return await tool.execute(parsed, callCtx);
+        return yield* this.maybePreviewThenExecute(tool, call, parsed, callCtx);
       }
       return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, null);
     }
@@ -1684,7 +1729,7 @@ export class ChatSession {
       };
     }
     if (pre.kind === "allow") {
-      return await tool.execute(parsed, callCtx);
+      return yield* this.maybePreviewThenExecute(tool, call, parsed, callCtx);
     }
     if (pre.kind === "defer-on-failure") {
       return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, resolver);
@@ -1703,7 +1748,163 @@ export class ChatSession {
     if (verdict.kind === "defer-on-failure") {
       return yield* this.runDeferOnFailure(tool, authCall, parsed, callCtx, resolver);
     }
+    return yield* this.maybePreviewThenExecute(tool, call, parsed, callCtx);
+  }
+
+  /**
+   * UX gap A — Diff preview gate around an already-AUTHORISED write. Called at
+   * every `allow` exit of {@link executeWithApproval}. When the call is a
+   * write-style tool whose matching `allow` rule set `requireDiffPreview` AND a
+   * {@link writeProposalResolver} is wired, it:
+   *
+   *   1. reads the existing file content (if any),
+   *   2. builds a {@link WriteProposal} (unified diff + truncated contents),
+   *   3. yields a `propose-write` event and BLOCKS on the resolver,
+   *   4. yields `propose-write-resolved`, then either runs the write (optionally
+   *      with the user's edited whole-file content) or returns a rejection.
+   *
+   * In every other case (no resolver, rule doesn't require preview, non-write
+   * tool, or a proposal that can't be derived) it is a thin pass-through to
+   * `tool.execute` — preserving the legacy behaviour exactly.
+   */
+  private async *maybePreviewThenExecute(
+    tool: ToolSpec,
+    call: { id: string; name: string },
+    parsed: Record<string, unknown>,
+    callCtx: ToolExecuteContext,
+  ): AsyncGenerator<ChatEvent, { ok: boolean; content: string }, void> {
+    const broker = this.approvalBroker;
+    if (
+      !this.writeProposalResolver ||
+      !broker ||
+      tool.riskClass !== "write" ||
+      typeof parsed.path !== "string" ||
+      !parsed.path
+    ) {
+      return await tool.execute(parsed, callCtx);
+    }
+    const needPreview = await broker.requiresDiffPreview({
+      tool: call.name,
+      args: parsed,
+    });
+    if (!needPreview) {
+      return await tool.execute(parsed, callCtx);
+    }
+
+    const rawPath = parsed.path;
+    const workspace = callCtx.workspace ?? this.workspace ?? null;
+    const resolved = path.isAbsolute(rawPath)
+      ? rawPath
+      : path.resolve(workspace ?? process.cwd(), rawPath);
+
+    // Workspace-escape boundary: mirror the write tools' own containment check
+    // (write-file.ts / edit-file.ts `resolvePath`). A path that escapes the
+    // workspace must NOT be previewed-then-written directly here — fall through
+    // to `tool.execute`, which rejects it with the canonical "escapes
+    // workspace" error. This keeps the boundary intact on the
+    // accept-with-edited-content path (which writes `resolved` directly).
+    if (workspace) {
+      const rel = path.relative(workspace, resolved);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) {
+        return await tool.execute(parsed, callCtx);
+      }
+    }
+
+    const fs = await import("node:fs/promises");
+    let oldContent: string | null = null;
+    let exists = false;
+    try {
+      oldContent = await fs.readFile(resolved, "utf-8");
+      exists = true;
+    } catch {
+      oldContent = null;
+      exists = false;
+    }
+
+    const proposal = buildWriteProposal({
+      toolCallId: call.id,
+      tool: call.name,
+      args: parsed,
+      path: rawPath,
+      oldContent,
+      exists,
+    });
+    // No derivable preview (unknown tool / ambiguous edit match) — let the tool
+    // run and fail loudly on its own terms rather than silently swallow it.
+    if (!proposal) {
+      return await tool.execute(parsed, callCtx);
+    }
+
+    yield { type: "propose-write", proposal };
+    const decision = await this.writeProposalResolver(proposal);
+    yield { type: "propose-write-resolved", toolCallId: call.id, decision };
+
+    if (decision.outcome === "decline") {
+      return {
+        ok: false,
+        content:
+          "⛔ write rejected by user (diff preview declined) — revise the change or pick a different approach",
+      };
+    }
+
+    // Accept. When the user edited the content in the modal, that edited string
+    // is the FULL new file. For write_file we just swap the `content` arg and
+    // reuse the tool (keeping its hooks / read-tracking). For other write tools
+    // (edit_file) the edited whole-file content can't round-trip through the
+    // tool's own diff-apply, so we write it directly.
+    if (typeof decision.editedContent === "string") {
+      if (call.name === "write_file") {
+        return await tool.execute(
+          { ...parsed, content: decision.editedContent },
+          callCtx,
+        );
+      }
+      return await this.applyEditedWrite(
+        resolved,
+        rawPath,
+        decision.editedContent,
+        callCtx,
+      );
+    }
+
     return await tool.execute(parsed, callCtx);
+  }
+
+  /**
+   * Write `content` directly to `resolved`, honouring pre/post-edit hooks and
+   * read-tracking. Used only on a diff-preview "accept with edits" for a tool
+   * (edit_file) whose own execute path can't take a whole-file replacement.
+   */
+  private async applyEditedWrite(
+    resolved: string,
+    rawPath: string,
+    content: string,
+    callCtx: ToolExecuteContext,
+  ): Promise<{ ok: boolean; content: string }> {
+    const fs = await import("node:fs/promises");
+    try {
+      if (callCtx.hooks) {
+        const pre = await callCtx.hooks.run("pre-edit", { filePath: resolved });
+        if (pre.blocked) {
+          return { ok: false, content: formatHookBlock("edit_file", pre) };
+        }
+      }
+      await fs.mkdir(path.dirname(resolved), { recursive: true });
+      await fs.writeFile(resolved, content, "utf-8");
+    } catch (err: any) {
+      return {
+        ok: false,
+        content: `edit_file error: ${err?.message ?? String(err)}`,
+      };
+    }
+    callCtx.recordRead?.(resolved);
+    const bytes = Buffer.byteLength(content, "utf-8");
+    let result = `wrote ${bytes} bytes to ${rawPath} (user-edited via diff preview)`;
+    if (callCtx.hooks) {
+      const post = await callCtx.hooks.run("post-edit", { filePath: resolved });
+      if (post.summary) result += `\n\n${post.summary}`;
+    }
+    return { ok: true, content: result };
   }
 
   /**

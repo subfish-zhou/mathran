@@ -92,11 +92,16 @@ import {
   resolveApprovalConfig,
   historyFor,
 } from "../core/approval/index.js";
+import type { WriteProposal } from "../core/approval/diff-preview.js";
 import {
   ApprovalRegistry,
   sharedApprovalRegistry,
   registerApprovalRoute,
 } from "./approval-routes.js";
+import {
+  sharedWriteProposalRegistry,
+  registerWriteProposalRoute,
+} from "./write-proposal-routes.js";
 import {
   SubagentScheduler,
   defaultSubagentRegistry,
@@ -1232,11 +1237,20 @@ export function defaultSessionFactory(
       ? (request: Parameters<typeof approvalRegistry.register>[1]) =>
           approvalRegistry.register(conversationId, request)
       : undefined;
+    // UX gap A — diff-preview resolver: park each write proposal in the shared
+    // registry; the SPA's DiffPreviewModal POST resolves it (see
+    // write-proposal-routes). Only wired when we have a conversation id to key
+    // the parked promise on.
+    const writeProposalResolver = conversationId
+      ? (proposal: WriteProposal) =>
+          sharedWriteProposalRegistry.register(conversationId, proposal)
+      : undefined;
     return new ChatSession({
       llm: router,
       model: resolvedModel,
       approvalBroker,
       ...(approvalResolver ? { approvalResolver } : {}),
+      ...(writeProposalResolver ? { writeProposalResolver } : {}),
       // C-1: when a profile is active, thread it into the session so the
       // dispatch-level hard reject (readOnlyMode / hardRejectMutations /
       // denylistTools) fires BEFORE the broker is consulted — i.e. even a
@@ -1550,6 +1564,7 @@ function registerChatScope(
   // Approval Policy 矩阵 — POST <base>/:cid/approval/:id resolves a parked
   // prompt; GET lists pending prompts for recovery after a page reload.
   registerApprovalRoute(app, basePath, approvalRegistry);
+  registerWriteProposalRoute(app, basePath, sharedWriteProposalRegistry);
   // POST <base>  — send a message (SSE)
   app.post(basePath, async (c) => {
     const resolved = getScope(c);
@@ -1819,6 +1834,7 @@ function registerChatScope(
         // decision (browser closed mid-approval) as a deny so the session never
         // hangs on a dead Promise.
         approvalRegistry.rejectPending(conversationId);
+        sharedWriteProposalRegistry.rejectPending(conversationId);
       }
     });
   });
@@ -2189,6 +2205,7 @@ function registerChatScope(
         releaseSteerSlot();
         releaseGoalGraded();
         approvalRegistry.rejectPending(id);
+        sharedWriteProposalRegistry.rejectPending(id);
       }
     });
   });
@@ -2587,6 +2604,7 @@ function registerChatScope(
         // Approval Policy 矩阵 — fail-safe: a resumed round can raise a fresh
         // approval prompt too; settle any still pending if the stream dies.
         approvalRegistry.rejectPending(id);
+        sharedWriteProposalRegistry.rejectPending(id);
       }
     });
   });

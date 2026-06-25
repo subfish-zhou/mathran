@@ -36,6 +36,16 @@ export interface Rule {
   action: "allow" | "deny";
   /** `session` rules live only in memory; `persistent` rules hit disk. */
   scope?: "session" | "persistent";
+  /**
+   * UX gap A — Diff preview before file write. When `true` on an `allow` rule
+   * that matches a write-style tool call (write_file / edit_file), the broker
+   * still authorises the call but the session first surfaces a `propose-write`
+   * event carrying the unified diff and BLOCKS until the user accepts / declines
+   * / edits it. Default (undefined / false) preserves the legacy behaviour: an
+   * allow rule runs the write immediately with no preview. Ignored on `deny`
+   * rules and on non-write tools.
+   */
+  requireDiffPreview?: boolean;
 }
 
 /** Shape of the `approval-rules.json` file. */
@@ -139,6 +149,22 @@ export function matchRules(
 ): "allow" | "deny" | null {
   for (const rule of rules) {
     if (ruleMatches(rule, tool, args)) return rule.action;
+  }
+  return null;
+}
+
+/**
+ * Like {@link matchRules}, but returns the first matching {@link Rule} object
+ * (not just its action) so callers can inspect per-rule metadata such as
+ * {@link Rule.requireDiffPreview}. Returns `null` when no rule matches.
+ */
+export function firstMatchingRule(
+  rules: Rule[],
+  tool: string,
+  args: Record<string, unknown>,
+): Rule | null {
+  for (const rule of rules) {
+    if (ruleMatches(rule, tool, args)) return rule;
   }
   return null;
 }

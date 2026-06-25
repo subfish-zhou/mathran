@@ -28,6 +28,7 @@ import type { PolicyContext } from "../approval/policy.js";
 import {
   matchDenylist,
   matchRules,
+  firstMatchingRule,
   loadRulesFile,
   appendRule,
 } from "../approval/rules.js";
@@ -153,6 +154,27 @@ export class ApprovalBroker {
   /** The active policy (read-only accessor for hosts / tests). */
   get activePolicy(): ApprovalPolicy {
     return this.policy;
+  }
+
+  /**
+   * UX gap A — whether an authorised write-style call should still surface a
+   * diff preview before it executes. True only when the FIRST matching standing
+   * rule is an `allow` rule carrying `requireDiffPreview: true`. The denylist
+   * and a `deny` rule short-circuit to `false` (the call won't run at all).
+   *
+   * This is consulted by the session AFTER the broker has already authorised
+   * the call (verdict `allow`); it never changes whether the call runs, only
+   * whether the user reviews the diff first. Default behaviour (no such rule)
+   * returns `false`, preserving the legacy "allow runs immediately" path.
+   */
+  async requiresDiffPreview(call: {
+    tool: string;
+    args: Record<string, unknown>;
+  }): Promise<boolean> {
+    const { tool, args } = call;
+    if (matchDenylist(this.denylist, tool, args)) return false;
+    const rule = firstMatchingRule(await this.allRules(), tool, args);
+    return rule?.action === "allow" && rule.requireDiffPreview === true;
   }
 
   /** Expose the live session rules (read-only copy) for tests / inspection. */
