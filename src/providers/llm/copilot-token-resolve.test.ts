@@ -101,12 +101,22 @@ describe("resolveCopilotToken: (2) env raw token + exchange", () => {
       const out1 = await resolveCopilotToken();
       expect(out1.token).toBe(sessionToken);
       expect(out1.expiresAt).toBeCloseTo(expiresAtSec * 1000, -2);
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      // 2026-06-25: resolveCopilotToken now also fires a best-effort
+      // `refreshCopilotModelsCacheFromBaseUrl(/models)` after a fresh
+      // exchange, which adds a second fetch (the /token exchange + the
+      // /models warm). It's intentionally fire-and-forget (`void …`)
+      // so the second call lands asynchronously — wait one microtask
+      // so it's observable in the spy count before asserting.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
 
-      // Second call within the cache window should NOT trigger a second fetch.
+      // Second call within the cache window should NOT trigger a third fetch
+      // (cache hit avoids the exchange; without a re-exchange there's also
+      // no new /models warm).
       const out2 = await resolveCopilotToken();
       expect(out2.token).toBe(sessionToken);
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
     });
   });
 

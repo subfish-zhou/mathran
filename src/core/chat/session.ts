@@ -123,6 +123,9 @@ import { createInstallPythonPackageTool } from "./tools/install-python-package.j
 import { createSearchWebTool } from "./tools/search-web.js";
 import { createVerifyPageTool } from "./tools/verify-page.js";
 import { createSearchArxivTool } from "./tools/search-arxiv.js";
+import { createGlobTool } from "./tools/glob.js";
+import { createGrepTool } from "./tools/grep.js";
+import { createWebFetchTool } from "./tools/web-fetch.js";
 import {
   createCompletePlanTool,
   createEnterPlanModeTool,
@@ -694,6 +697,17 @@ export interface ChatSessionOptions {
      * plain boolean.
      */
     search_arxiv?: boolean;
+    /**
+     * 2026-06-25 — Codex / Claude Code parity built-ins.
+     * `glob`: list workspace paths matching a pattern (Node fs.glob).
+     * `grep`: ripgrep wrapper with structured output (read-only).
+     * `web_fetch`: one-shot URL fetch w/ SSRF guard + 1 MB cap.
+     * Plain boolean or object cfg (web_fetch accepts allowPrivateNetwork
+     * for an SSRF-guard escape hatch, mainly for tests).
+     */
+    glob?: boolean;
+    grep?: boolean;
+    web_fetch?: boolean | { allowPrivateNetwork?: boolean; userAgent?: string };
     /**
      * Part B1 — chat-level plan mode tools (`enter_plan_mode` /
      * `complete_plan`). Default ON when the host explicitly enables them.
@@ -1609,6 +1623,24 @@ export class ChatSession {
     // gap #2 — stateless read-only arXiv search; no checkpoint wrapping needed.
     if (cfg.search_arxiv) {
       out.push(createSearchArxivTool());
+    }
+    // 2026-06-25 — three Codex/Claude-Code-parity tools wired in here so
+    // chat-mode + goal-mode (both share this factory) pick them up via
+    // the same `builtinTools` cfg map as the other read-only tools.
+    if (cfg.glob) {
+      out.push(createGlobTool(this.workspace ? { workspace: this.workspace } : {}));
+    }
+    if (cfg.grep) {
+      out.push(createGrepTool(this.workspace ? { workspace: this.workspace } : {}));
+    }
+    if (cfg.web_fetch) {
+      const wfCfg = typeof cfg.web_fetch === "object" ? cfg.web_fetch : {};
+      out.push(
+        createWebFetchTool({
+          ...(wfCfg.allowPrivateNetwork ? { allowPrivateNetwork: true } : {}),
+          ...(wfCfg.userAgent ? { userAgent: wfCfg.userAgent } : {}),
+        }),
+      );
     }
     // Part B1 — chat-level plan mode tools. Both tools are readOnly so the
     // model can always *exit* plan mode after entering it. We bind to

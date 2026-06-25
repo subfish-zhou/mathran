@@ -295,7 +295,10 @@ describe("buildUserMessageWithAttachments (unit)", () => {
 });
 
 describe("POST /api/global-chat with attachments", () => {
-  it("textual attachment: inlines UTF-8 contents under `[Attachment: …]`", async () => {
+  it("textual attachment: emits a path-only marker (no inline content)", async () => {
+    // 2026-06-25 — Codex/OpenClaw parity: text attachments are NOT inlined
+    // anymore. The chat sees a path marker and pulls the content with
+    // `read_file` on demand. Test asserts the new behaviour.
     const body = "# Hello\n\nThis is a markdown attachment.\n";
     const up = await uploadFile("hello.md", "text/markdown", new TextEncoder().encode(body));
 
@@ -306,11 +309,13 @@ describe("POST /api/global-chat with attachments", () => {
     const history = await readHistory(send.conversationId!);
     const userMsg = history.find((m) => m.role === "user");
     expect(userMsg).toBeDefined();
-    // Body comes first, attachment block follows after a blank line.
     expect(userMsg!.content).toMatch(/^Look at this file\n\n\[Attachment: hello\.md\]\n/);
-    // Inlined file body is present verbatim.
-    expect(userMsg!.content).toContain(body);
-    // No `[Image: …]` / `[Binary: …]` mis-render.
+    expect(userMsg!.content).toMatch(/  path: .*hello\.md/);
+    expect(userMsg!.content).toMatch(/  size: \d+ bytes/);
+    expect(userMsg!.content).toMatch(/  peek: # Hello/);
+    expect(userMsg!.content).toMatch(/→ Use `read_file path=/);
+    // Raw body NOT inlined verbatim — peek strips newlines.
+    expect(userMsg!.content).not.toContain(body);
     expect(userMsg!.content).not.toMatch(/\[Image:/);
     expect(userMsg!.content).not.toMatch(/\[Binary:/);
   });
@@ -335,8 +340,12 @@ describe("POST /api/global-chat with attachments", () => {
     expect(userMsg!.content).not.toMatch(/\[Attachment: diagram\.png\]/);
   });
 
-  it("oversize text attachment: truncates and appends `[truncated]` marker", async () => {
-    // 250 KB of repetitive text — larger than MAX_TEXT_ATTACHMENT_BYTES (200 KB).
+  it("oversize text attachment: still emits path-only marker (size visible)", async () => {
+    // 2026-06-25 — Codex/OpenClaw parity: oversize file is NOT truncated
+    // and inlined; the path-only marker just shows the size, and the
+    // model uses `read_file` with offset/limit to pull whatever segments
+    // it actually needs. So this test now verifies the size marker
+    // matches the upload size rather than checking for truncation.
     const big = "a".repeat(MAX_TEXT_ATTACHMENT_BYTES + 50 * 1024);
     const up = await uploadFile("big.txt", "text/plain", new TextEncoder().encode(big));
 
@@ -346,15 +355,19 @@ describe("POST /api/global-chat with attachments", () => {
     const history = await readHistory(send.conversationId!);
     const userMsg = history.find((m) => m.role === "user");
     expect(userMsg).toBeDefined();
-    // Truncation marker is present…
-    expect(userMsg!.content).toMatch(/… \[truncated\]\s*$/);
-    // …and the inlined body is exactly MAX_TEXT_ATTACHMENT_BYTES of 'a',
-    // not the full 250 KB. We count by extracting the body between the
-    // header and the truncated marker.
-    const header = "[Attachment: big.txt]\n";
-    const start = userMsg!.content.indexOf(header) + header.length;
-    const end = userMsg!.content.lastIndexOf("\n… [truncated]");
-    expect(end - start).toBe(MAX_TEXT_ATTACHMENT_BYTES);
+    // Header + path marker present.
+    expect(userMsg!.content).toContain("[Attachment: big.txt]");
+    expect(userMsg!.content).toMatch(/  path: .*big\.txt/);
+    // Size matches the upload — model can decide whether it's worth
+    // reading at all.
+    const expectedSize = MAX_TEXT_ATTACHMENT_BYTES + 50 * 1024;
+    expect(userMsg!.content).toContain(`size: ${expectedSize} bytes`);
+    // No truncation marker (we don't inline anymore).
+    expect(userMsg!.content).not.toMatch(/\[truncated\]/);
+    // The body is NOT inlined — message body should be radically
+    // smaller than the file (header + path + size + peek + hint ≈
+    // a few hundred bytes, vs 250 KB).
+    expect(userMsg!.content.length).toBeLessThan(2_000);
   });
 
   it("400 on bad attachment path (escape attempt)", async () => {

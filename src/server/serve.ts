@@ -1299,6 +1299,68 @@ export function defaultSessionFactory(
         read_file: true,
         write_file: true,
         edit_file: true,
+
+        // 2026-06-25 — wire all mathran-implemented tools that were
+        // previously inert. Audit doc: ~/.openclaw/workspace/_tasks/
+        // mathran-tool-registration-audit-2026-06-25.md.
+        //
+        // Memory tools (workspace-scoped MEMORY.md / scratchpad) — read
+        // side enabled always, write side defaults ON for ergonomics.
+        memory_list: true,
+        memory_read: true,
+        memory_write: true,
+        memory_append: true,
+        memory_search: true,
+
+        // Per-conversation scratchpad — useful for goal mode + long
+        // chats where the model needs a mid-turn workspace.
+        ...(conversationId
+          ? {
+              scratchpad_read: { conversationId },
+              scratchpad_write: { conversationId },
+            }
+          : { scratchpad_read: true }),
+
+        // Code execution helpers (python / latex / pip). All carry
+        // riskClass="exec" so they go through the approval broker and
+        // the diff-preview gate when relevant.
+        ...(conversationId
+          ? {
+              run_python: { conversationId },
+              run_latex: { conversationId },
+              install_python_package: { conversationId },
+            }
+          : {
+              run_python: true,
+              run_latex: true,
+              install_python_package: true,
+            }),
+
+        // Research utilities — read-only.
+        search_web: true,
+        search_arxiv: true,
+        verify_page: true,
+
+        // 2026-06-25 — Codex/Claude-Code parity built-ins (glob, grep,
+        // web_fetch). All read-only; sandboxed to workspace; safe defaults.
+        glob: true,
+        grep: true,
+        web_fetch: true,
+
+        // git: inspect tools (status / diff / log / show) always on;
+        // commit requires explicit opt-in via the cfg block.
+        git: true,
+
+        // Project / effort / wiki / doc cluster (mathub parity) —
+        // gated on scope: global chat doesn't need them (no project
+        // context); project + effort scopes opt in.
+        gap1_project_tools: scope?.kind !== "global",
+
+        // Plan mode — chat-level enter_plan_mode / complete_plan
+        // toggles. Lets the user say "plan it first" without a
+        // separate propose_plan round.
+        plan_mode: true,
+
         // #3 Background Agents: when this session belongs to a conversation,
         // wire the shared process-local background registry + a companion
         // get_subagent_result tool so `mode: "background"` is available and the
@@ -1398,6 +1460,32 @@ export const GOAL_MODE_BUILTIN_TOOLS = {
   read_file: true,
   write_file: true,
   edit_file: true,
+
+  // 2026-06-25 — goal mode benefits MOST from a wide tool surface:
+  // it runs unattended for many rounds on a single objective, so the
+  // model needs the full research toolkit, not just bash + read/write.
+  // All tools below were implemented in src/core/chat/tools/ but were
+  // never wired into goal-mode sessions (audit doc 2026-06-25).
+  //
+  // Conservative choice: only enable tools that don't need a per-
+  // conversation id binding (memory + search_web + search_arxiv +
+  // verify_page + git inspect + plan_mode). scratchpad / run_python /
+  // run_latex / install_python_package need conversationId and goal
+  // mode binds those via `runner.ts` (see `todoTools` pattern there).
+  memory_list: true,
+  memory_read: true,
+  memory_write: true,
+  memory_append: true,
+  memory_search: true,
+  search_web: true,
+  search_arxiv: true,
+  verify_page: true,
+  git: true,
+  plan_mode: true,
+  // 2026-06-25 — Codex/Claude-Code parity built-ins, also on for goal mode.
+  glob: true,
+  grep: true,
+  web_fetch: true,
 } as const;
 
 /** Append a short scope hint to the system prompt so the model knows where it is. */
