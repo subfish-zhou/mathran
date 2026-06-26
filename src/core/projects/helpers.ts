@@ -251,3 +251,62 @@ export async function updateDocPage(
   await atomicWriteFile(file, body);
   return { page, bytes: Buffer.byteLength(body, "utf-8") };
 }
+
+/**
+ * Move a project directory to `<workspace>/.trash/<slug>-<timestamp>/`.
+ *
+ * Soft-delete only — never `fs.rm` the data, so an accidental delete is
+ * recoverable by `mv ~/mathran-workspace/.trash/<slug>-* ~/mathran-workspace/projects/<slug>`.
+ * Matches the workspace-wide "trash > rm" safety convention.
+ *
+ * 2026-06-26 — added when subfish hit the "I can't delete placeholder
+ * projects" wall during the post-Mathub-migration smoke test.
+ *
+ * Returns `{ removed, trashPath }`:
+ *   - `removed: false, trashPath: null` when the slug doesn't exist
+ *     (idempotent — second call is a no-op, not an error).
+ *   - `removed: true, trashPath: <abs path>` on success.
+ *
+ * Throws on:
+ *   - invalid slug (security: never let `..` escape projects/)
+ *   - target rename failure that ISN'T because of a cross-device
+ *     boundary (those auto-retry via shutil.move).
+ */
+export async function deleteProject(
+  workspace: string,
+  slug: string,
+): Promise<{ removed: boolean; trashPath: string | null }> {
+  if (!isSafeSlug(slug)) {
+    throw new Error(`invalid project slug: ${slug}`);
+  }
+  const projectDir = path.join(workspace, PROJECTS_DIR, slug);
+  let stat;
+  try {
+    stat = await fs.stat(projectDir);
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return { removed: false, trashPath: null };
+    throw err;
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`not a directory: ${projectDir}`);
+  }
+
+  const trashRoot = path.join(workspace, ".trash");
+  await fs.mkdir(trashRoot, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const trashPath = path.join(trashRoot, `${slug}-${ts}`);
+
+  try {
+    await fs.rename(projectDir, trashPath);
+  } catch (err: any) {
+    if (err?.code === "EXDEV") {
+      // Cross-device — fall back to recursive copy + remove.
+      const { cp, rm } = await import("node:fs/promises");
+      await cp(projectDir, trashPath, { recursive: true });
+      await rm(projectDir, { recursive: true, force: true });
+    } else {
+      throw err;
+    }
+  }
+  return { removed: true, trashPath };
+}

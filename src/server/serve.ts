@@ -38,6 +38,7 @@ import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerMemoryRoutes } from "./memory-routes.js";
 import { registerProfileRoutes } from "./profile-routes.js";
 import { registerPaperRoutes } from "./paper-routes.js";
+import { deleteProject } from "../core/projects/helpers.js";
 import { registerSlashRoutes } from "./slash-routes.js";
 import {
   buildUserMessageWithAttachments,
@@ -3831,6 +3832,24 @@ function buildApp(
     const project = await readProject(workspace, slug);
     if (!project) return c.json({ error: "project not found" }, 404);
     return c.json(project);
+  });
+
+  // 2026-06-26 — soft-delete a project (moves to .trash/<slug>-<ts>/).
+  // Added after subfish hit "I can't delete placeholder projects" while
+  // smoke-testing the migrated init-project pipeline. Recoverable via
+  // mv ~/mathran-workspace/.trash/<slug>-* ~/mathran-workspace/projects/<slug>.
+  app.delete("/api/projects/:slug", async (c) => {
+    const slug = c.req.param("slug");
+    if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);
+    try {
+      const result = await deleteProject(workspace, slug);
+      if (!result.removed) {
+        return c.json({ error: "project not found" }, 404);
+      }
+      return c.json({ removed: true, trashPath: result.trashPath });
+    } catch (err: any) {
+      return c.json({ error: err?.message ?? String(err) }, 500);
+    }
   });
 
   // ─── Init-project agent (fs-only, DB-free) ─────────────────────────────────

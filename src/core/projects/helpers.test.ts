@@ -12,6 +12,7 @@ import {
   readDocPage,
   createDocPage,
   updateDocPage,
+  deleteProject,
 } from "./helpers.js";
 
 let workspace: string;
@@ -127,5 +128,39 @@ describe("doc pages", () => {
   it("readDocPage returns null for missing", async () => {
     await makeProject("p1");
     expect(await readDocPage(workspace, "p1", "ghost")).toBeNull();
+  });
+});
+
+describe("deleteProject (soft-delete to .trash)", () => {
+  beforeEach(async () => {
+    workspace = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-del-"));
+  });
+  it("moves an existing project to .trash/<slug>-<ts>", async () => {
+    const dir = path.join(workspace, "projects", "goldbach");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "marker.txt"), "hi");
+    const r = await deleteProject(workspace, "goldbach");
+    expect(r.removed).toBe(true);
+    expect(r.trashPath).toMatch(/\.trash\/goldbach-/);
+    // Original gone.
+    await expect(fs.access(dir)).rejects.toBeTruthy();
+    // Marker survives inside trash.
+    expect(await fs.readFile(path.join(r.trashPath!, "marker.txt"), "utf-8")).toBe("hi");
+  });
+  it("returns removed:false on missing slug (idempotent)", async () => {
+    const r = await deleteProject(workspace, "never-existed");
+    expect(r).toEqual({ removed: false, trashPath: null });
+  });
+  it("rejects invalid slugs (security: no `..` escape)", async () => {
+    await expect(deleteProject(workspace, "../etc")).rejects.toThrow("invalid project slug");
+  });
+  it("two deletes of same slug produce distinct trash dirs", async () => {
+    await fs.mkdir(path.join(workspace, "projects", "p"), { recursive: true });
+    const a = await deleteProject(workspace, "p");
+    await fs.mkdir(path.join(workspace, "projects", "p"), { recursive: true });
+    // Force a non-trivial gap so the ISO timestamps differ.
+    await new Promise((r) => setTimeout(r, 5));
+    const b = await deleteProject(workspace, "p");
+    expect(a.trashPath).not.toBe(b.trashPath);
   });
 });

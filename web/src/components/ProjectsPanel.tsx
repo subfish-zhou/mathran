@@ -42,6 +42,32 @@ export default function ProjectsPanel() {
     }
   }
 
+  /**
+   * Soft-delete a project after confirm. Server moves the dir to
+   * .trash/<slug>-<ts>/ — recoverable. We refresh the list after.
+   *
+   * 2026-06-26 — added so subfish can clear placeholder projects
+   * (goldbach-s-conjecture / riemann-zeta-bounds / smoke / twin-primes)
+   * before re-running the init-project pipeline.
+   */
+  async function handleDelete(slug: string, displayName: string): Promise<void> {
+    const ok = window.confirm(
+      `Delete project "${displayName}"?\n\nThe project folder will move to .trash/${slug}-<timestamp>/ — recoverable by mv back if you change your mind.`,
+    );
+    if (!ok) return;
+    setError(null);
+    try {
+      const result = await api.deleteProject(slug);
+      if (!result.removed) {
+        setError(`Project '${slug}' was not found.`);
+        return;
+      }
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   useEffect(() => {
     void refresh();
   }, []);
@@ -182,10 +208,10 @@ export default function ProjectsPanel() {
       ) : (
         <ul className="space-y-2">
           {projects.map((p) => (
-            <li key={p.slug}>
+            <li key={p.slug} className="flex items-stretch gap-2">
               <Link
                 to={`/projects/${p.slug}`}
-                className="block rounded-md border border-slate-200 bg-white px-4 py-3 hover:border-slate-400"
+                className="block flex-1 rounded-md border border-slate-200 bg-white px-4 py-3 hover:border-slate-400"
               >
                 <div className="font-medium">{p.name ?? p.slug}</div>
                 <div className="font-mono text-xs text-slate-400">
@@ -195,6 +221,17 @@ export default function ProjectsPanel() {
                   )}
                 </div>
               </Link>
+              {/* 2026-06-26 — soft-delete to .trash/. Confirm dialog
+                  prevents accidental click; recovery instructions in
+                  the prompt. */}
+              <button
+                type="button"
+                onClick={() => void handleDelete(p.slug, p.name ?? p.slug)}
+                title="Move project to .trash/ (recoverable)"
+                className="shrink-0 rounded-md border border-slate-200 bg-white px-3 text-rose-600 hover:border-rose-400 hover:bg-rose-50"
+              >
+                🗑
+              </button>
             </li>
           ))}
         </ul>

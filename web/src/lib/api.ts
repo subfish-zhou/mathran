@@ -212,6 +212,19 @@ export const api = {
     );
   },
   /**
+   * Soft-delete a project — moves the project dir to
+   * `<workspace>/.trash/<slug>-<ts>/`. Recoverable by `mv` back.
+   * 404s when the slug doesn't exist (idempotent UX-wise — caller
+   * may want to treat 404 as success on retries).
+   *
+   * 2026-06-26 (post-migration smoke-test gap).
+   */
+  async deleteProject(slug: string): Promise<{ removed: boolean; trashPath: string | null }> {
+    const res = await fetch(`/api/projects/${encodeURIComponent(slug)}`, { method: "DELETE" });
+    if (res.status === 404) return { removed: false, trashPath: null };
+    return jsonOrThrow(res);
+  },
+  /**
    * AI-assisted project init (v1a). Scaffolds the project then kicks off the
    * init-project agent (fs-only, runs in the background). Returns the new slug
    * plus the runId you can poll via the run ledger.
