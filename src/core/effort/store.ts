@@ -29,6 +29,23 @@ const EFFORTS_DIR = "efforts";
 const EFFORT_META = "effort.toml";
 const EFFORT_DOC = "document.md";
 const EFFORT_FILES = "files";
+// 2026-06-26 (sync-upgrade P2-A) — effort folder layout extension.
+// document.md remains for the user's narrative; below dirs hold the
+// "work itself" (papers, scratch, notes, generated artifacts).
+const EFFORT_REFERENCES = "references";   // <effort>/references/<arxivId>/ link to .tex sources
+const EFFORT_NOTES = "notes";              // markdown / jsonl scratch
+const EFFORT_SCRATCH = "scratch";          // computations, ipynb, partial proofs
+const EFFORT_ARTIFACTS_INDEX = "artifacts.jsonl";  // index of files/ contents
+
+/** Public so callers (tests, REST routes) can stat / walk these. */
+export const EFFORT_LAYOUT = {
+  doc: EFFORT_DOC,
+  files: EFFORT_FILES,
+  references: EFFORT_REFERENCES,
+  notes: EFFORT_NOTES,
+  scratch: EFFORT_SCRATCH,
+  artifactsIndex: EFFORT_ARTIFACTS_INDEX,
+} as const;
 const EFFORT_VERSIONS = ".versions";
 
 /** Slug allow-list (lowercase letters, digits, `_`, `-`, `.`). */
@@ -224,6 +241,16 @@ export async function initEffort(
     description: input.description,
   });
   await fs.mkdir(path.join(dir, EFFORT_FILES), { recursive: true });
+  // 2026-06-26 (sync-upgrade P2-A): scaffold the work-detail subdirs
+  // so callers (init agent, user actions) can drop content in without
+  // mkdir dance. .gitkeep prevents git from pruning empty dirs.
+  for (const sub of [EFFORT_REFERENCES, EFFORT_NOTES, EFFORT_SCRATCH]) {
+    const subDir = path.join(dir, sub);
+    await fs.mkdir(subDir, { recursive: true });
+    await fs.writeFile(path.join(subDir, ".gitkeep"), "", "utf-8");
+  }
+  // empty artifacts.jsonl so callers don't have to test for existence
+  await fs.writeFile(path.join(dir, EFFORT_ARTIFACTS_INDEX), "", "utf-8");
   await writeEffortMetadata(workspace, project, slug, meta);
   await fs.writeFile(path.join(dir, EFFORT_DOC), "", "utf-8");
   return { slug, effortDir: dir, metadata: meta };
@@ -725,4 +752,165 @@ export async function removeRelation(
   const body = after.map((e) => JSON.stringify(e)).join("\n");
   await fs.writeFile(file, body + (body ? "\n" : ""), "utf-8");
   return true;
+}
+
+// ─── References / artifacts (sync-upgrade P2-A) ───────────────────────────
+
+/**
+ * Attach a fetched arxiv paper source to an effort's references/ dir.
+ *
+ * Strategy: symlink the cached paper-sources/<arxivId>/ dir under
+ * <effort>/references/<arxivId>. Symlink keeps disk usage flat — the
+ * cache lives once per workspace, efforts just reference it. If
+ * symlink isn't permitted (rare on Linux), fall back to a marker file
+ * `references/<arxivId>.link` containing the absolute path.
+ *
+ * Idempotent: re-attaching the same arxivId is a no-op (returns
+ * `existed:true`).
+ */
+export async function attachReference(
+  workspace: string,
+  project: string,
+  effort: string,
+  arxivId: string,
+  sourceRootDir: string,
+): Promise<{ existed: boolean; linkPath: string; mode: "symlink" | "marker" }> {
+  if (!isSafeSlug(project) || !isSafeSlug(effort)) {
+    throw new Error("invalid project or effort slug");
+  }
+  // arxivId may contain `/` (legacy ids); use a safe filename
+  const safeName = arxivId.replace(/\//g, "_");
+  // Reject anything that produces `..` after escaping (defense in
+  // depth — caller should already supply valid arxiv ids).
+  if (!/^[A-Za-z0-9._-]+$/.test(safeName) || safeName.includes("..")) {
+    throw new Error(`invalid arxivId for reference: ${arxivId}`);
+  }
+  const refDir = path.join(effortDirFor(workspace, project, effort), EFFORT_REFERENCES);
+  await fs.mkdir(refDir, { recursive: true });
+  const target = path.join(refDir, safeName);
+  // Already exists?
+  try {
+    await fs.access(target);
+    return { existed: true, linkPath: target, mode: "symlink" };
+  } catch {
+    // fall through
+  }
+  try {
+    await fs.symlink(sourceRootDir, target, "dir");
+    return { existed: false, linkPath: target, mode: "symlink" };
+  } catch {
+    // EPERM (Windows / some FS) → marker file fallback
+    const marker = target + ".link";
+    await fs.writeFile(marker, sourceRootDir + "\n", "utf-8");
+    return { existed: false, linkPath: marker, mode: "marker" };
+  }
+}
+
+/** List the contents of an effort's references/ dir. */
+export interface AttachedReference {
+  name: string;       // basename, e.g. "2106.04561" or "cs.LG_0412020"
+  fullPath: string;   // absolute path of the symlink / dir / marker
+  isSymlink: boolean;
+  isMarker: boolean;
+}
+
+export async function listReferences(
+  workspace: string,
+  project: string,
+  effort: string,
+): Promise<AttachedReference[]> {
+  if (!isSafeSlug(project) || !isSafeSlug(effort)) {
+    throw new Error("invalid project or effort slug");
+  }
+  const refDir = path.join(effortDirFor(workspace, project, effort), EFFORT_REFERENCES);
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(refDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out: AttachedReference[] = [];
+  for (const e of entries) {
+    if (e.name === ".gitkeep") continue;
+    const full = path.join(refDir, e.name);
+    if (e.isSymbolicLink()) {
+      out.push({ name: e.name, fullPath: full, isSymlink: true, isMarker: false });
+    } else if (e.isFile() && e.name.endsWith(".link")) {
+      out.push({
+        name: e.name.replace(/\.link$/, ""),
+        fullPath: full,
+        isSymlink: false,
+        isMarker: true,
+      });
+    } else if (e.isDirectory()) {
+      // not a symlink — actual copied dir (rare)
+      out.push({ name: e.name, fullPath: full, isSymlink: false, isMarker: false });
+    }
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+/** Append an entry to artifacts.jsonl. */
+export interface ArtifactEntry {
+  /** Path relative to <effort>/files/. */
+  path: string;
+  kind: string;      // "pdf" / "png" / "json" / "csv" / freeform
+  summary?: string;
+  /** ISO timestamp written by us. */
+  createdAt: string;
+}
+
+export async function recordArtifact(
+  workspace: string,
+  project: string,
+  effort: string,
+  input: { path: string; kind: string; summary?: string },
+): Promise<ArtifactEntry> {
+  if (!isSafeSlug(project) || !isSafeSlug(effort)) {
+    throw new Error("invalid project or effort slug");
+  }
+  // Reject absolute paths or `..` escape.
+  if (path.isAbsolute(input.path) || input.path.includes("..")) {
+    throw new Error(`invalid artifact path: ${input.path}`);
+  }
+  const entry: ArtifactEntry = {
+    path: input.path,
+    kind: input.kind,
+    summary: input.summary,
+    createdAt: new Date().toISOString(),
+  };
+  const file = path.join(effortDirFor(workspace, project, effort), EFFORT_ARTIFACTS_INDEX);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.appendFile(file, JSON.stringify(entry) + "\n", "utf-8");
+  return entry;
+}
+
+export async function listArtifacts(
+  workspace: string,
+  project: string,
+  effort: string,
+): Promise<ArtifactEntry[]> {
+  if (!isSafeSlug(project) || !isSafeSlug(effort)) {
+    throw new Error("invalid project or effort slug");
+  }
+  const file = path.join(effortDirFor(workspace, project, effort), EFFORT_ARTIFACTS_INDEX);
+  let raw: string;
+  try {
+    raw = await fs.readFile(file, "utf-8");
+  } catch {
+    return [];
+  }
+  const out: ArtifactEntry[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const j = JSON.parse(trimmed);
+      if (j && typeof j === "object" && typeof j.path === "string") out.push(j as ArtifactEntry);
+    } catch {
+      // skip malformed line
+    }
+  }
+  return out;
 }

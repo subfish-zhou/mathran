@@ -116,6 +116,8 @@ import { createMemoryListTool } from "./tools/memory-list.js";
 import { createMemoryReadTool } from "./tools/memory-read.js";
 import { createUserProfileReadTool } from "./tools/user-profile-read.js";
 import { createUserProfileSearchTool } from "./tools/user-profile-search.js";
+import { createReadPaperTexTool } from "./tools/read-paper-tex.js";
+import { createEffortDepNeighborsTool } from "./tools/effort-dep-neighbors.js";
 import { createMemoryWriteTool } from "./tools/memory-write.js";
 import { createMemoryAppendTool } from "./tools/memory-append.js";
 import { createMemorySearchTool } from "./tools/memory-search.js";
@@ -697,6 +699,20 @@ export interface ChatSessionOptions {
      * see _tasks/user-distillation/PLAN.md.
      */
     user_profile_read?: boolean | { profileDir?: string };
+    /**
+     * sync-upgrade Phase 1-C — read-only access to arxiv paper LaTeX
+     * source. Enabled by default in chat + goal mode. No write —
+     * fetched sources go to <workspace>/.mathran/paper-sources/ via
+     * the shared cache.
+     */
+    read_paper_tex?: boolean;
+    /**
+     * sync-upgrade Phase 3-C — read-only inspection of an effort's
+     * predecessors/successors in the dep graph. Enabled by default;
+     * use case: agent looks up "what already exists around X" before
+     * generating a new effort.
+     */
+    effort_dep_neighbors?: boolean;
     /**
      * user-distillation Phase 4 — BM25 search over the profile so the
      * model can ask "is this topic relevant to anything the user
@@ -1591,6 +1607,14 @@ export class ChatSession {
           ? { profileDir: cfg.user_profile_search.profileDir }
           : {};
       out.push(createUserProfileSearchTool(searchOpts));
+    }
+    // sync-upgrade Phase 1-C — arxiv paper LaTeX source reader.
+    if (cfg.read_paper_tex) {
+      out.push(createReadPaperTexTool());
+    }
+    // sync-upgrade Phase 3-C — effort dep graph neighbor inspection.
+    if (cfg.effort_dep_neighbors) {
+      out.push(createEffortDepNeighborsTool());
     }
     // gap #3 — per-conversation scratchpad tools. The conversation id comes
     // from an explicit override, else the checkpoints conversation id.

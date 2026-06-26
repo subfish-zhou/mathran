@@ -65,8 +65,12 @@ export function buildNodeExtractionPrompt(
   },
 ): string {
   const paperDetails = papers.map((p) => {
+    // 2026-06-26 (sync-upgrade P1-C) — when fullText is present (the
+    // arxiv .tex source spliced in by spine builder), prefer it over
+    // abstract and DO NOT truncate further; the upstream loader has
+    // already capped per-paper / per-batch sizes.
     const text = p.fullText
-      ? `Full text (excerpt): ${p.fullText.slice(0, 4000)}`
+      ? `LaTeX source (main .tex):\n${p.fullText}`
       : `Abstract: ${p.abstract ?? "(none)"}`;
     return `### Paper [${p.id}]: "${p.title}" (${p.year ?? "?"})
 Authors: ${p.authors.slice(0, 5).join(", ")}
@@ -226,7 +230,7 @@ export function buildEffortDocumentPrompt(
 ): string {
   const paperDetails = papers.map((p) => {
     const text = p.fullText
-      ? `Full text (excerpt): ${p.fullText.slice(0, 6000)}`
+      ? `LaTeX source (main .tex):\n${p.fullText}`
       : `Abstract: ${p.abstract ?? "(none)"}`;
     return `### "${p.title}" (${p.year ?? "?"})
 Authors: ${p.authors.slice(0, 5).join(", ")}

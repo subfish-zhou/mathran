@@ -46,6 +46,7 @@ import { makeSpineLLM } from "./spine/llm.js";
 import { buildSpine, readSpine } from "./spine/builder.js";
 import { generateEffortsFromSpine } from "./spine/effort-from-spine.js";
 import { generateWikiFromSpine, wikiDir, extractWorkspaceRefs } from "./spine/wiki-from-spine.js";
+import { addRelation, type RelationType } from "../../effort/store.js";
 import { explorePaperGraph } from "./spine/explore-pipeline.js";
 import { CITATION_MAX_DEPTH, CITATION_MAX_NODES, type NeighborPaper } from "./citation-explorer.js";
 import {
@@ -552,9 +553,39 @@ async function runInitAgentSpine(
         )
       : { efforts: [], edges: [] };
     summary.effortsCreated = effortResult.efforts.length;
+    // 2026-06-26 (sync-upgrade P0-A): persist the dep edges the spine
+    // pipeline computed. Until now `effortResult.edges` was only used
+    // for a count in the checkpoint and then discarded — schema, CLI,
+    // and REST routes existed but the writer was missing. This loop
+    // closes the gap so the effort dep graph is actually populated by
+    // an init run.
+    let edgesPersisted = 0;
+    let edgesFailed = 0;
+    for (const edge of effortResult.edges) {
+      // spine relation type is a subset of the store's RelationType.
+      const relType = edge.relation as RelationType;
+      try {
+        await addRelation(workspace, slug, {
+          from: edge.fromId,
+          to: edge.toId,
+          type: relType,
+          description: edge.description,
+          confidence: edge.confidence,
+          source: "spine",
+        });
+        edgesPersisted += 1;
+      } catch (err) {
+        edgesFailed += 1;
+        await appendLog(projectDir, runId, "warn", `edge persist failed: ${edge.fromId}→${edge.toId} (${errMsg(err)})`);
+      }
+    }
+    if (effortResult.edges.length > 0) {
+      await appendLog(projectDir, runId, "spine", `persisted ${edgesPersisted}/${effortResult.edges.length} effort relations` + (edgesFailed > 0 ? ` (${edgesFailed} failed)` : ""));
+    }
     await writeCheckpoint(projectDir, runId, "build_efforts", {
       efforts: effortResult.efforts.length,
       edges: effortResult.edges.length,
+      edgesPersisted,
     });
     await appendPhase(projectDir, runId, "build_efforts", "end", {
       efforts: effortResult.efforts.length,

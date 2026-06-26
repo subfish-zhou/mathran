@@ -81,6 +81,18 @@ export interface EffortSummary {
   currentVersion: number;
 }
 
+// sync-upgrade P3-B
+export interface EffortRelation {
+  id: string;
+  from: string;
+  to: string;
+  type: "depends_on" | "extends" | "uses" | "supersedes" | "contradicts" | "related";
+  description?: string;
+  confidence?: number;
+  source?: "user" | "llm" | "spine";
+  createdAt: string;
+}
+
 export interface ConversationSummary {
   id: string;
   title: string;
@@ -338,6 +350,16 @@ export const api = {
       await fetch(`/api/projects/${enc(slug)}/efforts`),
     );
     return data.efforts;
+  },
+  /**
+   * Fetch every effort dep edge in the project (sync-upgrade P3-B).
+   * Backend route: GET /api/projects/<slug>/efforts/graph
+   */
+  async listAllEffortRelations(slug: string): Promise<EffortRelation[]> {
+    const data = await jsonOrThrow<{ edges: EffortRelation[] }>(
+      await fetch(`/api/projects/${enc(slug)}/efforts/graph`),
+    );
+    return data.edges;
   },
   async createEffort(
     slug: string,

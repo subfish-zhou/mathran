@@ -19,6 +19,8 @@ import { atomicWriteFile } from "../../../chat/atomic-write.js";
 
 import { slugify } from "../../../../lib/slug.js";
 import { getPaper } from "../../../paper-graph/index.js";
+import { fetchArxivSource } from "../../../paper-graph/arxiv-source.js";
+import { EFFORT_LAYOUT, attachReference } from "../../../effort/store.js";
 import { buildEffortDocumentPrompt, buildThreadDocumentPrompt } from "./prompts.js";
 import { errMsg, noopEmit, type SpineLLM, type EmitFn } from "./llm.js";
 import type {
@@ -41,6 +43,8 @@ interface PaperMeta {
   arxivId?: string;
   doi?: string;
   url?: string;
+  /** sync-upgrade P1-C: arxiv LaTeX source main .tex content (loaded on demand). */
+  fullText?: string;
 }
 
 export interface EffortFromSpineConfig {
@@ -84,19 +88,92 @@ function effortFrontmatter(e: WorkspaceEffortOutput): string {
   ].filter((l): l is string => l != null).join("\n");
 }
 
-async function writeEffort(projectDir: string, e: WorkspaceEffortOutput): Promise<void> {
+async function writeEffort(
+  projectDir: string,
+  workspace: string,
+  e: WorkspaceEffortOutput,
+): Promise<void> {
   try {
     const dir = path.join(effortsDir(projectDir), e.id);
     await fs.mkdir(dir, { recursive: true });
+    // 2026-06-26 (sync-upgrade P2-A/P2-B): scaffold the same work-detail
+    // subdirs that initEffort() creates so that workspace efforts coming
+    // out of the spine pipeline have the full layout (references/,
+    // notes/, scratch/, artifacts.jsonl). Match initEffort exactly.
+    for (const sub of [EFFORT_LAYOUT.references, EFFORT_LAYOUT.notes, EFFORT_LAYOUT.scratch, EFFORT_LAYOUT.files]) {
+      const subDir = path.join(dir, sub);
+      await fs.mkdir(subDir, { recursive: true });
+      try {
+        await fs.access(path.join(subDir, ".gitkeep"));
+      } catch {
+        await fs.writeFile(path.join(subDir, ".gitkeep"), "", "utf-8");
+      }
+    }
+    const artifactsPath = path.join(dir, EFFORT_LAYOUT.artifactsIndex);
+    try {
+      await fs.access(artifactsPath);
+    } catch {
+      await fs.writeFile(artifactsPath, "", "utf-8");
+    }
+
+    // 2026-06-26 (sync-upgrade P2-B): auto-attach arxiv references.
+    // Symlinks <workspace>/.mathran/paper-sources/<id>/ into
+    // <effort>/references/<id> for every paper in e.sources that has
+    // an arxivId. The fetch was done in the spine builder pass; here
+    // we only link to the cache (no re-fetch).
+    const refSummaries: string[] = [];
+    for (const src of e.sources) {
+      if (src.arxivId) {
+        try {
+          const arxivCache = await fetchArxivSource(src.arxivId, { workspace });
+          if (arxivCache.status === "ok") {
+            await attachReference(workspace, slugFromProjectDir(projectDir), e.id, src.arxivId, arxivCache.rootDir);
+            const mainRel = arxivCache.mainTexFile ? path.relative(arxivCache.rootDir, arxivCache.mainTexFile) : "(no main .tex auto-resolved)";
+            refSummaries.push(`- [arXiv:${src.arxivId}] **${src.title}** — see \`references/${src.arxivId.replace(/\//g, "_")}/${mainRel}\``);
+          } else {
+            refSummaries.push(`- [arXiv:${src.arxivId}] **${src.title}** — source unavailable (${arxivCache.status})`);
+          }
+        } catch (err) {
+          refSummaries.push(`- [arXiv:${src.arxivId}] **${src.title}** — attach failed: ${errMsg(err)}`);
+        }
+      } else if (src.url) {
+        refSummaries.push(`- **${src.title}** — ${src.url}`);
+      } else {
+        refSummaries.push(`- **${src.title}**`);
+      }
+    }
+
+    // 2026-06-26 (sync-upgrade P2-B): document.md no longer contains
+    // an LLM-generated "what should be done" summary. It's the user's
+    // work log. We seed it with a banner + reference index + spine
+    // context, but the body is meant for the user.
+    const banner = `> [Auto-generated scaffold by mathran init agent — ${new Date().toISOString()}]\n>\n> This effort was scaffolded from spine node \`${e.spineNodeId ?? e.spineThreadId ?? "(unknown)"}\`. The source papers below are auto-fetched (LaTeX source where available). Start your work by reading them and writing your own notes in this file or under \`scratch/\`.`;
+    const referencesSection = refSummaries.length > 0
+      ? `\n\n## References\n${refSummaries.join("\n")}`
+      : "";
+    const spineContext = e.description
+      ? `\n\n## Spine context\n${e.description}`
+      : "";
+    const userArea = `\n\n## Work log\n_(your notes go here)_\n`;
+    const body = banner + referencesSection + spineContext + userArea;
+
     await atomicWriteFile(
       path.join(dir, "document.md"),
-      effortFrontmatter(e) + (e.document.trim() || `# ${e.title}`) + "\n",
+      effortFrontmatter(e) + body + "\n",
     );
     await atomicWriteFile(path.join(dir, "effort.json"), JSON.stringify(e, null, 2) + "\n");
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn(`[spine-efforts] writeEffort(${e.id}) failed: ${errMsg(err)}`);
   }
+}
+
+/**
+ * `projectDir` is `<workspace>/projects/<slug>`. Extract the slug for
+ * attachReference (which needs the project slug, not the dir).
+ */
+function slugFromProjectDir(projectDir: string): string {
+  return path.basename(projectDir);
 }
 
 // ============================================================
@@ -160,17 +237,12 @@ export async function generateEffortsFromSpine(
     const years = threadNodes.map((n) => n.year).filter((y): y is number => typeof y === "number");
     const year = years.length > 0 ? Math.min(...years) : undefined;
 
-    let document: string;
-    try {
-      document = await llm(buildThreadDocumentPrompt(thread, threadNodes, papers, problemTitle), {
-        temperature: 0.3,
-        maxTokens: 4000,
-      });
-    } catch (err) {
-      emit({ type: "log", message: `Thread doc failed for "${thread.name}": ${errMsg(err)}` });
-      document = "";
-    }
-    if (!document.trim()) document = `Survey of ${thread.name}. ${thread.description}`;
+    // 2026-06-26 (sync-upgrade P2-B): we no longer LLM-generate a
+    // "what should be done" document — writeEffort() now seeds
+    // document.md from the spine context + references list, leaving
+    // the body for the user. effort.description still carries the
+    // thread description so writeEffort can use it as spine context.
+    const document = `Survey of ${thread.name}. ${thread.description}`;
 
     const effortId = reserveEffortId(slugify(thread.name, "thread"));
     spineToEffort.set(thread.id, effortId);
@@ -196,7 +268,7 @@ export async function generateEffortsFromSpine(
       includedSpineNodeIds: thread.nodeIds,
     };
     efforts.push(effort);
-    await writeEffort(projectDir, effort);
+    await writeEffort(projectDir, workspace, effort);
     emit({ type: "effort_created", effortId, title: thread.name, fromSpineNode: thread.id });
   }
 
@@ -233,22 +305,11 @@ export async function generateEffortsFromSpine(
     const era = spine.eras.find((e) => e.nodeIds.includes(node.id));
     const thread = spine.threads.find((t) => t.nodeIds.includes(node.id));
 
-    let document: string;
-    try {
-      document = await llm(
-        buildEffortDocumentPrompt(
-          { ...node, effortIds: [] },
-          papersForPrompt,
-          { era: era?.name, threadName: thread?.name, predecessors, successors },
-          problemTitle,
-        ),
-        { temperature: 0.3, maxTokens: 4000 },
-      );
-    } catch (err) {
-      emit({ type: "log", message: `Node effort doc failed for "${node.title}": ${errMsg(err)}` });
-      document = "";
-    }
-    if (!document.trim()) document = `${node.title}\n\n${node.statement}\n\n${node.significance}`;
+    // 2026-06-26 (sync-upgrade P2-B): skip the LLM "what should be
+    // done" doc. writeEffort() builds document.md from the spine
+    // node statement + references list. effort.description carries
+    // the node statement / significance for that downstream use.
+    const document = `${node.title}\n\n${node.statement}\n\n${node.significance}`;
 
     const effortId = reserveEffortId(slugify(node.title, "node-effort"));
     spineToEffort.set(node.id, effortId);
@@ -274,7 +335,7 @@ export async function generateEffortsFromSpine(
       deadEndReason: node.type === "dead_end" ? node.significance : undefined,
     };
     efforts.push(effort);
-    await writeEffort(projectDir, effort);
+    await writeEffort(projectDir, workspace, effort);
     emit({ type: "effort_created", effortId, title: node.title, fromSpineNode: node.id });
   }
 
@@ -303,10 +364,42 @@ export async function generateEffortsFromSpine(
 // ============================================================
 
 async function loadPaperMetadata(workspace: string, paperIds: string[]): Promise<PaperMeta[]> {
+  // 2026-06-26 (sync-upgrade P1-C): when a paper has an arxivId and
+  // we've already fetched the source (cache hit), splice its main
+  // .tex content into PaperMeta.fullText so downstream prompts see
+  // the real LaTeX rather than a 400-char abstract. We DO NOT fetch
+  // on a cache miss here — the spine builder pass earlier in the
+  // pipeline already pulled what's needed and we'd rather not
+  // double-fetch for the same arxiv id within one run.
   const out: PaperMeta[] = [];
+  const PER_PAPER_CAP = 60_000;
+  const BATCH_CAP = 200_000;
+  let running = 0;
   for (const id of paperIds) {
     const p = await getPaper(workspace, id);
     if (!p) continue;
+    let fullText: string | undefined;
+    if (p.arxivId && running < BATCH_CAP) {
+      try {
+        // We pass `force:false` (default) AND skip if cache miss.
+        // Loading the marker is cheap; reading 60 KB of .tex is cheap.
+        // If the spine builder didn't fetch this id, we still try
+        // once here — that's fine because the cache is shared and
+        // any subsequent loader pass also benefits.
+        const src = await fetchArxivSource(p.arxivId, { workspace });
+        if (src.status === "ok" && src.mainTexFile) {
+          const raw = await fs.readFile(src.mainTexFile, "utf-8");
+          const remaining = Math.max(0, BATCH_CAP - running);
+          const limit = Math.min(PER_PAPER_CAP, remaining);
+          if (limit > 0) {
+            fullText = raw.length > limit ? raw.slice(0, limit) + `\n\n[TRUNCATED at ${limit} bytes; full source at ${src.rootDir}]` : raw;
+            running += fullText.length;
+          }
+        }
+      } catch {
+        // ignore — abstract is still available
+      }
+    }
     out.push({
       id: p.id,
       title: p.title,
@@ -316,6 +409,7 @@ async function loadPaperMetadata(workspace: string, paperIds: string[]): Promise
       arxivId: p.arxivId ?? undefined,
       doi: p.doi ?? undefined,
       url: p.url ?? undefined,
+      fullText,
     });
   }
   return out;

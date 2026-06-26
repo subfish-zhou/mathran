@@ -1388,6 +1388,13 @@ export function defaultSessionFactory(
         // the same profile so the model can ask "anything relevant
         // to <topic>" without dumping the full profile.
         user_profile_search: true,
+        // 2026-06-26 (sync-upgrade P1-C) — arxiv paper LaTeX source
+        // reader. Lets the model navigate a paper's .tex tree the
+        // codex way: file handle + section index, not 6000-char
+        // upstream slicing.
+        read_paper_tex: true,
+        // 2026-06-26 (sync-upgrade P3-C) — dep graph neighbor lookup.
+        effort_dep_neighbors: true,
 
         // git: inspect tools (status / diff / log / show) always on;
         // commit requires explicit opt-in via the cfg block.
@@ -1534,6 +1541,10 @@ export const GOAL_MODE_BUILTIN_TOOLS = {
   user_profile_read: true,
   // 2026-06-26 (user-distillation Phase 4) — BM25 search in goal mode too.
   user_profile_search: true,
+  // 2026-06-26 (sync-upgrade P1-C) — arxiv paper LaTeX reader in goal mode.
+  read_paper_tex: true,
+  // 2026-06-26 (sync-upgrade P3-C) — dep graph neighbor lookup in goal mode.
+  effort_dep_neighbors: true,
 } as const;
 
 /** Append a short scope hint to the system prompt so the model knows where it is. */

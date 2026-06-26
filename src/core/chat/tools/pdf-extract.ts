@@ -29,6 +29,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import type { ToolSpec, ToolExecuteContext } from "../session.js";
 import { runProc } from "./python-venv.js";
+import { fetchArxivSource } from "../../paper-graph/arxiv-source.js";
 
 // ─── Where the helper venv lives ───────────────────────────────────────────
 // One shared venv per user; we don't recreate per session because
@@ -55,7 +56,13 @@ export function createPdfExtractTool(): ToolSpec {
       "'math' (Marker, slow but preserves LaTeX formulas — use for academic / " +
       "math-heavy PDFs). Returns a summary; call read_file on the output to " +
       "see the content. First call in a fresh install may take 30-60s to " +
-      "warm models; subsequent calls are fast.",
+      "warm models; subsequent calls are fast. " +
+      "ARXIV SHORTCUT: pass path='arxiv:<id>' (e.g. 'arxiv:2106.04561'). " +
+      "We fetch the author's original LaTeX source from arxiv.org/e-print/<id> " +
+      "(cached per-workspace under .mathran/paper-sources/<id>/) — that's the " +
+      "gold standard for math content. Returns the main .tex path; no PDF " +
+      "extract runs. Falls back to PDF + Marker only when the source isn't " +
+      "available.",
     parameters: {
       type: "object",
       properties: {
@@ -88,11 +95,53 @@ export function createPdfExtractTool(): ToolSpec {
     async execute(rawArgs: Record<string, unknown>, ctx: ToolExecuteContext) {
       const argPath = typeof rawArgs.path === "string" ? rawArgs.path : "";
       if (!argPath) return { ok: false, content: "pdf_extract: `path` is required" };
-      const inputAbs = path.isAbsolute(argPath) ? argPath : path.resolve(ctx.workspace ?? "", argPath);
 
-      // ─── Validate input exists + sandbox to workspace ──────────────────
+      // ─── arxiv: shortcut — fetch real LaTeX source (P1-B) ────────────────
+      // path='arxiv:2106.04561' → fetch /e-print/<id>, cache, return main
+      // .tex location without ever running the PDF helper. On source-not-
+      // available, fall through to PDF mode by rewriting `path` to the
+      // arxiv PDF URL — which we can't directly fetch here, so we just
+      // report the failure and let the model retry with a different
+      // path (typically an uploaded PDF).
       const ws = ctx.workspace ?? "";
       const wsAbs = ws ? path.resolve(ws) : "";
+      if (argPath.startsWith("arxiv:")) {
+        if (!wsAbs) {
+          return { ok: false, content: "pdf_extract: arxiv: paths require an active workspace" };
+        }
+        const arxivId = argPath.slice("arxiv:".length).trim();
+        const res = await fetchArxivSource(arxivId, { workspace: wsAbs });
+        if (res.status === "ok") {
+          const fileList = res.texFiles
+            .slice(0, 12)
+            .map((p) => "  - " + path.relative(wsAbs, p))
+            .join("\n");
+          const more = res.texFiles.length > 12 ? `\n  ... (+${res.texFiles.length - 12} more .tex files)` : "";
+          const cacheTag = res.fromCache ? "cached" : "fetched";
+          const bibTag = res.bibFiles.length > 0 ? `, ${res.bibFiles.length} .bib` : "";
+          const figTag = res.figureFiles.length > 0 ? `, ${res.figureFiles.length} figures` : "";
+          return {
+            ok: true,
+            content:
+              `pdf_extract: arxiv ${arxivId} ${cacheTag} (${res.byteSize} bytes${bibTag}${figTag})\n` +
+              `main .tex: ${res.mainTexFile ? path.relative(wsAbs, res.mainTexFile) : "(could not auto-resolve — see file list)"}\n` +
+              `all .tex files:\n${fileList}${more}\n` +
+              `→ use read_file to read individual .tex files; LaTeX commands are intact, no PDF extraction needed.`,
+          };
+        }
+        // Source unavailable — degrade message; caller can retry by
+        // grabbing the PDF themselves (web_fetch / curl) and passing
+        // an absolute path here.
+        return {
+          ok: false,
+          content:
+            `pdf_extract: arxiv ${arxivId} source unavailable (${res.status}: ${res.error}). ` +
+            `This paper has only a PDF on arxiv. Fetch it manually (e.g. curl https://arxiv.org/pdf/${arxivId}.pdf -o paper.pdf), ` +
+            `then call pdf_extract({path: 'paper.pdf', mode: 'math'}).`,
+        };
+      }
+
+      const inputAbs = path.isAbsolute(argPath) ? argPath : path.resolve(ctx.workspace ?? "", argPath);
       if (wsAbs && !inputAbs.startsWith(wsAbs + path.sep) && inputAbs !== wsAbs) {
         return { ok: false, content: `pdf_extract: input path escapes workspace (${inputAbs})` };
       }

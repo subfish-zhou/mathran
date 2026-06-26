@@ -5,7 +5,7 @@
  * user's real ~/mathran-workspace. Path-traversal tests guard BUG #5's
  * companion check at the effort layer.
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -33,6 +33,10 @@ import {
   listEffortDependents,
   removeRelation,
   slugifyTitle,
+  attachReference,
+  listReferences,
+  recordArtifact,
+  listArtifacts,
 } from "./store.js";
 import { BUILTIN_EFFORT_TYPES, EFFORT_STATUSES, isValidTransition, VALID_TRANSITIONS } from "./types.js";
 
@@ -566,5 +570,123 @@ describe("slugifyTitle (v0.4 §1 cap at 60)", () => {
     expect(out.length).toBeLessThanOrEqual(60);
     expect(out.startsWith("-")).toBe(false);
     expect(out.endsWith("-")).toBe(false);
+  });
+});
+
+// ─── P2-A: extended effort folder layout + references / artifacts ────
+
+describe("initEffort layout extension (P2-A)", () => {
+  let workspace: string;
+  let projectSlug: string;
+  beforeEach(async () => {
+    workspace = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-effort-layout-"));
+    projectSlug = "proj";
+    await fs.mkdir(path.join(workspace, "projects", projectSlug), { recursive: true });
+  });
+  afterEach(async () => {
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  it("scaffolds references/ notes/ scratch/ artifacts.jsonl on initEffort", async () => {
+    const { effortDir } = await initEffort(workspace, projectSlug, {
+      title: "Test",
+      type: "CONSTRUCTION",
+      description: "x",
+    });
+    for (const sub of ["references", "notes", "scratch", "files"]) {
+      const st = await fs.stat(path.join(effortDir, sub));
+      expect(st.isDirectory()).toBe(true);
+    }
+    const artifacts = await fs.readFile(path.join(effortDir, "artifacts.jsonl"), "utf-8");
+    expect(artifacts).toBe("");
+  });
+});
+
+describe("attachReference / listReferences (P2-A)", () => {
+  let workspace: string;
+  let projectSlug: string;
+  let effortSlug: string;
+  let cacheDir: string;
+  beforeEach(async () => {
+    workspace = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-effort-ref-"));
+    projectSlug = "proj";
+    await fs.mkdir(path.join(workspace, "projects", projectSlug), { recursive: true });
+    const r = await initEffort(workspace, projectSlug, { title: "Test", type: "CONSTRUCTION", description: "x" });
+    effortSlug = r.slug;
+    // pretend cache: workspace/.mathran/paper-sources/2106.04561/
+    cacheDir = path.join(workspace, ".mathran", "paper-sources", "2106.04561");
+    await fs.mkdir(cacheDir, { recursive: true });
+    await fs.writeFile(path.join(cacheDir, "main.tex"), "\\documentclass{article}\nbody", "utf-8");
+  });
+  afterEach(async () => {
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  it("symlinks cache dir into <effort>/references/<arxivId>", async () => {
+    const r = await attachReference(workspace, projectSlug, effortSlug, "2106.04561", cacheDir);
+    expect(r.existed).toBe(false);
+    expect(r.mode).toBe("symlink");
+    expect(r.linkPath.endsWith("2106.04561")).toBe(true);
+    const refs = await listReferences(workspace, projectSlug, effortSlug);
+    expect(refs.length).toBe(1);
+    expect(refs[0].name).toBe("2106.04561");
+    expect(refs[0].isSymlink).toBe(true);
+    // .gitkeep filtered out
+  });
+
+  it("returns existed:true on repeat attach", async () => {
+    await attachReference(workspace, projectSlug, effortSlug, "2106.04561", cacheDir);
+    const r2 = await attachReference(workspace, projectSlug, effortSlug, "2106.04561", cacheDir);
+    expect(r2.existed).toBe(true);
+  });
+
+  it("rejects unsafe arxiv ids", async () => {
+    await expect(
+      attachReference(workspace, projectSlug, effortSlug, "../etc/passwd", cacheDir),
+    ).rejects.toThrow(/invalid arxivId/);
+  });
+
+  it("escapes legacy slash ids to safe basenames", async () => {
+    const legacyCache = path.join(workspace, ".mathran", "paper-sources", "cs.LG_0412020");
+    await fs.mkdir(legacyCache, { recursive: true });
+    const r = await attachReference(workspace, projectSlug, effortSlug, "cs.LG/0412020", legacyCache);
+    expect(r.existed).toBe(false);
+    expect(path.basename(r.linkPath)).toBe("cs.LG_0412020");
+  });
+});
+
+describe("recordArtifact / listArtifacts (P2-A)", () => {
+  let workspace: string;
+  let projectSlug: string;
+  let effortSlug: string;
+  beforeEach(async () => {
+    workspace = await fs.mkdtemp(path.join(os.tmpdir(), "mathran-effort-art-"));
+    projectSlug = "proj";
+    await fs.mkdir(path.join(workspace, "projects", projectSlug), { recursive: true });
+    const r = await initEffort(workspace, projectSlug, { title: "T", type: "CONSTRUCTION", description: "x" });
+    effortSlug = r.slug;
+  });
+  afterEach(async () => {
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  it("appends, lists in order", async () => {
+    await recordArtifact(workspace, projectSlug, effortSlug, { path: "result.csv", kind: "csv" });
+    await recordArtifact(workspace, projectSlug, effortSlug, { path: "plot.png", kind: "png", summary: "loss curve" });
+    const all = await listArtifacts(workspace, projectSlug, effortSlug);
+    expect(all.length).toBe(2);
+    expect(all[0].path).toBe("result.csv");
+    expect(all[1].kind).toBe("png");
+    expect(all[1].summary).toBe("loss curve");
+    expect(all.every((a) => typeof a.createdAt === "string")).toBe(true);
+  });
+
+  it("rejects absolute path / .. escape", async () => {
+    await expect(
+      recordArtifact(workspace, projectSlug, effortSlug, { path: "/etc/x", kind: "x" }),
+    ).rejects.toThrow(/invalid artifact path/);
+    await expect(
+      recordArtifact(workspace, projectSlug, effortSlug, { path: "../outside", kind: "x" }),
+    ).rejects.toThrow(/invalid artifact path/);
   });
 });

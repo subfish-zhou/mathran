@@ -8,6 +8,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, type EffortSummary } from "../lib/api.ts";
+import { EffortDepGraph } from "./EffortDepGraph.tsx";
 
 const TYPES = [
   "CONSTRUCTION",
@@ -27,6 +28,8 @@ export default function EffortsPanel({ projectSlug }: { projectSlug: string }) {
   const [type, setType] = useState<(typeof TYPES)[number]>("PROOF_ATTEMPT");
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  // sync-upgrade P3-B: Tree | Graph view toggle
+  const [view, setView] = useState<"tree" | "graph">("tree");
 
   async function refresh() {
     setError(null);
@@ -58,14 +61,33 @@ export default function EffortsPanel({ projectSlug }: { projectSlug: string }) {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="border-b border-slate-200 bg-white px-6 py-3">
+      <div className="border-b border-slate-200 bg-white px-6 py-3 flex items-center justify-between">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
           Efforts <span className="text-slate-400">in {projectSlug}</span>
         </h2>
+        {/* sync-upgrade P3-B: Tree | Graph toggle */}
+        <div className="flex rounded-md border border-slate-200 bg-white text-xs">
+          <button
+            onClick={() => setView("tree")}
+            className={`px-3 py-1 ${view === "tree" ? "bg-slate-900 text-white" : "text-slate-500"}`}
+          >
+            Tree
+          </button>
+          <button
+            onClick={() => setView("graph")}
+            className={`px-3 py-1 ${view === "graph" ? "bg-slate-900 text-white" : "text-slate-500"}`}
+          >
+            Graph
+          </button>
+        </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-6">
-        <form onSubmit={create} className="mb-6 flex flex-wrap gap-2 rounded-md border border-slate-200 bg-white p-3">
+      <div className="flex-1 overflow-y-auto">
+        {view === "graph" ? (
+          <EffortDepGraph projectSlug={projectSlug} />
+        ) : (
+          <div className="p-6">
+            <form onSubmit={create} className="mb-6 flex flex-wrap gap-2 rounded-md border border-slate-200 bg-white p-3">
           <input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
@@ -122,6 +144,8 @@ export default function EffortsPanel({ projectSlug }: { projectSlug: string }) {
               </li>
             ))}
           </ul>
+        )}
+          </div>
         )}
       </div>
     </div>

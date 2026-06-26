@@ -18,6 +18,7 @@ import * as path from "node:path";
 
 import { slugify } from "../../../../lib/slug.js";
 import { getPaper, listCitations } from "../../../paper-graph/index.js";
+import { fetchArxivSource } from "../../../paper-graph/arxiv-source.js";
 import { buildNodeExtractionPrompt, buildSpineAssemblyPrompt } from "./prompts.js";
 import { extractSpineJSON, errMsg, noopEmit, type SpineLLM, type EmitFn } from "./llm.js";
 import type {
@@ -156,13 +157,50 @@ async function extractNodeCandidates(
     const batch = batches[i]!;
     emit({ type: "log", message: `Processing batch ${i + 1}/${batches.length} (${batch.length} papers)` });
 
-    const batchPapers = batch.map((p) => ({
-      id: p.id,
-      title: p.title,
-      authors: p.authors,
-      year: p.year ?? undefined,
-      abstract: p.abstract ?? undefined,
-    }));
+    // 2026-06-26 (sync-upgrade P1-C) — for each paper in the batch,
+    // try to load its arxiv LaTeX source. When present, splice the
+    // FULL main .tex into `fullText` so the LLM sees real math + theorem
+    // statements + section structure instead of just the 400-char
+    // abstract. We cap per-paper at 60 KB and total batch at 200 KB so
+    // a single dense batch doesn't blow the context window.
+    const PER_PAPER_CAP = 60_000;
+    const BATCH_CAP = 200_000;
+    let runningTotal = 0;
+    const batchPapers: Array<{
+      id: string;
+      title: string;
+      authors: string[];
+      year?: number;
+      abstract?: string;
+      fullText?: string;
+    }> = [];
+    for (const p of batch) {
+      let fullText: string | undefined;
+      if (p.arxivId && runningTotal < BATCH_CAP) {
+        try {
+          const src = await fetchArxivSource(p.arxivId, { workspace: config.workspace });
+          if (src.status === "ok" && src.mainTexFile) {
+            const raw = await fs.readFile(src.mainTexFile, "utf-8");
+            const remaining = Math.max(0, BATCH_CAP - runningTotal);
+            const limit = Math.min(PER_PAPER_CAP, remaining);
+            if (limit > 0) {
+              fullText = raw.length > limit ? raw.slice(0, limit) + `\n\n[TRUNCATED at ${limit} bytes; full source at ${src.rootDir}]` : raw;
+              runningTotal += fullText.length;
+            }
+          }
+        } catch {
+          // ignore — falling back to abstract-only is safe
+        }
+      }
+      batchPapers.push({
+        id: p.id,
+        title: p.title,
+        authors: p.authors,
+        year: p.year ?? undefined,
+        abstract: p.abstract ?? undefined,
+        fullText,
+      });
+    }
 
     const batchCitations = internalCitations
       .filter((c) => batch.some((p) => p.id === c.citingPaperId) || batch.some((p) => p.id === c.citedPaperId))

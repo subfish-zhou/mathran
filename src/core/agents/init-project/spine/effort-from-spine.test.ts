@@ -120,25 +120,40 @@ describe("generateEffortsFromSpine (fs integration)", () => {
     expect(result.edges.length).toBeGreaterThanOrEqual(1);
     expect(result.edges[0]!.source).toBe("spine");
 
-    // fs: each effort wrote a document.md with frontmatter
+    // fs: each effort wrote a document.md with frontmatter + the
+    // P2-B scaffold. The LLM "Detailed technical content" is no longer
+    // copied into document.md (P2-B: doc body is user's work log, not
+    // a generated summary). Verify the new scaffold instead.
     for (const e of result.efforts) {
       const doc = await fs.readFile(path.join(projectDir, "efforts", e.id, "document.md"), "utf-8");
       expect(doc).toContain(`id: ${e.id}`);
-      expect(doc).toContain("Detailed technical content");
+      expect(doc).toContain("[Auto-generated scaffold by mathran init agent");
+      expect(doc).toContain("## Work log");
+      // P2-A: the effort dir now has the full layout
+      for (const sub of ["references", "notes", "scratch", "files"]) {
+        const stat = await fs.stat(path.join(projectDir, "efforts", e.id, sub));
+        expect(stat.isDirectory()).toBe(true);
+      }
     }
   });
 
-  it("falls back to a stub document when the LLM throws", async () => {
+  it("scaffolds effort dirs even when LLM call would have errored (P2-B no longer calls LLM for the doc)", async () => {
     const pid = await ingestPaper(workspace, { title: "P", authors: ["A"], year: 2010, arxivId: "1001.00001" });
     await associatePaperToProject(projectDir, pid!, { discoveredBy: "seed" });
+    // P2-B: we never actually invoke `llm` for the doc anymore, so a
+    // throwing LLM is irrelevant — included here as a regression
+    // guard that we ARE NOT secretly still calling it.
+    let llmCalls = 0;
     const llm: SpineLLM = async () => {
-      throw new Error("llm down");
+      llmCalls += 1;
+      throw new Error("llm should not be called for effort docs");
     };
     const result = await generateEffortsFromSpine(
       { spine: smallSpine(pid!), projectDir, workspace, problemTitle: "LR" },
       llm,
     );
     expect(result.efforts.length).toBe(3);
+    expect(llmCalls).toBe(0);
     const threadEffort = result.efforts.find((e) => e.type === "REFERENCE")!;
     expect(threadEffort.document).toContain("Survey of");
   });
