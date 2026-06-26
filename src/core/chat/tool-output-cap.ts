@@ -10,6 +10,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { atomicWriteFile } from "./atomic-write.js";
 
 export interface ToolOutputCapOpts {
   /** Max bytes kept inline in the history message. Default 4096. */
@@ -74,7 +75,7 @@ export async function capToolOutput(
   if (opts.workspace) {
     const absPath = path.join(opts.workspace, relPath);
     await fs.mkdir(path.dirname(absPath), { recursive: true });
-    await fs.writeFile(absPath, rawContent, "utf-8");
+    await atomicWriteFile(absPath, rawContent);
     fullOutputPath = relPath;
   }
 

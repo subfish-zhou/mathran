@@ -15,6 +15,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { atomicWriteFile } from "../../../chat/atomic-write.js";
 
 import { slugify } from "../../../../lib/slug.js";
 import { getPaper } from "../../../paper-graph/index.js";
@@ -87,12 +88,11 @@ async function writeEffort(projectDir: string, e: WorkspaceEffortOutput): Promis
   try {
     const dir = path.join(effortsDir(projectDir), e.id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(
+    await atomicWriteFile(
       path.join(dir, "document.md"),
       effortFrontmatter(e) + (e.document.trim() || `# ${e.title}`) + "\n",
-      "utf-8",
     );
-    await fs.writeFile(path.join(dir, "effort.json"), JSON.stringify(e, null, 2) + "\n", "utf-8");
+    await atomicWriteFile(path.join(dir, "effort.json"), JSON.stringify(e, null, 2) + "\n");
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn(`[spine-efforts] writeEffort(${e.id}) failed: ${errMsg(err)}`);
