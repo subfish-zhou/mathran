@@ -143,7 +143,37 @@ async function readIndex(dir: string): Promise<ScopeIndex> {
 
 async function writeIndex(dir: string, idx: ScopeIndex): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(dir, ".index.json"), JSON.stringify(idx, null, 2), "utf-8");
+  // 2026-06-25 audit E7 — atomic write via tmp+rename so a crash mid-write
+  // doesn't leave a truncated/empty .index.json that breaks future loads.
+  // (read-modify-write race between concurrent flush() calls is still
+  // possible — the in-process per-dir lock below serialises them.)
+  const finalPath = path.join(dir, ".index.json");
+  const tmpPath = `${finalPath}.tmp.${process.pid}.${Date.now()}`;
+  await fs.writeFile(tmpPath, JSON.stringify(idx, null, 2), "utf-8");
+  await fs.rename(tmpPath, finalPath);
+}
+
+// In-process per-dir index lock — chains writeIndex calls so concurrent
+// flush() against the same scope dir can't tear each other's read-
+// modify-write cycle. Map key is the scope dir path; value is the tail
+// of the current chain.
+const indexLocks = new Map<string, Promise<void>>();
+async function withIndexLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const prev = indexLocks.get(dir) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>((r) => {
+    release = r;
+  });
+  indexLocks.set(dir, prev.then(() => next));
+  try {
+    await prev;
+    return await fn();
+  } finally {
+    release();
+    // Cleanup the map when our chain tail is no longer the latest
+    // (a later caller has already replaced it).
+    if (indexLocks.get(dir) === next) indexLocks.delete(dir);
+  }
 }
 
 function conversationFile(dir: string, conversationId: string): string {
@@ -524,39 +554,44 @@ export async function flushConversationHistory(
   opts?: { title?: string },
 ): Promise<void> {
   const dir = scopeDir(workspace, scope);
+  // 2026-06-25 audit E7 — serialise the read-modify-write of `.index.json`
+  // so concurrent flushes for sibling convs in the same scope dir can't
+  // tear each other (last write would win, dropping the earlier one's
+  // conv entry). The jsonl write itself is per-conv so it's outside the
+  // lock; only the index update needs serialisation.
   await flushSession(dir, conversationId, history);
-
-  const idx = await readIndex(dir);
-  const now = new Date().toISOString();
-  const existing = idx.conversations[conversationId];
-  const resolvedTitle = existing?.title ?? opts?.title ?? deriveTitle(history);
-  idx.conversations[conversationId] = {
-    id: conversationId,
-    title: resolvedTitle,
-    createdAt: existing?.createdAt ?? now,
-    lastUsedAt: now,
-    messageCount: history.length,
-    // v0.18 — preserve thread linkage on every flush. Without this the
-    // first send() in a freshly-created thread would wipe the parent
-    // pointer because flushConversationHistory rebuilds the meta from
-    // scratch using only the title-derivation inputs.
-    ...(existing?.parentConversationId !== undefined && {
-      parentConversationId: existing.parentConversationId,
-    }),
-    ...(existing?.anchorBubbleIdx !== undefined && {
-      anchorBubbleIdx: existing.anchorBubbleIdx,
-    }),
-    ...(existing?.threadDescription !== undefined && {
-      threadDescription: existing.threadDescription,
-    }),
-  };
-  await writeIndex(dir, idx);
-
-  try {
-    await flushTranscript(dir, conversationId, history, { scope, title: resolvedTitle });
-  } catch {
-    /* transcript is best-effort */
-  }
+  await withIndexLock(dir, async () => {
+    const idx = await readIndex(dir);
+    const now = new Date().toISOString();
+    const existing = idx.conversations[conversationId];
+    const resolvedTitle = existing?.title ?? opts?.title ?? deriveTitle(history);
+    idx.conversations[conversationId] = {
+      id: conversationId,
+      title: resolvedTitle,
+      createdAt: existing?.createdAt ?? now,
+      lastUsedAt: now,
+      messageCount: history.length,
+      // v0.18 — preserve thread linkage on every flush. Without this the
+      // first send() in a freshly-created thread would wipe the parent
+      // pointer because flushConversationHistory rebuilds the meta from
+      // scratch using only the title-derivation inputs.
+      ...(existing?.parentConversationId !== undefined && {
+        parentConversationId: existing.parentConversationId,
+      }),
+      ...(existing?.anchorBubbleIdx !== undefined && {
+        anchorBubbleIdx: existing.anchorBubbleIdx,
+      }),
+      ...(existing?.threadDescription !== undefined && {
+        threadDescription: existing.threadDescription,
+      }),
+    };
+    await writeIndex(dir, idx);
+    try {
+      await flushTranscript(dir, conversationId, history, { scope, title: resolvedTitle });
+    } catch {
+      /* transcript is best-effort */
+    }
+  });
 }
 
 /** Lazy-load a conversation's history from disk. Returns null if no file. */
@@ -748,6 +783,8 @@ export class ScopedChatSessionStore {
     if (!entry) return;
     // Delegate to the shared persistence helpers (v0.2 §10) so chat + goal
     // can never drift on jsonl layout, index format, or transcript shape.
+    // The index lock is inside flushConversationHistory (audit E7), so we
+    // don't need to re-wrap here.
     await flushConversationHistory(
       this.workspace,
       scope,
@@ -769,12 +806,17 @@ export class ScopedChatSessionStore {
     } catch {
       /* no file */
     }
-    const idx = await readIndex(dir);
-    const hadIndex = conversationId in idx.conversations;
-    if (hadIndex) {
-      delete idx.conversations[conversationId];
-      await writeIndex(dir, idx);
-    }
+    // 2026-06-25 audit E7 — same lock so a flush that's concurrent with
+    // this drop can't re-introduce the just-dropped index entry.
+    const hadIndex = await withIndexLock(dir, async () => {
+      const idx = await readIndex(dir);
+      const had = conversationId in idx.conversations;
+      if (had) {
+        delete idx.conversations[conversationId];
+        await writeIndex(dir, idx);
+      }
+      return had;
+    });
     // /diff + rewind: best-effort cleanup of this conversation's checkpoint
     // bucket so deleting a thread doesn't leak its snapshot cache.
     try {

@@ -1714,6 +1714,23 @@ function registerChatScope(
         : null;
     const conversationId = requested ?? ScopedChatSessionStore.newConversationId();
 
+    // 2026-06-25 audit E3 — reject overlapping sends to the same conv. Two
+    // concurrent POSTs would share the same `ChatSession` and both call
+    // .send(), corrupting the in-memory `messages` array (interleaved
+    // user pushes, the second LLM call sees both user turns at once,
+    // tool-call ids collide, etc). The SPA already serialises per channel
+    // via its busy flag — this is the server-side safety net for stray
+    // concurrent clients (multi-tab, retry storms, scripted callers).
+    if (hasActiveStream(conversationId)) {
+      return c.json(
+        {
+          error: "another send is already in flight for this conversation",
+          conversationId,
+        },
+        409,
+      );
+    }
+
     let session: ChatSession;
     try {
       session = await store.getOrCreate(scope, conversationId, model);
@@ -2200,6 +2217,14 @@ function registerChatScope(
     const pruneFromBubbleIdx = body?.pruneFromBubbleIdx;
     if (Number.isInteger(pruneFromBubbleIdx) && pruneFromBubbleIdx >= 0) {
       await pruneAnnotationsFrom(store.getWorkspace(), scope, id, pruneFromBubbleIdx);
+    }
+
+    // 2026-06-25 audit E3 — same single-stream-per-conv guard as POST /api/<scope>.
+    if (hasActiveStream(id)) {
+      return c.json(
+        { error: "another send is already in flight for this conversation", conversationId: id },
+        409,
+      );
     }
 
     let session: ChatSession;
