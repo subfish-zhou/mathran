@@ -169,14 +169,26 @@ export function createReadPaperTexTool(): ToolSpec {
       // ── Mode C: explicit file path
       if (fileArg) {
         const abs = path.isAbsolute(fileArg) ? fileArg : path.join(res.rootDir, fileArg);
-        // Sandbox check — must stay under res.rootDir
+        // Sandbox check — must stay under res.rootDir.
+        // [Fix A11 2026-06-26] use realpath to follow any symlinks
+        // BEFORE the prefix check, so a symlink inside the cache that
+        // points outside (e.g. crafted by a malicious arxiv tarball)
+        // can't escape. The tar filter (Fix A14) is the primary
+        // defense; this is belt-and-braces.
         const resolved = path.resolve(abs);
-        if (!resolved.startsWith(path.resolve(res.rootDir) + path.sep) && resolved !== path.resolve(res.rootDir)) {
+        let realResolved: string;
+        try {
+          realResolved = await fs.realpath(resolved);
+        } catch (err: any) {
+          return { ok: false, content: `read_paper_tex: cannot resolve ${fileArg}: ${err?.message ?? err}` };
+        }
+        const realRoot = await fs.realpath(res.rootDir).catch(() => path.resolve(res.rootDir));
+        if (!realResolved.startsWith(realRoot + path.sep) && realResolved !== realRoot) {
           return { ok: false, content: `read_paper_tex: file escapes paper-source dir (${fileArg})` };
         }
         let body: string;
         try {
-          body = await fs.readFile(resolved, "utf-8");
+          body = await fs.readFile(realResolved, "utf-8");
         } catch (err: any) {
           return { ok: false, content: `read_paper_tex: cannot read ${fileArg}: ${err?.message ?? err}` };
         }

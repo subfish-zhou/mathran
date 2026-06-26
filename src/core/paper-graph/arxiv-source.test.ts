@@ -297,3 +297,64 @@ describe("cacheDirFor", () => {
     );
   });
 });
+
+// ─── Audit fixes ─────────────────────────────────────────────────────────
+
+describe("ARXIV_ID_RE (Fix A5)", () => {
+  it("accepts modern ids YYMM.NNNNN with optional vN", async () => {
+    const buf = await buildTarGz({ "main.tex": "\\documentclass{article}\nbody" });
+    for (const id of ["2106.04561", "2106.04561v2", "0801.1234"]) {
+      const res = await fetchArxivSource(id, { workspace, fetchImpl: makeMockFetch(buf) });
+      expect(res.status).toBe("ok");
+    }
+  });
+
+  it("accepts legacy archive-prefix ids (cs.LG/, hep-th/, math.NT/)", async () => {
+    const buf = await buildTarGz({ "main.tex": "\\documentclass{article}\nbody" });
+    for (const id of ["cs.LG/0412020", "hep-th/9901001", "math.NT/0412020"]) {
+      const res = await fetchArxivSource(id, { workspace, fetchImpl: makeMockFetch(buf) });
+      expect(res.status).toBe("ok");
+    }
+  });
+
+  it("rejects malformed ids before network", async () => {
+    let called = false;
+    const res = await fetchArxivSource("../etc/passwd", {
+      workspace,
+      fetchImpl: async () => { called = true; return { ok: false, status: 999, body: null }; },
+    });
+    expect(called).toBe(false);
+    expect(res.status).toBe("invalid-id");
+  });
+});
+
+describe("content-type dispatch (Fix A24)", () => {
+  it("treats application/pdf as no-source (without exploding)", async () => {
+    const pdfBytes = Buffer.from("%PDF-1.4\nfake pdf body");
+    const mockFetch = async () => ({
+      ok: true,
+      status: 200,
+      body: Readable.toWeb(Readable.from(pdfBytes)) as unknown as ReadableStream<Uint8Array>,
+      headers: { get: (n: string) => n.toLowerCase() === "content-type" ? "application/pdf" : null },
+    });
+    const res = await fetchArxivSource("2106.04561", { workspace, fetchImpl: mockFetch });
+    expect(res.status).toBe("no-source");
+  });
+
+  it("handles single-file .tex submissions (text/plain)", async () => {
+    const rawTex = "\\documentclass{article}\n\\begin{document}\nfoo\n\\end{document}\n";
+    const mockFetch = async () => ({
+      ok: true,
+      status: 200,
+      body: Readable.toWeb(Readable.from(Buffer.from(rawTex))) as unknown as ReadableStream<Uint8Array>,
+      headers: { get: (n: string) => n.toLowerCase() === "content-type" ? "text/plain" : null },
+    });
+    const res = await fetchArxivSource("2106.04561", { workspace, fetchImpl: mockFetch });
+    expect(res.status).toBe("ok");
+    if (res.status === "ok") {
+      expect(res.mainTexFile).toBeTruthy();
+      const body = await fs.readFile(res.mainTexFile!, "utf-8");
+      expect(body).toContain("\\documentclass{article}");
+    }
+  });
+});

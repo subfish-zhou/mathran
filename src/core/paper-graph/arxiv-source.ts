@@ -44,8 +44,18 @@ const DEFAULT_TIMEOUT_MS = 60_000;
  * Match arxiv id forms we accept (modern + legacy). Used for input
  * sanitisation — anything not matching is rejected before going on
  * the wire. The match group is what we use as the cache dir name.
+ *
+ * Modern (2007+): `YYMM.NNNNN` (4 digits dot 4-7 digits), optional `vN`.
+ * Legacy (1991-2007): `archive[.SUBJ]/YYMMNNN` (e.g. `cs.LG/0412020`,
+ * `hep-th/9901001`, `math.NT/0412020`).
+ *
+ * Fix A5 (2026-06-26): the prior regex tried to combine modern + legacy
+ * into one optional-prefix expression but the trailing `\.?[0-9]{4,7}`
+ * required (or skipped) a dot in a way that rejected legacy ids like
+ * `hep-th/9901001` (7 digits after slash, no dot). Split into an
+ * explicit alternation.
  */
-const ARXIV_ID_RE = /^(?:(?:[a-z\-]+(?:\.[A-Z]{2})?\/)?[0-9]{4,5}\.?[0-9]{4,7}(?:v[0-9]+)?)$/i;
+const ARXIV_ID_RE = /^(?:[a-z\-]+(?:\.[A-Z]{2})?\/[0-9]{7}|[0-9]{4}\.[0-9]{4,7})(?:v[0-9]+)?$/i;
 
 /** Make a single-segment filename out of an arxiv id (escapes `/`). */
 function safeIdSegment(arxivId: string): string {
@@ -92,6 +102,13 @@ export interface FetchArxivSourceOptions {
     ok: boolean;
     status: number;
     body: ReadableStream<Uint8Array> | null;
+    /**
+     * [Fix A24 2026-06-26] Optional headers. arxiv `/e-print/` may
+     * return application/x-eprint (PDF) or text/plain (single .tex)
+     * rather than the usual gzipped-tar; when the wrapper passes
+     * headers we can dispatch correctly.
+     */
+    headers?: { get(name: string): string | null };
   }>;
   /** Override the HTTP timeout. */
   timeoutMs?: number;
@@ -101,7 +118,7 @@ export interface FetchArxivSourceOptions {
 
 const defaultFetch: NonNullable<FetchArxivSourceOptions["fetchImpl"]> = async (url, init) => {
   const res = await fetch(url, init);
-  return { ok: res.ok, status: res.status, body: res.body };
+  return { ok: res.ok, status: res.status, body: res.body, headers: res.headers };
 };
 
 /**
@@ -300,7 +317,12 @@ export async function fetchArxivSource(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  let response: { ok: boolean; status: number; body: ReadableStream<Uint8Array> | null };
+  let response: {
+    ok: boolean;
+    status: number;
+    body: ReadableStream<Uint8Array> | null;
+    headers?: { get(name: string): string | null };
+  };
   try {
     response = await fetchImpl(`${ARXIV_E_PRINT_URL}/${encodeURIComponent(arxivId)}`, {
       signal: controller.signal,
@@ -322,18 +344,60 @@ export async function fetchArxivSource(
     return { status: "fetch-failed", arxivId, error: "arxiv response had empty body" };
   }
 
+  // [Fix A24 2026-06-26] arxiv `/e-print/` content negotiation:
+  //   - application/x-eprint-tar  → gzipped tar (the common case)
+  //   - application/x-eprint      → bare PDF (no useful source)
+  //   - application/pdf           → bare PDF (no useful source)
+  //   - text/plain or text/x-tex  → single-file .tex submission
+  //   - other                     → unknown, try gzip+tar then fail
+  // When the test fetchImpl omits headers we keep the original behavior.
+  const contentType = response.headers?.get("content-type")?.toLowerCase() ?? "";
+  if (contentType.includes("application/pdf") || contentType === "application/x-eprint") {
+    try {
+      if (response.body && typeof (response.body as ReadableStream).cancel === "function") {
+        await (response.body as ReadableStream).cancel();
+      }
+    } catch { /* ignore */ }
+    return { status: "no-source", arxivId, error: `arxiv only ships PDF for ${arxivId}` };
+  }
+  const isPlainTex = contentType.includes("text/plain") || contentType.includes("text/x-tex");
+
   // ── extract to staging then atomic rename
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), `mathran-arxiv-${safeIdSegment(arxivId)}-`));
   try {
+   if (isPlainTex) {
+     // Single-file .tex submission: write the response body to main.tex.
+     const chunks: Buffer[] = [];
+     const nodeStream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
+     for await (const c of nodeStream) chunks.push(Buffer.from(c));
+     await fs.writeFile(path.join(stagingDir, "main.tex"), Buffer.concat(chunks));
+   } else {
     // Pipeline: response stream → gunzip → tar extractor (writes into stagingDir).
     // The stream we get from fetch() is a web ReadableStream; convert
     // to node Readable.
-    const nodeStream = Readable.fromWeb(response.body as any);
+    const nodeStream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
     await pipeline(
       nodeStream,
       createGunzip(),
-      tar.extract({ cwd: stagingDir, preservePaths: false, strict: false }),
+      // [Fix A14 2026-06-26] tar 7 + strict:false will silently allow
+      // symlinks / hardlinks / absolute paths; an attacker who controls
+      // the arxiv submission could ship `evil -> /etc/passwd` and any
+      // reader of the cache would follow that symlink. Drop all non-
+      // regular-file entries via filter.
+      tar.extract({
+        cwd: stagingDir,
+        preservePaths: false,
+        strict: false,
+        filter: (_p, entry) => {
+          const type = (entry as { type?: string }).type;
+          if (type !== "File" && type !== "Directory") return false;
+          const ep = (entry as { path?: string }).path ?? "";
+          if (ep.startsWith("/") || ep.includes("..")) return false;
+          return true;
+        },
+      }),
     );
+   } // close else (gzipped-tar branch — Fix A24)
   } catch (err: any) {
     // Could also be a single .tex file (not a tar). arxiv historically
     // sometimes returns a bare gzipped .tex for very simple papers.
