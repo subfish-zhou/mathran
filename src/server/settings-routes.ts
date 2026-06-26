@@ -40,6 +40,7 @@ import {
 import { MATHRAN_DIR, SETTINGS_FILE } from "../core/config/mathran-root.js";
 import { loadLayeredSettings } from "../core/config/layered-settings.js";
 import { atomicWriteFile } from "../core/chat/atomic-write.js";
+import { withFileLock } from "../core/chat/store.js";
 
 export type SettingsLayerName = "user" | "workspace" | "project";
 
@@ -205,14 +206,19 @@ export async function mergeAndWriteSettings(
   filePath: string,
   patch: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  const existing = await readRawSettings(filePath);
-  const merged = deepMergeSettings(existing, patch);
-  if (merged.schemaVersion === undefined) {
-    merged.schemaVersion = SETTINGS_SCHEMA_VERSION;
-  }
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await atomicWriteFile(filePath, JSON.stringify(merged, null, 2) + "\n");
-  return merged;
+  // 2026-06-25 audit K2 — RMW: read existing → merge → write. Two concurrent
+  // PUT /api/settings/<layer> for the same layer would otherwise lose one
+  // patch's modifications. Per-file lock serialises them.
+  return await withFileLock(filePath, async () => {
+    const existing = await readRawSettings(filePath);
+    const merged = deepMergeSettings(existing, patch);
+    if (merged.schemaVersion === undefined) {
+      merged.schemaVersion = SETTINGS_SCHEMA_VERSION;
+    }
+    await fsp.mkdir(path.dirname(filePath), { recursive: true });
+    await atomicWriteFile(filePath, JSON.stringify(merged, null, 2) + "\n");
+    return merged;
+  });
 }
 
 // ──────────────────────────────────────────────────────────────────────
