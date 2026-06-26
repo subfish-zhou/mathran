@@ -266,3 +266,71 @@ async function readJsonl<T>(file: string): Promise<T[]> {
   }
   return out;
 }
+
+/**
+ * [Design-Audit D-2a 2026-06-26] Scan all projects under `workspace`
+ * for `status:"running"` runs and flip them to `status:"error"` with
+ * a "stale" marker. Intended to be called once at serve startup —
+ * any run that was in-flight when the process died won't be
+ * resurrected, and the SPA / CLI will show a useful failure instead
+ * of a perpetual "running" badge.
+ *
+ * [Re-audit RE-2 2026-06-26] We snapshot the set of running runIds
+ * FIRST, then reap only that set. A run that gets POSTed while this
+ * function is in-flight won't be in the snapshot, so we won't reap
+ * it. (Without this, the reaper's `readdir` of agent-runs/ would
+ * pick up newly-created runIds and clobber them.)
+ *
+ * Returns the number of runs reaped. Failures (unreadable run.json,
+ * etc.) are silently skipped — best-effort cleanup, not a hard gate.
+ */
+export async function reapStaleRuns(workspace: string, projectsDirName = "projects"): Promise<number> {
+  // [Re-audit RE-2/RE-3 2026-06-26] Anchor on a startup timestamp
+  // captured at the entry to this function. Only flip runs whose
+  // `startedAt` is strictly before this anchor; new POSTs landing
+  // mid-reap will have `startedAt > anchor` and survive.
+  const anchorMs = Date.now();
+  const projectsRoot = path.join(workspace, projectsDirName);
+  let projectSlugs: string[];
+  try {
+    projectSlugs = await fs.readdir(projectsRoot);
+  } catch {
+    return 0; // no projects yet
+  }
+  const snapshot: Array<{ projectDir: string; runId: string; startedAt: string }> = [];
+  for (const slug of projectSlugs) {
+    const projectDir = path.join(projectsRoot, slug);
+    const runsRoot = runsDir(projectDir);
+    let runIds: string[];
+    try {
+      runIds = await fs.readdir(runsRoot);
+    } catch {
+      continue;
+    }
+    for (const runId of runIds) {
+      const file = runFile(projectDir, runId);
+      try {
+        const raw = await fs.readFile(file, "utf-8");
+        const run = JSON.parse(raw) as RunRecord;
+        if (run?.status === "running") {
+          snapshot.push({ projectDir, runId, startedAt: run.startedAt });
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+  let reaped = 0;
+  for (const { projectDir, runId, startedAt } of snapshot) {
+    // Only reap if startedAt is strictly before the anchor.
+    const startedMs = Date.parse(startedAt);
+    if (!Number.isFinite(startedMs) || startedMs >= anchorMs) continue;
+    try {
+      await finishRun(projectDir, runId, "error", "stale: process restarted while run was in flight");
+      reaped += 1;
+    } catch {
+      // best effort
+    }
+  }
+  return reaped;
+}

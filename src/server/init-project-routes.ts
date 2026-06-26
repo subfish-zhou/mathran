@@ -115,6 +115,12 @@ function str(v: unknown): string | undefined {
 
 export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps): void {
   const { workspace, llmFor } = deps;
+  // [Design-Audit D-2b 2026-06-26] In-process registry of live
+  // AbortControllers keyed by runId. Lives for the process lifetime.
+  // POST /:runId/cancel reads from here; the runner's finally{}
+  // deletes the entry. Stale-run reaper (D-2a) handles runs whose
+  // controller is gone because the process crashed.
+  const runControllers = new Map<string, AbortController>();
 
   app.post("/api/agent/init-project", async (c) => {
     let body: unknown;
@@ -160,6 +166,12 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
       },
     });
 
+    // [Design-Audit D-2b 2026-06-26] AbortController for this run.
+    // Stashed in runControllers so POST /:runId/cancel can fire it.
+    // Removed in finally{} so the map doesn't grow unbounded.
+    const ac = new AbortController();
+    runControllers.set(run.runId, ac);
+
     // Fire-and-forget: the fs runs ledger is the durable state. Errors are
     // recorded in the ledger by runInitAgent itself.
     void (async () => {
@@ -170,13 +182,34 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
           slug,
           runId: run.runId,
           llm: llmFor(),
+          signal: ac.signal,
         });
       } catch {
         /* ledger already flipped to error */
+      } finally {
+        runControllers.delete(run.runId);
       }
     })();
 
     return c.json({ projectSlug: slug, runId: run.runId, aiAssisted: true }, 202);
+  });
+
+  // [Design-Audit D-2b 2026-06-26] POST /:runId/cancel — abort an
+  // in-flight run. The agent's throwIfAborted() checks pick up the
+  // abort at the next phase boundary and flip the run to "error"
+  // with message "aborted by user".
+  app.post("/api/agent/init-project/:runId/cancel", async (c) => {
+    const runId = c.req.param("runId");
+    if (!/^run-[0-9a-f]{6,}$/.test(runId)) return c.json({ error: "invalid runId" }, 400);
+    const ac = runControllers.get(runId);
+    if (!ac) {
+      // Run is unknown to this process — either never existed, or
+      // already finished, or started in a prior process lifetime
+      // (stale; D-2a reaper should have flipped it).
+      return c.json({ cancelled: false, reason: "run not in flight in this process" }, 404);
+    }
+    ac.abort();
+    return c.json({ cancelled: true, runId }, 202);
   });
 
   app.get("/api/agent/init-project/:runId", async (c) => {
@@ -295,11 +328,18 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
     const slug = path.basename(projectDir);
     const input: InitAgentInput = { problem, seedReferences, aiInit, seedPdfs };
 
+    // [Design-Audit D-2b 2026-06-26] Resumed runs also get an
+    // AbortController so cancel works on them too.
+    const ac = new AbortController();
+    runControllers.set(runId, ac);
+
     void (async () => {
       try {
-        await resumeInitAgent(input, { workspace, projectDir, slug, runId, llm: llmFor() }, { fromPhase });
+        await resumeInitAgent(input, { workspace, projectDir, slug, runId, llm: llmFor(), signal: ac.signal }, { fromPhase });
       } catch {
         /* ledger already flipped to error */
+      } finally {
+        runControllers.delete(runId);
       }
     })();
 

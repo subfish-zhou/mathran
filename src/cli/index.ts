@@ -161,6 +161,37 @@ projectCmd
     process.exit(await runProjectList({ workspace: opts.workspace, json: opts.json }));
   });
 
+// `mathran ai-init <name>` — invoke the AI-assisted init pipeline via
+// the running serve process. Added 2026-06-26 (design-audit D-1).
+program
+  .command("ai-init")
+  .description("Run the AI-assisted init pipeline (requires `mathran serve` running)")
+  .argument("<name>", "Human-readable project name")
+  .option("--serve-url <url>", "Serve URL (default http://127.0.0.1:7878)")
+  .option("--seeds <ids>", "Comma-separated arxiv ids to seed the citation graph")
+  .option("--depth <d>", "Search depth: shallow | standard | deep", "standard")
+  .option("--no-wiki", "Skip the wiki phase")
+  .option("--no-workspace", "Skip the workspace/effort phase")
+  .option("--no-spine", "Use the legacy non-spine pipeline (not recommended)")
+  .option("--detach", "Print runId and exit without waiting for completion")
+  .option("--timeout-sec <n>", "Max seconds to wait for completion (default 1800)", (v) => parseInt(v, 10))
+  .option("--json", "Emit raw NDJSON events instead of pretty-printing", false)
+  .action(async (name: string, opts: { serveUrl?: string; seeds?: string; depth?: "shallow" | "standard" | "deep"; wiki?: boolean; workspace?: boolean; spine?: boolean; detach?: boolean; timeoutSec?: number; json?: boolean }) => {
+    const { runAiInit } = await import("./commands/ai-init.js");
+    // commander inverts --no-* booleans automatically (wiki/workspace/spine default true)
+    process.exit(await runAiInit(name, {
+      serveUrl: opts.serveUrl,
+      seeds: opts.seeds,
+      depth: opts.depth,
+      noWiki: opts.wiki === false,
+      noWorkspace: opts.workspace === false,
+      useSpine: opts.spine !== false,
+      detach: opts.detach,
+      timeoutSec: opts.timeoutSec,
+      json: opts.json,
+    }));
+  });
+
 const effortCmd = program
   .command("effort")
   .description("Manage workspace efforts inside a project");

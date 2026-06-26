@@ -201,6 +201,13 @@ export interface SpineBuilderConfig {
     description: string;
     tags: string[];
   };
+  /**
+   * [Design-Audit D-2b 2026-06-26] Optional abort signal. When
+   * provided, the spine builder checks it at the start of each
+   * paper-batch iteration so a `POST /:runId/cancel` takes effect
+   * within seconds (not minutes) during the build_spine phase.
+   */
+  signal?: AbortSignal;
 }
 
 // ============================================================

@@ -3874,6 +3874,22 @@ function buildApp(
         : new ModelRouter(loadConfig(configPathFor(workspace))),
   });
 
+  // [Design-Audit D-2a 2026-06-26] Reap stale "running" runs from
+  // prior process lifetimes. Without this, a serve restart while an
+  // init was in-flight leaves the run forever displayed as "running"
+  // in the SPA. Fire-and-forget; failures are logged but non-fatal.
+  void (async () => {
+    try {
+      const { reapStaleRuns } = await import("../core/agents/init-project/runs-ledger.js");
+      const reaped = await reapStaleRuns(workspace);
+      if (reaped > 0) {
+        console.log(`[serve] reaped ${reaped} stale init-project run(s) from prior lifetime`);
+      }
+    } catch (e) {
+      console.warn(`[serve] stale-run reaper failed: ${(e as Error).message}`);
+    }
+  })();
+
   app.get("/api/projects/:slug/wiki", async (c) => {
     const slug = c.req.param("slug");
     if (!isSafeSlug(slug)) return c.json({ error: "invalid project slug" }, 400);

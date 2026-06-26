@@ -154,6 +154,11 @@ async function extractNodeCandidates(
   emit({ type: "log", message: `Papers clustered into ${batches.length} batches` });
 
   for (let i = 0; i < batches.length; i++) {
+    // [Design-Audit D-2b 2026-06-26] Abort check at each batch start
+    // so the build_spine phase yields to cancel within ~one LLM call.
+    if (config.signal?.aborted) {
+      throw new Error("aborted by user");
+    }
     const batch = batches[i]!;
     emit({ type: "log", message: `Processing batch ${i + 1}/${batches.length} (${batch.length} papers)` });
 
