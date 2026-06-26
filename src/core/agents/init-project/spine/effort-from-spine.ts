@@ -116,6 +116,18 @@ async function writeEffort(
       await fs.writeFile(artifactsPath, "", "utf-8");
     }
 
+    // [Fix D5 2026-06-26] Escape markdown special chars in titles
+    // and paths so a paper title like "**bold** trick" or a filename
+    // with backticks doesn't break the scaffold's layout. Replace
+    // newlines too (titles shouldn't have them but defensively).
+    const escMd = (s: string): string =>
+      s
+        .replace(/\r?\n/g, " ")
+        .replace(/[\\`*_{}\[\]()#+\-.!|<>]/g, (c) => `\\${c}`);
+    const escCode = (s: string): string =>
+      // Filename in a backtick code-span — strip backticks (rare).
+      s.replace(/`/g, "");
+
     // 2026-06-26 (sync-upgrade P2-B): auto-attach arxiv references.
     // Symlinks <workspace>/.mathran/paper-sources/<id>/ into
     // <effort>/references/<id> for every paper in e.sources that has
@@ -123,23 +135,26 @@ async function writeEffort(
     // we only link to the cache (no re-fetch).
     const refSummaries: string[] = [];
     for (const src of e.sources) {
+      const titleMd = escMd(src.title ?? "(untitled)");
       if (src.arxivId) {
         try {
           const arxivCache = await fetchArxivSource(src.arxivId, { workspace });
           if (arxivCache.status === "ok") {
             await attachReference(workspace, slugFromProjectDir(projectDir), e.id, src.arxivId, arxivCache.rootDir);
             const mainRel = arxivCache.mainTexFile ? path.relative(arxivCache.rootDir, arxivCache.mainTexFile) : "(no main .tex auto-resolved)";
-            refSummaries.push(`- [arXiv:${src.arxivId}] **${src.title}** — see \`references/${src.arxivId.replace(/\//g, "_")}/${mainRel}\``);
+            const safeArxivPath = escCode(src.arxivId.replace(/\//g, "_"));
+            const safeMainRel = escCode(mainRel);
+            refSummaries.push(`- [arXiv:${src.arxivId}] **${titleMd}** — see \`references/${safeArxivPath}/${safeMainRel}\``);
           } else {
-            refSummaries.push(`- [arXiv:${src.arxivId}] **${src.title}** — source unavailable (${arxivCache.status})`);
+            refSummaries.push(`- [arXiv:${src.arxivId}] **${titleMd}** — source unavailable (${arxivCache.status})`);
           }
         } catch (err) {
-          refSummaries.push(`- [arXiv:${src.arxivId}] **${src.title}** — attach failed: ${errMsg(err)}`);
+          refSummaries.push(`- [arXiv:${src.arxivId}] **${titleMd}** — attach failed: ${errMsg(err)}`);
         }
       } else if (src.url) {
-        refSummaries.push(`- **${src.title}** — ${src.url}`);
+        refSummaries.push(`- **${titleMd}** — ${src.url}`);
       } else {
-        refSummaries.push(`- **${src.title}**`);
+        refSummaries.push(`- **${titleMd}**`);
       }
     }
 

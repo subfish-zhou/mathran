@@ -110,6 +110,16 @@ export function createPdfExtractTool(): ToolSpec {
           return { ok: false, content: "pdf_extract: arxiv: paths require an active workspace" };
         }
         const arxivId = argPath.slice("arxiv:".length).trim();
+        // [Fix D2 2026-06-26] Empty arxivId gives confusing
+        // 'bad arxiv id: ' downstream — return a clearer message here.
+        if (!arxivId) {
+          return {
+            ok: false,
+            content:
+              "pdf_extract: 'arxiv:' prefix requires an id, e.g. 'arxiv:2106.04561' " +
+              "or legacy 'arxiv:hep-th/9901001'.",
+          };
+        }
         const res = await fetchArxivSource(arxivId, { workspace: wsAbs });
         if (res.status === "ok") {
           const fileList = res.texFiles

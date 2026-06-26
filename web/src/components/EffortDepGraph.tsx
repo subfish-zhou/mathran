@@ -115,7 +115,11 @@ function layoutGraph(efforts: EffortSummary[], edges: EffortRelation[]): NodeLay
   const inCycle = new Set<string>();
   for (const s of slugs) {
     if (!level.has(s)) {
-      level.set(s, 0);
+      // [Fix D7 2026-06-26] Cycle nodes have no dep-free ancestors so
+      // BFS never reaches them. Put them at currentLevel (after every
+      // dep-free node was placed) so they render to the right of the
+      // real roots, not stacked on top of them at column 0.
+      level.set(s, currentLevel);
       inCycle.add(s);
     }
   }
