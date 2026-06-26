@@ -34,7 +34,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ToolSpec } from "../session.js";
-import { scopeDir, type ChatScope } from "../store.js";
+import { scopeDir, withFileLock, type ChatScope } from "../store.js";
 import { atomicWriteFile } from "../atomic-write.js";
 
 /** Status values the model is allowed to emit. Keep this list short — Cursor
@@ -367,9 +367,18 @@ export function createTodoWriteTool(opts: CreateTodoWriteToolOptions): ToolSpec 
             content: "error: todo_write requires a non-empty 'items' array",
           };
         }
-        const prev = await loadTodos(workspace, scope, conversationId);
-        const next = applyTodoPatch(prev, typed);
-        await saveTodos(workspace, scope, conversationId, next);
+        // 2026-06-25 audit G9 — same per-file lock as annotations / index
+        // / checkpoint store. A model that batches two todo_write calls in
+        // parallel (or two concurrent SPA reruns) would otherwise have
+        // both load → patch → save and the second writer would clobber the
+        // first.
+        const file = todosFile(workspace, scope, conversationId);
+        const next = await withFileLock(file, async () => {
+          const prev = await loadTodos(workspace, scope, conversationId);
+          const n = applyTodoPatch(prev, typed);
+          await saveTodos(workspace, scope, conversationId, n);
+          return n;
+        });
         return { ok: true, content: summarize(next) };
       } catch (err: any) {
         const msg = err && err.message ? String(err.message) : String(err);

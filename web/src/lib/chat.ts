@@ -452,7 +452,14 @@ async function pumpSSE(
 
   for (;;) {
     const { value, done } = await reader.read();
-    if (done) break;
+    if (done) {
+      // 2026-06-25 audit G8 — final decode without stream:true flushes any
+      // incomplete UTF-8 sequence the server may have left buffered. Without
+      // this, the last 1-3 bytes of a codepoint that straddled the EOF would
+      // be silently dropped (replaced with U+FFFD).
+      buffer += decoder.decode();
+      break;
+    }
     buffer += decoder.decode(value, { stream: true });
     let idx: number;
     while ((idx = buffer.indexOf("\n\n")) !== -1) {

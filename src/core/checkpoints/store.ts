@@ -22,6 +22,7 @@ import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 
 import { atomicWriteFile } from "../chat/atomic-write.js";
+import { withFileLock } from "../chat/store.js";
 import {
   toCheckpointIndexEntry,
   type Checkpoint,
@@ -115,6 +116,12 @@ async function writeCheckpointIndex(
 /**
  * Persist a checkpoint + prepend its index entry. Idempotent on `id` — a
  * second write for the same id overwrites the file and replaces the index row.
+ *
+ * 2026-06-25 audit G1 — index update is per-conv read-modify-write; if two
+ * write_file / edit_file tool calls land concurrently for the same conv,
+ * both would readCheckpointIndex → modify → write and the second writer
+ * would clobber the first's index row. Wrap the index update in
+ * withFileLock keyed on the index file path.
  */
 export async function writeCheckpoint(
   workspace: string,
@@ -129,10 +136,13 @@ export async function writeCheckpoint(
     JSON.stringify(checkpoint, null, 2) + "\n",
   );
 
-  const index = await readCheckpointIndex(workspace, checkpoint.conversationId);
-  const next = index.filter((e) => e.id !== checkpoint.id);
-  next.push(toCheckpointIndexEntry(checkpoint));
-  await writeCheckpointIndex(workspace, checkpoint.conversationId, next);
+  const indexFile = checkpointIndexFileFor(workspace, checkpoint.conversationId);
+  await withFileLock(indexFile, async () => {
+    const index = await readCheckpointIndex(workspace, checkpoint.conversationId);
+    const next = index.filter((e) => e.id !== checkpoint.id);
+    next.push(toCheckpointIndexEntry(checkpoint));
+    await writeCheckpointIndex(workspace, checkpoint.conversationId, next);
+  });
 }
 
 /**

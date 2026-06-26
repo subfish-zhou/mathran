@@ -155,9 +155,12 @@ async function writeIndex(dir: string, idx: ScopeIndex): Promise<void> {
 
 // In-process per-key file lock — chains operations so concurrent
 // read-modify-write cycles against the same disk file can't tear each
-// other. Used for `.index.json` (E7) and annotations sidecars (F3).
+// other. Used for `.index.json` (E7), annotations sidecars (F3), and
+// checkpoint index (G1). Exported so other modules that own their own
+// RMW disk files can serialise the same way without proliferating
+// near-identical locks.
 const fileLocks = new Map<string, Promise<void>>();
-async function withFileLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+export async function withFileLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   // Chain on the previous tail. If the prior caller rejected, swallow it
   // here — the caller already saw the error via its own promise. Without
   // this catch, the next acquirer would await a rejected promise, never
@@ -422,30 +425,35 @@ export async function pruneAnnotationsFrom(
   conversationId: string,
   fromIdx: number,
 ): Promise<void> {
-  const current = await loadAnnotations(workspace, scope, conversationId);
-  let changed = false;
-  const next: Record<string, MessageAnnotation> = {};
-  for (const [k, v] of Object.entries(current.byBubbleIdx)) {
-    if (Number(k) < fromIdx) next[k] = v;
-    else changed = true;
-  }
-  // v0.16 §11: a `pendingAsk` points at a placeholder tool message in the
-  // soon-to-be-truncated tail of history; once that message is gone the
-  // pending slot is meaningless. Drop it on any prune so reload doesn't
-  // resurrect a question whose tool-call no longer exists.
-  const droppingPendingAsk = Boolean(current.pendingAsk);
-  if (changed || droppingPendingAsk) {
-    const saved: ConversationAnnotations = {
-      version: 1,
-      byBubbleIdx: next,
-    };
-    // Preserve uiState across prune — it's coordinate-free user prefs,
-    // not message data. (Pre-v0.16 the old load impl stripped it on
-    // read, which made this a no-op; now that we round-trip it we must
-    // re-save it explicitly.)
-    if (current.uiState) saved.uiState = current.uiState;
-    await saveAnnotations(workspace, scope, conversationId, saved);
-  }
+  // 2026-06-25 audit G3 — wrap the load → mutate → save in the same
+  // per-file lock used by mutateAnnotations / PATCH /annotations. Without
+  // it a concurrent PATCH could land between this prune's load and save
+  // and get clobbered.
+  const file = annotationsFile(scopeDir(workspace, scope), conversationId);
+  await withFileLock(file, async () => {
+    const current = await loadAnnotations(workspace, scope, conversationId);
+    let changed = false;
+    const next: Record<string, MessageAnnotation> = {};
+    for (const [k, v] of Object.entries(current.byBubbleIdx)) {
+      if (Number(k) < fromIdx) next[k] = v;
+      else changed = true;
+    }
+    // v0.16 §11: a `pendingAsk` points at a placeholder tool message in the
+    // soon-to-be-truncated tail of history; once that message is gone the
+    // pending slot is meaningless. Drop it on any prune so reload doesn't
+    // resurrect a question whose tool-call no longer exists.
+    const droppingPendingAsk = Boolean(current.pendingAsk);
+    if (changed || droppingPendingAsk) {
+      const saved: ConversationAnnotations = {
+        version: 1,
+        byBubbleIdx: next,
+      };
+      // Preserve uiState across prune — it's coordinate-free user prefs,
+      // not message data.
+      if (current.uiState) saved.uiState = current.uiState;
+      await saveAnnotations(workspace, scope, conversationId, saved);
+    }
+  });
 }
 
 /**

@@ -3438,6 +3438,17 @@ function buildApp(
    * from the goal panel if the background run dies.
    */
   const autoRunGoal = (goalId: string, userMessage: string): void => {
+    // 2026-06-25 audit G12 — guard against double-fire. If a model
+    // mistakenly emits two propose_goal{ autoRun: true } calls in the
+    // same turn, or a SPA retry races with the original, both would
+    // start a round against the same goalId concurrently and clobber
+    // each other's writes. Skip when there's already one running.
+    if (inflightGoals.has(goalId)) {
+      console.warn(
+        `[mathran] autoRunGoal: round already in-flight for ${goalId}, ignoring double-fire`,
+      );
+      return;
+    }
     // Fire the round in a microtask so the current chat tool-result
     // returns first, the SSE pump emits its `goal-proposed` frame, and
     // THEN the goal round starts (so the SPA gets the notification
@@ -3494,6 +3505,13 @@ function buildApp(
    * Plan record stays on disk so the panel still renders the draft.
    */
   const autoRunPlan = (planId: string, objective: string): void => {
+    // 2026-06-25 audit G12 — guard against double-fire same as autoRunGoal.
+    if (planRuns.has(planId)) {
+      console.warn(
+        `[mathran] autoRunPlan: run already in-flight for ${planId}, ignoring double-fire`,
+      );
+      return;
+    }
     void (async () => {
       try {
         const cfg = loadConfig(configPathFor(workspace));
