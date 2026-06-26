@@ -278,6 +278,23 @@ export function classifyFiles(allFiles: string[]): {
  * Download + extract the arxiv source bundle. See module header for
  * the full contract.
  */
+/**
+ * [Fix B1 2026-06-26] In-process lock so concurrent fetchArxivSource()
+ * calls for the same (workspace, arxivId) serialize. Without it, two
+ * spine-builder paths fetching the same paper would both download,
+ * both extract to different staging dirs, and race on rename → second
+ * gets ENOTEMPTY and falls to the EXDEV branch which `cp -r` over
+ * the first's freshly-promoted cache, possibly mid-read by a third
+ * party. Per-process serialization is sufficient because the cache
+ * is workspace-local on disk (mathran is single-process; mathub
+ * multi-process is handled separately by a content-addressed name).
+ */
+const inflightFetches = new Map<string, Promise<FetchArxivSourceResult>>();
+
+/**
+ * Download + extract the arxiv source bundle. See module header for
+ * the full contract.
+ */
 export async function fetchArxivSource(
   arxivId: string,
   options: FetchArxivSourceOptions,
@@ -285,6 +302,24 @@ export async function fetchArxivSource(
   if (!ARXIV_ID_RE.test(arxivId)) {
     return { status: "invalid-id", arxivId, error: `bad arxiv id: ${arxivId}` };
   }
+  // [Fix B1] Deduplicate concurrent fetches by (workspace, arxivId).
+  // Note: force:true callers should still go through the same lock
+  // — otherwise a force-refetch racing with a normal fetch could
+  // double-promote.
+  const inflightKey = `${options.workspace}::${arxivId}::${options.force ? "force" : "normal"}`;
+  const existing = inflightFetches.get(inflightKey);
+  if (existing) return existing;
+  const promise = doFetchArxivSource(arxivId, options).finally(() => {
+    inflightFetches.delete(inflightKey);
+  });
+  inflightFetches.set(inflightKey, promise);
+  return promise;
+}
+
+async function doFetchArxivSource(
+  arxivId: string,
+  options: FetchArxivSourceOptions,
+): Promise<FetchArxivSourceResult> {
   const cacheDir = cacheDirFor(options.workspace, arxivId);
 
   // ── cache hit?
@@ -352,13 +387,21 @@ export async function fetchArxivSource(
   //   - other                     → unknown, try gzip+tar then fail
   // When the test fetchImpl omits headers we keep the original behavior.
   const contentType = response.headers?.get("content-type")?.toLowerCase() ?? "";
-  if (contentType.includes("application/pdf") || contentType === "application/x-eprint") {
-    try {
-      if (response.body && typeof (response.body as ReadableStream).cancel === "function") {
-        await (response.body as ReadableStream).cancel();
-      }
-    } catch { /* ignore */ }
-    return { status: "no-source", arxivId, error: `arxiv only ships PDF for ${arxivId}` };
+  // [Fix B8 2026-06-26] Use includes() not === because real arxiv
+  // responses carry suffixes like "; charset=binary".
+  if (contentType.includes("application/pdf") || contentType.includes("application/x-eprint")) {
+    // The full eprint type is "application/x-eprint-tar" for gzipped
+    // tar (the common case) — don't false-positive on that.
+    if (contentType.includes("application/x-eprint-tar")) {
+      // fall through to gzipped-tar path
+    } else {
+      try {
+        if (response.body && typeof (response.body as ReadableStream).cancel === "function") {
+          await (response.body as ReadableStream).cancel();
+        }
+      } catch { /* ignore */ }
+      return { status: "no-source", arxivId, error: `arxiv only ships PDF for ${arxivId}` };
+    }
   }
   const isPlainTex = contentType.includes("text/plain") || contentType.includes("text/x-tex");
 

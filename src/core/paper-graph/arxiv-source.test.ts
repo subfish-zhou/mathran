@@ -358,3 +358,29 @@ describe("content-type dispatch (Fix A24)", () => {
     }
   });
 });
+
+describe("concurrent fetch deduplication (Fix B1)", () => {
+  it("two simultaneous fetchArxivSource for same id share one network call", async () => {
+    const buf = await buildTarGz({ "main.tex": "\\documentclass{article}\nbody" });
+    // Build a tracking wrapper around makeMockFetch so each call wraps
+    // the ArrayBuffer in a fresh ReadableStream (the helper does this
+    // correctly; rolling our own with Readable.from(ArrayBuffer) breaks
+    // because Readable.from iterates an ArrayBuffer's elements rather
+    // than yielding bytes).
+    const inner = makeMockFetch(buf);
+    let callCount = 0;
+    const mockFetch: typeof inner = async (url) => {
+      callCount += 1;
+      // small delay so second call starts before first finishes
+      await new Promise((r) => setTimeout(r, 30));
+      return inner(url);
+    };
+    const [a, b] = await Promise.all([
+      fetchArxivSource("2106.04561", { workspace, fetchImpl: mockFetch }),
+      fetchArxivSource("2106.04561", { workspace, fetchImpl: mockFetch }),
+    ]);
+    expect(callCount).toBe(1);
+    expect(a.status).toBe("ok");
+    expect(b.status).toBe("ok");
+  });
+});
