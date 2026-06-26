@@ -198,7 +198,10 @@ export function historyToBubbles(history: LLMMessageWire[]): Bubble[] {
     if (m.role === "system") continue;
 
     if (m.role === "user") {
-      const bubble: TextBubble = { kind: "user", text: m.content };
+      // 2026-06-25 audit J2 — defensive coerce. A malformed jsonl entry
+      // (e.g. legacy file with `content: null`) would otherwise pass
+      // undefined to text and break downstream renderers.
+      const bubble: TextBubble = { kind: "user", text: m.content ?? "" };
       if (m.attachments && m.attachments.length > 0) {
         bubble.attachments = m.attachments;
       }

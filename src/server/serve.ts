@@ -2504,6 +2504,17 @@ function registerChatScope(
       ? history.slice(0, targetIdx + 1)
       : history.slice(0, targetIdx);
 
+    // 2026-06-25 audit J7 — refuse to truncate while a stream is in flight
+    // for this conv. replaceHistory on a session mid-send would blow away
+    // the in-memory `messages` array the active send() is appending to,
+    // corrupting both the stream and the persisted jsonl.
+    if (hasActiveStream(id)) {
+      return c.json(
+        { error: "cannot truncate while a stream is active; stop it first", conversationId: id },
+        409,
+      );
+    }
+
     let session: ChatSession;
     try {
       session = await store.getOrCreate(scope, id, undefined);
