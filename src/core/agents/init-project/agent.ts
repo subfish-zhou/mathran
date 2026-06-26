@@ -30,6 +30,7 @@ import {
 } from "./runs-ledger.js";
 import {
   searchArxiv as realSearchArxiv,
+  fetchArxivById as realFetchArxivById,
   fetchWikipediaSummary as realFetchWiki,
   sleep,
   ARXIV_RATE_DELAY,
@@ -66,6 +67,12 @@ export interface InitAgentContext {
   /** Test seams — default to the real network crawlers. */
   searchArxiv?: (query: string, maxResults: number) => Promise<CrawledResource[]>;
   fetchWikipediaSummary?: (topic: string) => Promise<string | null>;
+  /**
+   * Fetch one arxiv paper by id (for seed enrichment). Default: real
+   * crawlers.fetchArxivById. Tests inject a fake that returns null
+   * (= "no enrichment available") to avoid network.
+   */
+  fetchArxivById?: (arxivId: string) => Promise<CrawledResource | null>;
   /** Override the arXiv rate-limit delay (tests pass 0). */
   rateDelayMs?: number;
   /**
@@ -148,6 +155,51 @@ function refToResource(ref: ParsedReference): CrawledResource | null {
   };
 }
 
+/**
+ * Auto-enrich a seed resource from arxiv when the caller only gave us
+ * an arxivId (or an `arXiv:NNNN.NNNNN` placeholder title). Mathub's
+ * DB-write path did this automatically; mathran's fs path didn't,
+ * which is why early test runs produced paper nodes with empty
+ * authors and `"Yitang Zhang seed"` for the title instead of the
+ * real arxiv metadata. 2026-06-26.
+ *
+ * Returns the input untouched when:
+ *   - It's not an arxiv resource (no `arxivId`)
+ *   - The caller already supplied a real title (not the placeholder
+ *     `arXiv:<id>` form) AND non-empty authors
+ *   - The arxiv API fetch fails (network down, unknown id, etc.) —
+ *     graceful degrade, never throws.
+ *
+ * Otherwise we splice in title / authors / year / abstract / url /
+ * categories from the live arxiv record, keeping the caller's id.
+ */
+async function enrichSeedFromArxiv(
+  res: CrawledResource,
+  fetchById: (id: string) => Promise<CrawledResource | null>,
+): Promise<CrawledResource> {
+  if (!res.arxivId) return res;
+  const placeholderTitle = res.title === `arXiv:${res.arxivId}`;
+  const hasAuthors = Array.isArray(res.authors) && res.authors.length > 0;
+  if (!placeholderTitle && hasAuthors && res.title.length > 0) {
+    // Caller supplied enough metadata; trust it.
+    return res;
+  }
+  const fetched = await fetchById(res.arxivId);
+  if (!fetched) return res;
+  return {
+    ...res,
+    // Keep the existing id (it's already `arxiv-<id>` and stable),
+    // but pull every other field from arxiv when ours is empty.
+    title: fetched.title || res.title,
+    authors: fetched.authors.length > 0 ? fetched.authors : res.authors,
+    year: res.year ?? fetched.year,
+    abstract: res.abstract ?? fetched.abstract,
+    url: res.url ?? fetched.url,
+    categories: res.categories ?? fetched.categories,
+    sourceType: res.sourceType ?? fetched.sourceType,
+  };
+}
+
 export function extractArxivId(input: string): string | undefined {
   const m = input.match(/(\d{4}\.\d{4,5})(?:v\d+)?/) || input.match(/([a-z\-]+\/\d{7})(?:v\d+)?/);
   return m?.[1];
@@ -200,6 +252,7 @@ export async function runInitAgent(
   const { workspace, projectDir, slug, runId, llm, model } = ctx;
   const searchArxiv = ctx.searchArxiv ?? ((q, n) => realSearchArxiv(q, n));
   const fetchWiki = ctx.fetchWikipediaSummary ?? ((t) => realFetchWiki(t));
+  const fetchArxivById = ctx.fetchArxivById ?? ((id: string) => realFetchArxivById(id));
   const rateDelay = ctx.rateDelayMs ?? ARXIV_RATE_DELAY;
   const depth = DEPTH_PARAMS[input.aiInit.searchDepth] ?? DEPTH_PARAMS.standard!;
 
@@ -217,7 +270,12 @@ export async function runInitAgent(
     const seeds: CrawledResource[] = [];
     for (const ref of input.seedReferences) {
       const res = refToResource(ref);
-      if (res) seeds.push(res);
+      if (!res) continue;
+      // 2026-06-26 — enrich arxiv-id-only seeds from the arxiv API so
+      // paper nodes get real title / authors / abstract. Skips when
+      // caller already supplied metadata. Network failure -> degrade.
+      const enriched = await enrichSeedFromArxiv(res, fetchArxivById);
+      seeds.push(enriched);
     }
 
     const seedResult = await ingestSeedPapersForProject(
@@ -377,6 +435,7 @@ async function runInitAgentSpine(
   const started = Date.now();
   const { workspace, projectDir, slug, runId, llm, model } = ctx;
   const searchArxiv = ctx.searchArxiv ?? ((q, n) => realSearchArxiv(q, n));
+  const fetchArxivById = ctx.fetchArxivById ?? ((id: string) => realFetchArxivById(id));
   const rateDelay = ctx.rateDelayMs ?? ARXIV_RATE_DELAY;
   const depth = DEPTH_PARAMS[input.aiInit.searchDepth] ?? DEPTH_PARAMS.standard!;
   const spineLLM = makeSpineLLM(llm, model);
@@ -417,7 +476,10 @@ async function runInitAgentSpine(
     const seeds: CrawledResource[] = [];
     for (const ref of input.seedReferences) {
       const res = refToResource(ref);
-      if (res) seeds.push(res);
+      if (!res) continue;
+      // 2026-06-26 — same seed enrichment as the non-spine path.
+      const enriched = await enrichSeedFromArxiv(res, fetchArxivById);
+      seeds.push(enriched);
     }
     const seedResult = await ingestSeedPapersForProject(
       workspace,

@@ -157,6 +157,9 @@ function ctx(extra: Partial<InitAgentContext> = {}): InitAgentContext {
     rateDelayMs: 0,
     searchArxiv: async () => ARXIV_RESULT,
     fetchNeighbors: async () => [],
+    // 2026-06-26 — no enrichment in spine tests for the same reason as
+    // agent.test.ts (offline-safe).
+    fetchArxivById: async () => null,
     ...extra,
   };
 }

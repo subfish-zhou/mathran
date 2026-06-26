@@ -89,6 +89,35 @@ export async function searchArxiv(
   return parseArxivAtom(xml);
 }
 
+/**
+ * Fetch one arxiv paper by id (precise lookup, no relevance ranking).
+ * Uses arxiv's `id_list` query param which is much faster than
+ * full-text search for known ids. Returns `null` on network failure /
+ * unknown id so callers can degrade gracefully.
+ *
+ * 2026-06-26 — extracted from src/server/paper-routes.ts and exposed
+ * here so the init-project agent can ENRICH seed references that come
+ * in with only an arxivId (a real gap vs mathub, where the DB-write
+ * path pulled title/authors/year/abstract from arxiv automatically).
+ */
+export async function fetchArxivById(
+  arxivId: string,
+  fetchImpl: FetchLike = defaultFetch,
+): Promise<CrawledResource | null> {
+  try {
+    const params = new URLSearchParams({ id_list: arxivId, max_results: "1" });
+    const response = await fetchImpl(`${ARXIV_SEARCH_URL}?${params}`, {
+      signal: AbortSignal.timeout(15_000),
+    });
+    const xml = await response.text();
+    if (!xml || xml.indexOf("<entry") === -1) return null;
+    const parsed = parseArxivAtom(xml);
+    return parsed.length > 0 ? parsed[0] : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Fetch the intro extract for a Wikipedia topic, or null on any failure. */
 export async function fetchWikipediaSummary(
   topic: string,

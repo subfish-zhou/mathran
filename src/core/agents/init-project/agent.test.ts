@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
+import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 
@@ -93,6 +94,9 @@ function ctx(extra: Partial<InitAgentContext> = {}): InitAgentContext {
     rateDelayMs: 0,
     searchArxiv: async () => ARXIV_RESULT,
     fetchWikipediaSummary: async () => "Twin primes are pairs of primes differing by two.",
+    // 2026-06-26 — default tests to "no enrichment" so seeds in the test
+    // fixtures pass through verbatim and we don't hit arxiv.org in CI.
+    fetchArxivById: async () => null,
     ...extra,
   };
 }
@@ -239,5 +243,84 @@ describe("runInitAgent — full pipeline", () => {
     await runInitAgent(makeInput(), ctx());
     const ledger = await readRunLedger(projectDir, "run-test01");
     expect(ledger?.checkpoint?.phase).toBe("build_wiki");
+  });
+
+  // 2026-06-26 — regression test for the "arxiv-id-only seed" bug
+  // (subfish hit this in live smoke: paper node ended up with empty
+  // authors + placeholder title because mathub's DB-write path was
+  // auto-enriching from arxiv and the fs port wasn't).
+  it("enriches arxiv-id-only seeds from arxiv when caller omitted title/authors", async () => {
+    await createRun(projectDir, { runId: "run-test01" });
+    const seenIds: string[] = [];
+    const enriched: CrawledResource = {
+      id: "arxiv-1311.1234",
+      title: "Bounded gaps between primes",
+      authors: ["Yitang Zhang"],
+      year: 2014,
+      sourceType: "arxiv",
+      arxivId: "1311.1234",
+      url: "https://arxiv.org/abs/1311.1234",
+      abstract: "Real abstract pulled from arxiv.",
+    };
+    await runInitAgent(
+      makeInput({
+        seedReferences: [
+          {
+            originalInput: "arXiv:1311.1234",
+            type: "arxiv",
+            arxivId: "1311.1234",
+            // NO title, NO authors — exactly the case that hit the bug.
+          },
+        ],
+      }),
+      ctx({
+        fetchArxivById: async (id) => {
+          seenIds.push(id);
+          return enriched;
+        },
+      }),
+    );
+    expect(seenIds).toEqual(["1311.1234"]);
+    // The persisted paper node must have the enriched fields, not the
+    // placeholder.
+    const nodePath = path.join(workspace, ".mathran", "paper-graph", "nodes", "arxiv-1311.1234.json");
+    const node = JSON.parse(await fsp.readFile(nodePath, "utf-8"));
+    expect(node.title).toBe("Bounded gaps between primes");
+    expect(node.authors).toEqual(["Yitang Zhang"]);
+    expect(node.year).toBe(2014);
+  });
+
+  it("does NOT re-fetch arxiv when seed already has title + authors", async () => {
+    await createRun(projectDir, { runId: "run-test01" });
+    let calls = 0;
+    await runInitAgent(
+      makeInput(),  // default makeInput has full seed metadata
+      ctx({
+        fetchArxivById: async () => {
+          calls += 1;
+          return null;
+        },
+      }),
+    );
+    expect(calls).toBe(0);
+  });
+
+  it("degrades gracefully when arxiv enrichment returns null", async () => {
+    await createRun(projectDir, { runId: "run-test01" });
+    // arxiv-id-only seed AND fetchArxivById returns null (offline / unknown id).
+    const result = await runInitAgent(
+      makeInput({
+        seedReferences: [
+          {
+            originalInput: "arXiv:9999.9999",
+            type: "arxiv",
+            arxivId: "9999.9999",
+          },
+        ],
+      }),
+      ctx({ fetchArxivById: async () => null }),
+    );
+    // Run completes successfully — the seed just keeps its placeholder.
+    expect(result.summary.resourcesFound).toBeGreaterThanOrEqual(0);
   });
 });
