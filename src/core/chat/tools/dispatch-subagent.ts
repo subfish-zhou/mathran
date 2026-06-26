@@ -193,10 +193,18 @@ export function createDispatchSubagentTool(
       "research / lean_explore). Use this when you need to offload work that " +
       "would otherwise pollute your context: searching the workspace, " +
       "summarizing a long file, multi-step research, or Lean proof exploration. " +
-      "Each runner runs under a concurrency cap and wall-clock timeout; the " +
-      "result is a bounded text summary (≤ ~2KB) plus an optional artifact " +
-      "path with the full output. Set `runtime: 'subprocess'` for crashy LLM " +
-      "work that should not bring down the parent.",
+      "Each runner runs with a wall-clock timeout; the result is a bounded " +
+      "text summary (≤ ~2KB) plus an optional artifact path with the full " +
+      "output. Set `runtime: 'subprocess'` for crashy LLM work that should " +
+      "not bring down the parent.\n\n" +
+      "Concurrency: fan-out is allowed and encouraged for genuinely parallel " +
+      "work. When other subagents are already in flight, the result will " +
+      "include a `[concurrency: N/MAX ...]` advisory line. Read it: if it " +
+      "warns the fan-out is heavy, batch your remaining dispatches " +
+      "sequentially (await each result before issuing the next call) rather " +
+      "than firing them all in parallel. The model — not the tool — decides " +
+      "when to slow down. A safety backstop will silently queue dispatches " +
+      "if MAX is genuinely exceeded; you don't need to handle that case.",
     parameters: PARAMETERS as unknown as Record<string, unknown>,
     async execute(args: Record<string, unknown>) {
       const rawType = typeof args.type === "string" ? args.type : "";
@@ -317,31 +325,23 @@ export function createDispatchSubagentTool(
       }
 
       let result: Awaited<ReturnType<typeof opts.scheduler.dispatch>>;
+      // 2026-06-26 (subfish Option B follow-up) — Codex-style advisory
+      // concurrency. mathran does NOT hard-refuse parallel dispatch:
+      //   - The scheduler's semaphore queues transparently when full
+      //     (codex's stance: subagents are session category, not a
+      //     worker pool — let the host throttle, not the tool).
+      //   - We snapshot inflight + max BEFORE awaiting dispatch and
+      //     append an advisory `[concurrency: ...]` line to the result
+      //     so the model can self-pace organically. This is social
+      //     pressure, not enforcement.
+      //   - The cap (default 20) is a runaway-fan-out backstop. Under
+      //     normal use (3-8 parallel subagents) the model never sees
+      //     it. A model that genuinely tries to fire 30+ would just
+      //     experience slow responses as the queue drains — same as a
+      //     human accidentally spamming a build server.
+      const queueSnapshotBefore = opts.scheduler.inFlightCount();
+      const maxConcurrent = opts.scheduler.maxConcurrent();
       try {
-        // 2026-06-26 — Gentle cap-reached check (L5 audit follow-up).
-        // The scheduler's semaphore queues silently when full, which can
-        // mislead the main agent into thinking its tool call hung. Bail
-        // early with a structured message that names a remedy.
-        if (opts.scheduler.isAtCapacity()) {
-          const inflight = opts.scheduler.inFlightCount();
-          const max = opts.scheduler.maxConcurrent();
-          return {
-            ok: false,
-            content:
-              `dispatch_subagent: concurrency cap reached (${inflight}/${max} in-flight).\n` +
-              `\n` +
-              `Suggested remediation:\n` +
-              `  1. Wait for one of the running subagents to finish, then retry this call.\n` +
-              `  2. If you were fanning out N subtasks, switch to sequential dispatch —\n` +
-              `     await each result before issuing the next call so you stay under the cap.\n` +
-              `  3. If you genuinely need higher parallelism for this workload, ask the\n` +
-              `     user to raise \`subagent.maxConcurrent\` in mathran settings\n` +
-              `     (current default: ${max}). Do NOT override this yourself.\n` +
-              `\n` +
-              `This is a soft limit, not an error in your reasoning. Adjust your plan\n` +
-              `and try again.`,
-          };
-        }
         result = await opts.scheduler.dispatch(task);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -352,10 +352,44 @@ export function createDispatchSubagentTool(
       }
 
       const ok = result.status === "ok";
-      const content = formatResult(result);
+      const advisory = renderConcurrencyAdvisory(
+        queueSnapshotBefore,
+        maxConcurrent,
+      );
+      const content = advisory
+        ? `${formatResult(result)}\n${advisory}`
+        : formatResult(result);
       return { ok, content };
     },
   };
+}
+
+/**
+ * Build the advisory `[concurrency: N/MAX running ...]` line that gets
+ * appended to every dispatch result. Returns null when the snapshot is
+ * boring (0 or 1 in flight when this call started) — at low pressure
+ * the line is noise.
+ *
+ * 2026-06-26 (Option B) — this is the model's social-pressure signal.
+ * Cheap, advisory, never blocks. The scheduler's hard cap is still
+ * there as a runaway-fan-out backstop, but the model should never see
+ * it under normal use.
+ */
+function renderConcurrencyAdvisory(
+  inflightBefore: number,
+  maxConcurrent: number,
+): string | null {
+  // Don't bother annotating when the queue was empty / single — that
+  // would just clutter every solo dispatch.
+  if (inflightBefore <= 1) return null;
+  const utilization = maxConcurrent > 0 ? inflightBefore / maxConcurrent : 0;
+  const guidance =
+    utilization >= 0.75
+      ? " — close to the safety cap; consider sequential dispatch from here"
+      : utilization >= 0.4
+        ? " — fan-out is heavy; batch politely if you have more pending"
+        : "";
+  return `[concurrency: ${inflightBefore}/${maxConcurrent} other subagents were running when this dispatch started${guidance}]`;
 }
 
 function formatResult(

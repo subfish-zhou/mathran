@@ -298,29 +298,73 @@ describe("dispatch_subagent tool", () => {
     expect(result.content).toContain("scheduler threw: scheduler is down");
   });
 
-  // 2026-06-26 — L5 audit follow-up: subagent concurrency cap UX.
-  it("when scheduler.isAtCapacity() is true, returns a gentle ok:false with remedy", async () => {
-    const fake = new FakeScheduler(okResult());
-    fake.capReached = true;
-    fake.inflight = 5;
-    fake.cap = 5;
+  // 2026-06-26 — Option B follow-up: advisory concurrency hint.
+  // The cap-reached gentle-refusal path was REPLACED with an advisory
+  // line appended to every dispatch result. Tests below pin the new
+  // behaviour.
+  it("appends no advisory when the queue was effectively idle (inflight <= 1)", async () => {
+    const fake = new FakeScheduler(okResult({ summary: "fine" }));
+    fake.inflight = 0;
+    fake.cap = 20;
     const tool = createDispatchSubagentTool({ scheduler: asScheduler(fake) });
+    const result = await tool.execute({ type: "search", input: { query: "x" } });
+    expect(result.ok).toBe(true);
+    // No [concurrency: ...] line — solo dispatch should stay quiet.
+    expect(result.content).not.toContain("[concurrency:");
+  });
 
-    const result = await tool.execute({
-      type: "search",
-      input: { query: "x" },
-    });
+  it("appends a plain advisory when fan-out is moderate (under 40% util)", async () => {
+    const fake = new FakeScheduler(okResult({ summary: "fine" }));
+    fake.inflight = 2; // 2/20 = 10%
+    fake.cap = 20;
+    const tool = createDispatchSubagentTool({ scheduler: asScheduler(fake) });
+    const result = await tool.execute({ type: "search", input: { query: "x" } });
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain("[concurrency: 2/20 other subagents were running");
+    // No "heavy" / "close to" guidance at low utilization.
+    expect(result.content).not.toContain("heavy");
+    expect(result.content).not.toContain("close to");
+  });
 
-    expect(result.ok).toBe(false);
-    // The message must name BOTH the cap state AND the remedy so the
-    // main agent can react without going to the user.
-    expect(result.content).toContain("concurrency cap reached");
-    expect(result.content).toContain("5/5 in-flight");
-    expect(result.content).toContain("Wait for one");
+  it("appends a 'heavy' advisory at 40-74% utilization", async () => {
+    const fake = new FakeScheduler(okResult({ summary: "fine" }));
+    fake.inflight = 10; // 10/20 = 50%
+    fake.cap = 20;
+    const tool = createDispatchSubagentTool({ scheduler: asScheduler(fake) });
+    const result = await tool.execute({ type: "search", input: { query: "x" } });
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain("[concurrency: 10/20");
+    expect(result.content).toContain("fan-out is heavy");
+    expect(result.content).toContain("batch politely");
+  });
+
+  it("appends a 'close to the cap' advisory at >= 75% utilization", async () => {
+    const fake = new FakeScheduler(okResult({ summary: "fine" }));
+    fake.inflight = 18; // 18/20 = 90%
+    fake.cap = 20;
+    const tool = createDispatchSubagentTool({ scheduler: asScheduler(fake) });
+    const result = await tool.execute({ type: "search", input: { query: "x" } });
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain("[concurrency: 18/20");
+    expect(result.content).toContain("close to the safety cap");
     expect(result.content).toContain("sequential dispatch");
-    expect(result.content).toContain("subagent.maxConcurrent");
-    // And the scheduler must NOT have been called — that's the whole
-    // point of bailing before await.
-    expect(fake.dispatched).toEqual([]);
+  });
+
+  it("still dispatches when over the cap (Option B: cap is a safety backstop, not a hard refuse)", async () => {
+    // Even if isAtCapacity() is true (in the synthetic test fake), the
+    // tool should NOT bail before await. Real scheduler would queue the
+    // dispatch; the fake resolves immediately with our preset result.
+    const fake = new FakeScheduler(okResult({ summary: "still ran" }));
+    fake.capReached = true;
+    fake.inflight = 20;
+    fake.cap = 20;
+    const tool = createDispatchSubagentTool({ scheduler: asScheduler(fake) });
+    const result = await tool.execute({ type: "search", input: { query: "x" } });
+    // The dispatch went through — that's the whole point of Option B.
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain("still ran");
+    expect(fake.dispatched.length).toBe(1);
+    // And the at-or-over-cap snapshot gets the strongest advisory.
+    expect(result.content).toContain("close to the safety cap");
   });
 });

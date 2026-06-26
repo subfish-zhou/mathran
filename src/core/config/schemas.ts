@@ -186,13 +186,17 @@ export const MathranSettingsSchema = z
       .passthrough()
       .optional(),
     /**
-     * 2026-06-26 — Subagent scheduler settings (L5 audit follow-up).
+     * 2026-06-26 — Subagent scheduler settings (Option B follow-up).
      *
-     * `maxConcurrent` caps how many subagent runs can be in flight at the
-     * same time. When the cap is hit, `dispatch_subagent` returns a gentle
-     * tool error pointing the main agent at the remediation (wait or
-     * batch) rather than silently queueing forever. Default 5; subfish's
-     * preferred ceiling for parallel research / lean-explore fan-outs.
+     * `maxConcurrent` is a SAFETY BACKSTOP, not a polite limit. The
+     * scheduler queues transparently when full and tools receive an
+     * advisory `[concurrency: N/MAX ...]` hint they can react to. The
+     * default (20) is intentionally above any realistic fan-out so the
+     * model rarely sees it; raise it only if a genuine workload needs
+     * more parallel inline runners, lower it on resource-constrained
+     * boxes (single-core VMs) to push the model to sequential dispatch
+     * sooner. The model itself is told (via the dispatch_subagent tool
+     * description) to read the advisory hint and self-pace.
      */
     subagent: z
       .object({

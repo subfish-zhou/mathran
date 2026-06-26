@@ -23,9 +23,22 @@ import {
 
 const DEFAULT_HARD_CAP_BYTES = 2048;
 const DEFAULT_TIMEOUT_MS = 60_000;
-// 2026-06-26 (subfish post-audit) — bumped from 3 → 5 by user request.
-// settings.subagent.maxConcurrent overrides at scheduler construction time.
-const DEFAULT_MAX_CONCURRENT = 5;
+// 2026-06-26 (subfish post-audit) — Option B (advisory + safety backstop).
+//
+// 20 is a hard SAFETY backstop, not a "polite limit". The model isn't
+// expected to ever hit this in normal fan-out — typical research /
+// lean-explore parallelism is 3-8 subagents. Hitting 20 in flight means
+// runaway dispatch (model misread the task, model is in a loop, etc.),
+// at which point we'd rather refuse-and-tell than let the inline
+// runtime exhaust file descriptors / model rate limits / RAM.
+//
+// Resource-aware throttling is done in `dispatch-subagent.ts` by
+// appending a [concurrency: N/MAX] hint to every result so the model
+// can self-pace WITHOUT being denied. The cap-reached error is the
+// last line of defence, phrased as a backstop, not a queue.
+//
+// settings.subagent.maxConcurrent overrides at scheduler construction.
+const DEFAULT_MAX_CONCURRENT = 20;
 
 class Semaphore {
   private inflight = 0;
