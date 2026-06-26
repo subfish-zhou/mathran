@@ -47,8 +47,10 @@ import { createTwoFilesPatch } from "diff";
 
 import { resolveWorkspaceRoot, initProject } from "../cli/commands/project.js";
 import { registerInitProjectRoutes } from "./init-project-routes.js";
+import { reapOldUploads, sweepAtomicTmpFiles } from "./startup-sweep.js";
 import { resolveScopeRoot } from "../cli/commands/scope-paths.js";
 import { loadConfig } from "../core/config.js";
+import { loadLayeredSettings } from "../core/config/layered-settings.js";
 import {
   BUILTIN_EFFORT_TYPES,
   EFFORT_STATUSES,
@@ -1201,9 +1203,30 @@ export function defaultSessionFactory(
     // v0.5 wire-up Gap #4 + #5: scoped scheduler with all 5 runners so the
     // web UI's `dispatch_subagent` builtin tool can fan out to research /
     // lean_explore / etc. Mirrors the CLI chat scheduler wiring.
+    //
+    // 2026-06-26 — Read `subagent.maxConcurrent` from layered settings
+    // (user → workspace → project). Recreated per chat session so a
+    // settings change picks up on the next chat start without a restart.
+    let subagentMax: number | undefined;
+    try {
+      const layered = loadLayeredSettings({
+        home: os.homedir(),
+        workspace,
+        ...(scope?.kind === "project" || scope?.kind === "effort"
+          ? { projectSlug: scope.projectSlug }
+          : {}),
+      });
+      const raw = layered.settings.subagent?.maxConcurrent;
+      if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+        subagentMax = Math.floor(raw);
+      }
+    } catch {
+      // Settings layer unreadable / malformed → fall back to default cap.
+    }
     const scheduler = new SubagentScheduler({
       workspace: scopedWorkspace,
       registry: defaultSubagentRegistry(),
+      ...(subagentMax !== undefined ? { maxConcurrent: subagentMax } : {}),
     });
     // Approval Policy 矩阵 — build the broker from the layered config and wire a
     // session-level resolver that parks each prompt in the shared registry. The
@@ -6143,6 +6166,78 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
     // eslint-disable-next-line no-console
     console.error(`[mathran] MCP init failed: ${(err as Error)?.message ?? err}`);
   }
+
+  // 2026-06-26 (H8 audit follow-up) — sweep stale `*.tmp.<hex>` files
+  // left under .mathran by ungraceful shutdowns of atomicWriteFile. Each
+  // leak is small but they accumulate over months of crashes / OOM-kills.
+  // Async, non-blocking: kick it off but don't await — startup is allowed
+  // to proceed in parallel with the sweep.
+  //
+  // 2026-06-26 (H6 audit follow-up) — same async batch: reap old upload
+  // attachments. Default retention 30 days, overrideable via
+  // settings.uploads.retentionDays (set to 0 to disable).
+  void (async () => {
+    try {
+      const mathranDir = path.join(workspace, ".mathran");
+      const result = await sweepAtomicTmpFiles(mathranDir);
+      if (result.removedFiles > 0) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[mathran] startup sweep: removed ${result.removedFiles} stale ` +
+            `atomic-write tmp file(s) (${result.removedBytes} bytes) ` +
+            `from ${mathranDir}`,
+        );
+      }
+      if (result.errors > 0) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[mathran] startup sweep: ${result.errors} error(s) while scanning ` +
+            `${mathranDir} — some stale tmp files may remain`,
+        );
+      }
+    } catch (err) {
+      // Defensive: any unexpected throw is best-effort cleanup, not a
+      // boot blocker.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[mathran] startup sweep failed: ${(err as Error)?.message ?? err}`,
+      );
+    }
+
+    // Upload reaper.
+    try {
+      let retentionDays = 30; // default
+      try {
+        const layered = loadLayeredSettings({ home: os.homedir(), workspace });
+        const raw = layered.settings.uploads?.retentionDays;
+        if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) {
+          retentionDays = Math.floor(raw);
+        }
+      } catch {
+        /* fall back to default */
+      }
+      const uploadsDir = path.join(workspace, ".mathran", "uploads");
+      const reap = await reapOldUploads(uploadsDir, retentionDays);
+      if (reap.removed > 0) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[mathran] upload reaper: removed ${reap.removed} upload(s) ` +
+            `(${reap.removedBytes} bytes) older than ${retentionDays} days from ${uploadsDir}`,
+        );
+      }
+      if (reap.errors > 0) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[mathran] upload reaper: ${reap.errors} error(s) while scanning ${uploadsDir}`,
+        );
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[mathran] upload reaper failed: ${(err as Error)?.message ?? err}`,
+      );
+    }
+  })();
 
   const factory =
     opts.chatSessionFactory ??

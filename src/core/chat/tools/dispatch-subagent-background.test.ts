@@ -38,6 +38,13 @@ class DeferredScheduler {
   inFlightCount(): number {
     return 0;
   }
+  // 2026-06-26 — L5 audit follow-up: scheduler exposes cap state to tools.
+  maxConcurrent(): number {
+    return 5;
+  }
+  isAtCapacity(): boolean {
+    return false;
+  }
 }
 
 function asScheduler(s: DeferredScheduler): SubagentScheduler {

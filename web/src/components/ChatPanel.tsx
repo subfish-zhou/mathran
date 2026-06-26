@@ -3479,7 +3479,21 @@ export default function ChatPanel({
           />
         ) : null}
 
-        <div ref={scrollRef} onScroll={onChatScroll} className="flex-1 space-y-3 overflow-y-auto p-6">
+        {/* 2026-06-26 (E11 audit follow-up) — long-chat render perf.
+            Apply CSS `content-visibility: auto` + a coarse intrinsic-size
+            hint to each direct child row. The browser skips layout and
+            paint for off-screen children, which keeps scroll smooth for
+            500+ bubble conversations without dragging in a virtualizer
+            library (chat bubbles have variable height + dynamic content,
+            so true windowing would need a measurement layer). The
+            intrinsic-size estimate (180 px) only matters for the
+            scrollbar; the real height takes over once a row scrolls in
+            and the browser measures it. */}
+        <div
+          ref={scrollRef}
+          onScroll={onChatScroll}
+          className="flex-1 space-y-3 overflow-y-auto p-6 [&>*]:[content-visibility:auto] [&>*]:[contain-intrinsic-size:0_180px]"
+        >
           {loadingHistory && (
             <p className="text-sm text-slate-400">Loading history…</p>
           )}

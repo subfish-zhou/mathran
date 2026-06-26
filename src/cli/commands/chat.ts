@@ -399,9 +399,22 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
   // `dispatch_subagent` builtin tool has a place to dispatch into. Same
   // scheduler is also forwarded as `subagentScheduler` so compact uses it
   // instead of lazily building a smaller one.
+  //
+  // 2026-06-26 — Read `subagent.maxConcurrent` from layered settings.
+  let cliSubagentMax: number | undefined;
+  try {
+    const layered = loadLayeredSettings({ home: os.homedir(), workspace });
+    const raw = layered.settings.subagent?.maxConcurrent;
+    if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+      cliSubagentMax = Math.floor(raw);
+    }
+  } catch {
+    /* fall back to default */
+  }
   const scheduler = new SubagentScheduler({
     workspace,
     registry: defaultSubagentRegistry(),
+    ...(cliSubagentMax !== undefined ? { maxConcurrent: cliSubagentMax } : {}),
   });
   // Approval Policy 矩阵 — resolve the layered approval config (running the
   // legacy-settings migration), build the broker, and wire the interactive

@@ -21,6 +21,10 @@ import type {
 class FakeScheduler {
   readonly dispatched: SubagentTask[] = [];
   private next: SubagentResult | ((task: SubagentTask) => SubagentResult);
+  // 2026-06-26 — Lets tests toggle the cap-reached path of the tool.
+  capReached = false;
+  inflight = 0;
+  cap = 5;
 
   constructor(next: SubagentResult | ((task: SubagentTask) => SubagentResult)) {
     this.next = next;
@@ -38,7 +42,13 @@ class FakeScheduler {
   // Methods of SubagentScheduler the tool doesn't touch — stubbed for type
   // compatibility when we cast to SubagentScheduler below.
   inFlightCount(): number {
-    return 0;
+    return this.inflight;
+  }
+  maxConcurrent(): number {
+    return this.cap;
+  }
+  isAtCapacity(): boolean {
+    return this.capReached || this.inflight >= this.cap;
   }
 }
 
@@ -286,5 +296,31 @@ describe("dispatch_subagent tool", () => {
 
     expect(result.ok).toBe(false);
     expect(result.content).toContain("scheduler threw: scheduler is down");
+  });
+
+  // 2026-06-26 — L5 audit follow-up: subagent concurrency cap UX.
+  it("when scheduler.isAtCapacity() is true, returns a gentle ok:false with remedy", async () => {
+    const fake = new FakeScheduler(okResult());
+    fake.capReached = true;
+    fake.inflight = 5;
+    fake.cap = 5;
+    const tool = createDispatchSubagentTool({ scheduler: asScheduler(fake) });
+
+    const result = await tool.execute({
+      type: "search",
+      input: { query: "x" },
+    });
+
+    expect(result.ok).toBe(false);
+    // The message must name BOTH the cap state AND the remedy so the
+    // main agent can react without going to the user.
+    expect(result.content).toContain("concurrency cap reached");
+    expect(result.content).toContain("5/5 in-flight");
+    expect(result.content).toContain("Wait for one");
+    expect(result.content).toContain("sequential dispatch");
+    expect(result.content).toContain("subagent.maxConcurrent");
+    // And the scheduler must NOT have been called — that's the whole
+    // point of bailing before await.
+    expect(fake.dispatched).toEqual([]);
   });
 });

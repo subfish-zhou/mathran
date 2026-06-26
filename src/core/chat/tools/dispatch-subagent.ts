@@ -318,6 +318,30 @@ export function createDispatchSubagentTool(
 
       let result: Awaited<ReturnType<typeof opts.scheduler.dispatch>>;
       try {
+        // 2026-06-26 — Gentle cap-reached check (L5 audit follow-up).
+        // The scheduler's semaphore queues silently when full, which can
+        // mislead the main agent into thinking its tool call hung. Bail
+        // early with a structured message that names a remedy.
+        if (opts.scheduler.isAtCapacity()) {
+          const inflight = opts.scheduler.inFlightCount();
+          const max = opts.scheduler.maxConcurrent();
+          return {
+            ok: false,
+            content:
+              `dispatch_subagent: concurrency cap reached (${inflight}/${max} in-flight).\n` +
+              `\n` +
+              `Suggested remediation:\n` +
+              `  1. Wait for one of the running subagents to finish, then retry this call.\n` +
+              `  2. If you were fanning out N subtasks, switch to sequential dispatch —\n` +
+              `     await each result before issuing the next call so you stay under the cap.\n` +
+              `  3. If you genuinely need higher parallelism for this workload, ask the\n` +
+              `     user to raise \`subagent.maxConcurrent\` in mathran settings\n` +
+              `     (current default: ${max}). Do NOT override this yourself.\n` +
+              `\n` +
+              `This is a soft limit, not an error in your reasoning. Adjust your plan\n` +
+              `and try again.`,
+          };
+        }
         result = await opts.scheduler.dispatch(task);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

@@ -23,7 +23,9 @@ import {
 
 const DEFAULT_HARD_CAP_BYTES = 2048;
 const DEFAULT_TIMEOUT_MS = 60_000;
-const DEFAULT_MAX_CONCURRENT = 3;
+// 2026-06-26 (subfish post-audit) — bumped from 3 → 5 by user request.
+// settings.subagent.maxConcurrent overrides at scheduler construction time.
+const DEFAULT_MAX_CONCURRENT = 5;
 
 class Semaphore {
   private inflight = 0;
@@ -52,6 +54,10 @@ class Semaphore {
 
   count(): number {
     return this.inflight;
+  }
+
+  capacity(): number {
+    return this.cap;
   }
 }
 
@@ -151,6 +157,21 @@ export class SubagentScheduler {
 
   inFlightCount(): number {
     return this.semaphore.count();
+  }
+
+  /**
+   * 2026-06-26 — Exposed so `dispatch_subagent` can offer a gentle
+   * cap-reached error before awaiting the semaphore (which would queue
+   * silently forever). Pair with {@link inFlightCount} to render
+   * a "{inflight}/{max}" diagnostic.
+   */
+  maxConcurrent(): number {
+    return this.semaphore.capacity();
+  }
+
+  /** True when the next dispatch would have to wait for a running task to finish. */
+  isAtCapacity(): boolean {
+    return this.semaphore.count() >= this.semaphore.capacity();
   }
 
   async dispatch(

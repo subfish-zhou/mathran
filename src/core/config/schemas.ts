@@ -186,6 +186,37 @@ export const MathranSettingsSchema = z
       .passthrough()
       .optional(),
     /**
+     * 2026-06-26 — Subagent scheduler settings (L5 audit follow-up).
+     *
+     * `maxConcurrent` caps how many subagent runs can be in flight at the
+     * same time. When the cap is hit, `dispatch_subagent` returns a gentle
+     * tool error pointing the main agent at the remediation (wait or
+     * batch) rather than silently queueing forever. Default 5; subfish's
+     * preferred ceiling for parallel research / lean-explore fan-outs.
+     */
+    subagent: z
+      .object({
+        maxConcurrent: z.number().int().positive().optional(),
+      })
+      .passthrough()
+      .optional(),
+    /**
+     * 2026-06-26 — Upload retention (H6 audit follow-up).
+     *
+     * Attachments under `.mathran/uploads/` are referenced from chat
+     * jsonl by absolute path; deleting them breaks history rendering for
+     * old conversations. `retentionDays` caps how long to keep them.
+     * Default 30 days. Set to 0 to disable the reaper (keep forever);
+     * set to a positive integer to enforce a TTL. Files older than the
+     * cap are unlinked at server start (best-effort, async, non-blocking).
+     */
+    uploads: z
+      .object({
+        retentionDays: z.number().int().min(0).optional(),
+      })
+      .passthrough()
+      .optional(),
+    /**
      * Permission Profiles (#2) — default profile name applied when no
      * `--profile` flag is given (dev | ci | review | custom). The CLI `--profile`
      * flag overrides this.
