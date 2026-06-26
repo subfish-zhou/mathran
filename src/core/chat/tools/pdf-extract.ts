@@ -27,8 +27,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
-import { spawn } from "node:child_process";
 import type { ToolSpec, ToolExecuteContext } from "../session.js";
+import { runProc } from "./python-venv.js";
 
 // ─── Where the helper venv lives ───────────────────────────────────────────
 // One shared venv per user; we don't recreate per session because
@@ -164,47 +164,33 @@ interface RunResult {
   stderr: string;
 }
 
-function runPython(args: string[], timeoutMs: number): Promise<RunResult> {
-  return new Promise((resolve) => {
-    const child = spawn(HELPER_PY, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    // 2026-06-25 audit — cap captured stdio so a runaway Python script
-    // can't OOM the mathran serve process. 4 MB is generous (Marker's
-    // tqdm progress bars stay well under this).
-    const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
-    let killedForCapture = false;
-    const append = (existing: string, chunk: string): string => {
-      const next = existing + chunk;
-      if (next.length > MAX_CAPTURE_BYTES) {
-        if (!killedForCapture) {
-          killedForCapture = true;
-          stderr += `\n(killed: stdio exceeded ${MAX_CAPTURE_BYTES} bytes cap)`;
-          try { child.kill("SIGKILL"); } catch { /* ignore */ }
-        }
-        return next.slice(0, MAX_CAPTURE_BYTES);
-      }
-      return next;
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      resolve({
-        ok: false,
-        stdout,
-        stderr: stderr + `\n(killed after ${timeoutMs} ms)`,
-      });
-    }, timeoutMs);
-    child.stdout.on("data", (b) => { stdout = append(stdout, b.toString()); });
-    child.stderr.on("data", (b) => { stderr = append(stderr, b.toString()); });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ ok: code === 0 && !killedForCapture, stdout, stderr });
-    });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({ ok: false, stdout, stderr: stderr + `\nspawn error: ${err.message}` });
-    });
+/**
+ * Wrap shared `runProc` (which already handles SIGTERM→SIGKILL escalation,
+ * stdio capture cap, timeout, spawn error). We surface a `runPython`
+ * shape that just adds the helper-script venv path + caller-facing
+ * ok/stdout/stderr semantics.
+ */
+async function runPython(args: string[], timeoutMs: number): Promise<RunResult> {
+  // 4 MB stdio cap — generous enough for Marker's tqdm + lets pathological
+  // helper output be truncated rather than OOM mathran serve.
+  const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
+  const r = await runProc(HELPER_PY, args, {
+    timeoutMs,
+    maxOutputBytes: MAX_CAPTURE_BYTES,
   });
+  if (r.spawnError) {
+    return {
+      ok: false,
+      stdout: r.stdout,
+      stderr: r.stderr + `\nspawn error: ${r.spawnError.message}`,
+    };
+  }
+  if (r.timedOut) {
+    return {
+      ok: false,
+      stdout: r.stdout,
+      stderr: r.stderr + `\n(killed after ${timeoutMs} ms)`,
+    };
+  }
+  return { ok: r.exit === 0, stdout: r.stdout, stderr: r.stderr };
 }

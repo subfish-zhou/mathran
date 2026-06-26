@@ -15,7 +15,7 @@
  * as it works. Stops polling once it terminates.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { marked } from "marked";
+import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
 import {
   fetchThread,
   type GoalRow,
@@ -285,7 +285,7 @@ export function ThreadDrawer({
                         <div
                           className="md text-[13px]"
                           dangerouslySetInnerHTML={{
-                            __html: marked.parse(b.text || "…") as string,
+                            __html: safeRenderMarkdown(b.text || "…"),
                           }}
                         />
                       ) : (

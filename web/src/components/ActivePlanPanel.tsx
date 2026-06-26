@@ -36,7 +36,7 @@
  *     drawer on this panel.
  */
 import { useEffect, useState } from "react";
-import { marked } from "marked";
+import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
 import { fetchGoalPlan, type GoalPlanPayload } from "../lib/chat.ts";
 
 interface ActivePlanPanelProps {
@@ -85,7 +85,7 @@ export default function ActivePlanPanel({
   // extensions we don't use here, hence the `as string` cast pattern used
   // elsewhere in this app (see ThreadDrawer, ChatPanel).
   const html = payload?.body
-    ? checkboxify(marked.parse(payload.body) as string)
+    ? checkboxify(safeRenderMarkdown(payload.body))
     : "";
 
   const summary = (() => {

@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
 
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
@@ -3116,6 +3117,24 @@ function buildApp(
     console.log("[mathran] goal daemon enabled (set MATHRAN_DISABLE_GOAL_DAEMON=1 to opt out)");
   }
   const app = new Hono();
+  // 2026-06-25 audit D10 — global request body cap so a buggy / malicious
+  // SPA can't feed JSON.parse a multi-gigabyte payload and OOM the server.
+  // 30 MB is well above any reasonable user prompt; the file-upload route
+  // has its own multipart limit (MAX_UPLOAD_BYTES = 25 MB) which lives
+  // below this. Multipart parsing for /api/uploads is exempt because
+  // Hono's bodyLimit only applies to JSON / text bodies, not the streaming
+  // multipart parser used by parseBody().
+  app.use(
+    "*",
+    bodyLimit({
+      maxSize: 30 * 1024 * 1024,
+      onError: (c) =>
+        c.json(
+          { error: "request body too large (cap 30 MB)" },
+          413,
+        ),
+    }),
+  );
   // Adapt the test-friendly `ChatSessionFactory(opts)` to the store's
   // `ScopedChatSessionFactory({ scope, model })` signature. We pre-bind
   // the buildApp-scoped `autoRunGoal` lambda so the propose_goal builtin

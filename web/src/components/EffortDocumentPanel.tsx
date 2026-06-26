@@ -12,7 +12,7 @@
  * blueprint-style writing.
  */
 import { useEffect, useMemo, useState } from "react";
-import { marked } from "marked";
+import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
 import { api, type EffortSummary } from "../lib/api.ts";
 
 const STATUSES = [
@@ -101,7 +101,7 @@ export default function EffortDocumentPanel({
     }
   }
 
-  const rendered = useMemo(() => marked.parse(doc || "_(empty document)_"), [doc]);
+  const rendered = useMemo(() => safeRenderMarkdown(doc || "_(empty document)_"), [doc]);
 
   return (
     <div className="flex h-full flex-col">

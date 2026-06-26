@@ -11,7 +11,7 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { marked } from "marked";
+import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
 import {
   api,
   type WikiDiffResponse,
@@ -149,7 +149,7 @@ export default function WikiPanel({
     }
   }
 
-  const rendered = useMemo(() => (page ? marked.parse(page.body) : ""), [page]);
+  const rendered = useMemo(() => (page ? safeRenderMarkdown(page.body) : ""), [page]);
 
   return (
     <div className="grid h-full grid-cols-[16rem_1fr] overflow-hidden">

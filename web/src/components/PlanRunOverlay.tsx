@@ -36,7 +36,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { marked } from "marked";
+import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
 import {
   acceptPlan,
   createPlanRun,
@@ -369,7 +369,7 @@ function StreamingStage({
         {body.length === 0 ? (
           <span className="text-slate-400">Waiting for the first token…</span>
         ) : (
-          <div dangerouslySetInnerHTML={{ __html: marked.parse(body) as string }} />
+          <div dangerouslySetInnerHTML={{ __html: safeRenderMarkdown(body) }} />
         )}
       </div>
       <div className="mt-3 flex justify-end">
@@ -426,7 +426,7 @@ function ReviewStage({
         {body.length === 0 ? (
           <span className="text-slate-400">(empty plan — try again with a sharper objective)</span>
         ) : (
-          <div dangerouslySetInnerHTML={{ __html: marked.parse(body) as string }} />
+          <div dangerouslySetInnerHTML={{ __html: safeRenderMarkdown(body) }} />
         )}
       </div>
 

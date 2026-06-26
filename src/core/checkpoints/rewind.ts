@@ -99,8 +99,30 @@ async function applyCheckpointBefore(
   checkpoint: Checkpoint,
 ): Promise<RewindFileResult[]> {
   const results: RewindFileResult[] = [];
+  // 2026-06-25 audit D3 — even though middleware.ts validates paths at
+  // snapshot creation, defence-in-depth: re-check on restore. A tampered
+  // checkpoint file on disk could otherwise let `/rewind` overwrite
+  // arbitrary host files (e.g. ~/.ssh/authorized_keys) by setting
+  // file.path to `../../../...`.
+  const wsAbs = path.resolve(workspace);
   for (const file of checkpoint.files) {
+    if (file.path.startsWith("../") || path.isAbsolute(file.path)) {
+      results.push({
+        path: file.path,
+        action: "skipped",
+        reason: "path escapes workspace (rejected at restore time)",
+      });
+      continue;
+    }
     const abs = path.resolve(workspace, file.path);
+    if (!abs.startsWith(wsAbs + path.sep) && abs !== wsAbs) {
+      results.push({
+        path: file.path,
+        action: "skipped",
+        reason: "path escapes workspace (rejected at restore time)",
+      });
+      continue;
+    }
     const before = file.before;
     if (before.kind === "text") {
       await fs.mkdir(path.dirname(abs), { recursive: true });
