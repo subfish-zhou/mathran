@@ -35,6 +35,7 @@ import {
 } from "./static-assets.js";
 import { registerUploadRoutes } from "./upload-routes.js";
 import { registerSettingsRoutes } from "./settings-routes.js";
+import { registerMemoryRoutes } from "./memory-routes.js";
 import { registerSlashRoutes } from "./slash-routes.js";
 import {
   buildUserMessageWithAttachments,
@@ -3759,6 +3760,11 @@ function buildApp(
 
   // Layered `.mathran/settings.json` editor surface for the SPA /settings page.
   registerSettingsRoutes(app, workspace);
+
+  // 2026-06-26 (user-distillation Phase 0) — read-only listing + body
+  // of memory topics so the SPA can show what mathran has stored
+  // without going through the model tool path.
+  registerMemoryRoutes(app, workspace);
 
   app.get("/api/projects", async (c) => {
     return c.json({ projects: await listProjects(workspace) });

@@ -87,6 +87,7 @@ import { ReasoningBlock } from "./ReasoningBlock.tsx";
 import { ThreadDrawer } from "./ThreadDrawer.tsx";
 import { SubagentTreePanel } from "./SubagentTreePanel.tsx";
 import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel.tsx";
+import { MemoryPanel } from "./MemoryPanel.tsx";
 import type { SubagentCompletedFrame } from "../lib/subagents.ts";
 import SlashSuggester from "./SlashSuggester.tsx";
 import { fetchGoalAutonomy } from "../lib/goal-autonomy.ts";
@@ -597,6 +598,10 @@ export default function ChatPanel({
   // wants to find a thing, not also be filtered).
   const [searchQuery, setSearchQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
+  // 2026-06-26 (user-distillation Phase 0) — right-side memory drawer.
+  // Closed by default to keep the chat surface wide; toggled from the
+  // chat-header button.
+  const [memoryPanelOpen, setMemoryPanelOpen] = useState(false);
   // v0.16 §7: long-conversation compaction. When a conversation grows
   // past COMPACT_THRESHOLD bubbles we collapse the early prefix into a
   // single "📜 N earlier turns" strip; clicking it sets this to true
@@ -3275,6 +3280,22 @@ export default function ChatPanel({
                 🔍
               </button>
             )}
+            {/* 2026-06-26 (user-distillation Phase 0): toggle the
+                right-side memory drawer. Hidden behind a header
+                button so it doesn't push the chat surface narrower
+                for users who don't open it. */}
+            <button
+              type="button"
+              onClick={() => setMemoryPanelOpen((v) => !v)}
+              className={`ml-2 rounded-md border px-2 py-1 text-xs hover:bg-slate-50 ${
+                memoryPanelOpen
+                  ? "border-amber-400 bg-amber-50 text-amber-800"
+                  : "border-slate-300 bg-white text-slate-700"
+              }`}
+              title="Show / hide what mathran has stored in memory"
+            >
+              🧠 Memory
+            </button>
           </div>
           {/* v0.16 §3: "this conversation is a Goal" indicator. Clicking
               opens the primary thread (i.e. the goal's own conversation)
@@ -4534,6 +4555,16 @@ export default function ChatPanel({
           </form>
         </div>
       </div>
+      {/* 2026-06-26 (user-distillation Phase 0) — right-side drawer with
+          the memory panel. Sibling of the chat surface so it sits at
+          the rightmost edge without nesting inside the scroll
+          container. Self-hides on close so it doesn't steal layout
+          width. */}
+      {memoryPanelOpen && (
+        <aside className="flex h-full w-80 shrink-0 flex-col border-l border-slate-200 bg-white">
+          <MemoryPanel />
+        </aside>
+      )}
       {/* v0.16 §3: side-panel thread drawer. Rendered once at the top
           level so its fixed-position overlay isn't trapped inside the
           scrollable conversation column. */}

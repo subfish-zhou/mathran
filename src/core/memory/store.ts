@@ -22,7 +22,10 @@ export interface MemorySearchHit {
 }
 
 /** Topic names are flat slugs — no path separators, no traversal. */
-const TOPIC_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+/** Pattern for valid topic slugs: alphanumeric, dash, underscore; no path
+ * separators or traversal. Exported so callers (e.g. memory-routes) can
+ * pre-validate route params without throwing. */
+export const TOPIC_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
 /** Throw if `topic` isn't a safe, flat slug. */
 export function assertValidTopic(topic: string): void {
