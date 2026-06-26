@@ -32,13 +32,49 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 import * as tar from "tar";
 
 const ARXIV_E_PRINT_URL = "https://arxiv.org/e-print";
 const DEFAULT_TIMEOUT_MS = 60_000;
+
+/**
+ * [Fix C5/C6/C19 2026-06-26] Hard caps on what we'll pull from the
+ * network and what we'll write to disk per fetch. arxiv itself caps
+ * submissions around 50 MB but a MITM / malicious fetchImpl override
+ * could ship a gzip bomb (gigabytes-after-decompress from a tiny
+ * input). These caps DOS-protect /tmp and the cache.
+ *
+ *   DOWNLOAD_CAP  — bytes we read from the wire before aborting
+ *   DECOMPRESS_CAP — bytes we write into staging after gunzip
+ *
+ * Caps are conservative (60 MB each) — larger than any real paper
+ * but small enough that even a zip-bomb expansion can't fill disk.
+ */
+const DOWNLOAD_CAP = 60 * 1024 * 1024;
+const DECOMPRESS_CAP = 60 * 1024 * 1024;
+
+/**
+ * [Fix C5/C6/C19 2026-06-26] Stream that destroys with an error
+ * once total bytes through exceed `cap`. Used on download stream
+ * (cap bytes off the wire) and after gunzip (cap decompressed
+ * output, defeating gzip bombs).
+ */
+function byteCap(cap: number, label: string): Transform {
+  let seen = 0;
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      seen += chunk.length;
+      if (seen > cap) {
+        cb(new Error(`${label} exceeded cap of ${cap} bytes (got ${seen})`));
+        return;
+      }
+      cb(null, chunk);
+    },
+  });
+}
 
 /**
  * Match arxiv id forms we accept (modern + legacy). Used for input
@@ -410,18 +446,31 @@ async function doFetchArxivSource(
   try {
    if (isPlainTex) {
      // Single-file .tex submission: write the response body to main.tex.
+     // [Fix C19] Cap memory accumulation at DOWNLOAD_CAP. for-await
+     // can OOM otherwise on a malicious stream.
      const chunks: Buffer[] = [];
+     let total = 0;
      const nodeStream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
-     for await (const c of nodeStream) chunks.push(Buffer.from(c));
+     for await (const c of nodeStream) {
+       const b = Buffer.from(c);
+       total += b.length;
+       if (total > DOWNLOAD_CAP) {
+         throw new Error(`text/plain body exceeded cap of ${DOWNLOAD_CAP} bytes`);
+       }
+       chunks.push(b);
+     }
      await fs.writeFile(path.join(stagingDir, "main.tex"), Buffer.concat(chunks));
    } else {
-    // Pipeline: response stream → gunzip → tar extractor (writes into stagingDir).
+    // Pipeline: response stream → cap → gunzip → cap → tar extractor.
     // The stream we get from fetch() is a web ReadableStream; convert
-    // to node Readable.
+    // to node Readable. [Fix C5/C6] Insert byteCap on both download
+    // and decompressed sides so a malicious .gz can't fill /tmp.
     const nodeStream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
     await pipeline(
       nodeStream,
+      byteCap(DOWNLOAD_CAP, "downloaded tarball"),
       createGunzip(),
+      byteCap(DECOMPRESS_CAP, "decompressed tarball"),
       // [Fix A14 2026-06-26] tar 7 + strict:false will silently allow
       // symlinks / hardlinks / absolute paths; an attacker who controls
       // the arxiv submission could ship `evil -> /etc/passwd` and any

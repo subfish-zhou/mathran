@@ -384,3 +384,21 @@ describe("concurrent fetch deduplication (Fix B1)", () => {
     expect(b.status).toBe("ok");
   });
 });
+
+describe("byte caps (Fix C5/C6/C19)", () => {
+  it("text/plain body over DOWNLOAD_CAP is rejected", async () => {
+    // Build a fake 'text/plain' response with > 60 MB body.
+    const tooBig = Buffer.alloc(61 * 1024 * 1024, 0x61); // 61 MB of 'a'
+    const mockFetch = async () => ({
+      ok: true,
+      status: 200,
+      body: Readable.toWeb(Readable.from(tooBig)) as unknown as ReadableStream<Uint8Array>,
+      headers: { get: (n: string) => n.toLowerCase() === "content-type" ? "text/plain" : null },
+    });
+    const res = await fetchArxivSource("2106.04561", { workspace, fetchImpl: mockFetch });
+    expect(res.status).toBe("extract-failed");
+    if (res.status === "extract-failed") {
+      expect(res.error).toMatch(/exceeded cap/);
+    }
+  });
+});

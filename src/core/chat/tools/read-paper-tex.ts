@@ -186,6 +186,26 @@ export function createReadPaperTexTool(): ToolSpec {
         if (!realResolved.startsWith(realRoot + path.sep) && realResolved !== realRoot) {
           return { ok: false, content: `read_paper_tex: file escapes paper-source dir (${fileArg})` };
         }
+        // [Fix C7 2026-06-26] Reject obvious binary extensions —
+        // reading them as utf-8 returns garbled bytes that pollute
+        // the model's context. Allow .tex/.bib/.cls/.sty/.bbl and
+        // common text formats; everything else returns a helpful
+        // error pointing to the SPA file viewer or pdf_extract.
+        const ext = path.extname(realResolved).toLowerCase();
+        const TEXT_EXTS = new Set([
+          ".tex", ".bib", ".bbl", ".cls", ".sty", ".dtx",
+          ".md", ".txt", ".rst", ".org",
+          "", // no extension — common for raw paper text
+        ]);
+        if (!TEXT_EXTS.has(ext)) {
+          return {
+            ok: false,
+            content:
+              `read_paper_tex: refusing to read non-text file '${fileArg}' ` +
+              `(extension '${ext}'). To inspect figures or PDFs, use ` +
+              `the SPA file viewer or pdf_extract({path:'<file>', mode:'math'}).`,
+          };
+        }
         let body: string;
         try {
           body = await fs.readFile(realResolved, "utf-8");
