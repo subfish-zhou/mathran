@@ -21,7 +21,13 @@ import { slugify } from "../../../../lib/slug.js";
 import { getPaper } from "../../../paper-graph/index.js";
 import { fetchArxivSource } from "../../../paper-graph/arxiv-source.js";
 import { EFFORT_LAYOUT, attachReference } from "../../../effort/store.js";
-import { buildEffortDocumentPrompt, buildThreadDocumentPrompt } from "./prompts.js";
+// [sync-upgrade 2026-06-26 P2-B] buildEffortDocumentPrompt /
+// buildThreadDocumentPrompt are no longer used — apply-init-result.ts
+// (or this module's writeEffort) builds the scaffold from spine
+// context + references list, without an LLM call. The prompt
+// functions remain exported from ./prompts.js for callers outside the
+// init pipeline that may still want a one-shot doc-style summary
+// (none in mathran today; kept for API stability).
 import { errMsg, noopEmit, type SpineLLM, type EmitFn } from "./llm.js";
 import type {
   NarrativeSpine,
