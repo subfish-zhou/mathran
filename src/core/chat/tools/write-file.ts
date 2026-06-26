@@ -16,6 +16,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ToolSpec, ToolExecuteContext } from "../session.js";
+import { atomicWriteFile } from "../atomic-write.js";
 import { formatHookBlock } from "../../hooks/executor.js";
 
 export interface WriteFileToolOptions {
@@ -114,7 +115,9 @@ export function createWriteFileTool(
         }
 
         await fs.mkdir(path.dirname(resolved), { recursive: true });
-        await fs.writeFile(resolved, content, "utf-8");
+        // 2026-06-25 audit M2 — atomic write so a crash mid-write can't
+        // truncate the file. fs.writeFile alone is not atomic.
+        await atomicWriteFile(resolved, content);
       } catch (err: any) {
         return {
           ok: false,

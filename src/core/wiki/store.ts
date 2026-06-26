@@ -18,6 +18,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import YAML from "yaml";
+import { atomicWriteFile } from "../chat/atomic-write.js";
+import { withFileLock } from "../chat/store.js";
 
 const PROJECTS_DIR = "projects";
 export const WIKI_DIR = "wiki";
@@ -248,6 +250,12 @@ export async function writeWikiPage(
   await fs.mkdir(wikiDir, { recursive: true });
   const file = path.join(wikiDir, `${page}.md`);
 
+  // 2026-06-25 audit M2 — serialise the read-existing → bump version →
+  // snapshot + write cycle so two concurrent updateWikiPage calls for
+  // the same page can't both bump from N to N+1 (one would silently
+  // lose its history snapshot to the other's overwrite).
+  return await withFileLock(file, async () => {
+
   let existingFm: WikiFrontmatter = {};
   let existingRaw: string | null = null;
   try {
@@ -260,7 +268,7 @@ export async function writeWikiPage(
   if (existingRaw && oldVersion > 0) {
     const histDir = path.join(wikiDir, WIKI_HISTORY_DIR, page);
     await fs.mkdir(histDir, { recursive: true });
-    await fs.writeFile(path.join(histDir, `v${oldVersion}.md`), existingRaw, "utf-8");
+    await atomicWriteFile(path.join(histDir, `v${oldVersion}.md`), existingRaw);
   }
 
   const now = new Date().toISOString();
@@ -282,10 +290,14 @@ export async function writeWikiPage(
         ? { verification: existingFm.verification }
         : {}),
   };
-  await fs.writeFile(file, stringifyFrontmatter(next) + body, "utf-8");
+  // 2026-06-25 audit M2 — atomic write so a crash mid-write can't truncate
+  // the wiki page. The history snapshot below is also atomic for the same
+  // reason.
+  await atomicWriteFile(file, stringifyFrontmatter(next) + body);
   const result = await readWikiPage(workspace, project, page);
   if (!result) throw new Error("internal: wiki page lost after write");
   return result;
+  });
 }
 
 /**

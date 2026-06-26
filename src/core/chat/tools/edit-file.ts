@@ -17,6 +17,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ToolSpec, ToolExecuteContext } from "../session.js";
+import { atomicWriteFile } from "../atomic-write.js";
 import { formatHookBlock } from "../../hooks/executor.js";
 
 export interface EditFileToolOptions {
@@ -212,7 +213,9 @@ export function createEditFileTool(opts: EditFileToolOptions = {}): ToolSpec {
       }
 
       try {
-        await fs.writeFile(resolved, updated, "utf-8");
+        // 2026-06-25 audit M2 — atomic write so a partial-write crash
+        // can't corrupt the user's source file.
+        await atomicWriteFile(resolved, updated);
       } catch (err: any) {
         return {
           ok: false,

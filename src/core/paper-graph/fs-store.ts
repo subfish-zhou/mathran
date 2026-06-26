@@ -18,6 +18,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
+import { atomicWriteFile } from "../chat/atomic-write.js";
+import { withFileLock } from "../chat/store.js";
 
 import type {
   PaperNode,
@@ -87,7 +89,9 @@ async function readIndex(workspace: string): Promise<PaperGraphIndex> {
 
 async function writeIndex(workspace: string, index: PaperGraphIndex): Promise<void> {
   await fs.mkdir(paperGraphDir(workspace), { recursive: true });
-  await fs.writeFile(indexFile(workspace), JSON.stringify(index, null, 2) + "\n", "utf-8");
+  // 2026-06-25 audit M2 — atomic write so a crash mid-write can't truncate
+  // the dedup index. RMW serialisation is at the ingestPaper level.
+  await atomicWriteFile(indexFile(workspace), JSON.stringify(index, null, 2) + "\n");
 }
 
 // ── Write-side API ───────────────────────────────────────────────────────────
@@ -102,40 +106,46 @@ export async function ingestPaper(
 ): Promise<string | null> {
   return safe(
     "ingestPaper",
-    async () => {
-      const index = await readIndex(workspace);
-      if (input.arxivId && index.arxiv[input.arxivId]) return index.arxiv[input.arxivId]!;
-      if (input.doi && index.doi[input.doi]) return index.doi[input.doi]!;
+    async () =>
+      // 2026-06-25 audit M2 — serialise the readIndex → modify → writeIndex
+      // cycle per workspace so two concurrent ingestPaper calls dedupe
+      // correctly (two ingests of the same arxivId should yield ONE node,
+      // not two). Without the lock both load the same snapshot, miss each
+      // other's pending write, and create duplicate nodes.
+      withFileLock(indexFile(workspace), async () => {
+        const index = await readIndex(workspace);
+        if (input.arxivId && index.arxiv[input.arxivId]) return index.arxiv[input.arxivId]!;
+        if (input.doi && index.doi[input.doi]) return index.doi[input.doi]!;
 
-      const id = deriveNodeId(input);
-      const now = new Date().toISOString();
-      const node: PaperNode = {
-        id,
-        title: input.title,
-        authors: input.authors ?? [],
-        year: input.year,
-        abstract: input.abstract,
-        url: input.url ?? (input.arxivId ? `https://arxiv.org/abs/${input.arxivId}` : undefined),
-        arxivId: input.arxivId,
-        doi: input.doi,
-        categories: input.categories,
-        isSurvey: input.isSurvey ?? false,
-        embedding: input.embedding,
-        createdAt: now,
-        updatedAt: now,
-      };
-      await fs.mkdir(nodesDir(workspace), { recursive: true });
-      await fs.writeFile(path.join(nodesDir(workspace), `${id}.json`), JSON.stringify(node, null, 2) + "\n", "utf-8");
+        const id = deriveNodeId(input);
+        const now = new Date().toISOString();
+        const node: PaperNode = {
+          id,
+          title: input.title,
+          authors: input.authors ?? [],
+          year: input.year,
+          abstract: input.abstract,
+          url: input.url ?? (input.arxivId ? `https://arxiv.org/abs/${input.arxivId}` : undefined),
+          arxivId: input.arxivId,
+          doi: input.doi,
+          categories: input.categories,
+          isSurvey: input.isSurvey ?? false,
+          embedding: input.embedding,
+          createdAt: now,
+          updatedAt: now,
+        };
+        await fs.mkdir(nodesDir(workspace), { recursive: true });
+        await fs.writeFile(path.join(nodesDir(workspace), `${id}.json`), JSON.stringify(node, null, 2) + "\n", "utf-8");
 
-      if (input.arxivId) index.arxiv[input.arxivId] = id;
-      if (input.doi) index.doi[input.doi] = id;
-      await writeIndex(workspace, index);
-      return id;
-    },
+        if (input.arxivId) index.arxiv[input.arxivId] = id;
+        if (input.doi) index.doi[input.doi] = id;
+        await writeIndex(workspace, index);
+
+        return id;
+      }),
     null,
   );
 }
-
 /** Append a citation edge. Returns true on success (or duplicate), false on failure. */
 export async function ingestCitation(
   workspace: string,

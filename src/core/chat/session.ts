@@ -17,6 +17,7 @@
 
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
+import { atomicWriteFile } from "./atomic-write.js";
 import type {
   LLMProvider,
   LLMMessage,
@@ -1962,7 +1963,11 @@ export class ChatSession {
         }
       }
       await fs.mkdir(path.dirname(resolved), { recursive: true });
-      await fs.writeFile(resolved, content, "utf-8");
+      // 2026-06-25 audit M2 — atomic write so a crash mid-edit can't
+      // truncate the user's source file. fs.writeFile alone leaves a
+      // half-written file on the filesystem if the process dies between
+      // the open and the final flush.
+      await atomicWriteFile(resolved, content);
     } catch (err: any) {
       return {
         ok: false,
