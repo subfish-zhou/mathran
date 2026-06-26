@@ -1383,6 +1383,10 @@ export function defaultSessionFactory(
         // tool — all profile mutations go through the SPA so the user
         // sees and consents to every change.
         user_profile_read: true,
+        // 2026-06-26 (user-distillation Phase 4) — BM25 search over
+        // the same profile so the model can ask "anything relevant
+        // to <topic>" without dumping the full profile.
+        user_profile_search: true,
 
         // git: inspect tools (status / diff / log / show) always on;
         // commit requires explicit opt-in via the cfg block.
@@ -1527,6 +1531,8 @@ export const GOAL_MODE_BUILTIN_TOOLS = {
   // 2026-06-26 (user-distillation Phase 1) — goal mode also benefits
   // from knowing the user's research context. Same read-only contract.
   user_profile_read: true,
+  // 2026-06-26 (user-distillation Phase 4) — BM25 search in goal mode too.
+  user_profile_search: true,
 } as const;
 
 /** Append a short scope hint to the system prompt so the model knows where it is. */
@@ -3776,10 +3782,20 @@ function buildApp(
   // without going through the model tool path.
   registerMemoryRoutes(app, workspace);
 
-  // 2026-06-26 (user-distillation Phase 1) — user-authored taste +
-  // research profile (papers, projects). User-home scoped, no
-  // workspace argument — see core/profile/store.ts for rationale.
-  registerProfileRoutes(app);
+  // 2026-06-26 (user-distillation Phase 1 + 3) — user-authored taste +
+  // research profile (papers, projects) and Phase 3 LLM-inferred
+  // preferences with mandatory evidence + user approval flow. The
+  // inferenceLlmFactory uses the same ModelRouter + config the rest
+  // of the chat surface uses, so inference runs cost the user
+  // whatever their default chat model costs.
+  registerProfileRoutes(app, {
+    inferenceLlmFactory: () => {
+      const cfg = loadConfig(configPathFor(workspace));
+      const model = cfg.defaultModel;
+      if (!model) return null;
+      return { llm: new ModelRouter(cfg), model };
+    },
+  });
 
   // 2026-06-26 (user-distillation Phase 2) — paper lookup + ingest +
   // reactions. Workspace-scoped for paper-graph, user-home-scoped for

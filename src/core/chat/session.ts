@@ -115,6 +115,7 @@ import { createProposePlanTool } from "./tools/propose-plan.js";
 import { createMemoryListTool } from "./tools/memory-list.js";
 import { createMemoryReadTool } from "./tools/memory-read.js";
 import { createUserProfileReadTool } from "./tools/user-profile-read.js";
+import { createUserProfileSearchTool } from "./tools/user-profile-search.js";
 import { createMemoryWriteTool } from "./tools/memory-write.js";
 import { createMemoryAppendTool } from "./tools/memory-append.js";
 import { createMemorySearchTool } from "./tools/memory-search.js";
@@ -696,6 +697,12 @@ export interface ChatSessionOptions {
      * see _tasks/user-distillation/PLAN.md.
      */
     user_profile_read?: boolean | { profileDir?: string };
+    /**
+     * user-distillation Phase 4 — BM25 search over the profile so the
+     * model can ask "is this topic relevant to anything the user
+     * cares about" without dumping the full profile into context.
+     */
+    user_profile_search?: boolean | { profileDir?: string };
     /**
      * gap #3 — per-conversation scratchpad tools. They persist under
      * `<workspace>/.mathran/scratchpad/<convId>/<name>.md`. The conversation id
@@ -1576,6 +1583,14 @@ export class ChatSession {
           ? { profileDir: cfg.user_profile_read.profileDir }
           : {};
       out.push(createUserProfileReadTool(profileOpts));
+    }
+    // user-distillation Phase 4 — BM25 search across the same profile.
+    if (cfg.user_profile_search) {
+      const searchOpts =
+        typeof cfg.user_profile_search === "object" && cfg.user_profile_search.profileDir
+          ? { profileDir: cfg.user_profile_search.profileDir }
+          : {};
+      out.push(createUserProfileSearchTool(searchOpts));
     }
     // gap #3 — per-conversation scratchpad tools. The conversation id comes
     // from an explicit override, else the checkpoints conversation id.

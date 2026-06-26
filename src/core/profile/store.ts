@@ -29,6 +29,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 
 import { atomicWriteFile } from "../chat/atomic-write.js";
@@ -36,11 +37,22 @@ import { withFileLock } from "../chat/store.js";
 
 import {
   CitedPaperEntrySchema,
+  DisagreedEntrySchema,
+  InferenceCandidateSchema,
+  InferenceRunMetaSchema,
+  InferredEntrySchema,
   OwnPaperEntrySchema,
   ProfileSnapshotSchema,
   ProjectProfileEntrySchema,
   ReactionEntrySchema,
   type CitedPaperEntry,
+  type DisagreedEntry,
+  type DisagreedEntryInput,
+  type InferenceCandidate,
+  type InferenceCandidateInput,
+  type InferenceRunMeta,
+  type InferredEntry,
+  type InferredEntryInput,
   type OwnPaperEntry,
   type OwnPaperEntryInput,
   type ProfileSnapshot,
@@ -311,4 +323,285 @@ export async function readSnapshot(
   // Final validation — re-parse the merged shape so the return value
   // always conforms to ProfileSnapshot.
   return ProfileSnapshotSchema.parse(snap);
+}
+
+// ─── LAYER 3 — inferred / disagreed / pending candidates ─────────────
+//
+// Three jsonl files form the inference state:
+//
+//   inferred.jsonl              — approved entries (active + expired)
+//   pending-inferences.jsonl    — candidates awaiting user approval
+//   disagreed.jsonl             — rejected claims, future-pass blacklist
+//   inference-runs.jsonl        — one row per run for cost auditing
+//
+// 2026-06-26 (user-distillation Phase 3).
+
+const INFERRED_FILE = "inferred.jsonl";
+const PENDING_FILE = "pending-inferences.jsonl";
+const DISAGREED_FILE = "disagreed.jsonl";
+const RUNS_FILE = "inference-runs.jsonl";
+
+const DEFAULT_INFERRED_TTL_DAYS = 90;
+
+function isoFromNowDays(days: number): string {
+  return new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+// ─── Inferred (approved) ─────────────────────────────────────────────
+
+export async function readInferred(
+  profileDir: string = defaultProfileDir(),
+): Promise<InferredEntry[]> {
+  const raw = await readJsonl(path.join(profileDir, INFERRED_FILE));
+  const out: InferredEntry[] = [];
+  for (const row of raw) {
+    const parsed = InferredEntrySchema.safeParse(row);
+    if (parsed.success) out.push(parsed.data);
+  }
+  return out;
+}
+
+/**
+ * Subset of `readInferred()` that excludes expired entries. The model
+ * reads these via user_profile_read; expired ones stay on disk for
+ * auditability but no longer flow into prompts.
+ */
+export async function readActiveInferred(
+  profileDir: string = defaultProfileDir(),
+): Promise<InferredEntry[]> {
+  const all = await readInferred(profileDir);
+  const now = new Date().toISOString();
+  return all.filter((e) => e.expiresAt > now);
+}
+
+async function writeInferred(
+  profileDir: string,
+  entries: InferredEntry[],
+): Promise<void> {
+  const file = path.join(profileDir, INFERRED_FILE);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const body =
+    entries.map((r) => JSON.stringify(r)).join("\n") +
+    (entries.length > 0 ? "\n" : "");
+  await atomicWriteFile(file, body);
+}
+
+/**
+ * Persist an inferred entry. Fills `id` (uuid) and `expiresAt`
+ * (default 90 days out) when not provided.
+ */
+export async function addInferred(
+  input: InferredEntryInput,
+  profileDir: string = defaultProfileDir(),
+): Promise<InferredEntry> {
+  // Defaults are filled BEFORE schema validation so the parser sees a
+  // complete entry; otherwise z.infer (output) would reject the partial.
+  const withDefaults = {
+    ...input,
+    id: input.id ?? randomUUID(),
+    inferredAt: input.inferredAt ?? new Date().toISOString(),
+    expiresAt: input.expiresAt ?? isoFromNowDays(DEFAULT_INFERRED_TTL_DAYS),
+  };
+  const stamped = InferredEntrySchema.parse(withDefaults);
+  const file = path.join(profileDir, INFERRED_FILE);
+  return await withFileLock(file, async () => {
+    const existing = await readInferred(profileDir);
+    await writeInferred(profileDir, [...existing, stamped]);
+    return stamped;
+  });
+}
+
+/** Drop an inferred entry by id. Returns true if removed. */
+export async function removeInferred(
+  id: string,
+  profileDir: string = defaultProfileDir(),
+): Promise<boolean> {
+  const file = path.join(profileDir, INFERRED_FILE);
+  return await withFileLock(file, async () => {
+    const existing = await readInferred(profileDir);
+    const next = existing.filter((e) => e.id !== id);
+    if (next.length === existing.length) return false;
+    await writeInferred(profileDir, next);
+    return true;
+  });
+}
+
+// ─── Pending candidates ──────────────────────────────────────────────
+
+export async function readPendingCandidates(
+  profileDir: string = defaultProfileDir(),
+): Promise<InferenceCandidate[]> {
+  const raw = await readJsonl(path.join(profileDir, PENDING_FILE));
+  const out: InferenceCandidate[] = [];
+  for (const row of raw) {
+    const parsed = InferenceCandidateSchema.safeParse(row);
+    if (parsed.success) out.push(parsed.data);
+  }
+  return out;
+}
+
+async function writePending(
+  profileDir: string,
+  entries: InferenceCandidate[],
+): Promise<void> {
+  const file = path.join(profileDir, PENDING_FILE);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const body =
+    entries.map((r) => JSON.stringify(r)).join("\n") +
+    (entries.length > 0 ? "\n" : "");
+  await atomicWriteFile(file, body);
+}
+
+/** Append candidates from one pipeline run. */
+export async function addPendingCandidates(
+  inputs: InferenceCandidateInput[],
+  profileDir: string = defaultProfileDir(),
+): Promise<InferenceCandidate[]> {
+  if (inputs.length === 0) return [];
+  const stamped = inputs.map((i) =>
+    InferenceCandidateSchema.parse({
+      ...i,
+      id: i.id ?? randomUUID(),
+      proposedAt: i.proposedAt ?? new Date().toISOString(),
+    }),
+  );
+  const file = path.join(profileDir, PENDING_FILE);
+  return await withFileLock(file, async () => {
+    const existing = await readPendingCandidates(profileDir);
+    await writePending(profileDir, [...existing, ...stamped]);
+    return stamped;
+  });
+}
+
+/**
+ * Approve a pending candidate. Moves it from pending-inferences.jsonl
+ * to inferred.jsonl atomically (in two locks, ordered so pending lock
+ * is held while inferred write is queued — see below).
+ */
+export async function approveCandidate(
+  candidateId: string,
+  options: { userNote?: string } = {},
+  profileDir: string = defaultProfileDir(),
+): Promise<InferredEntry | null> {
+  const pendingFile = path.join(profileDir, PENDING_FILE);
+  // Take the pending lock and pop the candidate while holding it.
+  const candidate = await withFileLock(pendingFile, async () => {
+    const existing = await readPendingCandidates(profileDir);
+    const idx = existing.findIndex((c) => c.id === candidateId);
+    if (idx === -1) return null;
+    const popped = existing[idx];
+    const next = existing.filter((_, i) => i !== idx);
+    await writePending(profileDir, next);
+    return popped;
+  });
+  if (!candidate) return null;
+  // Then write to inferred (its own lock — no nesting). If this step
+  // crashes the candidate has been removed from pending but never
+  // written to inferred; the user can see this in inference-runs.jsonl
+  // and re-run. Better than nesting locks.
+  return await addInferred(
+    {
+      kind: candidate.kind,
+      content: candidate.content,
+      confidence: candidate.confidence,
+      evidence: candidate.evidence,
+      userNote: options.userNote,
+    },
+    profileDir,
+  );
+}
+
+/**
+ * Reject a pending candidate. Removes from pending + appends to
+ * disagreed.jsonl so future runs skip it.
+ */
+export async function rejectCandidate(
+  candidateId: string,
+  options: { userNote?: string } = {},
+  profileDir: string = defaultProfileDir(),
+): Promise<DisagreedEntry | null> {
+  const pendingFile = path.join(profileDir, PENDING_FILE);
+  const candidate = await withFileLock(pendingFile, async () => {
+    const existing = await readPendingCandidates(profileDir);
+    const idx = existing.findIndex((c) => c.id === candidateId);
+    if (idx === -1) return null;
+    const popped = existing[idx];
+    const next = existing.filter((_, i) => i !== idx);
+    await writePending(profileDir, next);
+    return popped;
+  });
+  if (!candidate) return null;
+  return await addDisagreed(
+    {
+      content: candidate.content,
+      sourceCandidateId: candidate.id,
+      userNote: options.userNote,
+    },
+    profileDir,
+  );
+}
+
+// ─── Disagreed ───────────────────────────────────────────────────────
+
+export async function readDisagreed(
+  profileDir: string = defaultProfileDir(),
+): Promise<DisagreedEntry[]> {
+  const raw = await readJsonl(path.join(profileDir, DISAGREED_FILE));
+  const out: DisagreedEntry[] = [];
+  for (const row of raw) {
+    const parsed = DisagreedEntrySchema.safeParse(row);
+    if (parsed.success) out.push(parsed.data);
+  }
+  return out;
+}
+
+export async function addDisagreed(
+  input: DisagreedEntryInput,
+  profileDir: string = defaultProfileDir(),
+): Promise<DisagreedEntry> {
+  const stamped = DisagreedEntrySchema.parse({
+    ...input,
+    disagreedAt: input.disagreedAt ?? new Date().toISOString(),
+  });
+  const file = path.join(profileDir, DISAGREED_FILE);
+  return await withFileLock(file, async () => {
+    const existing = await readDisagreed(profileDir);
+    const next = [...existing, stamped];
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await atomicWriteFile(
+      file,
+      next.map((r) => JSON.stringify(r)).join("\n") + "\n",
+    );
+    return stamped;
+  });
+}
+
+// ─── Inference runs (append-only audit log) ───────────────────────────
+
+export async function readInferenceRuns(
+  profileDir: string = defaultProfileDir(),
+): Promise<InferenceRunMeta[]> {
+  const raw = await readJsonl(path.join(profileDir, RUNS_FILE));
+  const out: InferenceRunMeta[] = [];
+  for (const row of raw) {
+    const parsed = InferenceRunMetaSchema.safeParse(row);
+    if (parsed.success) out.push(parsed.data);
+  }
+  return out;
+}
+
+export async function appendInferenceRun(
+  run: InferenceRunMeta,
+  profileDir: string = defaultProfileDir(),
+): Promise<void> {
+  const file = path.join(profileDir, RUNS_FILE);
+  await withFileLock(file, async () => {
+    const existing = await readInferenceRuns(profileDir);
+    const next = [...existing, run];
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await atomicWriteFile(
+      file,
+      next.map((r) => JSON.stringify(r)).join("\n") + "\n",
+    );
+  });
 }

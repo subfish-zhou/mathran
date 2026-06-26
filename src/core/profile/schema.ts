@@ -140,3 +140,139 @@ export const ProfileSnapshotSchema = z.object({
 });
 
 export type ProfileSnapshot = z.infer<typeof ProfileSnapshotSchema>;
+
+// ─── LAYER 3 — inferred preferences ──────────────────────────────────
+//
+// Distilled by an aux-model pass over LAYER 1 (own / cited papers,
+// projects) + LAYER 2 (reactions). Every entry MUST cite at least two
+// evidence items so the user can trace the inference back to its
+// source — without this rule the LLM hallucinates plausible-sounding
+// taste claims that aren't actually grounded.
+//
+// 2026-06-26 (user-distillation Phase 3).
+
+/**
+ * One unit of evidence — points back at either a reaction
+ * (`paperId#reaction`) or a conversation bubble (`conv:<id>#<idx>`).
+ * The store doesn't enforce a schema on the string — it's user-visible
+ * provenance, not a query target.
+ */
+export const InferenceEvidenceSchema = z.object({
+  /** e.g. "arxiv-2401.0001#like" or "conv:abc123#42" */
+  ref: z.string().min(1),
+  /** Human-readable shorthand the SPA renders on hover. */
+  label: z.string().optional(),
+});
+export type InferenceEvidence = z.infer<typeof InferenceEvidenceSchema>;
+
+/**
+ * What kind of preference is being expressed. Used by the SPA to
+ * group entries on the Inferred tab; not enforced semantically.
+ */
+export const InferenceKindSchema = z.enum([
+  "interest",
+  "method-preference",
+  "style",
+  "aversion",
+  "research-direction",
+]);
+export type InferenceKind = z.infer<typeof InferenceKindSchema>;
+
+const ISO_DATE = z.string().datetime();
+
+/**
+ * A persisted inferred preference. Lives in inferred.jsonl ONLY after
+ * the user approves it via the SPA (or a future ask_user flow). Models
+ * can read these via user_profile_read(slice="inferred-active").
+ *
+ * Stored entries always have `id`, `inferredAt`, `expiresAt` — the
+ * store fills them on write. Callers passing partial inputs should
+ * use `InferredEntryInput` (a separate type with those fields
+ * optional).
+ */
+export const InferredEntrySchema = z.object({
+  /** Stable id assigned at write time (uuid v4). */
+  id: z.string().min(1),
+  kind: InferenceKindSchema,
+  /** One-sentence statement of the preference, in the user's voice. */
+  content: z.string().min(1),
+  confidence: z.enum(["low", "medium", "high"]),
+  /** REQUIRED — at least two evidence items, see file header. */
+  evidence: z.array(InferenceEvidenceSchema).min(2),
+  /** When the inference was produced. */
+  inferredAt: ISO_DATE,
+  /** When the entry stops being injected (90d default). */
+  expiresAt: ISO_DATE,
+  /** Optional user-attached note (when they approved with an edit). */
+  userNote: z.string().optional(),
+});
+export type InferredEntry = z.infer<typeof InferredEntrySchema>;
+/** Loose input shape — store fills id / inferredAt / expiresAt when omitted. */
+export type InferredEntryInput = Omit<InferredEntry, "id" | "inferredAt" | "expiresAt"> & {
+  id?: string;
+  inferredAt?: string;
+  expiresAt?: string;
+};
+
+/**
+ * Something the user explicitly rejected. Future inference passes
+ * exclude topics matching these so the same wrong claim doesn't
+ * get re-proposed every run.
+ *
+ * Stored entries always have `disagreedAt`; callers passing partial
+ * inputs use `DisagreedEntryInput`.
+ */
+export const DisagreedEntrySchema = z.object({
+  /** The rejected claim, verbatim. */
+  content: z.string().min(1),
+  disagreedAt: ISO_DATE,
+  /** Inference run / candidate that produced the rejected claim. */
+  sourceCandidateId: z.string().optional(),
+  /** Optional user comment on why this was wrong. */
+  userNote: z.string().optional(),
+});
+export type DisagreedEntry = z.infer<typeof DisagreedEntrySchema>;
+export type DisagreedEntryInput = Omit<DisagreedEntry, "disagreedAt"> & {
+  disagreedAt?: string;
+};
+
+/**
+ * A candidate emitted by the inference pipeline, awaiting user
+ * approval. Identical to InferredEntry minus the "this got approved"
+ * fields. Lives in `pending-inferences.jsonl` until the user
+ * approves (-> moves to inferred.jsonl) or rejects (-> removes from
+ * pending + appends to disagreed.jsonl).
+ *
+ * Stored entries always have `id`/`proposedAt`; partial inputs use
+ * `InferenceCandidateInput`.
+ */
+export const InferenceCandidateSchema = z.object({
+  id: z.string().min(1),
+  kind: InferenceKindSchema,
+  content: z.string().min(1),
+  confidence: z.enum(["low", "medium", "high"]),
+  evidence: z.array(InferenceEvidenceSchema).min(2),
+  /** Which inference run produced this candidate. */
+  runId: z.string().min(1),
+  proposedAt: ISO_DATE,
+});
+export type InferenceCandidate = z.infer<typeof InferenceCandidateSchema>;
+export type InferenceCandidateInput = Omit<InferenceCandidate, "id" | "proposedAt"> & {
+  id?: string;
+  proposedAt?: string;
+};
+
+/** Metadata for one inference pipeline run. */
+export const InferenceRunMetaSchema = z.object({
+  runId: z.string().min(1),
+  startedAt: ISO_DATE,
+  finishedAt: ISO_DATE.optional(),
+  status: z.enum(["running", "ok", "failed"]),
+  /** Number of candidates emitted (only meaningful for ok). */
+  candidateCount: z.number().int().nonnegative().optional(),
+  /** Failure reason (only meaningful for failed). */
+  error: z.string().optional(),
+  /** Model id used for this run, for cost auditing. */
+  model: z.string().optional(),
+});
+export type InferenceRunMeta = z.infer<typeof InferenceRunMetaSchema>;

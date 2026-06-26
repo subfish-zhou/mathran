@@ -17,16 +17,27 @@ import { ZodError } from "zod";
 import {
   addCitedPaper,
   addOwnPaper,
+  appendInferenceRun,
+  approveCandidate,
   defaultProfileDir,
+  readActiveInferred,
   readCitedPapers,
+  readDisagreed,
+  readInferenceRuns,
+  readInferred,
   readOwnPapers,
+  readPendingCandidates,
   readProjects,
   readSnapshot,
+  rejectCandidate,
   removeCitedPaper,
+  removeInferred,
   removeOwnPaper,
   removeProject,
   upsertProject,
 } from "../core/profile/index.js";
+import { runInference } from "../core/profile/inference.js";
+import type { LLMProvider } from "../core/providers/llm.js";
 
 function zodErrorBody(err: ZodError): { error: string; issues: any[] } {
   return {
@@ -38,7 +49,20 @@ function zodErrorBody(err: ZodError): { error: string; issues: any[] } {
   };
 }
 
-export function registerProfileRoutes(app: Hono): void {
+export interface ProfileRoutesDeps {
+  /**
+   * Factory for the LLM used by the inference pipeline. Called per
+   * request so the route picks up provider config changes without a
+   * server restart. Returns null when no provider is configured —
+   * the route then 503s.
+   */
+  inferenceLlmFactory?: () => { llm: LLMProvider; model: string } | null;
+}
+
+export function registerProfileRoutes(
+  app: Hono,
+  deps: ProfileRoutesDeps = {},
+): void {
   const profileDir = defaultProfileDir();
 
   /** Full snapshot (used by SPA profile page header). */
@@ -163,5 +187,142 @@ export function registerProfileRoutes(app: Hono): void {
     if (!slug) return c.json({ error: "missing slug" }, 400);
     const removed = await removeProject(slug, profileDir);
     return c.json({ removed });
+  });
+
+  // ── inferred / inference (LAYER 3) ────────────────────────────────
+
+  /**
+   * Active (non-expired) inferred entries. The SPA shows these on
+   * the Inferred tab; the model reads them via user_profile_read
+   * (which slice="inferred-active" returns the same set).
+   */
+  app.get("/api/profile/inferred", async (c) => {
+    const includeExpired = c.req.query("includeExpired") === "1";
+    const entries = includeExpired
+      ? await readInferred(profileDir)
+      : await readActiveInferred(profileDir);
+    return c.json({ inferred: entries });
+  });
+
+  app.delete("/api/profile/inferred/:id", async (c) => {
+    const id = c.req.param("id");
+    if (!id) return c.json({ error: "missing id" }, 400);
+    const removed = await removeInferred(id, profileDir);
+    return c.json({ removed });
+  });
+
+  /** Disagreed-with claims (blacklist). User-visible audit only. */
+  app.get("/api/profile/disagreed", async (c) => {
+    return c.json({ disagreed: await readDisagreed(profileDir) });
+  });
+
+  /** Pending candidates awaiting approval / rejection. */
+  app.get("/api/profile/inference/pending", async (c) => {
+    return c.json({ pending: await readPendingCandidates(profileDir) });
+  });
+
+  /** Append-only run log — for the SPA to show "last ran X minutes ago". */
+  app.get("/api/profile/inference/runs", async (c) => {
+    const all = await readInferenceRuns(profileDir);
+    // Newest first; cap to 50 — anything older is auditing-only.
+    const tail = all.slice(-50).reverse();
+    return c.json({ runs: tail });
+  });
+
+  /**
+   * Trigger one inference pass. Synchronous (returns when the LLM call
+   * finishes) — keeps the surface dead simple. If the user wants to
+   * cancel mid-flight they reload the page; the AbortSignal here only
+   * fires when the SPA explicitly disconnects (rare for a fetch).
+   *
+   * 503s when no LLM factory is wired.
+   * 400s on bad body (just for forward-compat — currently no body args).
+   */
+  app.post("/api/profile/inference/run", async (c) => {
+    const factory = deps.inferenceLlmFactory;
+    if (!factory) {
+      return c.json(
+        { error: "no LLM provider wired for inference" },
+        503,
+      );
+    }
+    const built = factory();
+    if (!built) {
+      return c.json(
+        { error: "LLM factory returned null (provider not configured)" },
+        503,
+      );
+    }
+    try {
+      const result = await runInference(built.llm, {
+        profileDir,
+        model: built.model,
+        signal: (c.req.raw as any).signal,
+      });
+      return c.json(result);
+    } catch (err: any) {
+      // runInference is supposed to catch everything internally, but
+      // belt-and-suspenders — emit a failed run row too so the SPA
+      // can show it.
+      const runId = "uncaught-" + Date.now();
+      await appendInferenceRun(
+        {
+          runId,
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          status: "failed",
+          error: err?.message ?? String(err),
+          model: built.model,
+        },
+        profileDir,
+      );
+      return c.json(
+        { error: err?.message ?? String(err), runId },
+        500,
+      );
+    }
+  });
+
+  /**
+   * Approve one candidate. Body: { userNote?: string } (the user can
+   * attach an optional edit explaining their take).
+   * Returns the persisted InferredEntry on success, 404 when the
+   * candidate id doesn't exist.
+   */
+  app.post("/api/profile/inference/approve/:id", async (c) => {
+    const id = c.req.param("id");
+    if (!id) return c.json({ error: "missing id" }, 400);
+    let body: any = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      // No body is fine — userNote is optional.
+    }
+    const userNote =
+      typeof body?.userNote === "string" ? body.userNote : undefined;
+    const entry = await approveCandidate(id, { userNote }, profileDir);
+    if (!entry) return c.json({ error: "candidate not found" }, 404);
+    return c.json({ entry });
+  });
+
+  /**
+   * Reject one candidate. Same body shape as approve — the userNote
+   * gets attached to the resulting disagreed entry so future runs see
+   * not just "user said no" but also why.
+   */
+  app.post("/api/profile/inference/reject/:id", async (c) => {
+    const id = c.req.param("id");
+    if (!id) return c.json({ error: "missing id" }, 400);
+    let body: any = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      // optional
+    }
+    const userNote =
+      typeof body?.userNote === "string" ? body.userNote : undefined;
+    const entry = await rejectCandidate(id, { userNote }, profileDir);
+    if (!entry) return c.json({ error: "candidate not found" }, 404);
+    return c.json({ entry });
   });
 }

@@ -18,19 +18,30 @@
  * 2026-06-26.
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   addOwnPaper,
+  approveCandidateApi,
+  fetchActiveInferred,
+  fetchInferenceRuns,
+  fetchPendingCandidates,
+  rejectCandidateApi,
+  removeInferredApi,
   removeOwnPaper,
   removeProject,
+  triggerInferenceRun,
   upsertProject,
   useProfileSnapshot,
+  type InferenceCandidate,
+  type InferenceRunMeta,
+  type InferenceRunResult,
+  type InferredEntry,
   type OwnPaperEntry,
   type ProjectProfileEntry,
 } from "../lib/profile.ts";
 
-type Tab = "papers" | "projects" | "saved";
+type Tab = "papers" | "projects" | "saved" | "inferred";
 
 export default function ProfilePage(): JSX.Element {
   const { state, refresh } = useProfileSnapshot();
@@ -79,6 +90,9 @@ export default function ProfilePage(): JSX.Element {
         <TabButton active={tab === "saved"} onClick={() => setTab("saved")}>
           Saved ({snap.papersCited.length + snap.reactions.length})
         </TabButton>
+        <TabButton active={tab === "inferred"} onClick={() => setTab("inferred")}>
+          Inferred
+        </TabButton>
       </nav>
 
       <div className="flex-1 overflow-y-auto">
@@ -91,6 +105,7 @@ export default function ProfilePage(): JSX.Element {
         {tab === "saved" && (
           <SavedTab citedCount={snap.papersCited.length} />
         )}
+        {tab === "inferred" && <InferredTab />}
       </div>
     </div>
   );
@@ -578,5 +593,311 @@ function EmptyState({
       <p className="font-medium text-slate-700">{title}</p>
       <p className="mx-auto mt-2 max-w-xl text-sm text-slate-500">{body}</p>
     </div>
+  );
+}
+
+// ─── Inferred tab (Phase 3 + 4 surface) ───────────────────────────────
+
+/**
+ * Inferred tab — shows three things:
+ *   - "Run inference" button + status of the most recent run
+ *   - Pending candidates (approve/reject)
+ *   - Active inferred entries (with evidence pills + remove)
+ *
+ * Refresh strategy: after every action that mutates server state
+ * (run / approve / reject / remove) we re-fetch the three lists in
+ * parallel. SSE push would be nicer but is out of scope for the v1
+ * landing.
+ */
+function InferredTab(): JSX.Element {
+  const [pending, setPending] = useState<InferenceCandidate[]>([]);
+  const [active, setActive] = useState<InferredEntry[]>([]);
+  const [runs, setRuns] = useState<InferenceRunMeta[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const [runResult, setRunResult] = useState<InferenceRunResult | null>(null);
+
+  async function reloadAll(): Promise<void> {
+    setLoading(true);
+    setErr(null);
+    try {
+      const [p, a, r] = await Promise.all([
+        fetchPendingCandidates(),
+        fetchActiveInferred(),
+        fetchInferenceRuns(),
+      ]);
+      setPending(p);
+      setActive(a);
+      setRuns(r);
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void reloadAll();
+  }, []);
+
+  async function handleRun(): Promise<void> {
+    setRunning(true);
+    setRunResult(null);
+    setErr(null);
+    try {
+      const result = await triggerInferenceRun();
+      setRunResult(result);
+      await reloadAll();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function handleApprove(id: string): Promise<void> {
+    try {
+      await approveCandidateApi(id);
+      await reloadAll();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    }
+  }
+
+  async function handleReject(id: string): Promise<void> {
+    const note = prompt(
+      "Optional: why is this claim wrong? (used to avoid re-proposing it)",
+    );
+    try {
+      await rejectCandidateApi(id, note ?? undefined);
+      await reloadAll();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    }
+  }
+
+  async function handleRemoveActive(id: string): Promise<void> {
+    if (!confirm("Remove this inferred entry?")) return;
+    try {
+      await removeInferredApi(id);
+      await reloadAll();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    }
+  }
+
+  const lastRun = runs.length > 0 ? runs[0] : null;
+
+  return (
+    <div className="space-y-4">
+      {/* Header — run button + last-run status */}
+      <div className="rounded border border-slate-200 bg-slate-50 p-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium text-slate-800">
+              LLM-inferred preferences (LAYER 3)
+            </p>
+            <p className="mt-0.5 text-xs text-slate-500">
+              Distilled by reading your papers, projects, and PaperCard
+              reactions. Every candidate must cite ≥2 evidence items
+              before mathran will offer it. You approve or reject — nothing
+              writes here without your click.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void handleRun()}
+            disabled={running}
+            className="shrink-0 rounded bg-amber-600 px-3 py-1.5 text-xs text-white hover:bg-amber-700 disabled:opacity-50"
+          >
+            {running ? "Running…" : "Run inference"}
+          </button>
+        </div>
+        {runResult && (
+          <p className="mt-2 text-xs text-slate-600">
+            Last run: <strong>{runResult.status}</strong>
+            {runResult.status === "ok" &&
+              ` — ${runResult.candidates.length} candidate${runResult.candidates.length === 1 ? "" : "s"} proposed`}
+            {runResult.status === "empty" &&
+              " — not enough profile data to distill anything yet"}
+            {runResult.error && ` — ${runResult.error}`}
+          </p>
+        )}
+        {!runResult && lastRun && (
+          <p className="mt-2 text-xs text-slate-500">
+            Last run {new Date(lastRun.startedAt).toLocaleString()} —{" "}
+            <strong>{lastRun.status}</strong>
+            {lastRun.candidateCount !== undefined &&
+              ` (${lastRun.candidateCount} candidates)`}
+            {lastRun.error && ` — ${lastRun.error}`}
+          </p>
+        )}
+      </div>
+
+      {err && (
+        <p className="rounded border border-rose-200 bg-rose-50 p-2 text-xs text-rose-700">
+          {err}
+        </p>
+      )}
+
+      {loading ? (
+        <p className="text-xs text-slate-400">Loading…</p>
+      ) : (
+        <>
+          {/* Pending candidates */}
+          <section>
+            <h3 className="mb-2 text-sm font-semibold text-slate-700">
+              Pending review ({pending.length})
+            </h3>
+            {pending.length === 0 ? (
+              <EmptyState
+                title="No pending candidates"
+                body={
+                  "When inference runs and produces claims, they wait here for " +
+                  "you to approve or reject before mathran starts using them."
+                }
+              />
+            ) : (
+              <ul className="space-y-2">
+                {pending.map((c) => (
+                  <CandidateRow
+                    key={c.id}
+                    candidate={c}
+                    onApprove={() => void handleApprove(c.id)}
+                    onReject={() => void handleReject(c.id)}
+                  />
+                ))}
+              </ul>
+            )}
+          </section>
+
+          {/* Active inferred entries */}
+          <section>
+            <h3 className="mb-2 text-sm font-semibold text-slate-700">
+              Active inferences ({active.length})
+            </h3>
+            {active.length === 0 ? (
+              <EmptyState
+                title="Nothing inferred yet"
+                body={
+                  "Approved claims show up here and are visible to mathran via " +
+                  "user_profile_read('inferred-active') / user_profile_search."
+                }
+              />
+            ) : (
+              <ul className="space-y-2">
+                {active.map((e) => (
+                  <InferredRow
+                    key={e.id}
+                    entry={e}
+                    onRemove={() => void handleRemoveActive(e.id)}
+                  />
+                ))}
+              </ul>
+            )}
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
+
+function CandidateRow({
+  candidate,
+  onApprove,
+  onReject,
+}: {
+  candidate: InferenceCandidate;
+  onApprove: () => void;
+  onReject: () => void;
+}): JSX.Element {
+  return (
+    <li className="rounded border border-amber-200 bg-amber-50 p-3 text-sm">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="font-medium text-slate-800">{candidate.content}</p>
+          <p className="mt-0.5 text-xs text-slate-500">
+            {candidate.kind} · confidence: <strong>{candidate.confidence}</strong>
+          </p>
+          {candidate.evidence.length > 0 && (
+            <div className="mt-1 flex flex-wrap gap-1">
+              {candidate.evidence.map((ev, i) => (
+                <span
+                  key={i}
+                  title={ev.label}
+                  className="rounded bg-white px-1.5 py-0.5 text-[10px] font-mono text-slate-600"
+                >
+                  {ev.ref}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="flex shrink-0 gap-1">
+          <button
+            type="button"
+            onClick={onApprove}
+            className="rounded bg-emerald-600 px-2 py-1 text-xs text-white hover:bg-emerald-700"
+          >
+            Approve
+          </button>
+          <button
+            type="button"
+            onClick={onReject}
+            className="rounded border border-rose-300 bg-white px-2 py-1 text-xs text-rose-700 hover:bg-rose-50"
+          >
+            Reject
+          </button>
+        </div>
+      </div>
+    </li>
+  );
+}
+
+function InferredRow({
+  entry,
+  onRemove,
+}: {
+  entry: InferredEntry;
+  onRemove: () => void;
+}): JSX.Element {
+  return (
+    <li className="rounded border border-slate-200 bg-white p-3 text-sm">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="font-medium text-slate-800">{entry.content}</p>
+          <p className="mt-0.5 text-xs text-slate-500">
+            {entry.kind} · confidence: <strong>{entry.confidence}</strong> ·
+            expires {new Date(entry.expiresAt).toLocaleDateString()}
+          </p>
+          {entry.userNote && (
+            <p className="mt-1 text-xs italic text-slate-600">
+              note: {entry.userNote}
+            </p>
+          )}
+          {entry.evidence.length > 0 && (
+            <div className="mt-1 flex flex-wrap gap-1">
+              {entry.evidence.map((ev, i) => (
+                <span
+                  key={i}
+                  title={ev.label}
+                  className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-mono text-slate-600"
+                >
+                  {ev.ref}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onRemove}
+          className="shrink-0 rounded border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100"
+        >
+          Remove
+        </button>
+      </div>
+    </li>
   );
 }

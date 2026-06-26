@@ -142,3 +142,139 @@ export async function removeProject(slug: string): Promise<void> {
     throw new Error(`removeProject failed: ${text}`);
   }
 }
+
+// ─── Phase 3 — inferred / pending candidates ─────────────────────────
+
+export interface InferenceEvidence {
+  ref: string;
+  label?: string;
+}
+
+export interface InferredEntry {
+  id: string;
+  kind:
+    | "interest"
+    | "method-preference"
+    | "style"
+    | "aversion"
+    | "research-direction";
+  content: string;
+  confidence: "low" | "medium" | "high";
+  evidence: InferenceEvidence[];
+  inferredAt: string;
+  expiresAt: string;
+  userNote?: string;
+}
+
+export interface InferenceCandidate {
+  id: string;
+  kind: InferredEntry["kind"];
+  content: string;
+  confidence: "low" | "medium" | "high";
+  evidence: InferenceEvidence[];
+  runId: string;
+  proposedAt: string;
+}
+
+export interface InferenceRunMeta {
+  runId: string;
+  startedAt: string;
+  finishedAt?: string;
+  status: "running" | "ok" | "failed";
+  candidateCount?: number;
+  error?: string;
+  model?: string;
+}
+
+export interface InferenceRunResult {
+  runId: string;
+  status: "ok" | "failed" | "empty";
+  candidates: InferenceCandidate[];
+  error?: string;
+  inputSummary: {
+    papersOwn: number;
+    papersCited: number;
+    projects: number;
+    reactions: number;
+    disagreed: number;
+  };
+}
+
+export async function fetchActiveInferred(): Promise<InferredEntry[]> {
+  const res = await fetch("/api/profile/inferred");
+  if (!res.ok) throw new Error(await res.text());
+  const data = (await res.json()) as { inferred: InferredEntry[] };
+  return data.inferred ?? [];
+}
+
+export async function fetchPendingCandidates(): Promise<InferenceCandidate[]> {
+  const res = await fetch("/api/profile/inference/pending");
+  if (!res.ok) throw new Error(await res.text());
+  const data = (await res.json()) as { pending: InferenceCandidate[] };
+  return data.pending ?? [];
+}
+
+export async function fetchInferenceRuns(): Promise<InferenceRunMeta[]> {
+  const res = await fetch("/api/profile/inference/runs");
+  if (!res.ok) throw new Error(await res.text());
+  const data = (await res.json()) as { runs: InferenceRunMeta[] };
+  return data.runs ?? [];
+}
+
+export async function triggerInferenceRun(): Promise<InferenceRunResult> {
+  const res = await fetch("/api/profile/inference/run", { method: "POST" });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(
+      typeof data === "object" && data?.error ? data.error : `HTTP ${res.status}`,
+    );
+  }
+  return data as InferenceRunResult;
+}
+
+export async function approveCandidateApi(
+  candidateId: string,
+  userNote?: string,
+): Promise<void> {
+  const res = await fetch(
+    `/api/profile/inference/approve/${encodeURIComponent(candidateId)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(userNote ? { userNote } : {}),
+    },
+  );
+  if (!res.ok) {
+    const text = await res.text().catch(() => `HTTP ${res.status}`);
+    throw new Error(`approve failed: ${text}`);
+  }
+}
+
+export async function rejectCandidateApi(
+  candidateId: string,
+  userNote?: string,
+): Promise<void> {
+  const res = await fetch(
+    `/api/profile/inference/reject/${encodeURIComponent(candidateId)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(userNote ? { userNote } : {}),
+    },
+  );
+  if (!res.ok) {
+    const text = await res.text().catch(() => `HTTP ${res.status}`);
+    throw new Error(`reject failed: ${text}`);
+  }
+}
+
+export async function removeInferredApi(id: string): Promise<void> {
+  const res = await fetch(
+    `/api/profile/inferred/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) {
+    const text = await res.text().catch(() => `HTTP ${res.status}`);
+    throw new Error(`remove failed: ${text}`);
+  }
+}
