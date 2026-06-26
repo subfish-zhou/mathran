@@ -12,7 +12,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
+import { BubbleMarkdownWithPaperCards } from "./BubbleMarkdownWithPaperCards.tsx";
 // v0.17 follow-up: KaTeX + LLM-math-delimiter preprocess registration
 // has moved to `lib/markdown.ts` which is imported once from `main.tsx`.
 // This component no longer needs to register it (was a duplicate /
@@ -3791,11 +3791,16 @@ export default function ChatPanel({
                           {row.bubble.reasoning && showReasoning ? (
                             <ReasoningBlock reasoning={row.bubble.reasoning} />
                           ) : null}
-                          <div
-                            className="md"
-                            dangerouslySetInnerHTML={{
-                              __html: safeRenderMarkdown(row.bubble.text),
-                            }}
+                          {/* 2026-06-26 (user-distillation Phase 2):
+                              detect arXiv/DOI references in the
+                              assistant text and render them as
+                              interactive PaperCards. When zero refs
+                              detected this falls back to the same
+                              dangerouslySetInnerHTML path as before. */}
+                          <BubbleMarkdownWithPaperCards
+                            text={row.bubble.text}
+                            conversationId={conversationId ?? undefined}
+                            bubbleIdx={i}
                           />
                         </>
                       ) : (

@@ -249,6 +249,47 @@ export async function getPaper(workspace: string, id: string): Promise<PaperNode
   );
 }
 
+/**
+ * Look up a PaperNode by arXiv id. Uses the index built by ingestPaper —
+ * never falls back to scanning all nodes.
+ *
+ * 2026-06-26 (user-distillation Phase 2) — added so the SPA can render
+ * a PaperCard for any `arXiv:2401.12345` link mentioned in chat without
+ * the model having to ingest the paper first.
+ */
+export async function getPaperByArxiv(
+  workspace: string,
+  arxivId: string,
+): Promise<PaperNode | null> {
+  return safe(
+    "getPaperByArxiv",
+    async () => {
+      const idx = await readIndex(workspace);
+      const nodeId = idx.arxiv[arxivId];
+      if (!nodeId) return null;
+      return getPaper(workspace, nodeId);
+    },
+    null,
+  );
+}
+
+/** Look up a PaperNode by DOI. Same shape as getPaperByArxiv. */
+export async function getPaperByDoi(
+  workspace: string,
+  doi: string,
+): Promise<PaperNode | null> {
+  return safe(
+    "getPaperByDoi",
+    async () => {
+      const idx = await readIndex(workspace);
+      const nodeId = idx.doi[doi];
+      if (!nodeId) return null;
+      return getPaper(workspace, nodeId);
+    },
+    null,
+  );
+}
+
 export async function listPapers(workspace: string): Promise<PaperNode[]> {
   return safe(
     "listPapers",

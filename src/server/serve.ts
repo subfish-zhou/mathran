@@ -37,6 +37,7 @@ import { registerUploadRoutes } from "./upload-routes.js";
 import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerMemoryRoutes } from "./memory-routes.js";
 import { registerProfileRoutes } from "./profile-routes.js";
+import { registerPaperRoutes } from "./paper-routes.js";
 import { registerSlashRoutes } from "./slash-routes.js";
 import {
   buildUserMessageWithAttachments,
@@ -3779,6 +3780,12 @@ function buildApp(
   // research profile (papers, projects). User-home scoped, no
   // workspace argument — see core/profile/store.ts for rationale.
   registerProfileRoutes(app);
+
+  // 2026-06-26 (user-distillation Phase 2) — paper lookup + ingest +
+  // reactions. Workspace-scoped for paper-graph, user-home-scoped for
+  // reactions (reactions persist across workspaces; the paper graph
+  // is per-workspace). PaperCard rendering depends on both.
+  registerPaperRoutes(app, workspace);
 
   app.get("/api/projects", async (c) => {
     return c.json({ projects: await listProjects(workspace) });
