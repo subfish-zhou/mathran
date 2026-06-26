@@ -590,12 +590,17 @@ export async function flushConversationHistory(
   opts?: { title?: string },
 ): Promise<void> {
   const dir = scopeDir(workspace, scope);
-  // 2026-06-25 audit E7 — serialise the read-modify-write of `.index.json`
-  // so concurrent flushes for sibling convs in the same scope dir can't
-  // tear each other (last write would win, dropping the earlier one's
-  // conv entry). The jsonl write itself is per-conv so it's outside the
-  // lock; only the index update needs serialisation.
-  await flushSession(dir, conversationId, history);
+  // 2026-06-25 audit E7 + H5 — serialise both the jsonl write AND the
+  // .index.json read-modify-write per conv. Two concurrent flushes to
+  // the same conv with different history snapshots would otherwise
+  // atomic-write each independently → last write wins → first snapshot
+  // lost. Per-conv key so sibling convs in the same scope can still
+  // flush in parallel (only their respective jsonls; the index lock is
+  // per-dir below to serialise the index RMW).
+  const jsonlFile = conversationFile(dir, conversationId);
+  await withFileLock(jsonlFile, async () => {
+    await flushSession(dir, conversationId, history);
+  });
   await withIndexLock(dir, async () => {
     const idx = await readIndex(dir);
     const now = new Date().toISOString();
