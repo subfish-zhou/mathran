@@ -64,6 +64,17 @@ export function createInstallPythonPackageTool(
           content: "error: install_python_package requires 'package'",
         };
       }
+      // 2026-06-25 audit I7 — reject pkg specs that start with `-` so the
+      // model can't accidentally pass a pip flag (e.g. `--target=/etc/foo`,
+      // `-r /etc/passwd`) where a package name was expected. URL specs
+      // (git+https://, https://) and PEP 508 markers (name[extras]) are
+      // still allowed because they don't start with `-`.
+      if (pkg.startsWith("-")) {
+        return {
+          ok: false,
+          content: "error: install_python_package 'package' must be a name or URL, not a pip flag",
+        };
+      }
       if (!conversationId) {
         return {
           ok: false,
