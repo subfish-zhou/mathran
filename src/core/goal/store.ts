@@ -36,6 +36,8 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { ChatScope } from "../chat/store.js";
+import { withFileLock } from "../chat/store.js";
+import { atomicWriteFile } from "../chat/atomic-write.js";
 
 const GOALS_DIR = path.join(".mathran", "goals");
 
@@ -323,7 +325,32 @@ export function migrateGoalStats(raw: unknown): Goal["stats"] {
 export async function writeGoal(workspace: string, goal: Goal): Promise<void> {
   const file = goalFileFor(workspace, goal.id);
   await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, JSON.stringify(goal, null, 2) + "\n", "utf-8");
+  // 2026-06-25 audit L6 — atomic write so a crash mid-write can't leave a
+  // truncated/unparseable goal file. fs.writeFile is NOT atomic.
+  await atomicWriteFile(file, JSON.stringify(goal, null, 2) + "\n");
+}
+
+/**
+ * 2026-06-25 audit L6 — atomic read-modify-write on a goal record.
+ * Goal-runner has several read→mutate→write patterns (refresh
+ * summaryPath, append end-reason, etc.). Concurrent updates against the
+ * same goalId (e.g. /interrupt POST racing the round's own write at
+ * completion) would otherwise lose one writer's modifications. Per-file
+ * lock keyed on the goal file path.
+ */
+export async function mutateGoal(
+  workspace: string,
+  goalId: string,
+  mutator: (current: Goal) => Goal | Promise<Goal>,
+): Promise<Goal | null> {
+  const file = goalFileFor(workspace, goalId);
+  return await withFileLock(file, async () => {
+    const current = await readGoal(workspace, goalId);
+    if (!current) return null;
+    const next = await mutator(current);
+    await writeGoal(workspace, next);
+    return next;
+  });
 }
 
 /** List all goals on disk, newest first. */
