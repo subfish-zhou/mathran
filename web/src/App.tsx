@@ -36,6 +36,7 @@ import SettingsLayout from "./components/SettingsLayout.tsx";
 import McpConfigForm from "./components/McpConfigForm.tsx";
 import EffortsPanel from "./components/EffortsPanel.tsx";
 import EffortDocumentPanel from "./components/EffortDocumentPanel.tsx";
+import ProfilePage from "./pages/ProfilePage.tsx";
 
 export default function App() {
   return (
@@ -48,6 +49,10 @@ export default function App() {
             path="/global-chat"
             element={<ChatPanel scope={{ kind: "global" }} scopeLabel="global" />}
           />
+          {/* 2026-06-26 (user-distillation Phase 1) — user-authored
+              profile (own papers + active projects). Read-only to the
+              model; mutations are SPA-driven. */}
+          <Route path="/profile" element={<ProfilePage />} />
           {/* TODO-3 UI #4.B — Settings tabs share a layout shell so all four
               sub-routes get the same top tab bar. Deep-links still work
               because each child <Route> retains its own path. */}
@@ -119,6 +124,9 @@ function GlobalSidebar() {
       </NavLink>
       <NavLink to="/global-chat" className={linkClass}>
         💬 Global chat
+      </NavLink>
+      <NavLink to="/profile" className={linkClass}>
+        👤 Profile
       </NavLink>
       <NavLink to="/settings" className={linkClass}>
         ⚙️ Settings

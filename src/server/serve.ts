@@ -36,6 +36,7 @@ import {
 import { registerUploadRoutes } from "./upload-routes.js";
 import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerMemoryRoutes } from "./memory-routes.js";
+import { registerProfileRoutes } from "./profile-routes.js";
 import { registerSlashRoutes } from "./slash-routes.js";
 import {
   buildUserMessageWithAttachments,
@@ -1376,6 +1377,11 @@ export function defaultSessionFactory(
         // pdftotext" workaround (which destroyed math formulas) with a
         // proper Python pipeline (PyMuPDF4LLM fast / Marker math).
         pdf_extract: true,
+        // 2026-06-26 (user-distillation Phase 1) — let the model read
+        // the user's research profile (papers / projects). No write
+        // tool — all profile mutations go through the SPA so the user
+        // sees and consents to every change.
+        user_profile_read: true,
 
         // git: inspect tools (status / diff / log / show) always on;
         // commit requires explicit opt-in via the cfg block.
@@ -1517,6 +1523,9 @@ export const GOAL_MODE_BUILTIN_TOOLS = {
   grep: true,
   web_fetch: true,
   pdf_extract: true,
+  // 2026-06-26 (user-distillation Phase 1) — goal mode also benefits
+  // from knowing the user's research context. Same read-only contract.
+  user_profile_read: true,
 } as const;
 
 /** Append a short scope hint to the system prompt so the model knows where it is. */
@@ -3765,6 +3774,11 @@ function buildApp(
   // of memory topics so the SPA can show what mathran has stored
   // without going through the model tool path.
   registerMemoryRoutes(app, workspace);
+
+  // 2026-06-26 (user-distillation Phase 1) — user-authored taste +
+  // research profile (papers, projects). User-home scoped, no
+  // workspace argument — see core/profile/store.ts for rationale.
+  registerProfileRoutes(app);
 
   app.get("/api/projects", async (c) => {
     return c.json({ projects: await listProjects(workspace) });

@@ -114,6 +114,7 @@ import { createGoalSendMessageTool } from "./tools/goal-send-message.js";
 import { createProposePlanTool } from "./tools/propose-plan.js";
 import { createMemoryListTool } from "./tools/memory-list.js";
 import { createMemoryReadTool } from "./tools/memory-read.js";
+import { createUserProfileReadTool } from "./tools/user-profile-read.js";
 import { createMemoryWriteTool } from "./tools/memory-write.js";
 import { createMemoryAppendTool } from "./tools/memory-append.js";
 import { createMemorySearchTool } from "./tools/memory-search.js";
@@ -687,6 +688,14 @@ export interface ChatSessionOptions {
     memory_write?: boolean;
     memory_append?: boolean;
     memory_search?: boolean;
+    /**
+     * user-distillation Phase 1 — read-only access to the user's
+     * research profile (papers / projects / taste). User-home scoped,
+     * NOT workspace scoped, so the same profile follows the user
+     * across workspaces. There is intentionally no write-side tool —
+     * see _tasks/user-distillation/PLAN.md.
+     */
+    user_profile_read?: boolean | { profileDir?: string };
     /**
      * gap #3 — per-conversation scratchpad tools. They persist under
      * `<workspace>/.mathran/scratchpad/<convId>/<name>.md`. The conversation id
@@ -1559,6 +1568,14 @@ export class ChatSession {
     }
     if (cfg.memory_search) {
       out.push(createMemorySearchTool(memWorkspace));
+    }
+    // user-distillation Phase 1 — read-only profile access for the model.
+    if (cfg.user_profile_read) {
+      const profileOpts =
+        typeof cfg.user_profile_read === "object" && cfg.user_profile_read.profileDir
+          ? { profileDir: cfg.user_profile_read.profileDir }
+          : {};
+      out.push(createUserProfileReadTool(profileOpts));
     }
     // gap #3 — per-conversation scratchpad tools. The conversation id comes
     // from an explicit override, else the checkpoints conversation id.
