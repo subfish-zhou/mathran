@@ -1858,7 +1858,6 @@ function registerChatScope(
         }
         // Flush the freshly-augmented history to disk before closing the stream.
         await store.flush(scope, conversationId);
-        await store.flush(scope, conversationId);
       } catch (err: any) {
         // v0.16 §11: an `ask_user` round paused itself — not an error,
         // intentional escape. The session has already (a) yielded the

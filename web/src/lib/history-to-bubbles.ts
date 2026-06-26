@@ -128,6 +128,70 @@ function isErrorResult(s: string): boolean {
   return /^\s*error:/i.test(s);
 }
 
+/**
+ * 2026-06-25 audit C8 — parse a successful write_file / edit_file tool
+ * result and synthesise the structured fileWritten metadata the SSE event
+ * would have produced if the stream were still alive. Used by ToolBubble
+ * rehydration on reload so the FileBubble download chip survives a page
+ * refresh. Returns undefined when the result doesn't match the expected
+ * shape (the bubble just renders without a chip — same as pre-refactor).
+ */
+function parseFileWrittenFromResult(
+  toolName: string | undefined,
+  content: string,
+): ToolBubble["fileWritten"] | undefined {
+  if (!content || typeof content !== "string") return undefined;
+  if (toolName !== "write_file" && toolName !== "edit_file") return undefined;
+  const firstLine = content.split(/\r?\n/, 1)[0] ?? "";
+  let path: string | undefined;
+  let bytes = 0;
+  const writeMatch = firstLine.match(/^wrote (\d+) bytes to (.+)$/);
+  if (writeMatch) {
+    bytes = Number(writeMatch[1]) || 0;
+    path = writeMatch[2];
+  } else {
+    const editMatch = firstLine.match(/^edited (.+?): \d+ replacements?$/);
+    if (editMatch) {
+      path = editMatch[1];
+      // edit_file doesn't report file size; chip shows "edited" without bytes
+    }
+  }
+  if (!path) return undefined;
+  const slash = path.lastIndexOf("/");
+  const filename = slash >= 0 ? path.slice(slash + 1) : path;
+  return {
+    path,
+    relPath: filename,
+    filename,
+    bytes,
+    mime: filenameToMime(filename),
+  };
+}
+
+function filenameToMime(filename: string): string {
+  const dot = filename.lastIndexOf(".");
+  if (dot < 0) return "application/octet-stream";
+  const ext = filename.slice(dot).toLowerCase();
+  switch (ext) {
+    case ".md": return "text/markdown";
+    case ".txt": return "text/plain";
+    case ".json": return "application/json";
+    case ".pdf": return "application/pdf";
+    case ".tex": return "application/x-tex";
+    case ".csv": return "text/csv";
+    case ".py": return "text/x-python";
+    case ".ts": case ".tsx": return "text/typescript";
+    case ".js": case ".jsx": return "text/javascript";
+    case ".html": return "text/html";
+    case ".css": return "text/css";
+    case ".png": return "image/png";
+    case ".jpg":
+    case ".jpeg": return "image/jpeg";
+    case ".svg": return "image/svg+xml";
+    default: return "application/octet-stream";
+  }
+}
+
 export function historyToBubbles(history: LLMMessageWire[]): Bubble[] {
   const out: Bubble[] = [];
   for (const m of history) {
@@ -171,10 +235,18 @@ export function historyToBubbles(history: LLMMessageWire[]): Bubble[] {
         : -1;
       if (idx !== -1) {
         const bubble = out[idx] as ToolBubble;
+        const ok = !isErrorResult(m.content);
+        // 2026-06-25 audit C8 — rehydrate the file-written chip on reload
+        // for successful write_file / edit_file calls. The SSE event that
+        // populates this is one-shot; without parsing the persisted tool
+        // result here, refreshing the tab loses the FileBubble download
+        // chip even though /api/file?path=… still works.
+        const fileWritten = ok ? parseFileWrittenFromResult(bubble.name, m.content) : undefined;
         out[idx] = {
           ...bubble,
           result: m.content,
-          ok: !isErrorResult(m.content),
+          ok,
+          ...(fileWritten ? { fileWritten } : {}),
         };
       } else {
         out.push({

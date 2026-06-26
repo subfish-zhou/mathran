@@ -171,6 +171,23 @@ function runPython(args: string[], timeoutMs: number): Promise<RunResult> {
     });
     let stdout = "";
     let stderr = "";
+    // 2026-06-25 audit — cap captured stdio so a runaway Python script
+    // can't OOM the mathran serve process. 4 MB is generous (Marker's
+    // tqdm progress bars stay well under this).
+    const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
+    let killedForCapture = false;
+    const append = (existing: string, chunk: string): string => {
+      const next = existing + chunk;
+      if (next.length > MAX_CAPTURE_BYTES) {
+        if (!killedForCapture) {
+          killedForCapture = true;
+          stderr += `\n(killed: stdio exceeded ${MAX_CAPTURE_BYTES} bytes cap)`;
+          try { child.kill("SIGKILL"); } catch { /* ignore */ }
+        }
+        return next.slice(0, MAX_CAPTURE_BYTES);
+      }
+      return next;
+    };
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       resolve({
@@ -179,11 +196,11 @@ function runPython(args: string[], timeoutMs: number): Promise<RunResult> {
         stderr: stderr + `\n(killed after ${timeoutMs} ms)`,
       });
     }, timeoutMs);
-    child.stdout.on("data", (b) => { stdout += b.toString(); });
-    child.stderr.on("data", (b) => { stderr += b.toString(); });
+    child.stdout.on("data", (b) => { stdout = append(stdout, b.toString()); });
+    child.stderr.on("data", (b) => { stderr = append(stderr, b.toString()); });
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve({ ok: code === 0, stdout, stderr });
+      resolve({ ok: code === 0 && !killedForCapture, stdout, stderr });
     });
     child.on("error", (err) => {
       clearTimeout(timer);

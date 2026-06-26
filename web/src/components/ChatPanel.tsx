@@ -53,6 +53,7 @@ import PlanRunOverlay from "./PlanRunOverlay.tsx";
 import ApprovalDialog from "./ApprovalDialog.tsx";
 import {
   postApprovalDecision,
+  fetchPendingApprovals,
   type ApprovalRequest,
   type ApprovalDecision,
 } from "../lib/approval-client.ts";
@@ -982,7 +983,7 @@ export default function ChatPanel({
       // list on first-ever load is normal; failures are non-fatal.
       fetchTodos(scope, conversationId).catch<TodoList | null>(() => null),
     ])
-      .then(([data, ann, goalLookup, todoList]) => {
+      .then(async ([data, ann, goalLookup, todoList]) => {
         if (cancelled) return;
         // v0.16 §11: if the conversation paused on an `ask_user`, the
         // sidecar carries the pending question keyed by tool-call id.
@@ -1029,6 +1030,25 @@ export default function ChatPanel({
         setBubbles(initialBubbles);
         setAnnotations(ann);
         setOwningGoal(goalLookup ? goalLookup.goal : null);
+        // 2026-06-25 — restore any in-flight approval prompt on conv switch.
+        // SSE delivery is one-shot per stream; without this, switching away
+        // from a channel mid-prompt and back leaves the user with no UI
+        // surface to approve / deny the parked tool call (the server stream
+        // stays blocked indefinitely until reload or stop). Fetch pending
+        // approvals from the server-side registry and pop the first one.
+        try {
+          const pendingApprovals = await fetchPendingApprovals(scope, conversationId);
+          if (!cancelled && pendingApprovals.length > 0) {
+            setPendingApproval(pendingApprovals[0]);
+            setApprovalError(null);
+            setApprovalSubmitting(false);
+          } else if (!cancelled) {
+            // Clear any modal from the previous channel that's not pending here.
+            setPendingApproval(null);
+          }
+        } catch {
+          // Approval restore is best-effort — don't block conversation load.
+        }
         // v0.17 W12 — seed the TODO panel from disk. Reset the
         // collapsed flag too so switching to a fresh conversation
         // starts with the panel visible (matches first-load UX).
@@ -1754,14 +1774,26 @@ export default function ChatPanel({
     // 2026-06-25 — stop the stream associated with the channel currently
     // on screen. Other channels' streams keep running (see bug 5: user
     // expects to come back to their completed answer).
-    if (!conversationId) {
-      // pre-mint case: there's at most one __pre_mint__ entry; abort it.
-      const c = abortByConvIdRef.current.get("__pre_mint__");
-      if (c) c.abort();
-      return;
+    //
+    // Race-safety: between SSE session event re-keying (__pre_mint__ →
+    // server-minted id) and React's render that propagates the new
+    // conversationId into closures, the user might click Stop. In that
+    // brief window the map has the new id but `conversationId` is still
+    // null. Try both keys to cover the race.
+    const candidates: string[] = [];
+    if (conversationId) candidates.push(conversationId);
+    candidates.push("__pre_mint__");
+    // Walk the map to catch the case where conversationIdRef raced ahead
+    // (post-mint but state hasn't propagated). For the multi-channel
+    // case the explicit conversationId match above is what binds Stop
+    // to *this* channel.
+    for (const key of candidates) {
+      const ctrl = abortByConvIdRef.current.get(key);
+      if (ctrl) {
+        ctrl.abort();
+        return;
+      }
     }
-    const c = abortByConvIdRef.current.get(conversationId);
-    if (c) c.abort();
   }
 
   // ─── Send a Live Steer (v0.17 mathub parity W9) ────────────────────
