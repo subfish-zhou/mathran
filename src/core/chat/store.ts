@@ -153,28 +153,34 @@ async function writeIndex(dir: string, idx: ScopeIndex): Promise<void> {
   await fs.rename(tmpPath, finalPath);
 }
 
-// In-process per-dir index lock — chains writeIndex calls so concurrent
-// flush() against the same scope dir can't tear each other's read-
-// modify-write cycle. Map key is the scope dir path; value is the tail
-// of the current chain.
-const indexLocks = new Map<string, Promise<void>>();
-async function withIndexLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
-  const prev = indexLocks.get(dir) ?? Promise.resolve();
+// In-process per-key file lock — chains operations so concurrent
+// read-modify-write cycles against the same disk file can't tear each
+// other. Used for `.index.json` (E7) and annotations sidecars (F3).
+const fileLocks = new Map<string, Promise<void>>();
+async function withFileLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  // Chain on the previous tail. If the prior caller rejected, swallow it
+  // here — the caller already saw the error via its own promise. Without
+  // this catch, the next acquirer would await a rejected promise, never
+  // enter the try block, never release(), and the dir would deadlock
+  // permanently for the rest of the process lifetime.
+  const prev = (fileLocks.get(key) ?? Promise.resolve()).catch(() => undefined);
   let release!: () => void;
   const next = new Promise<void>((r) => {
     release = r;
   });
-  indexLocks.set(dir, prev.then(() => next));
+  fileLocks.set(key, prev.then(() => next));
   try {
     await prev;
     return await fn();
   } finally {
     release();
-    // Cleanup the map when our chain tail is no longer the latest
-    // (a later caller has already replaced it).
-    if (indexLocks.get(dir) === next) indexLocks.delete(dir);
+    if (fileLocks.get(key) === next) fileLocks.delete(key);
   }
 }
+
+// Backwards-compatible alias — earlier audit E7 used withIndexLock with the
+// scope dir as the key. We keep the name for self-documenting call sites.
+const withIndexLock = withFileLock;
 
 function conversationFile(dir: string, conversationId: string): string {
   return path.join(dir, `${conversationId}.jsonl`);
@@ -379,6 +385,28 @@ export async function saveAnnotations(
     annotationsFile(scopeDir(workspace, scope), conversationId),
     JSON.stringify(data, null, 2),
   );
+}
+
+/**
+ * 2026-06-25 audit F3 — atomic read-modify-write on the annotations
+ * sidecar. Two concurrent PATCH annotations / POST react requests for
+ * the same conv would both load -> mutate -> save and the second writer
+ * would clobber the first. Wrap in an in-process per-file lock keyed on
+ * the sidecar path so the modify is serialised.
+ */
+export async function mutateAnnotations(
+  workspace: string,
+  scope: ChatScope,
+  conversationId: string,
+  mutator: (current: ConversationAnnotations) => ConversationAnnotations | Promise<ConversationAnnotations>,
+): Promise<ConversationAnnotations> {
+  const file = annotationsFile(scopeDir(workspace, scope), conversationId);
+  return await withFileLock(file, async () => {
+    const current = await loadAnnotations(workspace, scope, conversationId);
+    const next = await mutator(current);
+    await saveAnnotations(workspace, scope, conversationId, next);
+    return next;
+  });
 }
 
 /**

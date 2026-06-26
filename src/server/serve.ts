@@ -135,6 +135,7 @@ import {
   type ChatScope,
   type ScopedChatSessionFactory,
   loadAnnotations,
+  mutateAnnotations,
   saveAnnotations,
   pruneAnnotationsFrom,
   loadConversationHistory,
@@ -2844,55 +2845,62 @@ function registerChatScope(
       return c.json({ error: "body must be an object" }, 400);
     }
 
-    const current = await loadAnnotations(store.getWorkspace(), scope, id);
-    const existing: MessageAnnotation = current.byBubbleIdx[String(bubbleIdx)] ?? {};
-    const merged: MessageAnnotation = { ...existing };
+    const merged = await mutateAnnotations(
+      store.getWorkspace(),
+      scope,
+      id,
+      (current) => {
+        const existing: MessageAnnotation = current.byBubbleIdx[String(bubbleIdx)] ?? {};
+        const m: MessageAnnotation = { ...existing };
 
-    // Merge each known field. null clears, undefined leaves alone, any
-    // other value overwrites. Whitelist what we accept so a typo doesn't
-    // pollute the sidecar.
-    if ("reactions" in body) {
-      if (body.reactions === null) delete merged.reactions;
-      else if (body.reactions && typeof body.reactions === "object") {
-        merged.reactions = body.reactions;
-      }
-    }
-    if ("pinned" in body) {
-      if (body.pinned === null || body.pinned === false) delete merged.pinned;
-      else if (body.pinned === true) merged.pinned = true;
-    }
-    if ("note" in body) {
-      if (body.note === null || body.note === "") delete merged.note;
-      else if (typeof body.note === "string") merged.note = body.note;
-    }
-    if ("replyTo" in body) {
-      if (body.replyTo === null) delete merged.replyTo;
-      else if (
-        body.replyTo &&
-        typeof body.replyTo === "object" &&
-        Number.isInteger(body.replyTo.bubbleIdx) &&
-        typeof body.replyTo.snippet === "string"
-      ) {
-        merged.replyTo = {
-          bubbleIdx: body.replyTo.bubbleIdx,
-          snippet: body.replyTo.snippet,
-        };
-      }
-    }
+        // Merge each known field. null clears, undefined leaves alone, any
+        // other value overwrites. Whitelist what we accept so a typo doesn't
+        // pollute the sidecar.
+        if ("reactions" in body) {
+          if (body.reactions === null) delete m.reactions;
+          else if (body.reactions && typeof body.reactions === "object") {
+            m.reactions = body.reactions;
+          }
+        }
+        if ("pinned" in body) {
+          if (body.pinned === null || body.pinned === false) delete m.pinned;
+          else if (body.pinned === true) m.pinned = true;
+        }
+        if ("note" in body) {
+          if (body.note === null) delete m.note;
+          else if (typeof body.note === "string") m.note = body.note;
+        }
+        if ("replyTo" in body) {
+          if (body.replyTo === null) delete m.replyTo;
+          else if (
+            body.replyTo &&
+            typeof body.replyTo === "object" &&
+            Number.isInteger(body.replyTo.bubbleIdx) &&
+            typeof body.replyTo.snippet === "string"
+          ) {
+            m.replyTo = {
+              bubbleIdx: body.replyTo.bubbleIdx,
+              snippet: body.replyTo.snippet,
+            };
+          }
+        }
 
-    // If the record went empty (everything cleared) drop the key so the
-    // sidecar stays tidy.
-    const next = { ...current.byBubbleIdx };
-    if (Object.keys(merged).length === 0) {
-      delete next[String(bubbleIdx)];
-    } else {
-      next[String(bubbleIdx)] = merged;
-    }
-    await saveAnnotations(store.getWorkspace(), scope, id, {
-      version: 1,
-      byBubbleIdx: next,
+        // If the record went empty (everything cleared) drop the key so the
+        // sidecar stays tidy.
+        const next = { ...current.byBubbleIdx };
+        if (Object.keys(m).length === 0) {
+          delete next[String(bubbleIdx)];
+        } else {
+          next[String(bubbleIdx)] = m;
+        }
+        return { ...current, version: 1, byBubbleIdx: next };
+      },
+    );
+    return c.json({
+      ok: true,
+      bubbleIdx,
+      annotation: merged.byBubbleIdx[String(bubbleIdx)] ?? {},
     });
-    return c.json({ ok: true, bubbleIdx, annotation: merged });
   });
 
   // ─── UI state PATCH (v0.16 §4) ─────────────────────────────────────
@@ -2975,23 +2983,30 @@ function registerChatScope(
       return c.json({ error: "emoji must be 👍 or 👎" }, 400);
     }
 
-    const current = await loadAnnotations(store.getWorkspace(), scope, id);
-    const existing: MessageAnnotation = current.byBubbleIdx[String(bubbleIdx)] ?? {};
-    const reactions = { ...(existing.reactions ?? {}) };
-    if (reactions[emoji]) delete reactions[emoji];
-    else reactions[emoji] = 1;
-    const merged: MessageAnnotation = { ...existing };
-    if (Object.keys(reactions).length === 0) delete merged.reactions;
-    else merged.reactions = reactions;
+    const result = await mutateAnnotations(
+      store.getWorkspace(),
+      scope,
+      id,
+      (current) => {
+        const existing: MessageAnnotation = current.byBubbleIdx[String(bubbleIdx)] ?? {};
+        const reactions = { ...(existing.reactions ?? {}) };
+        if (reactions[emoji]) delete reactions[emoji];
+        else reactions[emoji] = 1;
+        const m: MessageAnnotation = { ...existing };
+        if (Object.keys(reactions).length === 0) delete m.reactions;
+        else m.reactions = reactions;
 
-    const next = { ...current.byBubbleIdx };
-    if (Object.keys(merged).length === 0) delete next[String(bubbleIdx)];
-    else next[String(bubbleIdx)] = merged;
-    await saveAnnotations(store.getWorkspace(), scope, id, {
-      version: 1,
-      byBubbleIdx: next,
+        const next = { ...current.byBubbleIdx };
+        if (Object.keys(m).length === 0) delete next[String(bubbleIdx)];
+        else next[String(bubbleIdx)] = m;
+        return { ...current, version: 1, byBubbleIdx: next };
+      },
+    );
+    return c.json({
+      ok: true,
+      bubbleIdx,
+      reactions: result.byBubbleIdx[String(bubbleIdx)]?.reactions ?? {},
     });
-    return c.json({ ok: true, bubbleIdx, reactions: merged.reactions ?? {} });
   });
 
   // GET <base>/:conversationId/usage  — token + context-window stats (v0.3 §19)
