@@ -135,7 +135,7 @@ export async function ingestPaper(
           updatedAt: now,
         };
         await fs.mkdir(nodesDir(workspace), { recursive: true });
-        await fs.writeFile(path.join(nodesDir(workspace), `${id}.json`), JSON.stringify(node, null, 2) + "\n", "utf-8");
+        await atomicWriteFile(path.join(nodesDir(workspace), `${id}.json`), JSON.stringify(node, null, 2) + "\n");
 
         if (input.arxivId) index.arxiv[input.arxivId] = id;
         if (input.doi) index.doi[input.doi] = id;

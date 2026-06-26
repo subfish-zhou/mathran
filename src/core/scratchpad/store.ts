@@ -9,6 +9,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { atomicWriteFile } from "../chat/atomic-write.js";
 
 /** Conversation ids and scratchpad names share the same flat-slug rule. */
 const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -62,7 +63,7 @@ export async function writeScratchpad(
 ): Promise<void> {
   const p = scratchpadPath(workspace, convId, name);
   await fs.mkdir(path.dirname(p), { recursive: true });
-  await fs.writeFile(p, content, "utf-8");
+  await atomicWriteFile(p, content);
 }
 
 /** Remove an entire conversation's scratchpad directory. No-op if absent. */

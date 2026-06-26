@@ -6,6 +6,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { atomicWriteFile } from "../chat/atomic-write.js";
 
 const SUBAGENTS_DIR = path.join(".mathran", "subagents");
 
@@ -33,7 +34,7 @@ export async function writeArtifact(
 ): Promise<string> {
   const dir = await createArtifactDir(workspace, runId);
   const abs = path.join(dir, name);
-  await fs.writeFile(abs, content);
+  await atomicWriteFile(abs, content);
   return toPosix(path.relative(workspace, abs));
 }
 

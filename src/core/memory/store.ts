@@ -10,6 +10,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { atomicWriteFile } from "../chat/atomic-write.js";
 
 /** Match for a single search hit returned by {@link searchTopics}. */
 export interface MemorySearchHit {
@@ -82,7 +83,9 @@ export async function writeTopic(
 ): Promise<void> {
   const p = topicPath(workspace, topic);
   await fs.mkdir(path.dirname(p), { recursive: true });
-  await fs.writeFile(p, content, "utf-8");
+  // 2026-06-25 audit O1 — atomic write so a crash can't truncate the
+  // memory topic. Memory is persistent across sessions.
+  await atomicWriteFile(p, content);
 }
 
 /** Append a single line to a topic, creating it if needed. */

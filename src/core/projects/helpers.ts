@@ -18,6 +18,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { isSafeSlug, projectDirFor } from "../wiki/store.js";
+import { atomicWriteFile } from "../chat/atomic-write.js";
 
 export const PROJECTS_DIR = "projects";
 export const DOCS_DIR = "docs";
@@ -153,7 +154,7 @@ export async function updateProjectMetadata(
   if (!mutated) {
     throw new Error("no recognised fields to update (name/description/tags)");
   }
-  await fs.writeFile(file, stringifyToml(toml), "utf-8");
+  await atomicWriteFile(file, stringifyToml(toml));
   return toml;
 }
 
@@ -232,7 +233,7 @@ export async function createDocPage(
   await fs.mkdir(dir, { recursive: true });
   const file = path.join(dir, `${page}.md`);
   if (await pathExists(file)) throw new Error(`doc page already exists: ${page}`);
-  await fs.writeFile(file, body, "utf-8");
+  await atomicWriteFile(file, body);
   return { page, bytes: Buffer.byteLength(body, "utf-8") };
 }
 
@@ -247,6 +248,6 @@ export async function updateDocPage(
   if (!isSafeSlug(page)) throw new Error(`invalid doc page slug: ${page}`);
   const file = path.join(docsDirFor(workspace, slug), `${page}.md`);
   if (!(await pathExists(file))) throw new Error(`doc page not found: ${page}`);
-  await fs.writeFile(file, body, "utf-8");
+  await atomicWriteFile(file, body);
   return { page, bytes: Buffer.byteLength(body, "utf-8") };
 }

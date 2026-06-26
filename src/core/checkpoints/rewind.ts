@@ -16,6 +16,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { atomicWriteFile } from "../chat/atomic-write.js";
 
 import {
   readCheckpoint,
@@ -126,7 +127,10 @@ async function applyCheckpointBefore(
     const before = file.before;
     if (before.kind === "text") {
       await fs.mkdir(path.dirname(abs), { recursive: true });
-      await fs.writeFile(abs, before.content, "utf-8");
+      // 2026-06-25 audit O1 — atomic restore so a crash mid-rewind can't
+      // truncate the user's file (worst case: partial restore where the
+      // file is neither original nor checkpoint snapshot).
+      await atomicWriteFile(abs, before.content);
       results.push({ path: file.path, action: "restored" });
     } else if (before.kind === "absent") {
       try {
