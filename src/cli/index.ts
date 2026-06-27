@@ -174,6 +174,23 @@ projectCmd
     process.exit(await runReadReport(slug, { workspace: opts.workspace, json: opts.json }));
   });
 
+// `mathran project upgrade-to-v3 <slug>` — re-run the v3 pipeline on an
+// existing v1 project (preserves the old wiki/ and efforts/ first).
+projectCmd
+  .command("upgrade-to-v3")
+  .description("Re-run the v3 pipeline on an existing project (preserves wiki.v1/ and efforts.v1/)")
+  .argument("<slug>", "Project slug")
+  .option("--workspace <dir>", "Workspace root (overrides MATHRAN_WORKSPACE and the default)")
+  .option("--serve-url <url>", "Serve URL (default http://127.0.0.1:7878)")
+  .option("--writer-model <id>", "Writer model for the writer-reviewer loop (default openai/gpt-5.5)")
+  .option("--reviewer-model <id>", "Reviewer model for the writer-reviewer loop (default anthropic/opus-4.8)")
+  .option("--timeout-sec <n>", "Max seconds to wait for completion (default 1800)", (v) => parseInt(v, 10))
+  .option("--json", "Emit raw NDJSON events instead of pretty-printing", false)
+  .action(async (slug: string, opts: { workspace?: string; serveUrl?: string; writerModel?: string; reviewerModel?: string; timeoutSec?: number; json?: boolean }) => {
+    const { runUpgradeToV3 } = await import("./commands/project-upgrade.js");
+    process.exit(await runUpgradeToV3(slug, opts));
+  });
+
 // `mathran project plan <description>` — formalize a problem with the Plan
 // Agent (W1-γ) before optionally proceeding to AI-assisted init.
 projectCmd
