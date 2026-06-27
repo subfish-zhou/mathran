@@ -28,6 +28,7 @@ import type {
   PaperAssociation,
   ProjectPaperInput,
   PaperGraphIndex,
+  PaperRead,
 } from "./types.js";
 
 export function paperGraphDir(workspace: string): string {
@@ -36,6 +37,10 @@ export function paperGraphDir(workspace: string): string {
 
 function nodesDir(workspace: string): string {
   return path.join(paperGraphDir(workspace), "nodes");
+}
+
+function readsDir(workspace: string): string {
+  return path.join(paperGraphDir(workspace), "reads");
 }
 
 function citationsFile(workspace: string): string {
@@ -146,6 +151,95 @@ export async function ingestPaper(
     null,
   );
 }
+/**
+ * Overwrite a PaperNode file verbatim. Used by post-hoc annotators (e.g. the
+ * rigor pipeline writing `rigor`/`quality`/`citationCount` onto an existing
+ * node) where dedup-by-index is not needed. Returns true on success.
+ */
+export async function writePaperRaw(workspace: string, node: PaperNode): Promise<boolean> {
+  return safe(
+    "writePaperRaw",
+    async () => {
+      await fs.mkdir(nodesDir(workspace), { recursive: true });
+      await atomicWriteFile(
+        path.join(nodesDir(workspace), `${sanitizeId(node.id)}.json`),
+        JSON.stringify(node, null, 2) + "\n",
+      );
+      return true;
+    },
+    false,
+  );
+}
+
+// ── PaperRead persistence (reads/<paperId>.json) ─────────────────────────────
+
+/** Write a PaperRead atomically to reads/<paperId>.json. Never throws. */
+export async function writePaperReadFile(workspace: string, read: PaperRead): Promise<boolean> {
+  return safe(
+    "writePaperReadFile",
+    async () => {
+      await fs.mkdir(readsDir(workspace), { recursive: true });
+      await atomicWriteFile(
+        path.join(readsDir(workspace), `${sanitizeId(read.paperId)}.json`),
+        JSON.stringify(read, null, 2) + "\n",
+      );
+      return true;
+    },
+    false,
+  );
+}
+
+/** Read a PaperRead from reads/<paperId>.json. Returns null if absent/malformed. */
+export async function readPaperReadFile(workspace: string, paperId: string): Promise<PaperRead | null> {
+  return safe(
+    "readPaperReadFile",
+    async () => {
+      try {
+        const raw = await fs.readFile(
+          path.join(readsDir(workspace), `${sanitizeId(paperId)}.json`),
+          "utf-8",
+        );
+        return JSON.parse(raw) as PaperRead;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+        throw err;
+      }
+    },
+    null,
+  );
+}
+
+/** Delete reads/<paperId>.json. Idempotent — missing file is not an error. */
+export async function deletePaperReadFile(workspace: string, paperId: string): Promise<boolean> {
+  return safe(
+    "deletePaperReadFile",
+    async () => {
+      await fs.rm(path.join(readsDir(workspace), `${sanitizeId(paperId)}.json`), { force: true });
+      return true;
+    },
+    false,
+  );
+}
+
+/** Enumerate paperIds that have a persisted read under reads/. */
+export async function listPaperReadIds(workspace: string): Promise<string[]> {
+  return safe(
+    "listPaperReadIds",
+    async () => {
+      let entries: string[];
+      try {
+        entries = await fs.readdir(readsDir(workspace));
+      } catch {
+        return [];
+      }
+      return entries
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => name.slice(0, -".json".length));
+    },
+    [],
+  );
+}
+
 /** Append a citation edge. Returns true on success (or duplicate), false on failure. */
 export async function ingestCitation(
   workspace: string,

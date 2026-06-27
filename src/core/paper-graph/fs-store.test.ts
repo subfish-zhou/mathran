@@ -12,6 +12,7 @@ import {
   listPapers,
   listCitations,
   getProjectPapers,
+  writePaperRaw,
   paperGraphDir,
 } from "./fs-store.js";
 
@@ -75,6 +76,56 @@ describe("paper-graph fs ingest", () => {
 
   it("returns null for a missing node", async () => {
     expect(await getPaper(workspace, "arxiv-nope")).toBeNull();
+  });
+
+  it("round-trips PaperNode with rigor and quality fields", async () => {
+    const id = await ingestPaper(workspace, {
+      title: "Rigor target",
+      authors: ["A"],
+      arxivId: "2401.99999",
+    });
+    const node = await getPaper(workspace, id!);
+    expect(node).not.toBeNull();
+    const ok = await writePaperRaw(workspace, {
+      ...node!,
+      rigor: {
+        verdict: "trusted",
+        score: 8,
+        flags: [],
+        pass: "fine",
+        checkedAt: new Date().toISOString(),
+        sourceRead: "tex",
+      },
+      quality: "trusted",
+      citationCount: 42,
+    });
+    expect(ok).toBe(true);
+    const reloaded = await getPaper(workspace, id!);
+    expect(reloaded?.rigor?.verdict).toBe("trusted");
+    expect(reloaded?.rigor?.score).toBe(8);
+    expect(reloaded?.rigor?.pass).toBe("fine");
+    expect(reloaded?.rigor?.sourceRead).toBe("tex");
+    expect(reloaded?.quality).toBe("trusted");
+    expect(reloaded?.citationCount).toBe(42);
+  });
+
+  it("loads legacy PaperNode without rigor/quality fields", async () => {
+    const dir = path.join(paperGraphDir(workspace), "nodes");
+    await fs.mkdir(dir, { recursive: true });
+    const legacy = {
+      id: "arxiv-legacy.0001",
+      title: "Legacy node",
+      authors: ["L"],
+      isSurvey: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await fs.writeFile(path.join(dir, "arxiv-legacy.0001.json"), JSON.stringify(legacy, null, 2));
+    const node = await getPaper(workspace, "arxiv-legacy.0001");
+    expect(node?.title).toBe("Legacy node");
+    expect(node?.rigor).toBeUndefined();
+    expect(node?.quality).toBeUndefined();
+    expect(node?.citationCount).toBeUndefined();
   });
 });
 
