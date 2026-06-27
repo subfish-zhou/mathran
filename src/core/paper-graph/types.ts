@@ -24,6 +24,9 @@ export interface PaperNodeInput {
    * verbatim when present so the schema is forward-compatible.
    */
   embedding?: number[];
+  rigor?: RigorAudit;
+  quality?: QualityTier;
+  citationCount?: number;
 }
 
 export interface ProjectPaperInput {
@@ -49,6 +52,9 @@ export interface PaperNode {
   categories?: string[];
   isSurvey: boolean;
   embedding?: number[];
+  rigor?: RigorAudit;
+  quality?: QualityTier;
+  citationCount?: number;            // populated opportunistically when known
   createdAt: string;
   updatedAt: string;
 }
@@ -74,4 +80,125 @@ export interface PaperAssociation {
 export interface PaperGraphIndex {
   arxiv: Record<string, string>;
   doi: Record<string, string>;
+}
+
+// ── Rigor audit verdict from the init-project pipeline. ──────────────
+export type RigorVerdict =
+  | "trusted"        // passed both coarse + fine, OR exempt (seed/vendored/highly-cited)
+  | "warn"           // coarse flagged but fine not yet run, OR fine found minor issues
+  | "rejected"       // fine pass confirmed pseudoscience; paper will be hard-deleted
+  | "skipped";       // OCR-only source or rigor disabled; held with neutral trust
+
+export type QualityTier =
+  | "trusted"        // default for normal arxiv papers
+  | "seed"           // user explicitly seeded — bypass rigor
+  | "vendored"       // present under refs/<dir>/00README.json — bypass rigor
+  | "suspect";       // rigor wants to delete but was held by a guard
+
+export interface RigorAudit {
+  verdict: RigorVerdict;
+  score?: number;                  // 0-10; 10 = airtight; ≤3 = reject
+  flags: string[];
+  reason?: string;                 // ≤500 chars, human-readable
+  pass: "coarse" | "fine";
+  checkedAt: string;               // ISO8601
+  sourceRead?: "abstract" | "tex" | "pdf" | "ocr";
+}
+
+// ── PaperRead: the agent's persistent multi-pass notes on one paper. ──
+export interface PaperReadSkim {
+  oneLineSummary: string;          // ≤200 chars
+  mainContribution: string;        // 2-4 sentences
+  sectionOutline: Array<{ level: 1 | 2 | 3; title: string }>;
+  decision: "study" | "skim_sufficient" | "discard";
+  decisionReason: string;
+}
+
+export interface PaperReadMainResult {
+  label: string;                   // "Theorem 1.1", "Main Theorem", "Lemma 3.2"
+  statement: string;               // verbatim LaTeX, no \cdots truncation
+  whereInPaper: string;            // "§3, p. 12"
+  noveltyVsPrior: string;          // "Improves on Tao 2012 by..."
+}
+
+export interface PaperReadTechnique {
+  name: string;                    // "Vaughan identity", "large sieve"
+  role: string;                    // "Used to handle Type II sums"
+}
+
+export interface PaperReadDependency {
+  claim: string;                   // verbatim if short, else faithful paraphrase
+  source: string;                  // arxiv id / DOI / author-year
+  whereUsed: string;               // "Lemma 2.4 of this paper"
+}
+
+export interface PaperReadBody {
+  mainResults: PaperReadMainResult[];
+  proofStrategy: string;           // 1-3 paragraphs of high-level idea
+  keyTechniques: PaperReadTechnique[];
+  technicalDependencies: PaperReadDependency[];
+  novelContributions: string;
+  standardMaterial: string;
+  hardSteps: string[];
+  role:
+    | "milestone"
+    | "refinement"
+    | "technique_origin"
+    | "barrier"
+    | "bridge"
+    | "survey"
+    | "computation"
+    | "dead_end"
+    | "foundational";
+}
+
+export interface PaperReadOutgoingCitation {
+  citedTitle?: string;
+  citedAuthors?: string[];
+  citedYear?: number;
+  citedArxivId?: string;
+  citedDoi?: string;
+  contextInThisPaper: string;
+  importanceToThisPaper: "essential" | "supporting" | "passing";
+}
+
+/** Survey-specific distillation (only populated for isSurvey=true reads). */
+export interface PaperReadSurveyDistillation {
+  coveredSubAreas: string[];
+  keyReferences: Array<{
+    author: string;
+    year: number;
+    title: string;
+    arxivId?: string;
+    whyTheSurveyHighlighted: string;
+  }>;
+  surveyAuthorOpinion?: string;
+  surveyOutline?: Array<{ heading: string; summary: string }>;
+}
+
+export interface PaperRead {
+  paperId: string;
+  arxivId?: string;
+  doi?: string;
+  sourceKind: "tex" | "pdf-text" | "html" | "abstract-only";
+  sourceBytes: number;
+  sourcePath?: string;
+  truncated: boolean;
+
+  skim: PaperReadSkim;
+  read?: PaperReadBody;
+  audit?: RigorAudit;
+  outgoingCitations: PaperReadOutgoingCitation[];
+
+  isSurvey: boolean;
+  surveyDistillation?: PaperReadSurveyDistillation;
+
+  modelUsed: string;               // e.g. "anthropic/claude-sonnet-4"
+  promptVersion: string;           // bumped when prompt template changes; invalidates cache
+  passesCompleted: ("skim" | "read" | "audit")[];
+  totalLlmCalls: number;
+  totalTokensIn: number;
+  totalTokensOut: number;
+  createdAt: string;               // ISO8601
+  updatedAt: string;               // ISO8601
 }
