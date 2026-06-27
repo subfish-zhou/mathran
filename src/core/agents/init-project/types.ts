@@ -31,7 +31,6 @@ export interface ParsedReference {
 export interface AiInitConfig {
   enableWiki: boolean;
   enableWorkspace: boolean;
-  searchDepth: "quick" | "standard" | "deep";
   /**
    * Opt into the Spine-First pipeline (v1b). When false (default) the v1a
    * 4-phase path runs unchanged.

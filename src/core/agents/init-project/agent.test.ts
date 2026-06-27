@@ -7,7 +7,7 @@ import * as os from "node:os";
 import { runInitAgent, extractJSON, extractArxivId, type InitAgentContext } from "./agent.js";
 import { createRun, readRunLedger } from "./runs-ledger.js";
 import { getProjectPapers, listPapers } from "../../paper-graph/index.js";
-import type { InitAgentInput, CrawledResource } from "./types.js";
+import type { InitAgentInput, CrawledResource, AiInitConfig } from "./types.js";
 import type { LLMProvider, LLMRequest, LLMResponse, LLMStreamChunk } from "../../providers/llm.js";
 
 /** Fake LLM that returns canned replies keyed by prompt content. */
@@ -63,7 +63,7 @@ function makeInput(overrides: Partial<InitAgentInput> = {}): InitAgentInput {
         abstract: "Bounded gaps proof.",
       },
     ],
-    aiInit: { enableWiki: true, enableWorkspace: true, searchDepth: "standard" },
+    aiInit: { enableWiki: true, enableWorkspace: true },
     ...overrides,
   };
 }
@@ -122,6 +122,16 @@ describe("extractJSON", () => {
   });
   it("returns null on garbage", () => {
     expect(extractJSON("not json")).toBeNull();
+  });
+});
+
+describe("AiInitConfig", () => {
+  it("type no longer accepts searchDepth", () => {
+    const cfg: AiInitConfig = { enableWiki: true, enableWorkspace: true, useSpine: true };
+    // @ts-expect-error — searchDepth must be a type error now
+    const bad: AiInitConfig = { enableWiki: true, enableWorkspace: true, useSpine: true, searchDepth: "deep" };
+    void bad;
+    expect(cfg.useSpine).toBe(true);
   });
 });
 
@@ -197,22 +207,6 @@ describe("runInitAgent — full pipeline", () => {
     const result = await runInitAgent(makeInput(), ctx({ llm }));
     expect(result.summary.queriesRun).toBeGreaterThan(0);
     expect(calls).toBeGreaterThan(0);
-  });
-
-  it("respects searchDepth=quick (≤2 queries)", async () => {
-    await createRun(projectDir, { runId: "run-test01" });
-    const seen: string[] = [];
-    const result = await runInitAgent(
-      makeInput({ aiInit: { enableWiki: true, enableWorkspace: false, searchDepth: "quick" } }),
-      ctx({
-        searchArxiv: async (q) => {
-          seen.push(q);
-          return ARXIV_RESULT;
-        },
-      }),
-    );
-    expect(result.summary.queriesRun).toBeLessThanOrEqual(2);
-    expect(seen.length).toBeLessThanOrEqual(2);
   });
 
   it("handles an empty seed reference list (e2e empty problem)", async () => {

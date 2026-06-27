@@ -92,11 +92,6 @@ export interface InitAgentContext {
   fetchNeighbors?: (paper: PaperNode) => Promise<NeighborPaper[]>;
 }
 
-const DEPTH_PARAMS: Record<string, { maxQueries: number; perQuery: number }> = {
-  quick: { maxQueries: 2, perQuery: 3 },
-  standard: { maxQueries: 4, perQuery: 5 },
-  deep: { maxQueries: 8, perQuery: 8 },
-};
 
 /** Consume an LLM stream and return concatenated text. */
 async function collectText(stream: AsyncIterable<LLMStreamChunk>): Promise<string> {
@@ -267,7 +262,6 @@ export async function runInitAgent(
   const fetchWiki = ctx.fetchWikipediaSummary ?? ((t) => realFetchWiki(t));
   const fetchArxivById = ctx.fetchArxivById ?? ((id: string) => realFetchArxivById(id));
   const rateDelay = ctx.rateDelayMs ?? ARXIV_RATE_DELAY;
-  const depth = DEPTH_PARAMS[input.aiInit.searchDepth] ?? DEPTH_PARAMS.standard!;
 
   const summary = {
     conceptsExtracted: 0,
@@ -339,9 +333,10 @@ export async function runInitAgent(
     if (queries.length === 0) {
       // Fallback: derive queries from the problem title + tags so deep_crawl
       // still has something to chew on even if the LLM call failed.
-      queries = [input.problem.title, ...(input.problem.tags ?? [])].filter(Boolean).slice(0, depth.maxQueries);
+      queries = [input.problem.title, ...(input.problem.tags ?? [])].filter(Boolean);
     }
-    queries = queries.slice(0, depth.maxQueries);
+    // keep all generated queries; concept-extraction prompt already returns a sensible count.
+    queries = queries.filter((q): q is string => typeof q === "string" && q.trim().length > 0);
     summary.conceptsExtracted = concepts.length;
 
     await writeCheckpoint(projectDir, runId, "seed_research", {
@@ -363,7 +358,7 @@ export async function runInitAgent(
     for (let i = 0; i < queries.length; i++) {
       const query = queries[i]!;
       try {
-        const found = await searchArxiv(query, depth.perQuery);
+        const found = await searchArxiv(query, 20);
         summary.queriesRun += 1;
         for (const r of found) {
           if (r.arxivId && seenArxiv.has(r.arxivId)) continue;
@@ -476,7 +471,6 @@ async function runInitAgentSpine(
   const searchArxiv = ctx.searchArxiv ?? ((q, n) => realSearchArxiv(q, n));
   const fetchArxivById = ctx.fetchArxivById ?? ((id: string) => realFetchArxivById(id));
   const rateDelay = ctx.rateDelayMs ?? ARXIV_RATE_DELAY;
-  const depth = DEPTH_PARAMS[input.aiInit.searchDepth] ?? DEPTH_PARAMS.standard!;
   const spineLLM = makeSpineLLM(llm, model);
 
   // Forward spine pipeline events into the runs ledger as logs (fire-and-forget;
@@ -541,9 +535,10 @@ async function runInitAgentSpine(
     );
     await appendLog(projectDir, runId, "seed_ingest", `ingested ${seedResult.ingested.length} seeds (${seedResult.failed} failed)`);
 
+    const KEYWORD_CAP = 8;
     const keywords = [input.problem.title, ...(input.problem.tags ?? [])]
       .filter((k): k is string => typeof k === "string" && k.trim().length > 0)
-      .slice(0, Math.max(1, Math.min(5, depth.maxQueries)));
+      .slice(0, KEYWORD_CAP);
 
     const explore = await explorePaperGraph(
       {

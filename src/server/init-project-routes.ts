@@ -93,11 +93,9 @@ function coerceSeedPdfs(raw: unknown): string[] {
 
 function coerceAiInit(raw: unknown): AiInitConfig {
   const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-  const depth = r.searchDepth;
   return {
     enableWiki: r.enableWiki !== false,
     enableWorkspace: r.enableWorkspace !== false,
-    searchDepth: depth === "quick" || depth === "deep" ? depth : "standard",
     useSpine: r.useSpine === true,
   };
 }
@@ -157,7 +155,6 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
       input: {
         title: problem.title,
         seeds: seedReferences.length,
-        searchDepth: aiInit.searchDepth,
         // Full input snapshot so a later /resume can reconstruct the run.
         problem: problem as unknown as Record<string, unknown>,
         seedReferences: seedReferences as unknown as Record<string, unknown>[],
