@@ -37,47 +37,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 // ── PriorArtCorpus (DESIGN-REFERENCE §3.3) ───────────────────────────────────
-// Defined here so the reading loop is self-contained and unit-testable without
-// a hard dependency on the (concurrently-developed) `prior-art/` module. The
-// shape mirrors §3.3 exactly; `prior-art/index.ts` produces this same shape.
-export interface PriorArtCorpus {
-  surveys: Array<{
-    paperId: string;
-    title: string;
-    authors: string[];
-    year?: number;
-    source: "arxiv" | "bourbaki" | "annual-review" | "lecture-notes-pdf";
-    confidence: number;
-    why: string;
-  }>;
-  expositoryAnswers: Array<{
-    url: string;
-    title: string;
-    author: string;
-    score: number;
-    excerpt: string;
-    confidence: number;
-  }>;
-  /**
-   * Canonical landmark papers proposed by the LLM and resolved via arxiv +
-   * Crossref. The full shape lives in `prior-art/canonical-landmarks-search.ts`;
-   * this loose type is the structural projection the reading loop / report
-   * consume. Optional + permissive because two PriorArtCorpus declarations
-   * coexist (this one + prior-art/index.ts) and the field flows opaquely
-   * between them.
-   */
-  canonicalLandmarks?: Array<{
-    title: string;
-    authors: string[];
-    year?: number;
-    venue?: string;
-    why: string;
-    arxivId?: string;
-    doi?: string;
-    crossrefVenue?: string;
-    crossrefYear?: number;
-  }>;
-}
+// Re-exported from prior-art/index.ts so there is ONE source of truth. This
+// used to be a separate local copy (with subtly different `source` enums and
+// no `rawHit` field) bridged via `as PriorArtCorpus` casts in agent.ts — a
+// silent source of drift bugs every time someone added a field to one side
+// but not the other. Unified 2026-06-27 per 子鱼's structural cleanup request.
+export type { PriorArtCorpus } from "./prior-art/index.js";
+import type { PriorArtCorpus } from "./prior-art/index.js";
 
 // ── Public API ───────────────────────────────────────────────────────────────
 

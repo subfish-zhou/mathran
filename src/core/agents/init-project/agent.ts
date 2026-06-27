@@ -612,7 +612,7 @@ async function runInitAgentSpine(
         });
       });
     try {
-      priorArt = (await discoverFn({
+      priorArt = await discoverFn({
         workspace,
         projectDir,
         problem: {
@@ -624,7 +624,7 @@ async function runInitAgentSpine(
           slug,
         },
         llm: priorArtLLM,
-      })) as PriorArtCorpus | null;
+      });
     } catch (err) {
       await appendLog(projectDir, runId, "prior_art", `discoverPriorArt failed (continuing): ${errMsg(err)}`);
       priorArt = null;
@@ -1463,7 +1463,7 @@ export async function resumeInitAgent(
       // original's 8). loadPriorArt returns null when nothing was persisted,
       // which preserves the prior behaviour.
       const { loadPriorArt } = await import("./prior-art/index.js");
-      const reloadedPriorArt = (await loadPriorArt(ctx.workspace, slug)) as PriorArtCorpus | null;
+      const reloadedPriorArt = await loadPriorArt(ctx.workspace, slug);
       pages = await runWikiSynthesis({
         spine,
         reads: await reloadReads(ctx.workspace),
