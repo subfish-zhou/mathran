@@ -299,4 +299,26 @@ describe("runReadingLoop", () => {
     expect(result.convergence.reason).toBe("queue_exhausted");
     expect(result.convergence.consecutiveEmptyRounds).toBeGreaterThanOrEqual(1);
   });
+
+  it("(i) within the same priority band, reads the EARLIEST year first (chronological tiebreaker)", async () => {
+    // Three user-supplied seeds, ingested in REVERSE chronological order.
+    // The chronological tiebreaker (within PRIORITY_SEED) should still pop
+    // Brun 1920 → Selberg 1950 → Chen 1973 so the reader sees the
+    // methodological lineage in the order it actually unfolded.
+    const chenId = await ingest({ arxivId: "chen-1973", title: "Chen", year: 1973 });
+    const selbergId = await ingest({ arxivId: "selberg-1950", title: "Selberg", year: 1950 });
+    const brunId = await ingest({ arxivId: "brun-1920", title: "Brun", year: 1920 });
+
+    const order: string[] = [];
+    const deps: ReadingLoopDeps = {
+      readPaper: async (node) => {
+        order.push(node.id);
+        return makeRead(node, { novel: "novel", cites: [] });
+      },
+    };
+
+    // Seeds intentionally listed in reverse-chronological order in the input.
+    await runReadingLoop(baseConfig({ seedPaperIds: [chenId, selbergId, brunId] }), deps);
+    expect(order).toEqual([brunId, selbergId, chenId]);
+  });
 });

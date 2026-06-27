@@ -45,6 +45,30 @@ export interface ReadPaperCtx {
   fetchArxivSource?: typeof import("../../../paper-graph/arxiv-source.js").fetchArxivSource;
   runPdfToText?: (pdfPath: string) => Promise<string | null>;
   rateDelayMs?: number;
+  /**
+   * Lineage context (层 0 from 2026-06-27 narrative-ordering work): the reader
+   * is told which papers have ALREADY been read in this run, in chronological
+   * order, with a one-line summary each. This lets the reader frame the current
+   * paper as "what does this add on top of those" instead of as an isolated
+   * artifact, so Chen 1973 can talk about "in the Pan 1+3 framework" instead
+   * of restating sieve theory from scratch.
+   * Empty array (default) preserves current behaviour for callers that don't
+   * collect lineage (e.g. unit tests).
+   */
+  priorReads?: PriorReadSummary[];
+}
+
+/** One-line digest of a previously-read paper, for lineage context. */
+export interface PriorReadSummary {
+  paperId: string;
+  title: string;
+  /** First author / corresponding name. Empty when unknown. */
+  firstAuthor: string;
+  year?: number;
+  /** From PaperRead.skim.oneLineSummary — the model's own 1-sentence framing. */
+  oneLineSummary: string;
+  /** From PaperRead.skim.mainContribution — the headline result, when distinct. */
+  mainContribution?: string;
 }
 
 function isStudyRegime(source: LoadedSource): "A" | "B" | "C" {
@@ -58,7 +82,11 @@ function isStudyRegime(source: LoadedSource): "A" | "B" | "C" {
 async function runRead(
   regime: "A" | "B" | "C",
   args: { paper: PaperNode; source: LoadedSource; skim: PaperReadSkim; problemTitle: string },
-  deps: { llm: SpineLLM; emitLog?: (m: string) => void },
+  deps: {
+    llm: SpineLLM;
+    emitLog?: (m: string) => void;
+    priorReads?: PriorReadSummary[];
+  },
 ): Promise<{ body: PaperReadBody; llmCalls: number }> {
   // Regime B may issue N+1 calls (section-by-section); A and C issue 1.
   if (regime === "B") {
@@ -152,7 +180,7 @@ export async function readPaper(paper: PaperNode, ctx: ReadPaperCtx): Promise<Pa
   try {
     const regime = isStudyRegime(source);
     log(`[read] regime ${regime} for "${paper.title}"`);
-    const res = await runRead(regime, { paper, source, skim, problemTitle }, { llm, emitLog });
+    const res = await runRead(regime, { paper, source, skim, problemTitle }, { llm, emitLog, priorReads: ctx.priorReads });
     body = res.body;
     totalLlmCalls += res.llmCalls;
     passesCompleted.push("read");

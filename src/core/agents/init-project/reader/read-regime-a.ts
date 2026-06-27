@@ -25,6 +25,19 @@ import type { LoadedSource } from "./source-loader.js";
 export interface ReadRegimeDeps {
   llm: SpineLLM;
   emitLog?: (message: string) => void;
+  /**
+   * Lineage context (层 0) — previously-read papers in this run. Forwarded to
+   * the read prompt so the LLM can frame the current paper as a step in the
+   * methodological story. Default empty preserves existing behaviour.
+   */
+  priorReads?: Array<{
+    paperId: string;
+    title: string;
+    firstAuthor: string;
+    year?: number;
+    oneLineSummary: string;
+    mainContribution?: string;
+  }>;
 }
 
 const READ_ROLES = [
@@ -184,7 +197,7 @@ export async function readPaperRegimeA(
 ): Promise<PaperReadBody> {
   const log = deps.emitLog ?? (() => {});
   const sourceKind = SOURCE_KIND_FOR_REGIME_A[source.kind] ?? "tex";
-  const prompt = buildReadRegimeAPrompt(paper, source.text, sourceKind);
+  const prompt = buildReadRegimeAPrompt(paper, source.text, sourceKind, deps.priorReads ?? []);
 
   let reply: string;
   try {

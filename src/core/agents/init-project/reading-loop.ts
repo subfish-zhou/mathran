@@ -31,7 +31,7 @@ import {
   type PaperNodeInput,
 } from "../../paper-graph/index.js";
 import { deletePaperRead, writePaperRead } from "../../paper-graph/reads.js";
-import { readPaper as realReadPaper, type ReadPaperCtx } from "./reader/index.js";
+import { readPaper as realReadPaper, type ReadPaperCtx, type PriorReadSummary } from "./reader/index.js";
 import { buildSurveyDistillationPrompt } from "./reading-loop-prompts.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -118,6 +118,15 @@ interface QueueEntry {
   paperId: string;
   why: string;
   priority: number;
+  /**
+   * Publication year, when known. Used as a SECONDARY sort key after
+   * priority — within the same priority band, earlier papers are read first
+   * so the reader sees the methodological lineage in the order it actually
+   * unfolded (Brun 1920 → Selberg 1950 → Chen 1973, not "Chen first because
+   * the LLM happened to list it first in the canon array"). Missing year
+   * sorts AFTER all dated entries so we still make forward progress.
+   */
+  year?: number;
 }
 
 // ── Implementation ───────────────────────────────────────────────────────────
@@ -137,6 +146,11 @@ export async function runReadingLoop(
   const queue: QueueEntry[] = [];
   const queued = new Set<string>();
   const reads = new Map<string, PaperRead>();
+  // Cache PaperNode metadata for each read paper so we can construct
+  // lineage context (priorReads) for the next read without re-hitting disk.
+  // 层 0 (2026-06-27 narrative-ordering): the reader sees what it has already
+  // absorbed so it can frame the current paper as a step in the story.
+  const nodeById = new Map<string, PaperNode>();
   const rejected = new Set<string>();
   const unresolved: ReadingLoopUnresolvedCitation[] = [];
 
@@ -157,7 +171,7 @@ export async function runReadingLoop(
   // ── Initialize the queue ───────────────────────────────────────────────────
   for (const s of config.priorArt?.surveys ?? []) {
     surveyConfidence.set(s.paperId, s.confidence);
-    push({ paperId: s.paperId, why: `survey: ${s.why}`, priority: PRIORITY_SURVEY });
+    push({ paperId: s.paperId, why: `survey: ${s.why}`, priority: PRIORITY_SURVEY, year: s.year });
   }
   // Canonical landmarks resolved to arxiv (Chen 1973-class papers the LLM named
   // and Crossref/arxiv resolved). These outrank user seeds: a user seed is
@@ -169,10 +183,20 @@ export async function runReadingLoop(
       paperId: lm.arxivId,
       why: `canonical landmark: ${lm.why}`,
       priority: PRIORITY_CANON,
+      year: lm.year,
     });
   }
   for (const seedId of config.seedPaperIds) {
-    push({ paperId: seedId, why: "user-confirmed seed", priority: PRIORITY_SEED });
+    // Seeds were already ingested before reading-loop started, so their
+    // PaperNode is on disk — fetch year for the chronological tiebreaker.
+    // Missing node (race / not-yet-ingested) just leaves year undefined.
+    const seedNode = await getPaper(config.workspace, seedId);
+    push({
+      paperId: seedId,
+      why: "user-confirmed seed",
+      priority: PRIORITY_SEED,
+      year: seedNode?.year,
+    });
   }
   // Expository MO/SE answers are URLs, not papers (§7.1) — only enqueue if an
   // arxiv id is resolvable. We have no URL→arxiv resolver here, so they are
@@ -208,10 +232,20 @@ export async function runReadingLoop(
 
     totalRounds++;
 
-    // Pick the highest-priority candidate.
+    // Pick the highest-priority candidate; within the same priority band,
+    // pick the EARLIEST year (Brun 1920 before Chen 1973 within `canon`).
+    // Missing year sorts last so it never starves a dated entry.
     let bestIdx = 0;
     for (let i = 1; i < queue.length; i++) {
-      if (queue[i].priority > queue[bestIdx].priority) bestIdx = i;
+      const cand = queue[i];
+      const best = queue[bestIdx];
+      if (cand.priority > best.priority) {
+        bestIdx = i;
+      } else if (cand.priority === best.priority) {
+        const candYear = cand.year ?? Number.POSITIVE_INFINITY;
+        const bestYear = best.year ?? Number.POSITIVE_INFINITY;
+        if (candYear < bestYear) bestIdx = i;
+      }
     }
     const candidate = queue.splice(bestIdx, 1)[0];
     queued.delete(candidate.paperId);
@@ -222,9 +256,26 @@ export async function runReadingLoop(
       log(`[reading-loop] could not load/ingest "${candidate.paperId}" — skipping`);
       continue;
     }
+    nodeById.set(candidate.paperId, node);
 
     // Defensively flag surveys (should already be set during prior-art ingest).
     const isSurvey = node.isSurvey || surveyConfidence.has(candidate.paperId);
+
+    // Build the lineage context (priorReads) from everything read so far so the
+    // reader can frame the current paper relative to its predecessors. 12-cap +
+    // chronological sort applied inside buildPriorReadsBlock at the prompt layer.
+    const priorReads: PriorReadSummary[] = [];
+    for (const [pid, r] of reads.entries()) {
+      const pNode = nodeById.get(pid);
+      priorReads.push({
+        paperId: pid,
+        title: pNode?.title ?? r.paperId,
+        firstAuthor: pNode?.authors?.[0] ?? "",
+        year: pNode?.year,
+        oneLineSummary: r.skim?.oneLineSummary ?? "",
+        mainContribution: r.skim?.mainContribution,
+      });
+    }
 
     const ctx: ReadPaperCtx = {
       workspace,
@@ -236,6 +287,7 @@ export async function runReadingLoop(
       fetchArxivSource: deps.fetchArxivSource,
       runPdfToText: deps.runPdfToText,
       rateDelayMs: deps.rateDelayMs,
+      priorReads,
     };
 
     let read: PaperRead;
@@ -296,7 +348,7 @@ export async function runReadingLoop(
         for (const ref of distilled.keyReferences) {
           if (!ref.arxivId) continue;
           const refId = await ingestArxiv(workspace, ref.arxivId, ref.title, ref.author ? [ref.author] : [], ref.year, fetchArxivById, log);
-          if (refId) push({ paperId: refId, why: `survey key reference: ${ref.whyTheSurveyHighlighted}`, priority: PRIORITY_SURVEY_KEYREF });
+          if (refId) push({ paperId: refId, why: `survey key reference: ${ref.whyTheSurveyHighlighted}`, priority: PRIORITY_SURVEY_KEYREF, year: ref.year });
         }
       }
     }
@@ -326,7 +378,7 @@ export async function runReadingLoop(
           log,
         );
         if (citedId && !reads.has(citedId) && !rejected.has(citedId)) {
-          push({ paperId: citedId, why: citation.contextInThisPaper, priority });
+          push({ paperId: citedId, why: citation.contextInThisPaper, priority, year: citation.citedYear });
         }
         continue;
       }
@@ -341,7 +393,7 @@ export async function runReadingLoop(
           const top = hits[0];
           const citedId = await ingestArxiv(workspace, top.arxivId, top.title, top.authors, top.year, fetchArxivById, log, top.abstract);
           if (citedId && !reads.has(citedId) && !rejected.has(citedId)) {
-            push({ paperId: citedId, why: citation.contextInThisPaper, priority });
+            push({ paperId: citedId, why: citation.contextInThisPaper, priority, year: citation.citedYear });
           }
           continue;
         }

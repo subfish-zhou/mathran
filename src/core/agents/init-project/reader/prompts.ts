@@ -87,7 +87,7 @@ export function buildSkimPrompt(
 //  READ PASS  (owned by W2-β — Tasks 8/9/10)
 // ============================================================
 
-export const READ_PROMPT_VERSION = "v1";
+export const READ_PROMPT_VERSION = "v2";
 
 /** The JSON shape every read prompt asks the model to emit (a `PaperReadBody`). */
 const READ_BODY_JSON_SHAPE = `{
@@ -103,7 +103,50 @@ const READ_BODY_JSON_SHAPE = `{
   "role": "milestone|refinement|technique_origin|barrier|bridge|survey|computation|dead_end|foundational"
 }`;
 
-/** Shared instructions block enforcing verbatim statements + JSON-only output. */
+/**
+ * Format previously-read papers as a prompt context block so the reader can
+ * frame the current paper as "what does this add on top of those". Sorted
+ * chronologically. Capped at 12 entries to keep token budget bounded — once
+ * a literature gets dense the chronological tiebreaker has already put the
+ * most relevant precedents first, so the 12-cap acts as a "recent + closest"
+ * window. Empty when no priors → returns an empty string so the caller can
+ * cheaply omit the section. Each entry kept to ~150 chars to stay tight.
+ *
+ * Cf. 层 0 from the 2026-06-27 narrative-ordering design: lineage-aware reading.
+ */
+export function buildPriorReadsBlock(
+  priorReads: Array<{
+    paperId: string;
+    title: string;
+    firstAuthor: string;
+    year?: number;
+    oneLineSummary: string;
+    mainContribution?: string;
+  }>,
+): string {
+  if (!priorReads || priorReads.length === 0) return "";
+  const sorted = [...priorReads]
+    .sort((a, b) => (a.year ?? 9999) - (b.year ?? 9999))
+    .slice(-12); // tail = most recent + closest-to-current
+  const lines = sorted.map((r) => {
+    const yr = r.year ?? "?";
+    const author = r.firstAuthor || "(unknown)";
+    const summary = (r.mainContribution || r.oneLineSummary || "").slice(0, 160).replace(/\s+/g, " ").trim();
+    return `  - [${yr}] ${author}, "${r.title.slice(0, 80)}": ${summary}`;
+  });
+  return [
+    `PRIOR READS IN THIS RESEARCH RUN (chronological — methodological lineage you have already absorbed):`,
+    ...lines,
+    ``,
+    `USE THIS LINEAGE WHEN READING THE PAPER BELOW. Frame the current paper as a step in this story:`,
+    `- What does it build on from the priors above? Name the predecessor and the specific dependency.`,
+    `- What does it improve over the closest prior? Be explicit about the delta (constants, hypotheses, technique).`,
+    `- If the paper post-dates these priors but ignores them, NOTE that gap.`,
+    `- Do NOT restate facts that are clearly established by the priors — link to them by author/year instead.`,
+    ``,
+  ].join("\n");
+}
+
 function readContract(projectName: string): string {
   return [
     `You are an expert mathematician reading a paper on behalf of the research`,
@@ -146,11 +189,14 @@ export function buildReadRegimeAPrompt(
   paper: PaperNode,
   fullSourceText: string,
   sourceKind: "tex" | "pdf-text" | "html",
+  priorReads: Parameters<typeof buildPriorReadsBlock>[0] = [],
 ): string {
   const projectName = (paper as { projectName?: string }).projectName ?? paper.title;
+  const priorBlock = buildPriorReadsBlock(priorReads);
   return [
     readContract(projectName),
     ``,
+    priorBlock,
     paperHeader(paper),
     `SOURCE KIND: ${sourceKind}`,
     ``,
@@ -160,7 +206,7 @@ export function buildReadRegimeAPrompt(
     `------------------------------------------------------------`,
     ``,
     `Output ONLY valid JSON.`,
-  ].join("\n");
+  ].filter((s) => s !== "" || true).join("\n").replace(/\n\n\n+/g, "\n\n");
 }
 
 /** Regime B per-section prompt — read one section in isolation. */
@@ -169,6 +215,7 @@ export function buildSectionReadPrompt(
   sectionTitle: string,
   sectionText: string,
   alreadyReadSectionTitles: string[],
+  priorReads: Parameters<typeof buildPriorReadsBlock>[0] = [],
 ): string {
   const projectName = (paper as { projectName?: string }).projectName ?? paper.title;
   const priorContext =
@@ -177,10 +224,12 @@ export function buildSectionReadPrompt(
           "; ",
         )}`
       : `This is the first section.`;
+  const priorBlock = buildPriorReadsBlock(priorReads);
   return [
     `You are an expert mathematician reading ONE section of a paper for the`,
     `research project "${projectName}". Extract what THIS section contributes.`,
     ``,
+    priorBlock,
     paperHeader(paper),
     `CURRENT SECTION: ${sectionTitle}`,
     priorContext,
@@ -237,8 +286,10 @@ export function buildReadRegimeCPrompt(
   paper: PaperNode,
   sourceText: string,
   isAbstractOnly: boolean,
+  priorReads: Parameters<typeof buildPriorReadsBlock>[0] = [],
 ): string {
   const projectName = (paper as { projectName?: string }).projectName ?? paper.title;
+  const priorBlock = buildPriorReadsBlock(priorReads);
   const warning = isAbstractOnly
     ? [
         `SOURCE QUALITY WARNING: Only the ABSTRACT is available for this paper; the`,
@@ -257,6 +308,7 @@ export function buildReadRegimeCPrompt(
   return [
     readContract(projectName),
     ``,
+    priorBlock,
     warning,
     ``,
     paperHeader(paper),

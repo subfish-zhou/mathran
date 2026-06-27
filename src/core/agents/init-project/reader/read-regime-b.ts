@@ -94,6 +94,7 @@ export async function readSection(
     sectionTitle,
     sectionText,
     alreadyReadSectionTitles,
+    deps.priorReads ?? [],
   );
 
   const empty: SectionRead = {

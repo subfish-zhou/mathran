@@ -40,7 +40,7 @@ export async function readPaperRegimeC(
   const isAbstractOnly = source.kind === "abstract-only";
   const sourceText = source.text?.trim() ? source.text : (paper.abstract ?? "");
 
-  const prompt = buildReadRegimeCPrompt(paper, sourceText, isAbstractOnly);
+  const prompt = buildReadRegimeCPrompt(paper, sourceText, isAbstractOnly, deps.priorReads ?? []);
 
   let reply: string;
   try {
