@@ -206,11 +206,13 @@ program
   .option("--no-plan", "Skip the Plan Agent pre-pass even when no --seeds are given")
   .option("-y, --yes", "Auto-confirm the Plan Agent seed suggestions (non-interactive)", false)
   .option("--model <id>", "Model id for the Plan Agent pre-pass")
+  .option("--writer-model <id>", "Writer model for the writer-reviewer loop (default openai/gpt-5.5)")
+  .option("--reviewer-model <id>", "Reviewer model for the writer-reviewer loop (default anthropic/opus-4.8)")
   .option("--config <path>", "Config file path for the Plan Agent pre-pass")
   .option("--detach", "Print runId and exit without waiting for completion")
   .option("--timeout-sec <n>", "Max seconds to wait for completion (default 1800)", (v) => parseInt(v, 10))
   .option("--json", "Emit raw NDJSON events instead of pretty-printing", false)
-  .action(async (name: string, opts: { serveUrl?: string; seeds?: string; depth?: "shallow" | "standard" | "deep"; wiki?: boolean; workspace?: boolean; spine?: boolean; plan?: boolean; yes?: boolean; model?: string; config?: string; detach?: boolean; timeoutSec?: number; json?: boolean }) => {
+  .action(async (name: string, opts: { serveUrl?: string; seeds?: string; depth?: "shallow" | "standard" | "deep"; wiki?: boolean; workspace?: boolean; spine?: boolean; plan?: boolean; yes?: boolean; model?: string; writerModel?: string; reviewerModel?: string; config?: string; detach?: boolean; timeoutSec?: number; json?: boolean }) => {
     const { runAiInit } = await import("./commands/ai-init.js");
     // commander inverts --no-* booleans automatically (wiki/workspace/spine/plan default true)
     process.exit(await runAiInit(name, {
@@ -223,6 +225,8 @@ program
       autoPlan: opts.plan !== false,
       yes: opts.yes,
       model: opts.model,
+      writerModel: opts.writerModel,
+      reviewerModel: opts.reviewerModel,
       configPath: opts.config,
       detach: opts.detach,
       timeoutSec: opts.timeoutSec,

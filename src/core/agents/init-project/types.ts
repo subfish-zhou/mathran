@@ -36,6 +36,18 @@ export interface AiInitConfig {
    * 4-phase path runs unchanged.
    */
   useSpine?: boolean;
+  /**
+   * Writer model for the writer-reviewer dual-model loop (Phase 7).
+   * When unset, resolves to `MATHRAN_WRITER_MODEL` or the gpt-5.5 default.
+   * @see DESIGN-REFERENCE §6.7
+   */
+  writerModel?: string;
+  /**
+   * Reviewer model for the writer-reviewer dual-model loop (Phase 7).
+   * When unset, resolves to `MATHRAN_REVIEWER_MODEL` or the opus-4.8 default.
+   * @see DESIGN-REFERENCE §6.7
+   */
+  reviewerModel?: string;
 }
 
 export interface InitAgentInput {
