@@ -273,31 +273,43 @@ describe("runReadingLoop", () => {
     expect(krNode).not.toBeNull();
   });
 
-  it("(h) does NOT harvest the bibliography of an off-topic paper, and counts it as empty-novelty", async () => {
-    const seedId = await ingest({ arxivId: "seed-h", title: "Seed H (will be off-topic)" });
+  it("(h) does NOT harvest the bibliography of an off-topic paper, and counts it as empty-novelty (harvest band)", async () => {
+    // Two papers: a real seed that harvests a citation, and that harvested
+    // citation will come back off_topic. We test the off_topic handling at
+    // the HARVEST band — that's where the empty-novelty counter actually
+    // matters (initial-band off_topic doesn't increment the counter per the
+    // 2026-06-27 dogfood-run-11 fix; see reading-loop.ts L320 comment).
+    const seedId = await ingest({ arxivId: "seed-h", title: "Seed H (on-topic, harvests one cite)" });
+    let harvestCallCount = 0;
     const deps: ReadingLoopDeps = {
-      readPaper: async (node) =>
-        makeRead(node, {
+      readPaper: async (node) => {
+        if (node.id === seedId) {
+          return makeRead(node, { novel: "novel", cites: [arxivCite("phys-cited-by-seed")] });
+        }
+        // The HARVESTED paper is the off-topic one.
+        harvestCallCount++;
+        return makeRead(node, {
           verdict: "off_topic",
           novel: "would-be novel but irrelevant",
           cites: [arxivCite("phys-citation-should-not-appear")],
-        }),
+        });
+      },
     };
     const result = await runReadingLoop(baseConfig({ seedPaperIds: [seedId] }), deps);
 
-    // The off-topic seed itself is KEPT (so the user can see what was visited).
-    expect(result.reads.length).toBe(1);
-    expect(result.reads[0].paperId).toBe(seedId);
-    expect(result.reads[0].audit?.verdict).toBe("off_topic");
-    // It is NOT in the rejected list (off_topic ≠ rejected; not hard-deleted).
-    expect(result.rejectedPaperIds).not.toContain(seedId);
-    // The phys-citation must NOT have been queued, ingested, or read.
+    // Both papers are read (seed + harvested citation), the harvest citation
+    // is KEPT (off_topic ≠ rejected; not hard-deleted).
+    expect(result.reads.length).toBe(2);
+    expect(result.reads.some((r) => r.audit?.verdict === "off_topic")).toBe(true);
+    expect(result.rejectedPaperIds.length).toBe(0);
+    // The 3rd-hop phys-citation must NOT have been queued, ingested, or read.
     expect(result.reads.some((r) => r.arxivId === "phys-citation-should-not-appear")).toBe(false);
     const physNode = await getPaper(workspace, "arxiv-phys-citation-should-not-appear");
     expect(physNode).toBeNull();
-    // The off-topic round counts as empty-novelty; with only one paper the queue then exhausts.
-    expect(result.convergence.reason).toBe("queue_exhausted");
+    // The off-topic harvest-band round DID increment the counter; with no more
+    // candidates the queue then exhausts.
     expect(result.convergence.consecutiveEmptyRounds).toBeGreaterThanOrEqual(1);
+    expect(harvestCallCount).toBe(1);
   });
 
   it("(i) within the same priority band, reads the EARLIEST year first (chronological tiebreaker)", async () => {
@@ -320,5 +332,38 @@ describe("runReadingLoop", () => {
     // Seeds intentionally listed in reverse-chronological order in the input.
     await runReadingLoop(baseConfig({ seedPaperIds: [chenId, selbergId, brunId] }), deps);
     expect(order).toEqual([brunId, selbergId, chenId]);
+  });
+
+  it("(j) consecutiveEmptyRounds counter does NOT increment for initial-band candidates (no premature termination)", async () => {
+    // dogfood-run-11 regression: chronological tiebreaker pulled an abstract-only
+    // canon (Montgomery 1975, 0 citations) ahead of a deep canon (Helfgott 2013).
+    // 3 reads × 0 novel citations → premature `natural` convergence at K=3,
+    // leaving 4 canon/seed candidates UNREAD in the queue. The fix: initial-band
+    // pops (priority >= PRIORITY_SEED) reset the counter regardless of novelty,
+    // because well-curated entries should always be consumed.
+    const s1 = await ingest({ arxivId: "init-1", title: "Init 1" });
+    const s2 = await ingest({ arxivId: "init-2", title: "Init 2" });
+    const s3 = await ingest({ arxivId: "init-3", title: "Init 3" });
+    const s4 = await ingest({ arxivId: "init-4", title: "Init 4" });
+    const s5 = await ingest({ arxivId: "init-5", title: "Init 5" });
+
+    const order: string[] = [];
+    const deps: ReadingLoopDeps = {
+      readPaper: async (node) => {
+        order.push(node.id);
+        // All 5 initial candidates produce zero novel citations (abstract-only style).
+        return makeRead(node, { novel: "novel", cites: [] });
+      },
+    };
+
+    const result = await runReadingLoop(baseConfig({ seedPaperIds: [s1, s2, s3, s4, s5] }), deps);
+
+    // Pre-fix: only 3 would be read (consecutiveEmptyRounds hits K=3 after read 3
+    // even though 2 seeds are still in the queue). Post-fix: all 5 must be read
+    // because seed reads don't increment the counter.
+    expect(order.length).toBe(5);
+    expect(result.reads.length).toBe(5);
+    // Exits via queue_exhausted, NOT natural, because the counter never tripped.
+    expect(result.convergence.reason).toBe("queue_exhausted");
   });
 });

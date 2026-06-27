@@ -317,11 +317,17 @@ export async function runReadingLoop(
     // skip survey distillation, skip biblio harvest, and count this round as
     // empty so the convergence-K can trip and stop the off-topic walk.)
     if (read.audit?.verdict === "off_topic") {
-      consecutiveEmptyRounds++;
+      // Same logic as the post-harvest novelty check below: off_topic on a
+      // harvest candidate IS a signal that the citation walk has drifted out
+      // of scope and should converge. Off_topic on an INITIAL candidate
+      // (survey/canon/seed) means the user (or canon LLM) misjudged the
+      // paper's relevance — we shouldn't punish the rest of the queue for it.
+      const isHarvestCandidate = candidate.priority < PRIORITY_SEED;
+      if (isHarvestCandidate) consecutiveEmptyRounds++;
       const flagStr = read.audit.flags?.length ? ` [${read.audit.flags.join(",")}]` : "";
       emit({
         type: "log",
-        message: `[reading-loop] paper_off_topic: "${node.title}"${flagStr} — kept, no harvest (consecutiveEmptyRounds=${consecutiveEmptyRounds}/${K})`,
+        message: `[reading-loop] paper_off_topic: "${node.title}"${flagStr} — kept, no harvest (consecutiveEmptyRounds=${consecutiveEmptyRounds}/${K}, initialBand=${!isHarvestCandidate})`,
       });
       continue;
     }
@@ -354,14 +360,34 @@ export async function runReadingLoop(
     }
 
     // ── Novelty check. ────────────────────────────────────────────────────────
-    if (isNovelty(read)) {
-      consecutiveEmptyRounds = 0;
+    // Convergence (consecutiveEmptyRounds) tracks "harvest exploration has run
+    // dry", NOT "the initial well-curated queue is uninteresting". Initial
+    // candidates (surveys, canon, seeds — anything with priority >= PRIORITY_SEED)
+    // should ALWAYS be read regardless of their novelty contribution. Otherwise
+    // a survey or abstract-only canon entry that legitimately has 0 outgoing
+    // citations can trip the K=3 timer and kill the loop while 4 untouched
+    // canon/seed entries are still sitting in the queue.
+    //
+    // Caught in dogfood-run-11 (2026-06-27): chronological tiebreaker pulled
+    // Montgomery 1975 (abstract-only, 0 citations) ahead of Helfgott 2013;
+    // 3 reads in a row with 0 novel citations → premature `natural` convergence,
+    // 4 papers left unread. Pre-tiebreaker runs got lucky because Helfgott
+    // happened to be read first and its 138 citations flooded the queue.
+    const isHarvestCandidate = candidate.priority < PRIORITY_SEED;
+    if (isHarvestCandidate) {
+      if (isNovelty(read)) {
+        consecutiveEmptyRounds = 0;
+      } else {
+        consecutiveEmptyRounds++;
+      }
     } else {
-      consecutiveEmptyRounds++;
+      // Initial candidate consumed — explicitly reset so a streak of empty
+      // harvest rounds before this one doesn't carry over.
+      consecutiveEmptyRounds = 0;
     }
     emit({
       type: "log",
-      message: `[reading-loop] convergence_check: consecutiveEmptyRounds=${consecutiveEmptyRounds}/${K}, reads=${reads.size}`,
+      message: `[reading-loop] convergence_check: consecutiveEmptyRounds=${consecutiveEmptyRounds}/${K}, reads=${reads.size}, initialBand=${!isHarvestCandidate}`,
     });
 
     // ── Bibliography harvest → new candidates. ────────────────────────────────
