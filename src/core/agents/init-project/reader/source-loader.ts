@@ -25,6 +25,8 @@ export interface LoadedSource {
   bytes: number;
   text: string; // full text, NEVER truncated by this loader
   path?: string; // absolute path to underlying file (when applicable)
+  /** Always false in v3 — kept optional for downstream callers that fill it. */
+  truncated?: boolean;
   sectionMarkers?: Array<{
     title: string;
     level: 1 | 2 | 3;
