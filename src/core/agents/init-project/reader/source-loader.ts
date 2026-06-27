@@ -42,6 +42,8 @@ export interface SourceLoaderDeps {
   runPdfToText?: (pdfPath: string) => Promise<string | null>;
   /** ms between external fetches; honor arxiv rate-limit when calling real fetchArxivSource. */
   rateDelayMs?: number;
+  /** Optional logger; matches the convention used by SkimDeps / ReadRegimeDeps / AuditDeps. */
+  emitLog?: (message: string) => void;
 }
 
 const REGIME_A_MAX_BYTES = 30_000;
