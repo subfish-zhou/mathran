@@ -161,6 +161,19 @@ projectCmd
     process.exit(await runProjectList({ workspace: opts.workspace, json: opts.json }));
   });
 
+// `mathran project read-report <slug>` — summarize an init run: reads by
+// verdict, rejected papers, unresolved citations, convergence, LLM cost.
+projectCmd
+  .command("read-report")
+  .description("Summarize an init run (reads by verdict, unresolved citations, convergence, LLM cost)")
+  .argument("<slug>", "Project slug")
+  .option("--workspace <dir>", "Workspace root (overrides MATHRAN_WORKSPACE and the default)")
+  .option("--json", "Emit JSON instead of a human-readable summary", false)
+  .action(async (slug: string, opts: { workspace?: string; json?: boolean }) => {
+    const { runReadReport } = await import("./commands/project-read-report.js");
+    process.exit(await runReadReport(slug, { workspace: opts.workspace, json: opts.json }));
+  });
+
 // `mathran project plan <description>` — formalize a problem with the Plan
 // Agent (W1-γ) before optionally proceeding to AI-assisted init.
 projectCmd
