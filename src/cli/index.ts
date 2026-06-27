@@ -161,6 +161,36 @@ projectCmd
     process.exit(await runProjectList({ workspace: opts.workspace, json: opts.json }));
   });
 
+// `mathran project read-report <slug>` — summarize an init run: reads by
+// verdict, rejected papers, unresolved citations, convergence, LLM cost.
+projectCmd
+  .command("read-report")
+  .description("Summarize an init run (reads by verdict, unresolved citations, convergence, LLM cost)")
+  .argument("<slug>", "Project slug")
+  .option("--workspace <dir>", "Workspace root (overrides MATHRAN_WORKSPACE and the default)")
+  .option("--json", "Emit JSON instead of a human-readable summary", false)
+  .action(async (slug: string, opts: { workspace?: string; json?: boolean }) => {
+    const { runReadReport } = await import("./commands/project-read-report.js");
+    process.exit(await runReadReport(slug, { workspace: opts.workspace, json: opts.json }));
+  });
+
+// `mathran project upgrade-to-v3 <slug>` — re-run the v3 pipeline on an
+// existing v1 project (preserves the old wiki/ and efforts/ first).
+projectCmd
+  .command("upgrade-to-v3")
+  .description("Re-run the v3 pipeline on an existing project (preserves wiki.v1/ and efforts.v1/)")
+  .argument("<slug>", "Project slug")
+  .option("--workspace <dir>", "Workspace root (overrides MATHRAN_WORKSPACE and the default)")
+  .option("--serve-url <url>", "Serve URL (default http://127.0.0.1:7878)")
+  .option("--writer-model <id>", "Writer model for the writer-reviewer loop (default openai/gpt-5.5)")
+  .option("--reviewer-model <id>", "Reviewer model for the writer-reviewer loop (default anthropic/opus-4.8)")
+  .option("--timeout-sec <n>", "Max seconds to wait for completion (default 1800)", (v) => parseInt(v, 10))
+  .option("--json", "Emit raw NDJSON events instead of pretty-printing", false)
+  .action(async (slug: string, opts: { workspace?: string; serveUrl?: string; writerModel?: string; reviewerModel?: string; timeoutSec?: number; json?: boolean }) => {
+    const { runUpgradeToV3 } = await import("./commands/project-upgrade.js");
+    process.exit(await runUpgradeToV3(slug, opts));
+  });
+
 // `mathran project plan <description>` — formalize a problem with the Plan
 // Agent (W1-γ) before optionally proceeding to AI-assisted init.
 projectCmd
@@ -206,11 +236,13 @@ program
   .option("--no-plan", "Skip the Plan Agent pre-pass even when no --seeds are given")
   .option("-y, --yes", "Auto-confirm the Plan Agent seed suggestions (non-interactive)", false)
   .option("--model <id>", "Model id for the Plan Agent pre-pass")
+  .option("--writer-model <id>", "Writer model for the writer-reviewer loop (default openai/gpt-5.5)")
+  .option("--reviewer-model <id>", "Reviewer model for the writer-reviewer loop (default anthropic/opus-4.8)")
   .option("--config <path>", "Config file path for the Plan Agent pre-pass")
   .option("--detach", "Print runId and exit without waiting for completion")
   .option("--timeout-sec <n>", "Max seconds to wait for completion (default 1800)", (v) => parseInt(v, 10))
   .option("--json", "Emit raw NDJSON events instead of pretty-printing", false)
-  .action(async (name: string, opts: { serveUrl?: string; seeds?: string; depth?: "shallow" | "standard" | "deep"; wiki?: boolean; workspace?: boolean; spine?: boolean; plan?: boolean; yes?: boolean; model?: string; config?: string; detach?: boolean; timeoutSec?: number; json?: boolean }) => {
+  .action(async (name: string, opts: { serveUrl?: string; seeds?: string; depth?: "shallow" | "standard" | "deep"; wiki?: boolean; workspace?: boolean; spine?: boolean; plan?: boolean; yes?: boolean; model?: string; writerModel?: string; reviewerModel?: string; config?: string; detach?: boolean; timeoutSec?: number; json?: boolean }) => {
     const { runAiInit } = await import("./commands/ai-init.js");
     // commander inverts --no-* booleans automatically (wiki/workspace/spine/plan default true)
     process.exit(await runAiInit(name, {
@@ -223,6 +255,8 @@ program
       autoPlan: opts.plan !== false,
       yes: opts.yes,
       model: opts.model,
+      writerModel: opts.writerModel,
+      reviewerModel: opts.reviewerModel,
       configPath: opts.config,
       detach: opts.detach,
       timeoutSec: opts.timeoutSec,

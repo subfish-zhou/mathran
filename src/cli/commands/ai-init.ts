@@ -61,6 +61,10 @@ export interface AiInitOptions {
   configPath?: string;
   /** Skip the Plan Agent confirm prompt (== answering "yes"). */
   yes?: boolean;
+  /** Writer model for the writer-reviewer loop (default openai/gpt-5.5). */
+  writerModel?: string;
+  /** Reviewer model for the writer-reviewer loop (default anthropic/opus-4.8). */
+  reviewerModel?: string;
 }
 
 interface InitResponseOk {
@@ -328,8 +332,14 @@ export async function runAiInit(name: string, opts: AiInitOptions): Promise<numb
       useSpine: opts.useSpine ?? true,
       enableWiki: opts.noWiki ? false : true,
       enableWorkspace: opts.noWorkspace ? false : true,
+      ...(opts.writerModel ? { writerModel: opts.writerModel } : {}),
+      ...(opts.reviewerModel ? { reviewerModel: opts.reviewerModel } : {}),
     },
   };
+
+  if (opts.writerModel && opts.reviewerModel && opts.writerModel === opts.reviewerModel && !opts.json) {
+    console.warn("[warn] writer and reviewer models are identical; self-review is weaker than dual-model review.");
+  }
 
   const startWall = Date.now();
   let post: { status: number; body: string };

@@ -97,6 +97,8 @@ function coerceAiInit(raw: unknown): AiInitConfig {
     enableWiki: r.enableWiki !== false,
     enableWorkspace: r.enableWorkspace !== false,
     useSpine: r.useSpine === true,
+    writerModel: typeof r.writerModel === "string" && r.writerModel.length > 0 ? r.writerModel : undefined,
+    reviewerModel: typeof r.reviewerModel === "string" && r.reviewerModel.length > 0 ? r.reviewerModel : undefined,
   };
 }
 

@@ -36,6 +36,18 @@ export interface AiInitConfig {
    * 4-phase path runs unchanged.
    */
   useSpine?: boolean;
+  /**
+   * Writer model for the writer-reviewer dual-model loop (Phase 7).
+   * When unset, resolves to `MATHRAN_WRITER_MODEL` or the gpt-5.5 default.
+   * @see DESIGN-REFERENCE §6.7
+   */
+  writerModel?: string;
+  /**
+   * Reviewer model for the writer-reviewer dual-model loop (Phase 7).
+   * When unset, resolves to `MATHRAN_REVIEWER_MODEL` or the opus-4.8 default.
+   * @see DESIGN-REFERENCE §6.7
+   */
+  reviewerModel?: string;
 }
 
 export interface InitAgentInput {
@@ -85,6 +97,40 @@ export interface CrawledResource {
   isSurvey?: boolean;
 }
 
+/**
+ * Comprehensive run report (Task 38, DESIGN-REFERENCE Phase K) — cost
+ * accounting + verdict/revision summary for one init run. Persisted to
+ * `<project>/.mathran/agent-runs/<run-id>/report.json` and printed to stdout
+ * at the end of init. Read back by `mathran project read-report`.
+ */
+export interface InitAgentReport {
+  runId: string;
+  projectSlug: string;
+  generatedAt: string;
+  writerModel: string;
+  reviewerModel: string;
+  llmAccounting: {
+    writerCallsTotal: number;
+    reviewerCallsTotal: number;
+    /** skim + read + audit across all PaperReads. */
+    readerCallsTotal: number;
+    planAgentCalls: number;
+    /** best-effort, derived from token counts + a per-model price table. */
+    estimatedTotalUsd: number;
+    breakdownByPhase: Record<string, { calls: number; estimatedUsd: number }>;
+  };
+  revisionsSummary: {
+    artifactsReviewed: number;
+    artifactsApproved: number;
+    artifactsFlaggedPersistent: number;
+    avgRevisionsPerArtifact: number;
+    maxRevisionsAcrossArtifacts: number;
+  };
+  unresolvedCitations: Array<{ citedTitle: string; whyImportant: string }>;
+  convergenceSummary: { reason: string; rounds: number };
+  fieldTooLargeTripped: boolean;
+}
+
 export interface InitAgentResult {
   projectSlug: string;
   wikiPages: string[];
@@ -107,4 +153,6 @@ export interface InitAgentResult {
     pagesFlagged?: number;
     spineCoverage?: number;
   };
+  /** Comprehensive run report (Spine-First pipeline only; Task 38). */
+  report?: InitAgentReport;
 }
