@@ -101,4 +101,73 @@ describe("synthesizeEffort (4-piece-set, end-to-end)", () => {
     expect(effortJson.readmeStatus).toBe("generated");
     expect(effortJson.readingNotesStatus).toBe("generated");
   });
+
+  it("runs the writer-reviewer loop and persists documentRevisions when a reviewer model is supplied", async () => {
+    const node = makeNode("n1", { depth: "foundational" });
+    const reads = [makeFullPaperRead("n1-paper")];
+
+    // Reviewer: reject the document once (blocks-understanding), then approve;
+    // approve the README on first read.
+    let docReviews = 0;
+    const reviewerLlm: SpineLLM = async (prompt: string) => {
+      const isReadme = prompt.includes("reading-guide README");
+      if (isReadme) {
+        return JSON.stringify({ verdict: "approve", overallReaderExperience: "Clear guide.", issues: [], verdict_reasoning: "ok" });
+      }
+      docReviews++;
+      if (docReviews === 1) {
+        return JSON.stringify({
+          verdict: "rewrite_requested",
+          overallReaderExperience: "Lost me in the proof.",
+          issues: [{ location: "Proof p1", severity: "blocks-understanding", kind: "skips-steps", what_you_experienced: "jump", what_would_help: "expand" }],
+          verdict_reasoning: "needs steps",
+        });
+      }
+      return JSON.stringify({ verdict: "approve", overallReaderExperience: "Now clear.", issues: [], verdict_reasoning: "ok" });
+    };
+
+    const result = await synthesizeEffort(
+      {
+        node,
+        spine: makeSpine([node]),
+        paperReads: reads,
+        predecessorNodes: [],
+        successorNodes: [],
+        problemTitle: "Chromatic numbers",
+        projectDir,
+      },
+      { llm: scriptedLLM(), reviewerLlm, writerModel: "openai/gpt-5.5", reviewerModel: "anthropic/opus-4.8" },
+    );
+
+    expect(result.documentRevisions).toBeDefined();
+    // revision 0 (rejected) + revision 1 (approved) = 2 history entries
+    expect(result.documentRevisions!.length).toBe(2);
+    expect(result.documentRevisions![0]!.reviewerVerdict).toBe("rewrite_requested");
+    expect(result.documentRevisions![1]!.reviewerVerdict).toBe("approve");
+
+    const dir = path.join(projectDir, "efforts", result.effortId);
+    const effortJson = JSON.parse(await fs.readFile(path.join(dir, "effort.json"), "utf-8"));
+    expect(effortJson.documentRevisions).toHaveLength(2);
+  });
+
+  it("skips the review loop (no documentRevisions) when no reviewer model is supplied", async () => {
+    const node = makeNode("n2");
+    const reads = [makeFullPaperRead("n2-paper")];
+    const result = await synthesizeEffort(
+      {
+        node,
+        spine: makeSpine([node]),
+        paperReads: reads,
+        predecessorNodes: [],
+        successorNodes: [],
+        problemTitle: "Chromatic numbers",
+        projectDir,
+      },
+      { llm: scriptedLLM() },
+    );
+    expect(result.documentRevisions).toBeUndefined();
+    const dir = path.join(projectDir, "efforts", result.effortId);
+    const effortJson = JSON.parse(await fs.readFile(path.join(dir, "effort.json"), "utf-8"));
+    expect(effortJson.documentRevisions).toBeUndefined();
+  });
 });
