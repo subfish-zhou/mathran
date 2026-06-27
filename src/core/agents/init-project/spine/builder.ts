@@ -17,6 +17,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { slugify } from "../../../../lib/slug.js";
+import { atomicWriteFile } from "../../../chat/atomic-write.js";
 import { getPaper, listCitations } from "../../../paper-graph/index.js";
 import { fetchArxivSource } from "../../../paper-graph/arxiv-source.js";
 import { buildNodeExtractionPrompt, buildSpineAssemblyPrompt } from "./prompts.js";
@@ -72,11 +73,16 @@ export function spineFile(projectDir: string): string {
   return path.join(spineDir(projectDir), "spine.json");
 }
 
-/** Persist a spine to `<project>/.mathran/spine/spine.json`. Never throws. */
+/** Persist a spine to `<project>/.mathran/spine/spine.json`. Never throws.
+ *
+ * Uses atomicWriteFile (write to tmp + rename) so a crash mid-write can't
+ * leave a half-written spine.json that would crash resume / link-review on
+ * the next start. The spine is one of the most important persisted
+ * artifacts — a corrupted spine.json blocks every downstream phase. */
 export async function writeSpine(projectDir: string, spine: NarrativeSpine): Promise<void> {
   try {
     await fs.mkdir(spineDir(projectDir), { recursive: true });
-    await fs.writeFile(spineFile(projectDir), JSON.stringify(spine, null, 2) + "\n", "utf-8");
+    await atomicWriteFile(spineFile(projectDir), JSON.stringify(spine, null, 2) + "\n");
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn(`[spine] writeSpine failed: ${errMsg(err)}`);

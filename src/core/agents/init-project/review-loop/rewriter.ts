@@ -13,7 +13,7 @@ import type { ReviewerVerdict } from "./reviewer.js";
 import { buildRewriterPrompt } from "./prompts.js";
 
 export interface RewriteInput {
-  artifactKind: "wiki-page" | "effort-document" | "effort-readme";
+  artifactKind: "wiki-page" | "effort-document" | "effort-readme" | "thread-survey";
   artifactTitle: string;
   originalContent: string;
   reviewerVerdict: ReviewerVerdict;

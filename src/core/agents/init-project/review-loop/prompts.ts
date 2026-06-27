@@ -21,7 +21,7 @@ export const REWRITER_PROMPT_VERSION = "v1";
 
 /** Human-readable "document type" phrase injected into the reviewer prompt. */
 export function artifactKindLabel(
-  kind: "wiki-page" | "effort-document" | "effort-readme",
+  kind: "wiki-page" | "effort-document" | "effort-readme" | "thread-survey",
 ): string {
   switch (kind) {
     case "wiki-page":
@@ -30,6 +30,8 @@ export function artifactKindLabel(
       return "research-effort document";
     case "effort-readme":
       return "reading-guide README";
+    case "thread-survey":
+      return "thread survey (a coherent narrative weaving several related results into a single methodological story)";
   }
 }
 

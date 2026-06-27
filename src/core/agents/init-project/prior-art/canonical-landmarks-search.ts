@@ -188,6 +188,12 @@ async function defaultCrossrefSearch(
 /** A landmark as the LLM names it before any resolution. */
 interface ProposedLandmark {
   title: string;
+  /**
+   * English alias of `title`. Used by resolvers (Crossref / arxiv) which
+   * have much better recall on English text. Falls back to `title` when the
+   * LLM didn't supply one or the title is already English.
+   */
+  titleEn?: string;
   authors: string[];
   year?: number;
   venue?: string;
@@ -216,6 +222,11 @@ function buildCanonPrompt(problem: {
     "",
     `Output a JSON array of 10-20 landmark papers. EACH entry MUST include:`,
     `  - "title":   the canonical title as published, NOT a paraphrase`,
+    `  - "titleEn": ALWAYS provide this. If "title" is non-English (Russian "Представление…",`,
+    `               French "Le crible…", German "Über…", etc.), give the standard English`,
+    `               translation. If "title" is already English, copy it verbatim. Crossref/arxiv`,
+    `               resolvers search English text better, so this dramatically improves recall`,
+    `               for pre-arxiv classics like Vinogradov 1937 / Brun 1920.`,
     `  - "authors": ["Family", "Family", ...] up to 4 entries`,
     `  - "year":    integer publication year (the ORIGINAL year, not a reprint)`,
     `  - "venue":   journal / proceedings / arxiv as published (e.g. "Sci. Sinica", "Ann. of Math.")`,
@@ -230,7 +241,7 @@ function buildCanonPrompt(problem: {
     `  - You will NOT be asked to provide an arxiv id; a downstream resolver handles that.`,
     ``,
     `Output ONLY the JSON array, no surrounding prose, no markdown fences:`,
-    `[{"title": "...", "authors": ["..."], "year": 1973, "venue": "...", "why": "..."}, ...]`,
+    `[{"title": "...", "titleEn": "...", "authors": ["..."], "year": 1973, "venue": "...", "why": "..."}, ...]`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -245,6 +256,7 @@ function parseProposedLandmarks(reply: string, maxKeep: number): ProposedLandmar
     const r = raw as Record<string, unknown>;
     const title = typeof r.title === "string" ? r.title.trim() : "";
     if (!title) continue;
+    const titleEn = typeof r.titleEn === "string" ? r.titleEn.trim() : undefined;
     const authors = Array.isArray(r.authors)
       ? r.authors
           .filter((a) => typeof a === "string")
@@ -256,7 +268,7 @@ function parseProposedLandmarks(reply: string, maxKeep: number): ProposedLandmar
     const year = Number.isFinite(yearRaw) ? yearRaw : undefined;
     const venue = typeof r.venue === "string" ? r.venue.trim() : undefined;
     const why = typeof r.why === "string" ? r.why.trim() : "";
-    out.push({ title, authors, year, venue, why });
+    out.push({ title, titleEn, authors, year, venue, why });
     if (out.length >= maxKeep) break;
   }
   return out;
@@ -295,6 +307,19 @@ async function resolveOneLandmark(
     log: (m: string) => void;
   },
 ): Promise<CanonicalLandmarkHit> {
+  // Use the English alias for resolver queries when present. The original
+  // (possibly non-English) title is still used as the canonical display label.
+  const queryTitle = lm.titleEn || lm.title;
+  // For title-similarity scoring we compare against BOTH titles and take the
+  // best score — so a Crossref hit whose title matches lm.title (when the
+  // record happens to use the original-language title) OR lm.titleEn (when
+  // Crossref normalised to English) both count as matches.
+  const simBest = (candidate: string): number => {
+    const a = titleSimilarity(lm.title, candidate);
+    const b = lm.titleEn ? titleSimilarity(lm.titleEn, candidate) : 0;
+    return Math.max(a, b);
+  };
+
   const arxivAttempts: string[] = [];
   const crossrefAttempts: string[] = [];
   let arxivId: string | undefined;
@@ -304,14 +329,14 @@ async function resolveOneLandmark(
 
   // (a) arxiv title search
   try {
-    const hits = await deps.searchArxivByTitle(lm.title, 3);
+    const hits = await deps.searchArxivByTitle(queryTitle, 3);
     if (hits.length === 0) {
       arxivAttempts.push("arxiv: 0 hits");
     } else {
       let best: { id: string; score: number } | null = null;
       for (const h of hits) {
         if (!h.arxivId) continue;
-        const sim = titleSimilarity(lm.title, h.title);
+        const sim = simBest(h.title);
         if (!best || sim > best.score) best = { id: h.arxivId, score: sim };
       }
       if (best && best.score >= TITLE_MATCH_THRESHOLD) {
@@ -334,7 +359,7 @@ async function resolveOneLandmark(
   try {
     const firstAuthor = lm.authors[0]?.split(/\s+/).pop() ?? ""; // family name only when "Given Family"
     const works = await deps.searchCrossref({
-      title: lm.title,
+      title: queryTitle,
       author: firstAuthor || undefined,
       bibliographic: lm.year ? String(lm.year) : undefined,
       rows: 5,
@@ -344,7 +369,7 @@ async function resolveOneLandmark(
     } else {
       let best: { w: CrossrefWork; score: number } | null = null;
       for (const w of works) {
-        const sim = titleSimilarity(lm.title, w.title);
+        const sim = simBest(w.title);
         if (!best || sim > best.score) best = { w, score: sim };
       }
       if (best && best.score >= TITLE_MATCH_THRESHOLD) {

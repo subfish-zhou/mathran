@@ -633,6 +633,15 @@ async function runInitAgentSpine(
       surveys: priorArt?.surveys.length ?? 0,
       expositoryAnswers: priorArt?.expositoryAnswers.length ?? 0,
     });
+    // Surface unresolved canonical landmarks to the project root so the user
+    // sees the "papers we couldn't auto-ingest" list without digging into
+    // report.json. Skipped silently when everything resolved (no file ⇒ no
+    // friction). Failure-isolated.
+    try {
+      await writeCanonToVendor(projectDir, priorArt);
+    } catch (err) {
+      await appendLog(projectDir, runId, "prior_art", `canon-to-vendor.md write failed: ${errMsg(err)}`);
+    }
     await appendPhase(projectDir, runId, "prior_art_discovery", "end", {
       surveys: priorArt?.surveys.length ?? 0,
       expositoryAnswers: priorArt?.expositoryAnswers.length ?? 0,
@@ -1058,6 +1067,78 @@ async function buildInitReport(args: BuildReportArgs): Promise<InitAgentReport> 
 }
 
 /** Persist the report to `<project>/.mathran/agent-runs/<run-id>/report.json`. */
+/**
+ * Write a human-readable `canon-to-vendor.md` to the project root listing the
+ * canonical landmark papers that the resolver could NOT auto-ingest into the
+ * paper-graph. Split into two sections:
+ *   1. DOI-only — Crossref found a reprint/journal record but no arxiv copy.
+ *      The user needs to fetch the PDF from the venue (Springer / AMS / etc.).
+ *   2. Fully unresolved — neither arxiv nor Crossref matched. Usually pre-arxiv
+ *      classics in foreign languages or obscure venues; the user has to source
+ *      the paper manually.
+ *
+ * Skipped (no file written) when both lists are empty so a fully-resolved
+ * project doesn't have a misleading stub in its root. Failure-isolated by
+ * the caller.
+ */
+async function writeCanonToVendor(projectDir: string, priorArt: PriorArtCorpus | null): Promise<void> {
+  const canon = priorArt?.canonicalLandmarks ?? [];
+  const doiOnly = canon.filter((c) => !c.arxivId && c.doi);
+  const unresolved = canon.filter((c) => !c.arxivId && !c.doi);
+  if (doiOnly.length === 0 && unresolved.length === 0) return;
+
+  const lines: string[] = [];
+  lines.push("# Canonical landmarks to vendor manually");
+  lines.push("");
+  lines.push(
+    "The init agent named the following canonical landmark papers for this problem, " +
+    "but could not auto-ingest them into the paper-graph (no arxiv copy is available). " +
+    "Vendor the PDFs yourself so they can be referenced from efforts and the wiki.",
+  );
+  lines.push("");
+  lines.push("Generated: " + new Date().toISOString());
+  lines.push("");
+
+  if (doiOnly.length > 0) {
+    lines.push("## DOI resolved — fetch from publisher");
+    lines.push("");
+    lines.push("These have a Crossref / DOI record. Follow the link, log in to the venue if needed, and download the PDF.");
+    lines.push("");
+    for (const c of doiOnly) {
+      const yr = c.year ?? c.crossrefYear ?? "?";
+      const venue = c.venue ?? c.crossrefVenue ?? "?";
+      const authors = c.authors.length > 0 ? c.authors.join(", ") : "(unknown authors)";
+      lines.push(`- **${c.title}** (${yr}, ${venue})`);
+      lines.push(`  - Authors: ${authors}`);
+      lines.push(`  - DOI: https://doi.org/${c.doi}`);
+      lines.push(`  - Why canon: ${c.why}`);
+      lines.push("");
+    }
+  }
+
+  if (unresolved.length > 0) {
+    lines.push("## Fully unresolved — find manually");
+    lines.push("");
+    lines.push(
+      "Neither arxiv nor Crossref returned a match. Usually pre-arxiv classics in foreign languages " +
+      "(Vinogradov 1937 in Russian, Brun 1920 in French, etc.) or papers in obscure venues. " +
+      "Use Google Scholar, the venue's archive, or a librarian.",
+    );
+    lines.push("");
+    for (const c of unresolved) {
+      const yr = c.year ?? "?";
+      const venue = c.venue ?? "?";
+      const authors = c.authors.length > 0 ? c.authors.join(", ") : "(unknown authors)";
+      lines.push(`- **${c.title}** (${yr}, ${venue})`);
+      lines.push(`  - Authors: ${authors}`);
+      lines.push(`  - Why canon: ${c.why}`);
+      lines.push("");
+    }
+  }
+
+  await fs.writeFile(path.join(projectDir, "canon-to-vendor.md"), lines.join("\n"), "utf8");
+}
+
 async function persistInitReport(projectDir: string, runId: string, report: InitAgentReport): Promise<void> {
   try {
     const dir = runDir(projectDir, runId);
@@ -1072,15 +1153,25 @@ async function persistInitReport(projectDir: string, runId: string, report: Init
 function printInitReport(report: InitAgentReport): void {
   const a = report.llmAccounting;
   const r = report.revisionsSummary;
+  const phaseLines: string[] = [];
+  const entries = Object.entries(a.breakdownByPhase).sort((x, y) => y[1].estimatedUsd - x[1].estimatedUsd);
+  for (const [phase, stat] of entries) {
+    phaseLines.push(`    ${phase.padEnd(28)} ${String(stat.calls).padStart(4)} calls   $${stat.estimatedUsd.toFixed(4)}`);
+  }
+  const canonNote = report.unresolvedCanonicalLandmarks
+    ? `  canon to vendor: ${report.unresolvedCanonicalLandmarks.doiOnly.length} DOI-only, ${report.unresolvedCanonicalLandmarks.unresolved.length} unresolved (see canon-to-vendor.md)`
+    : "";
   const lines = [
     "",
     `── init report: ${report.projectSlug} (${report.runId}) ──`,
     `  writer=${report.writerModel}  reviewer=${report.reviewerModel}`,
     `  LLM calls: writer=${a.writerCallsTotal} reviewer=${a.reviewerCallsTotal} reader=${a.readerCallsTotal} plan=${a.planAgentCalls}`,
-    `  estimated cost: $${a.estimatedTotalUsd.toFixed(4)}`,
+    `  estimated cost: $${a.estimatedTotalUsd.toFixed(4)} total`,
+    ...(phaseLines.length > 0 ? ["  cost by phase:", ...phaseLines] : []),
     `  revisions: reviewed=${r.artifactsReviewed} approved=${r.artifactsApproved} flagged=${r.artifactsFlaggedPersistent} avg=${r.avgRevisionsPerArtifact} max=${r.maxRevisionsAcrossArtifacts}`,
     `  convergence: ${report.convergenceSummary.reason} (${report.convergenceSummary.rounds} rounds)`,
     `  unresolved citations: ${report.unresolvedCitations.length}`,
+    canonNote,
     report.fieldTooLargeTripped ? "  ⚠ field-too-large tripped (a source was truncated)" : "",
   ].filter(Boolean);
   console.log(lines.join("\n"));
@@ -1365,10 +1456,18 @@ export async function resumeInitAgent(
       pages = await reloadPages(projectDir);
     } else if (input.aiInit.enableWiki) {
       await appendPhase(projectDir, runId, "spine_wiki", "start", { resumed: true });
+      // Reload the persisted prior-art corpus so the wiki writer still has the
+      // canonical-landmarks bibliography and survey context the original run
+      // had. Without this, resume produces a thinner wiki than the main run
+      // (caught when resume from build_efforts produced 3 wiki pages vs the
+      // original's 8). loadPriorArt returns null when nothing was persisted,
+      // which preserves the prior behaviour.
+      const { loadPriorArt } = await import("./prior-art/index.js");
+      const reloadedPriorArt = (await loadPriorArt(ctx.workspace, slug)) as PriorArtCorpus | null;
       pages = await runWikiSynthesis({
         spine,
         reads: await reloadReads(ctx.workspace),
-        priorArt: null,
+        priorArt: reloadedPriorArt,
         efforts,
         problem,
         mathStatus: input.problem.mathStatus,

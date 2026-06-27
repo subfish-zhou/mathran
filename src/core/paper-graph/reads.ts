@@ -25,6 +25,24 @@ export async function getPaperRead(workspace: string, paperId: string): Promise<
 
 export async function writePaperRead(workspace: string, read: PaperRead): Promise<void> {
   await writePaperReadFile(workspace, read);
+  // 档 3.12 (dogfood-run-10 followup): mirror the audit verdict onto PaperNode.rigor
+  // so consumers that hold a PaperNode (wiki bibliography, paper-graph dumps,
+  // resume code paths) can filter on `node.rigor.verdict === "off_topic"`
+  // without having to load the PaperRead. Best-effort + failure-isolated:
+  // a stale PaperNode is non-fatal — the PaperRead is still the source of truth.
+  if (read.audit) {
+    try {
+      const { getPaper, writePaperRaw } = await import("./fs-store.js");
+      const node = await getPaper(workspace, read.paperId);
+      if (node) {
+        node.rigor = read.audit;
+        node.updatedAt = new Date().toISOString();
+        await writePaperRaw(workspace, node);
+      }
+    } catch {
+      /* non-fatal — the read itself was persisted */
+    }
+  }
 }
 
 export async function deletePaperRead(workspace: string, paperId: string): Promise<void> {

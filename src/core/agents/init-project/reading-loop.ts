@@ -134,10 +134,12 @@ export interface ReadingLoopDeps {
 export const CONVERGENCE_K_DEFAULT = 3;
 export const SOFT_CIRCUIT_BREAKER_PAPERS = 1000;
 
-// Priority bands. Surveys outrank seeds (§7.1: "above seeds"); a survey's own
-// curated references outrank generic harvest; harvest priority is set by the
-// citation's importance to the citing paper.
+// Priority bands. Canon (LLM-named landmark papers) outrank user-supplied seeds
+// because canon represents the field's historical baseline a researcher MUST
+// see first; surveys outrank canon because a survey of a problem subsumes the
+// "what should I read first" question. Survey ≻ canon ≻ seed ≻ survey-keyref ≻ harvest.
 const PRIORITY_SURVEY = 1e12;
+const PRIORITY_CANON = 5e11;
 const PRIORITY_SEED = 1e9;
 const PRIORITY_SURVEY_KEYREF = 1e6;
 const IMPORTANCE_PRIORITY: Record<"essential" | "supporting" | "passing", number> = {
@@ -191,6 +193,18 @@ export async function runReadingLoop(
     surveyConfidence.set(s.paperId, s.confidence);
     push({ paperId: s.paperId, why: `survey: ${s.why}`, priority: PRIORITY_SURVEY });
   }
+  // Canonical landmarks resolved to arxiv (Chen 1973-class papers the LLM named
+  // and Crossref/arxiv resolved). These outrank user seeds: a user seed is
+  // whatever they happened to know about; a canon entry is what the field
+  // collectively considers required reading.
+  for (const lm of config.priorArt?.canonicalLandmarks ?? []) {
+    if (!lm.arxivId) continue;
+    push({
+      paperId: lm.arxivId,
+      why: `canonical landmark: ${lm.why}`,
+      priority: PRIORITY_CANON,
+    });
+  }
   for (const seedId of config.seedPaperIds) {
     push({ paperId: seedId, why: "user-confirmed seed", priority: PRIORITY_SEED });
   }
@@ -201,9 +215,10 @@ export async function runReadingLoop(
     log(`[reading-loop] expository answer noted (not enqueued, no arxiv id): ${ans.url}`);
   }
 
+  const canonCount = (config.priorArt?.canonicalLandmarks ?? []).filter((l) => l.arxivId).length;
   log(
     `[reading-loop] start: ${queue.length} initial candidates ` +
-      `(${config.priorArt?.surveys.length ?? 0} surveys, ${config.seedPaperIds.length} seeds), K=${K}`,
+      `(${config.priorArt?.surveys.length ?? 0} surveys, ${canonCount} canon, ${config.seedPaperIds.length} seeds), K=${K}`,
   );
 
   // ── Main loop ──────────────────────────────────────────────────────────────

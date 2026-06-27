@@ -114,11 +114,37 @@ describe("reviewArtifact — multiple severities", () => {
 });
 
 describe("reviewArtifact — robustness", () => {
-  it("accepts by default when the LLM returns unparseable output", async () => {
-    const llm: SpineLLM = async () => "I'm sorry, I can't do that.";
+  it("accepts by default when the LLM returns unparseable output (after retry)", async () => {
+    let calls = 0;
+    const llm: SpineLLM = async () => {
+      calls++;
+      return "I'm sorry, I can't do that.";
+    };
     const verdict = await reviewArtifact(input(), llm);
     expect(verdict.verdict).toBe("approve");
     expect(verdict.issues).toHaveLength(0);
+    expect(calls).toBe(2); // first try + retry, both failed
+    expect(verdict.verdictReasoning).toContain("after one retry");
+  });
+
+  it("retries with strict-format reminder and recovers when the second attempt is valid JSON", async () => {
+    let calls = 0;
+    const llm: SpineLLM = async (prompt: string) => {
+      calls++;
+      if (calls === 1) return "Sure, here's my review: it's fine."; // unparseable prose
+      // Second call should include the strict-format reminder.
+      expect(prompt).toContain("STRICT FORMAT REMINDER");
+      return JSON.stringify({
+        verdict: "approve",
+        overallReaderExperience: "Recovered on retry.",
+        issues: [],
+        verdictReasoning: "ok",
+      });
+    };
+    const verdict = await reviewArtifact(input(), llm);
+    expect(calls).toBe(2);
+    expect(verdict.verdict).toBe("approve");
+    expect(verdict.overallReaderExperience).toBe("Recovered on retry.");
   });
 
   it("accepts by default when the LLM throws", async () => {

@@ -31,6 +31,7 @@ import { EFFORT_LAYOUT, attachReference } from "../../../effort/store.js";
 import { errMsg, noopEmit, type SpineLLM, type EmitFn } from "./llm.js";
 import { getPaperRead } from "../../../paper-graph/reads.js";
 import { synthesizeEffort } from "../effort-synthesis/index.js";
+import { synthesizeThreadSurvey } from "../effort-synthesis/thread-survey.js";
 import type { PaperRead } from "../../../paper-graph/types.js";
 import type {
   NarrativeSpine,
@@ -285,12 +286,34 @@ export async function generateEffortsFromSpine(
     const years = threadNodes.map((n) => n.year).filter((y): y is number => typeof y === "number");
     const year = years.length > 0 ? Math.min(...years) : undefined;
 
-    // 2026-06-26 (sync-upgrade P2-B): we no longer LLM-generate a
-    // "what should be done" document — writeEffort() now seeds
-    // document.md from the spine context + references list, leaving
-    // the body for the user. effort.description still carries the
-    // thread description so writeEffort can use it as spine context.
-    const document = `Survey of ${thread.name}. ${thread.description}`;
+    // 2026-06-27 (档 3.11): when effort synthesis is enabled and a reviewerLlm
+    // is available, fold the thread into a real narrative survey via the
+    // writer-reviewer loop instead of leaving it as a 2-sentence scaffold.
+    // The body weaves together the thread description + every node's
+    // statement / significance / role so the user has a coherent reading
+    // entry-point per thread rather than just "see node A, node B, …".
+    // Failure-isolated: any LLM error degrades to the legacy scaffold body.
+    let document = `Survey of ${thread.name}. ${thread.description}`;
+    if (useSynthesis && reviewer.reviewerLlm) {
+      try {
+        document = await synthesizeThreadSurvey({
+          thread,
+          threadNodes,
+          era,
+          problemTitle,
+          projectDir,
+        }, {
+          llm,
+          reviewerLlm: reviewer.reviewerLlm,
+          writerModel: reviewer.writerModel ?? "",
+          reviewerModel: reviewer.reviewerModel ?? "",
+          estimateCost: reviewer.estimateCost,
+          emitLog: (m) => emit({ type: "log", message: m }),
+        });
+      } catch (err) {
+        emit({ type: "log", message: `[spine-efforts] synthesizeThreadSurvey(${thread.id}) failed: ${errMsg(err)}; falling back to scaffold` });
+      }
+    }
 
     const effortId = reserveEffortId(slugify(thread.name, "thread"));
     spineToEffort.set(thread.id, effortId);

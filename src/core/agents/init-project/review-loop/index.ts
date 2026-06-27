@@ -48,7 +48,7 @@ export {
 } from "./prompts.js";
 
 export interface ReviewLoopConfig {
-  artifactKind: "wiki-page" | "effort-document" | "effort-readme";
+  artifactKind: "wiki-page" | "effort-document" | "effort-readme" | "thread-survey";
   artifactTitle: string;
   artifactSlug: string;
   initialContent: string;

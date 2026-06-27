@@ -41,7 +41,7 @@ export interface ReviewerVerdict {
 }
 
 export interface ReviewArtifactInput {
-  artifactKind: "wiki-page" | "effort-document" | "effort-readme";
+  artifactKind: "wiki-page" | "effort-document" | "effort-readme" | "thread-survey";
   artifactTitle: string;
   artifactSlug: string;
   /** FULL content, no slicing — the reviewer reads everything. */
@@ -152,16 +152,37 @@ export async function reviewArtifact(
 ): Promise<ReviewerVerdict> {
   const emit = deps.emitLog ?? (() => {});
   const prompt = buildReviewerPrompt(input);
+  // Also drop maxTokens from the reviewer call: dogfood-run-10 showed long
+  // (>2500 token) reviewer outputs being cut off mid-JSON, which then failed
+  // to parse and triggered the silent "accept by default" fallback for 5+ of
+  // every 10 reviewer calls. With no maxTokens the provider uses its model's
+  // actual cap (128K for gpt-5.5) — the same fix as canonical-landmarks.
   try {
-    const raw = await reviewerLlm(prompt, { temperature: 0.2, maxTokens: 2500 });
-    const parsed = extractSpineJSON<RawVerdict>(raw);
+    let raw = await reviewerLlm(prompt, { temperature: 0.2 });
+    let parsed = extractSpineJSON<RawVerdict>(raw);
+
+    // Retry once with a strict "ONLY JSON, no prose" reminder when the first
+    // attempt failed to parse. Catches the case where the model produced
+    // valid content but wrapped it in prose / markdown headers / etc.
     if (!parsed) {
-      emit(`[review-loop] reviewer returned unparseable JSON for "${input.artifactSlug}"; accepting`);
+      emit(`[review-loop] reviewer "${input.artifactSlug}" returned unparseable JSON; retrying once with strict-format reminder`);
+      const strictPrompt =
+        prompt +
+        "\n\n=== STRICT FORMAT REMINDER ===\n" +
+        "Your previous response could not be parsed. Output ONLY a single JSON object " +
+        "matching the schema. NO markdown code fence, NO prose before or after, NO " +
+        "commentary on your own output. Start with `{` and end with `}`.";
+      raw = await reviewerLlm(strictPrompt, { temperature: 0.1 });
+      parsed = extractSpineJSON<RawVerdict>(raw);
+    }
+
+    if (!parsed) {
+      emit(`[review-loop] reviewer "${input.artifactSlug}" still unparseable after retry; accepting`);
       return {
         verdict: "approve",
-        overallReaderExperience: "(reviewer output could not be parsed; accepted by default)",
+        overallReaderExperience: "(reviewer output could not be parsed after retry; accepted by default)",
         issues: [],
-        verdictReasoning: "Reviewer response was not valid JSON.",
+        verdictReasoning: "Reviewer response was not valid JSON after one retry with strict-format reminder.",
       };
     }
     const verdict = normalizeVerdict(parsed);
