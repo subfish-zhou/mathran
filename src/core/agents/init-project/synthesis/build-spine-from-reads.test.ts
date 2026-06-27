@@ -191,6 +191,10 @@ describe("buildSpineFromReads", () => {
       makeRead({ paperId: "good" }),
       makeRead({ paperId: "rejected", audit: { verdict: "rejected", flags: [], pass: "fine", checkedAt: "2026-06-27T00:00:00.000Z" } }),
       makeRead({
+        paperId: "off-topic-physics",
+        audit: { verdict: "off_topic", flags: ["physics", "not_number_theory"], pass: "fine", checkedAt: "2026-06-27T00:00:00.000Z" },
+      }),
+      makeRead({
         paperId: "discarded",
         skim: { oneLineSummary: "x", mainContribution: "x", sectionOutline: [], decision: "discard", decisionReason: "off-topic" },
       }),
@@ -212,6 +216,7 @@ describe("buildSpineFromReads", () => {
 
     expect(capturedPrompt).toContain("[good]");
     expect(capturedPrompt).not.toContain("[rejected]");
+    expect(capturedPrompt).not.toContain("[off-topic-physics]");
     expect(capturedPrompt).not.toContain("[discarded]");
     // Orphan node still gets attached to a synthesized era.
     expect(spine.eras.length).toBeGreaterThanOrEqual(1);

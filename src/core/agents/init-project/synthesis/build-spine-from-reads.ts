@@ -88,6 +88,16 @@ export async function buildSpineFromReads(
   // ── 1. Pre-filter reads (defensive) ──
   const usableReads = input.reads.filter((r) => {
     if (r.audit?.verdict === "rejected") return false;
+    // off_topic reads are KEPT as PaperRead records (so the wiki bibliography
+    // can mention them) but EXCLUDED from spine extraction: they're factually
+    // unrelated to the target problem and would otherwise generate efforts
+    // about physics / unrelated math that the user has to read + reject.
+    // Caught in dogfood-run-10: a LaFeAsO condensed-matter paper got skim'd,
+    // audit flagged it off_topic, harvest was correctly suppressed by
+    // reading-loop, but spine fallback still pulled skim.mainContribution
+    // into a node and the writer-reviewer loop spent multiple minutes
+    // grading a README for "Neutron Scattering Study Finds LaFeAsO …".
+    if (r.audit?.verdict === "off_topic") return false;
     if (r.skim?.decision === "discard") return false;
     return true;
   });
