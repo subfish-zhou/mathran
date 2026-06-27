@@ -410,16 +410,25 @@ export async function searchCanonicalLandmarks(
 
   // Stage 1: propose
   let proposed: ProposedLandmark[];
+  let llmReply = "";
   try {
     const prompt = buildCanonPrompt(problem);
-    const reply = await deps.llm(prompt, { temperature: 0.2, maxTokens: 4000 });
-    proposed = parseProposedLandmarks(reply, maxProposed);
+    // No explicit maxTokens — let the provider use its model's own output cap.
+    // (Earlier we passed maxTokens:4000 which empirically made gpt-5.5 via
+    // /responses return empty text on a long-context prompt; the
+    // maxOutputTokensForModel default for gpt-5.5 is 128K which is the right
+    // ceiling for a 10-20 entry JSON array.)
+    llmReply = await deps.llm(prompt, { temperature: 0.2 });
+    proposed = parseProposedLandmarks(llmReply, maxProposed);
   } catch (err) {
     log(`[canonical-landmarks] LLM proposal failed: ${String(err)}`);
     return [];
   }
   if (proposed.length === 0) {
-    log(`[canonical-landmarks] LLM proposed 0 landmarks`);
+    // Surface a peek of the reply so future debugging doesn't need to repro
+    // a 20-min run. Truncate hard so the log line stays readable.
+    const peek = (llmReply || "").slice(0, 400).replace(/\s+/g, " ");
+    log(`[canonical-landmarks] LLM proposed 0 landmarks — reply head: "${peek}${llmReply.length > 400 ? "…" : ""}"`);
     return [];
   }
   log(`[canonical-landmarks] LLM proposed ${proposed.length} landmarks; resolving…`);
