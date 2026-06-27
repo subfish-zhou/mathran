@@ -72,3 +72,8 @@ logs/
 src/server/static-assets.generated.ts
 PROMPT-WORKER-*.md
 PROMPT-W-*.md
+
+# Init-agent v3 parallel-worker artifacts (skill: copilot-cli)
+PROMPT-WORKER-*.md
+PROMPT-W-*.md
+DESIGN-REFERENCE.md
