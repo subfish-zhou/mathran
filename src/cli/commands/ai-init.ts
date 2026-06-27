@@ -46,6 +46,21 @@ export interface AiInitOptions {
    * Doesn't cancel the run server-side; just stops watching.
    */
   timeoutSec?: number;
+  /**
+   * When true (default) and no `seeds` are supplied, run the Plan Agent first
+   * to formalize the problem and auto-discover seed papers, then proceed to
+   * init with the confirmed seeds. Set false to skip (used when ai-init is
+   * invoked *by* `project plan`, which already ran the Plan Agent).
+   */
+  autoPlan?: boolean;
+  /** Workspace root (for Plan Agent persistence). */
+  workspace?: string;
+  /** Model override for the in-process Plan Agent. */
+  model?: string;
+  /** Config path override for the in-process Plan Agent. */
+  configPath?: string;
+  /** Skip the Plan Agent confirm prompt (== answering "yes"). */
+  yes?: boolean;
 }
 
 interface InitResponseOk {
@@ -187,6 +202,79 @@ function fmtPhase(e: PhaseEvent, startWall: number): string {
   return `[${elapsed}s] ${status} ${e.phase.padEnd(20)}${tail}`;
 }
 
+/**
+ * In-process Plan Agent phase for `ai-init`. Formalizes `description`, prints
+ * the box-drawn result, and (for a SINGLE problem) asks whether to proceed with
+ * the auto-discovered seeds. Returns the seeds to use plus an optional refined
+ * title; for MULTIPLE / INSUFFICIENT it signals an abort with an exit code.
+ */
+async function runPlanPhase(
+  description: string,
+  opts: AiInitOptions,
+): Promise<{ abort: false; seeds: Array<{ arxivId: string }>; title?: string } | { abort: true; code: number }> {
+  const { buildCliLLM, renderPlanBox, confirmProceed, seedsToArg } = await import("./project-plan.js");
+  const { resolveWorkspaceRoot } = await import("./project.js");
+  const { runPlanAgent } = await import("../../core/agents/plan/index.js");
+
+  let planLLM: import("../../providers/index.js").ModelRouter;
+  let model: string;
+  try {
+    const built = buildCliLLM({ model: opts.model, configPath: opts.configPath });
+    planLLM = built.llm;
+    model = built.model;
+  } catch (e) {
+    console.error(`mathran ai-init: cannot build LLM for plan phase: ${(e as Error).message}`);
+    return { abort: true, code: 1 };
+  }
+  const workspace = resolveWorkspaceRoot(opts.workspace);
+
+  let result;
+  try {
+    result = await runPlanAgent(
+      { description },
+      {
+        llm: planLLM,
+        model,
+        workspace,
+        emit: (e) => {
+          if (!opts.json) console.log(`[plan-agent] Phase: ${e.phase}${e.message ? ` (${e.message})` : ""}`);
+        },
+      },
+    );
+  } catch (e) {
+    console.error(`mathran ai-init: plan phase failed: ${(e as Error).message}`);
+    return { abort: true, code: 1 };
+  }
+
+  if (!opts.json) {
+    console.log("");
+    console.log(renderPlanBox(result));
+    console.log("");
+    if (result.savedTo) console.log(`[plan-agent] Result saved to: ${result.savedTo}`);
+  }
+
+  if (result.status === "insufficient") {
+    console.error("mathran ai-init: problem is underspecified — refine the description and re-run.");
+    return { abort: true, code: 2 };
+  }
+  if (result.status === "multiple") {
+    console.error("mathran ai-init: ambiguous problem — re-run with a more specific description.");
+    return { abort: true, code: 2 };
+  }
+
+  const answer = opts.yes
+    ? "yes"
+    : await confirmProceed("Proceed with project init using these seeds? [Y]es / [N]o / [E]dit seeds: ");
+  if (answer === "edit") {
+    console.log("edit not supported in CLI; specify --seeds <arxiv-ids> and re-run");
+    return { abort: true, code: 0 };
+  }
+
+  const seedArg = answer === "yes" ? seedsToArg(result.suggestedSeeds) : "";
+  const seeds = parseSeeds(seedArg || undefined);
+  return { abort: false, seeds, title: result.problem?.title };
+}
+
 export async function runAiInit(name: string, opts: AiInitOptions): Promise<number> {
   const serveUrl = (opts.serveUrl ?? DEFAULT_SERVE_URL).replace(/\/$/, "");
 
@@ -217,8 +305,20 @@ export async function runAiInit(name: string, opts: AiInitOptions): Promise<numb
     return 2;
   }
 
+  // Auto-plan: when the user supplied no explicit seeds, formalize the problem
+  // with the Plan Agent first and proceed with its auto-discovered seeds. The
+  // Plan Agent runs in-process (no serve needed). Skipped when `project plan`
+  // already ran it (autoPlan === false) or when seeds were given explicitly.
+  let problemTitle = name;
+  if (seeds.length === 0 && opts.autoPlan !== false) {
+    const planExit = await runPlanPhase(name, opts);
+    if (planExit.abort) return planExit.code;
+    seeds = planExit.seeds;
+    if (planExit.title) problemTitle = planExit.title;
+  }
+
   const body = {
-    problem: { title: name },
+    problem: { title: problemTitle },
     seedReferences: seeds,
     aiInit: {
       useSpine: opts.useSpine ?? true,
