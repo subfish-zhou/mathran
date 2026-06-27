@@ -161,6 +161,36 @@ projectCmd
     process.exit(await runProjectList({ workspace: opts.workspace, json: opts.json }));
   });
 
+// `mathran project plan <description>` — formalize a problem with the Plan
+// Agent (W1-γ) before optionally proceeding to AI-assisted init.
+projectCmd
+  .command("plan")
+  .description("Formalize a problem with the Plan Agent (single/multiple/insufficient + seed discovery)")
+  .argument("<description>", "Free-text problem description, e.g. \"binary Goldbach\"")
+  .option("--workspace <dir>", "Workspace root (overrides MATHRAN_WORKSPACE and the default)")
+  .option("--refs <links>", "Comma-separated reference links (arxiv ids / DOIs / URLs)")
+  .option("--model <id>", "Model id for the Plan Agent (overrides config defaultModel)")
+  .option("--config <path>", "Config file path")
+  .option("--json", "Emit the raw result as JSON instead of the box-drawn output", false)
+  .option("-y, --yes", "Skip the confirm prompt and proceed with the suggested seeds", false)
+  .option("--no-init", "Only plan + save; do not proceed to project init")
+  .option("--serve-url <url>", "Serve URL forwarded to init (default http://127.0.0.1:7878)")
+  .option("--depth <d>", "Search depth forwarded to init: shallow | standard | deep", "standard")
+  .action(async (description: string, opts: { workspace?: string; refs?: string; model?: string; config?: string; json?: boolean; yes?: boolean; init?: boolean; serveUrl?: string; depth?: "shallow" | "standard" | "deep" }) => {
+    const { runProjectPlan } = await import("./commands/project-plan.js");
+    process.exit(await runProjectPlan(description, {
+      workspace: opts.workspace,
+      refs: opts.refs,
+      model: opts.model,
+      configPath: opts.config,
+      json: opts.json,
+      yes: opts.yes,
+      noInit: opts.init === false,
+      serveUrl: opts.serveUrl,
+      depth: opts.depth,
+    }));
+  });
+
 // `mathran ai-init <name>` — invoke the AI-assisted init pipeline via
 // the running serve process. Added 2026-06-26 (design-audit D-1).
 program
@@ -173,12 +203,16 @@ program
   .option("--no-wiki", "Skip the wiki phase")
   .option("--no-workspace", "Skip the workspace/effort phase")
   .option("--no-spine", "Use the legacy non-spine pipeline (not recommended)")
+  .option("--no-plan", "Skip the Plan Agent pre-pass even when no --seeds are given")
+  .option("-y, --yes", "Auto-confirm the Plan Agent seed suggestions (non-interactive)", false)
+  .option("--model <id>", "Model id for the Plan Agent pre-pass")
+  .option("--config <path>", "Config file path for the Plan Agent pre-pass")
   .option("--detach", "Print runId and exit without waiting for completion")
   .option("--timeout-sec <n>", "Max seconds to wait for completion (default 1800)", (v) => parseInt(v, 10))
   .option("--json", "Emit raw NDJSON events instead of pretty-printing", false)
-  .action(async (name: string, opts: { serveUrl?: string; seeds?: string; depth?: "shallow" | "standard" | "deep"; wiki?: boolean; workspace?: boolean; spine?: boolean; detach?: boolean; timeoutSec?: number; json?: boolean }) => {
+  .action(async (name: string, opts: { serveUrl?: string; seeds?: string; depth?: "shallow" | "standard" | "deep"; wiki?: boolean; workspace?: boolean; spine?: boolean; plan?: boolean; yes?: boolean; model?: string; config?: string; detach?: boolean; timeoutSec?: number; json?: boolean }) => {
     const { runAiInit } = await import("./commands/ai-init.js");
-    // commander inverts --no-* booleans automatically (wiki/workspace/spine default true)
+    // commander inverts --no-* booleans automatically (wiki/workspace/spine/plan default true)
     process.exit(await runAiInit(name, {
       serveUrl: opts.serveUrl,
       seeds: opts.seeds,
@@ -186,6 +220,10 @@ program
       noWiki: opts.wiki === false,
       noWorkspace: opts.workspace === false,
       useSpine: opts.spine !== false,
+      autoPlan: opts.plan !== false,
+      yes: opts.yes,
+      model: opts.model,
+      configPath: opts.config,
       detach: opts.detach,
       timeoutSec: opts.timeoutSec,
       json: opts.json,
