@@ -212,10 +212,28 @@ function fmtPhase(e: PhaseEvent, startWall: number): string {
  * the auto-discovered seeds. Returns the seeds to use plus an optional refined
  * title; for MULTIPLE / INSUFFICIENT it signals an abort with an exit code.
  */
+/**
+ * Lightweight refined problem snapshot forwarded from plan-agent into ai-init's
+ * HTTP body. Keeps the rich `background` / `description` / `tags` / `formalStatement`
+ * fields the Plan Agent produced so downstream phases (prior-art canonical-
+ * landmarks discovery, reading-loop, wiki/effort synthesis) see real context
+ * instead of only the bare title.
+ */
+export interface RefinedProblem {
+  title: string;
+  formalStatement?: string;
+  description?: string;
+  backgroundSummary?: string;
+  tags?: string[];
+  mathStatus?: "OPEN" | "PARTIALLY_SOLVED" | "SOLVED" | "DISPUTED";
+}
+
 async function runPlanPhase(
   description: string,
   opts: AiInitOptions,
-): Promise<{ abort: false; seeds: Array<{ arxivId: string }>; title?: string } | { abort: true; code: number }> {
+): Promise<
+  { abort: false; seeds: Array<{ arxivId: string }>; refined?: RefinedProblem } | { abort: true; code: number }
+> {
   const { buildCliLLM, renderPlanBox, confirmProceed, seedsToArg } = await import("./project-plan.js");
   const { resolveWorkspaceRoot } = await import("./project.js");
   const { runPlanAgent } = await import("../../core/agents/plan/index.js");
@@ -276,7 +294,21 @@ async function runPlanPhase(
 
   const seedArg = answer === "yes" ? seedsToArg(result.suggestedSeeds) : "";
   const seeds = parseSeeds(seedArg || undefined);
-  return { abort: false, seeds, title: result.problem?.title };
+  // Forward the FULL formalized problem (title + formalStatement + description +
+  // background + tags + mathStatus) so server-side phases see real context,
+  // not just the bare title. Without this the CLI bridge was dropping all the
+  // rich plan-agent output and the init agent re-invented context from scratch.
+  const refined: RefinedProblem | undefined = result.problem
+    ? {
+        title: result.problem.title,
+        formalStatement: result.problem.formalStatement,
+        description: result.problem.description,
+        backgroundSummary: result.problem.background,
+        tags: result.problem.tags,
+        mathStatus: result.problem.mathStatus,
+      }
+    : undefined;
+  return { abort: false, seeds, refined };
 }
 
 export async function runAiInit(name: string, opts: AiInitOptions): Promise<number> {
@@ -318,15 +350,19 @@ export async function runAiInit(name: string, opts: AiInitOptions): Promise<numb
   // Plan Agent runs in-process (no serve needed). Skipped when `project plan`
   // already ran it (autoPlan === false) or when seeds were given explicitly.
   let problemTitle = name;
+  let refinedProblem: RefinedProblem | undefined;
   if (seeds.length === 0 && opts.autoPlan !== false) {
     const planExit = await runPlanPhase(name, opts);
     if (planExit.abort) return planExit.code;
     seeds = planExit.seeds;
-    if (planExit.title) problemTitle = planExit.title;
+    if (planExit.refined) {
+      refinedProblem = planExit.refined;
+      problemTitle = planExit.refined.title;
+    }
   }
 
   const body = {
-    problem: { title: problemTitle },
+    problem: refinedProblem ?? { title: problemTitle },
     seedReferences: seeds,
     aiInit: {
       useSpine: opts.useSpine ?? true,

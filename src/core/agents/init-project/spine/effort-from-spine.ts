@@ -612,6 +612,13 @@ function estimateNodeDifficulty(node: SpineNode): WorkspaceEffortOutput["difficu
 }
 
 export function shouldProcessNodeInFullInit(node: SpineNode): boolean {
+  // Shallow-fallback nodes (synthesized when LLM extraction returned 0 LLM
+  // candidates) are intentionally marked `depth: "incremental"` to flag their
+  // thin provenance, but they are the ONLY material the downstream synthesizers
+  // have — without an override they'd be filtered out and every shallow-fallback
+  // run would produce 0 efforts and 0 spine citations in the wiki. Caught in
+  // dogfood-run-5 (11 nodes survived the fallback; 0 efforts ran).
+  if (node.shallowFallback) return true;
   if (node.depth !== "incremental") return true;
   return node.type === "dead_end" || node.type === "open_direction";
 }

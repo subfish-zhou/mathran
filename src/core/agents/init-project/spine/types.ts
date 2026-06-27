@@ -59,6 +59,16 @@ export interface SpineNode {
   /** Workspace effort IDs linked to this node */
   effortIds: string[];
   depth: SpineNodeDepth;
+  /**
+   * Set true when the node was produced by the shallow-fallback path in
+   * buildSpineFromReads (LLM extracted 0 candidates, so we synthesized one
+   * incremental-depth node per skim.mainContribution / surveyOutline entry).
+   * Downstream filters that normally skip `incremental` nodes treat these as
+   * eligible — without that override, a shallow-fallback run would produce a
+   * spine but 0 efforts and 0 wiki citations, defeating the fallback's purpose.
+   * Caught in dogfood-run-5: 11 nodes, 0 efforts, 0 spine citations in wiki.
+   */
+  shallowFallback?: boolean;
 }
 
 export interface SpineEdge {

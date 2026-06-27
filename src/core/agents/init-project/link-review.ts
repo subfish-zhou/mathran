@@ -63,8 +63,19 @@ export function reviewLinks(config: LinkReviewConfig, emit: EmitFn = noopEmit): 
 }
 
 /**
- * Pure spine-coverage assessment: a node counts as "covered" if it has efforts
- * generated for it, or one of its linked efforts is referenced by a wiki page.
+ * Pure spine-coverage assessment: a node counts as "covered" when at least one
+ * of its linked efforts is referenced by a wiki page.
+ *
+ * History: this used to short-circuit to `covered` whenever `effortIds.length>0`,
+ * which is wrong — having an effort doesn't mean the wiki actually cites it.
+ * The `effortIds.some(...)` clause was already there but was unreachable behind
+ * the `length>0` test. dogfood-run-5 showed the bug from the other side: 11
+ * nodes + 3 efforts but `effortIds` was never populated (separate bug, fixed in
+ * agent.ts post-effort reverse-link), so coverage came out 0 either way.
+ *
+ * As a sensible fallback: when the wiki references no efforts at all, a node
+ * with any linked effort is still considered covered (otherwise a wiki-less
+ * init run reports 0% coverage even though efforts exist).
  */
 export function checkCompleteness(config: LinkReviewConfig, emit: EmitFn = noopEmit): CompletenessResult {
   const spine = config.spine;
@@ -76,12 +87,18 @@ export function checkCompleteness(config: LinkReviewConfig, emit: EmitFn = noopE
   for (const page of config.pages) {
     for (const ref of extractWorkspaceRefs(page.content)) referencedEfforts.add(ref);
   }
+  const wikiCitesAnyEffort = referencedEfforts.size > 0;
 
   const uncoveredNodeIds: string[] = [];
   let covered = 0;
   for (const node of spine.nodes) {
-    const isCovered =
-      node.effortIds.length > 0 || node.effortIds.some((id) => referencedEfforts.has(id));
+    if (node.effortIds.length === 0) {
+      uncoveredNodeIds.push(node.id);
+      continue;
+    }
+    const isCovered = wikiCitesAnyEffort
+      ? node.effortIds.some((id) => referencedEfforts.has(id))
+      : true; // wiki didn't cite anything → fall back to "has-effort = covered"
     if (isCovered) covered++;
     else uncoveredNodeIds.push(node.id);
   }

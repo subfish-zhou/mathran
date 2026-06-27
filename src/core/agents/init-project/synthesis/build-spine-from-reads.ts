@@ -415,6 +415,7 @@ function synthesizeShallowCandidatesFromReads(reads: PaperRead[]): ExtractedCand
           proofIdea: undefined,
           paperIds: [r.paperId],
           depth: "incremental",
+          shallowFallback: true,
         },
         suggestedEdges: [],
       });
@@ -437,6 +438,7 @@ function synthesizeShallowCandidatesFromReads(reads: PaperRead[]): ExtractedCand
         proofIdea: undefined,
         paperIds: [r.paperId],
         depth: "incremental",
+        shallowFallback: true,
       },
       suggestedEdges: [],
     });

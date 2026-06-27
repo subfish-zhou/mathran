@@ -115,7 +115,14 @@ export interface InitAgentContext {
   discoverPriorArt?: (args: {
     workspace: string;
     projectDir: string;
-    problem: { title: string; formalStatement: string; tags: string[]; slug: string };
+    problem: {
+      title: string;
+      formalStatement: string;
+      tags: string[];
+      backgroundSummary?: string;
+      mathStatus?: string;
+      slug: string;
+    };
     llm: import("./spine/llm.js").SpineLLM;
   }) => Promise<PriorArtCorpus | null>;
 }
@@ -597,6 +604,8 @@ async function runInitAgentSpine(
             title: problem.title,
             formalStatement: problem.formalStatement,
             tags: problem.tags,
+            backgroundSummary: input.problem.backgroundSummary,
+            mathStatus: input.problem.mathStatus,
             slug,
           },
           llm: priorArtLLM,
@@ -768,6 +777,32 @@ async function runInitAgentSpine(
         )
       : { efforts: [], edges: [] };
     summary.effortsCreated = effortResult.efforts.length;
+
+    // Reverse-link efforts back into the spine: each effort with a `spineNodeId`
+    // gets its id pushed into the corresponding spine node's `effortIds`. This
+    // is required for downstream `checkCompleteness` to report non-zero spine
+    // coverage — without it the spine's `node.effortIds` stays at `[]` forever
+    // (caught in dogfood-run-5: spine had 11 nodes + 3 efforts but coverage=0%).
+    let effortIdsLinked = 0;
+    for (const e of effortResult.efforts) {
+      const targetId = e.spineNodeId;
+      if (!targetId) continue;
+      const node = spine.nodes.find((n) => n.id === targetId);
+      if (!node) continue;
+      if (!node.effortIds.includes(e.id)) {
+        node.effortIds.push(e.id);
+        effortIdsLinked++;
+      }
+    }
+    if (effortIdsLinked > 0) {
+      try {
+        const { writeSpine } = await import("./spine/builder.js");
+        await writeSpine(projectDir, spine);
+        await appendLog(projectDir, runId, "spine", `linked ${effortIdsLinked} effort id(s) back into spine nodes`);
+      } catch (err) {
+        await appendLog(projectDir, runId, "warn", `effortId reverse-link persist failed: ${errMsg(err)}`);
+      }
+    }
     // 2026-06-26 (sync-upgrade P0-A): persist the dep edges the spine
     // pipeline computed. Until now `effortResult.edges` was only used
     // for a count in the checkpoint and then discarded — schema, CLI,

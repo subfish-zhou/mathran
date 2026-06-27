@@ -98,4 +98,27 @@ describe("checkCompleteness — completeness_check (pure)", () => {
     expect(result.coverage).toBeCloseTo(0.5);
     expect(result.uncoveredNodeIds).toEqual(["n2"]);
   });
+
+  it("gates coverage on wiki-cites-effort when the wiki actually cites things", () => {
+    // Two nodes, both with effortIds, but only one's effort is referenced by the wiki.
+    const spine = spineWith([
+      { id: "n1", effortIds: ["e1"] },
+      { id: "n2", effortIds: ["e2"] },
+    ]);
+    const pages = [page({ slug: "p1", content: "Cites @ws:e1 only." })];
+    const result = checkCompleteness(config({ spine, pages }));
+    expect(result.coveredNodes).toBe(1);
+    expect(result.uncoveredNodeIds).toEqual(["n2"]);
+  });
+
+  it("falls back to has-effort = covered when the wiki cites nothing (no-wiki path)", () => {
+    const spine = spineWith([
+      { id: "n1", effortIds: ["e1"] },
+      { id: "n2", effortIds: ["e2"] },
+    ]);
+    // No pages at all — checkCompleteness should not punish has-effort nodes.
+    const result = checkCompleteness(config({ spine, pages: [] }));
+    expect(result.coveredNodes).toBe(2);
+    expect(result.uncoveredNodeIds).toEqual([]);
+  });
 });

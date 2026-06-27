@@ -19,6 +19,12 @@ import type { SpineLLM } from "../spine/llm.js";
 import { searchArxivSurveys, type ArxivSurveyHit, type SearchArxivFn } from "./arxiv-survey-search.js";
 import { searchBourbakiSeminars, type BourbakiHit } from "./bourbaki-search.js";
 import { searchMathOverflow, type MathOverflowHit } from "./mathoverflow-search.js";
+import {
+  searchCanonicalLandmarks,
+  type CanonicalLandmarkHit,
+  type SearchArxivByTitleFn,
+  type CrossrefSearchFn,
+} from "./canonical-landmarks-search.js";
 
 export interface PriorArtSurvey {
   paperId: string; // arxiv id, or `bourbaki:<n>`, or `mo:<question-id>` for external sources
@@ -34,6 +40,14 @@ export interface PriorArtSurvey {
 export interface PriorArtCorpus {
   surveys: PriorArtSurvey[];
   expositoryAnswers: MathOverflowHit[];
+  /**
+   * Canonical landmark papers proposed by the LLM and resolved via arxiv +
+   * Crossref. Includes both arxiv-resolved entries (which will be ingested as
+   * priority-1 seeds by the reading loop) and unresolved-to-arxiv entries
+   * (which the run report surfaces as "vendor manually" notes — these are
+   * pre-arxiv classics like Chen 1973 / Vinogradov 1937).
+   */
+  canonicalLandmarks?: CanonicalLandmarkHit[];
   discoveredAt?: string;
 }
 
@@ -41,6 +55,13 @@ export interface DiscoverPriorArtDeps {
   workspace: string;
   llm: SpineLLM;
   searchArxiv?: SearchArxivFn;
+  /**
+   * Optional title-only arxiv search for canonical-landmark resolution.
+   * Default falls back to {@link searchArxiv} (which accepts arbitrary queries).
+   */
+  searchArxivByTitle?: SearchArxivByTitleFn;
+  /** Optional Crossref bibliographic search; defaults to the real Crossref REST client. */
+  searchCrossref?: CrossrefSearchFn;
   fetchBourbakiIndex?: () => Promise<string>;
   fetchMathOverflowApi?: (url: string) => Promise<unknown>;
   rateDelayMs?: number;
@@ -66,17 +87,26 @@ function extractMoId(hit: MathOverflowHit): string {
 }
 
 /**
- * Run all three prior-art sub-searches concurrently, merge into a
- * `PriorArtCorpus`, ingest arxiv surveys into the paper-graph, and persist.
+ * Run all four prior-art sub-searches concurrently, merge into a
+ * `PriorArtCorpus`, ingest arxiv surveys and arxiv-resolved canonical
+ * landmarks into the paper-graph, and persist.
  */
 export async function discoverPriorArt(
-  problem: { title: string; tags: string[]; formalStatement?: string; slug: string },
+  problem: {
+    title: string;
+    tags: string[];
+    formalStatement?: string;
+    /** Plan-agent `background` (state-of-the-art summary). Used by canonical-landmarks LLM grounding. */
+    backgroundSummary?: string;
+    mathStatus?: string;
+    slug: string;
+  },
   deps: DiscoverPriorArtDeps,
 ): Promise<PriorArtCorpus> {
   const log = deps.emitLog ?? (() => {});
   const { workspace } = deps;
 
-  const [arxivHits, bourbakiHits, moHits] = await Promise.all([
+  const [arxivHits, bourbakiHits, moHits, canonHits] = await Promise.all([
     searchArxivSurveys(
       { title: problem.title, tags: problem.tags, formalStatement: problem.formalStatement },
       {
@@ -93,6 +123,22 @@ export async function discoverPriorArt(
     searchMathOverflow(
       { title: problem.title, tags: problem.tags },
       { apiFetch: deps.fetchMathOverflowApi, rateDelayMs: deps.rateDelayMs, emitLog: deps.emitLog },
+    ),
+    searchCanonicalLandmarks(
+      {
+        title: problem.title,
+        tags: problem.tags,
+        formalStatement: problem.formalStatement,
+        background: problem.backgroundSummary,
+        mathStatus: problem.mathStatus,
+      },
+      {
+        llm: deps.llm,
+        searchArxivByTitle: deps.searchArxivByTitle ?? deps.searchArxiv,
+        searchCrossref: deps.searchCrossref,
+        rateDelayMs: deps.rateDelayMs,
+        emitLog: deps.emitLog,
+      },
     ),
   ]);
 
@@ -153,9 +199,30 @@ export async function discoverPriorArt(
 
   surveys.sort((a, b) => b.confidence - a.confidence);
 
+  // Ingest arxiv-resolved canonical landmarks into the paper-graph so the
+  // reading loop picks them up as priority candidates (alongside user-supplied
+  // seeds). DOI-only and fully unresolved canon entries stay in the corpus as
+  // metadata so the run report can surface them under unresolvedCitations.
+  const ingestedCanonArxivIds: string[] = [];
+  for (const lm of canonHits) {
+    if (!lm.arxivId) continue;
+    try {
+      await ingestPaper(workspace, {
+        title: lm.title,
+        authors: lm.authors,
+        year: lm.year ?? lm.crossrefYear,
+        arxivId: lm.arxivId,
+      });
+      ingestedCanonArxivIds.push(lm.arxivId);
+    } catch (err) {
+      log(`[canonical-landmarks] ingest failed for ${lm.arxivId}: ${String(err)}`);
+    }
+  }
+
   const corpus: PriorArtCorpus = {
     surveys,
     expositoryAnswers: moHits,
+    canonicalLandmarks: canonHits,
     discoveredAt: new Date().toISOString(),
   };
 
@@ -166,9 +233,15 @@ export async function discoverPriorArt(
     log(`[prior-art] persist failed: ${String(err)}`);
   }
 
+  const canonArxiv = canonHits.filter((h) => h.arxivId).length;
+  const canonDoiOnly = canonHits.filter((h) => !h.arxivId && h.doi).length;
+  const canonUnresolved = canonHits.filter((h) => !h.arxivId && !h.doi).length;
   log(
     `[prior-art] corpus: ${surveys.length} surveys (` +
-      `${arxivHits.length} arxiv, ${bourbakiHits.length} bourbaki, ${moHits.length} MO answers)`,
+      `${arxivHits.length} arxiv, ${bourbakiHits.length} bourbaki, ${moHits.length} MO answers), ` +
+      `${canonHits.length} canon landmarks (` +
+      `${canonArxiv} arxiv-ingested, ${canonDoiOnly} doi-only, ${canonUnresolved} unresolved); ` +
+      `${ingestedCanonArxivIds.length} canon arxiv ids fed to paper-graph`,
   );
   return corpus;
 }
