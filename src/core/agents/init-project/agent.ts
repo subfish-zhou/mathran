@@ -42,6 +42,7 @@ import { buildConceptExtractionPrompt, buildWikiPagePrompt } from "./prompts.js"
 import type {
   InitAgentInput,
   InitAgentResult,
+  InitAgentReport,
   CrawledResource,
   ParsedReference,
 } from "./types.js";
@@ -61,6 +62,13 @@ import {
 } from "./review-verify.js";
 import type { SpinePipelineEvent, WikiPageOutput, WorkspaceEffortOutput } from "./spine/types.js";
 import type { PaperNode } from "../../paper-graph/index.js";
+import {
+  resolveModelPair,
+  persistModelPair,
+  IDENTICAL_MODELS_WARNING,
+} from "./model-pair.js";
+import { LlmAccounting } from "./llm-accounting.js";
+import { runDir } from "./runs-ledger.js";
 
 export interface InitAgentContext {
   workspace: string;
@@ -498,6 +506,33 @@ async function runInitAgentSpine(
   const rateDelay = ctx.rateDelayMs ?? ARXIV_RATE_DELAY;
   const spineLLM = makeSpineLLM(llm, model);
 
+  // [Task 37] Resolve, warn-on-identical, and persist the writer/reviewer
+  // model pair. Resolution honours explicit config > env > persisted settings >
+  // default (gpt-5.5 / opus-4.8). Persisting back to settings.json means a
+  // later re-run reuses the same pair unless overridden.
+  const modelPair = await resolveModelPair(
+    { writerModel: input.aiInit.writerModel, reviewerModel: input.aiInit.reviewerModel },
+    projectDir,
+  );
+  if (modelPair.identical) {
+    console.warn(IDENTICAL_MODELS_WARNING);
+    await appendLog(projectDir, runId, "warn", IDENTICAL_MODELS_WARNING);
+  }
+  await persistModelPair(projectDir, modelPair);
+  await appendLog(projectDir, runId, "config", "model pair resolved", {
+    writerModel: modelPair.writerModel,
+    reviewerModel: modelPair.reviewerModel,
+  });
+
+  // [Task 38] LLM cost accounting. Wrap the base SpineLLM per phase so calls
+  // and (estimated) tokens are attributed to writer / reviewer / plan roles.
+  const accounting = new LlmAccounting(modelPair.writerModel, modelPair.reviewerModel);
+  const planLLM = accounting.wrap(spineLLM, "build_spine", "plan");
+  const effortsLLM = accounting.wrap(spineLLM, "build_efforts", "writer");
+  const wikiLLM = accounting.wrap(spineLLM, "spine_wiki", "writer");
+  const reviewLLM = accounting.wrap(spineLLM, "review_refine", "reviewer");
+  const verifyLLM = accounting.wrap(spineLLM, "verify", "reviewer");
+
   // Forward spine pipeline events into the runs ledger as logs (fire-and-forget;
   // appendLog is failure-isolated and never throws).
   const emit = (e: SpinePipelineEvent): void => {
@@ -665,7 +700,7 @@ async function runInitAgentSpine(
     await appendPhase(projectDir, runId, "build_spine", "start", { papers: spinePaperIds.length });
     const spine = await buildSpine(
       { projectDir, workspace, paperIds: spinePaperIds, mode: "full", problem, signal: ctx.signal },
-      spineLLM,
+      planLLM,
       emit,
     );
     summary.spineNodes = spine.nodes.length;
@@ -686,7 +721,7 @@ async function runInitAgentSpine(
     const effortResult = input.aiInit.enableWorkspace
       ? await generateEffortsFromSpine(
           { spine, projectDir, workspace, problemTitle: problem.title },
-          spineLLM,
+          effortsLLM,
           emit,
         )
       : { efforts: [], edges: [] };
@@ -741,7 +776,7 @@ async function runInitAgentSpine(
           problem,
           mathStatus: input.problem.mathStatus,
           projectDir,
-          llm: spineLLM,
+          llm: wikiLLM,
           emit,
         })
       : [];
@@ -751,6 +786,8 @@ async function runInitAgentSpine(
     await appendPhase(projectDir, runId, "spine_wiki", "end", { wikiPages: wikiPages.length });
 
     // ── Phase 5-8: review / verify / link / completeness (only with wiki) ──
+    let review: import("./review-verify.js").ReviewResult | undefined;
+    let verify: import("./review-verify.js").VerifyResult | undefined;
     if (input.aiInit.enableWiki && pages.length > 0) {
       const rvConfig = {
         projectDir,
@@ -764,7 +801,7 @@ async function runInitAgentSpine(
       // Phase 5: review_refine
       throwIfAborted();
       await appendPhase(projectDir, runId, "review_refine", "start");
-      const review = await reviewAndRefinePages(rvConfig, spineLLM, emit);
+      review = await reviewAndRefinePages(rvConfig, reviewLLM, emit);
       summary.pagesRefined = review.refinedCount;
       await writeCheckpoint(projectDir, runId, "review_refine", {
         refined: review.refinedCount,
@@ -775,7 +812,7 @@ async function runInitAgentSpine(
       // Phase 6: verify
       throwIfAborted();
       await appendPhase(projectDir, runId, "verify", "start");
-      const verify = await verifyPages(rvConfig, spineLLM, emit);
+      verify = await verifyPages(rvConfig, verifyLLM, emit);
       summary.pagesFlagged = verify.flaggedCount;
       await writeCheckpoint(projectDir, runId, "verify", {
         flagged: verify.flaggedCount,
@@ -810,6 +847,30 @@ async function runInitAgentSpine(
       });
     }
 
+    // ── final report (Task 38) ─────────────────────────────────────────────
+    // Fold reader stats already captured on persisted PaperReads into the
+    // accounting (the reading loop's own LLM calls are tracked there, so we
+    // don't double-count via the SpineLLM wrappers).
+    for (const r of loopResult.reads) {
+      accounting.addReaderStats("read_and_explore", r.totalLlmCalls ?? 0, r.totalTokensIn ?? 0, r.totalTokensOut ?? 0);
+    }
+    const report = await buildInitReport({
+      runId,
+      projectSlug: slug,
+      projectDir,
+      writerModel: modelPair.writerModel,
+      reviewerModel: modelPair.reviewerModel,
+      accounting,
+      reads: loopResult.reads,
+      efforts: effortResult.efforts,
+      unresolvedCitations: loopResult.unresolvedCitations,
+      convergence: loopResult.convergence,
+      review,
+      verify,
+    });
+    await persistInitReport(projectDir, runId, report);
+    printInitReport(report);
+
     // ── completed ─────────────────────────────────────────────────────────
     summary.durationMs = Date.now() - started;
     await appendPhase(projectDir, runId, "completed", "end", { summary });
@@ -822,6 +883,7 @@ async function runInitAgentSpine(
       seedPapers: seedResult.ingested.length,
       mode: "spine",
       summary,
+      report,
     };
   } catch (err) {
     await appendPhase(projectDir, runId, "error", "end", { error: errMsg(err) });
@@ -831,8 +893,116 @@ async function runInitAgentSpine(
 }
 
 // ============================================================
-//  Resume (Spine-First pipeline)
+//  Final report (Task 38)
 // ============================================================
+
+interface BuildReportArgs {
+  runId: string;
+  projectSlug: string;
+  projectDir: string;
+  writerModel: string;
+  reviewerModel: string;
+  accounting: LlmAccounting;
+  reads: PaperRead[];
+  efforts: WorkspaceEffortOutput[];
+  unresolvedCitations: Array<{ citedTitle?: string; whyImportant: string }>;
+  convergence: { reason: string; totalRoundsRun: number };
+  review?: import("./review-verify.js").ReviewResult;
+  verify?: import("./review-verify.js").VerifyResult;
+}
+
+/**
+ * Scan persisted effort.json files for a `revisionHistory` array (populated by
+ * the writer-reviewer loop, W4b-γ). Forward-compatible: returns an empty list
+ * today and reflects real revision counts once that loop lands. Never throws.
+ */
+async function collectRevisionCounts(projectDir: string, efforts: WorkspaceEffortOutput[]): Promise<number[]> {
+  const counts: number[] = [];
+  for (const eff of efforts) {
+    try {
+      const raw = await fs.readFile(path.join(projectDir, "efforts", eff.id, "effort.json"), "utf-8");
+      const parsed = JSON.parse(raw) as { revisionHistory?: unknown };
+      if (Array.isArray(parsed.revisionHistory)) counts.push(parsed.revisionHistory.length);
+    } catch {
+      /* no effort.json or no revisionHistory — skip */
+    }
+  }
+  return counts;
+}
+
+/** Assemble the comprehensive InitAgentReport from run artifacts. */
+async function buildInitReport(args: BuildReportArgs): Promise<InitAgentReport> {
+  const {
+    runId, projectSlug, projectDir, writerModel, reviewerModel,
+    accounting, reads, efforts, unresolvedCitations, convergence, review, verify,
+  } = args;
+
+  // Revisions summary — prefer real per-effort revisionHistory; fall back to
+  // the wiki review/verify pass counts so the report is never empty.
+  const effortRevisions = await collectRevisionCounts(projectDir, efforts);
+  const reviewedSlugs = review?.scores.map((s) => s.slug) ?? [];
+  const flaggedPersistent = verify?.results.filter((r) => r.status === "flagged").length ?? 0;
+  const pageRevisions = (review?.scores ?? []).map((s) => (s.refined ? 1 : 0));
+  const allRevisions = [...effortRevisions, ...pageRevisions];
+
+  const artifactsReviewed = efforts.length + reviewedSlugs.length;
+  const artifactsApproved = Math.max(0, artifactsReviewed - flaggedPersistent);
+  const sumRevisions = allRevisions.reduce((a, b) => a + b, 0);
+  const avgRevisionsPerArtifact = artifactsReviewed > 0 ? sumRevisions / artifactsReviewed : 0;
+  const maxRevisionsAcrossArtifacts = allRevisions.length > 0 ? Math.max(...allRevisions) : 0;
+
+  return {
+    runId,
+    projectSlug,
+    generatedAt: new Date().toISOString(),
+    writerModel,
+    reviewerModel,
+    llmAccounting: accounting.report(),
+    revisionsSummary: {
+      artifactsReviewed,
+      artifactsApproved,
+      artifactsFlaggedPersistent: flaggedPersistent,
+      avgRevisionsPerArtifact: Math.round(avgRevisionsPerArtifact * 100) / 100,
+      maxRevisionsAcrossArtifacts,
+    },
+    unresolvedCitations: unresolvedCitations.map((u) => ({
+      citedTitle: u.citedTitle ?? "(untitled)",
+      whyImportant: u.whyImportant,
+    })),
+    convergenceSummary: { reason: convergence.reason, rounds: convergence.totalRoundsRun },
+    fieldTooLargeTripped: reads.some((r) => r.truncated),
+  };
+}
+
+/** Persist the report to `<project>/.mathran/agent-runs/<run-id>/report.json`. */
+async function persistInitReport(projectDir: string, runId: string, report: InitAgentReport): Promise<void> {
+  try {
+    const dir = runDir(projectDir, runId);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "report.json"), JSON.stringify(report, null, 2) + "\n", "utf-8");
+  } catch {
+    /* report persistence is best-effort */
+  }
+}
+
+/** Print a human-readable summary of the report to stdout. */
+function printInitReport(report: InitAgentReport): void {
+  const a = report.llmAccounting;
+  const r = report.revisionsSummary;
+  const lines = [
+    "",
+    `── init report: ${report.projectSlug} (${report.runId}) ──`,
+    `  writer=${report.writerModel}  reviewer=${report.reviewerModel}`,
+    `  LLM calls: writer=${a.writerCallsTotal} reviewer=${a.reviewerCallsTotal} reader=${a.readerCallsTotal} plan=${a.planAgentCalls}`,
+    `  estimated cost: $${a.estimatedTotalUsd.toFixed(4)}`,
+    `  revisions: reviewed=${r.artifactsReviewed} approved=${r.artifactsApproved} flagged=${r.artifactsFlaggedPersistent} avg=${r.avgRevisionsPerArtifact} max=${r.maxRevisionsAcrossArtifacts}`,
+    `  convergence: ${report.convergenceSummary.reason} (${report.convergenceSummary.rounds} rounds)`,
+    `  unresolved citations: ${report.unresolvedCitations.length}`,
+    report.fieldTooLargeTripped ? "  ⚠ field-too-large tripped (a source was truncated)" : "",
+  ].filter(Boolean);
+  console.log(lines.join("\n"));
+}
+
 
 /**
  * Ordered Spine-First phases. `resumeInitAgent` uses this to decide which
