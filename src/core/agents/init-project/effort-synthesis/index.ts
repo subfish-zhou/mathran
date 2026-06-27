@@ -22,7 +22,14 @@ import { writeEffortSection } from "./write-sections.js";
 import { generateEffortReadme } from "./readme.js";
 import { renderReadingNotes } from "./reading-notes.js";
 
-import type { NarrativeSpine, SpineNode } from "../spine/types.js";
+import {
+  reviewLoop,
+  DEFAULT_REVIEW_LOOP_BUDGET,
+  type ReviewLoopBudget,
+  type ReviewLoopResult,
+} from "../review-loop/index.js";
+
+import type { NarrativeSpine, SpineNode, SpineNodeDepth } from "../spine/types.js";
 import type { PaperRead } from "../../../paper-graph/types.js";
 
 export interface EffortSynthesisInput {
@@ -37,8 +44,30 @@ export interface EffortSynthesisInput {
 }
 
 export interface EffortSynthesisDeps {
+  /** Writer model: drafts the outline, sections, README. */
   llm: SpineLLM;
+  /**
+   * Reviewer model — SEPARATE from the writer (§6.7). When provided, document.md
+   * and README.md are run through the writer-reviewer review loop after drafting.
+   * When omitted, the review loop is skipped (back-compat for callers that have
+   * no second model wired in).
+   */
+  reviewerLlm?: SpineLLM;
+  /** Routing label for the writer model (cost estimation only). */
+  writerModel?: string;
+  /** Routing label for the reviewer model (cost estimation only). */
+  reviewerModel?: string;
+  /** Override the default per-artifact review budget (3 revisions / $5). */
+  reviewBudget?: ReviewLoopBudget;
+  estimateCost?: (model: string, tokens: { in: number; out: number }) => number;
   emitLog?: (m: string) => void;
+}
+
+export interface EffortDocumentRevision {
+  revisionNumber: number;
+  timestamp: string;
+  reviewerVerdict: "approve" | "rewrite_requested";
+  reviewerNotes: string;
 }
 
 export interface EffortSynthesisResult {
@@ -47,12 +76,39 @@ export interface EffortSynthesisResult {
   readmePath: string;
   readingNotesPath: string;
   outline: EffortOutline;
+  /** Present only when the review loop ran (reviewerLlm supplied). */
+  documentRevisions?: EffortDocumentRevision[];
 }
 
 const SCRATCH_PLACEHOLDER = "> Your scratch space; not touched by the agent.\n";
 
 function effortId(node: SpineNode): string {
   return slugify(node.title, node.id || "effort");
+}
+
+/** Audience hint for the effort document, derived from spine-node depth. */
+function documentAudience(depth: SpineNodeDepth): string {
+  switch (depth) {
+    case "incremental":
+      return "expert";
+    case "foundational":
+      return "graduate-student-entering-field";
+    default:
+      return "specialist-refresher";
+  }
+}
+
+/** Flatten a ReviewLoopResult's history into the effort.json revision schema (§5.5). */
+function toDocumentRevisions(result: ReviewLoopResult): EffortDocumentRevision[] {
+  return result.revisionHistory.map((r) => ({
+    revisionNumber: r.revisionNumber,
+    timestamp: r.timestamp,
+    reviewerVerdict: r.reviewerVerdict.verdict,
+    reviewerNotes:
+      r.reviewerVerdict.overallReaderExperience ||
+      r.reviewerVerdict.verdictReasoning ||
+      "",
+  }));
 }
 
 function documentFrontmatter(node: SpineNode, outline: EffortOutline, id: string): string {
@@ -115,8 +171,9 @@ export async function synthesizeEffort(
     sectionTexts.push(text);
   }
   const document = assembleDocument(node, outline, sectionTexts, id);
+  let documentContent = document;
   const documentPath = path.join(dir, "document.md");
-  await atomicWriteFile(documentPath, document);
+  await atomicWriteFile(documentPath, documentContent);
 
   // ── Step 3: README reading guide ──
   const readme = await generateEffortReadme(
@@ -126,8 +183,79 @@ export async function synthesizeEffort(
     { problemTitle, predecessors: predecessorNodes, successors: successorNodes },
     deps,
   );
+  let readmeContent = readme;
   const readmePath = path.join(dir, "README.md");
-  await atomicWriteFile(readmePath, readme);
+  await atomicWriteFile(readmePath, readmeContent);
+
+  // ── Step 3.5: writer-reviewer review loop (DESIGN-REFERENCE §6.5) ──
+  // Only runs when a SEPARATE reviewer model is supplied. document.md is
+  // reviewed for its node-depth audience; README.md as the most reader-facing
+  // artifact for a graduate student entering the field.
+  let documentRevisions: EffortDocumentRevision[] | undefined;
+  if (deps.reviewerLlm) {
+    const writerModel = deps.writerModel ?? "writer";
+    const reviewerModel = deps.reviewerModel ?? "reviewer";
+    const budget = deps.reviewBudget ?? DEFAULT_REVIEW_LOOP_BUDGET;
+    const loopDeps = {
+      writerLlm: deps.llm,
+      reviewerLlm: deps.reviewerLlm,
+      emitLog: emit,
+      estimateCost: deps.estimateCost,
+    };
+
+    try {
+      const docResult = await reviewLoop(
+        {
+          artifactKind: "effort-document",
+          artifactTitle: outline.title,
+          artifactSlug: id,
+          initialContent: documentContent,
+          sourcePaperReads: paperReads,
+          topic: problemTitle,
+          audienceHint: documentAudience(node.depth),
+          writerModel,
+          reviewerModel,
+        },
+        budget,
+        loopDeps,
+      );
+      documentContent = docResult.finalContent;
+      await atomicWriteFile(documentPath, documentContent);
+      documentRevisions = toDocumentRevisions(docResult);
+      emit(
+        `[effort-synthesis] ${id}: document review ${docResult.finalVerdict} ` +
+          `(${docResult.revisionHistory.length - 1} rewrite(s), $${docResult.totalCostUsd.toFixed(3)})`,
+      );
+    } catch (err) {
+      emit(`[effort-synthesis] ${id}: document review loop failed (${errMsg(err)})`);
+    }
+
+    try {
+      const readmeResult = await reviewLoop(
+        {
+          artifactKind: "effort-readme",
+          artifactTitle: `${outline.title} — Reading Guide`,
+          artifactSlug: `${id}-readme`,
+          initialContent: readmeContent,
+          sourcePaperReads: paperReads,
+          topic: problemTitle,
+          audienceHint: "graduate-student-entering-field",
+          writerModel,
+          reviewerModel,
+        },
+        budget,
+        loopDeps,
+      );
+      readmeContent = readmeResult.finalContent;
+      await atomicWriteFile(readmePath, readmeContent);
+      emit(
+        `[effort-synthesis] ${id}: README review ${readmeResult.finalVerdict} ` +
+          `(${readmeResult.revisionHistory.length - 1} rewrite(s))`,
+      );
+    } catch (err) {
+      emit(`[effort-synthesis] ${id}: README review loop failed (${errMsg(err)})`);
+    }
+  }
 
   // ── Step 4a: reading notes (no LLM) ──
   const notesBody = paperReads.length > 0
@@ -151,6 +279,7 @@ export async function synthesizeEffort(
     readmeStatus: "generated" as const,
     readingNotesStatus: paperReads.length > 0 ? ("generated" as const) : ("skipped" as const),
     includedPaperIds: paperReads.map((r) => r.paperId),
+    ...(documentRevisions ? { documentRevisions } : {}),
     generatedBy: "effort-synthesis",
     generatedAt: new Date().toISOString(),
   };
@@ -161,5 +290,5 @@ export async function synthesizeEffort(
   }
 
   emit(`[effort-synthesis] ${id}: wrote 4-piece set (${outline.sections.length} sections, ${paperReads.length} reads)`);
-  return { effortId: id, documentPath, readmePath, readingNotesPath, outline };
+  return { effortId: id, documentPath, readmePath, readingNotesPath, outline, documentRevisions };
 }

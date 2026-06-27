@@ -53,12 +53,7 @@ import { outlineWikiPages, persistWikiPlan } from "./wiki-plan/index.js";
 import { addRelation, type RelationType } from "../../effort/store.js";
 import { type NeighborPaper } from "./citation-explorer.js";
 import { runReadingLoop, type PriorArtCorpus } from "./reading-loop.js";
-import {
-  reviewAndRefinePages,
-  verifyPages,
-  reviewLinks,
-  checkCompleteness,
-} from "./review-verify.js";
+import { reviewLinks, checkCompleteness } from "./link-review.js";
 import type { SpinePipelineEvent, WikiPageOutput, WorkspaceEffortOutput } from "./spine/types.js";
 import type { PaperNode } from "../../paper-graph/index.js";
 
@@ -750,38 +745,15 @@ async function runInitAgentSpine(
     await writeCheckpoint(projectDir, runId, "spine_wiki", { wikiPages });
     await appendPhase(projectDir, runId, "spine_wiki", "end", { wikiPages: wikiPages.length });
 
-    // ── Phase 5-8: review / verify / link / completeness (only with wiki) ──
+    // ── Phase 7-8: link / completeness review (pure; only with wiki) ──
+    // The LLM review/verify passes were replaced by the writer-reviewer
+    // review-loop, which now runs inline during effort- and wiki-synthesis.
     if (input.aiInit.enableWiki && pages.length > 0) {
       const rvConfig = {
-        projectDir,
         pages,
-        problem,
         efforts: effortResult.efforts,
         spine,
-        tags: problem.tags,
       };
-
-      // Phase 5: review_refine
-      throwIfAborted();
-      await appendPhase(projectDir, runId, "review_refine", "start");
-      const review = await reviewAndRefinePages(rvConfig, spineLLM, emit);
-      summary.pagesRefined = review.refinedCount;
-      await writeCheckpoint(projectDir, runId, "review_refine", {
-        refined: review.refinedCount,
-        scores: review.scores,
-      });
-      await appendPhase(projectDir, runId, "review_refine", "end", { refined: review.refinedCount });
-
-      // Phase 6: verify
-      throwIfAborted();
-      await appendPhase(projectDir, runId, "verify", "start");
-      const verify = await verifyPages(rvConfig, spineLLM, emit);
-      summary.pagesFlagged = verify.flaggedCount;
-      await writeCheckpoint(projectDir, runId, "verify", {
-        flagged: verify.flaggedCount,
-        results: verify.results,
-      });
-      await appendPhase(projectDir, runId, "verify", "end", { flagged: verify.flaggedCount });
 
       // Phase 7: link_review (pure)
       throwIfAborted();
@@ -843,8 +815,6 @@ const SPINE_PHASE_ORDER = [
   "build_spine",
   "build_efforts",
   "spine_wiki",
-  "review_refine",
-  "verify",
   "link_review",
   "completeness_check",
 ] as const;
@@ -1109,20 +1079,8 @@ export async function resumeInitAgent(
 
     // ── review / verify / link / completeness ─────────────────────────────
     if (input.aiInit.enableWiki && pages.length > 0) {
-      const rvConfig = { projectDir, pages, problem, efforts, spine, tags: problem.tags };
+      const rvConfig = { pages, efforts, spine };
 
-      if (!done("review_refine")) {
-        await appendPhase(projectDir, runId, "review_refine", "start", { resumed: true });
-        const review = await reviewAndRefinePages(rvConfig, spineLLM, emit);
-        await writeCheckpoint(projectDir, runId, "review_refine", { refined: review.refinedCount });
-        await appendPhase(projectDir, runId, "review_refine", "end", { refined: review.refinedCount });
-      }
-      if (!done("verify")) {
-        await appendPhase(projectDir, runId, "verify", "start", { resumed: true });
-        const verify = await verifyPages(rvConfig, spineLLM, emit);
-        await writeCheckpoint(projectDir, runId, "verify", { flagged: verify.flaggedCount });
-        await appendPhase(projectDir, runId, "verify", "end", { flagged: verify.flaggedCount });
-      }
       if (!done("link_review")) {
         await appendPhase(projectDir, runId, "link_review", "start", { resumed: true });
         const links = reviewLinks(rvConfig, emit);
