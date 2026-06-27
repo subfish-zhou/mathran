@@ -73,6 +73,20 @@ export interface EffortFromSpineConfig {
   useEffortSynthesis?: boolean;
 }
 
+/**
+ * Optional review-loop wiring for effort synthesis (Task 31-34). When `reviewerLlm`
+ * is supplied, `synthesizeEffort` runs the writer-reviewer loop on document.md
+ * and README.md. When omitted, no review happens (the v3 dogfood-run-2 bug was
+ * exactly this: agent.ts called us without passing a reviewer LLM, so the
+ * review-loop's `if (!deps.reviewerLlm) return` short-circuited every artifact).
+ */
+export interface EffortFromSpineReviewerDeps {
+  reviewerLlm?: SpineLLM;
+  writerModel?: string;
+  reviewerModel?: string;
+  estimateCost?: (model: string, tokens: { in: number; out: number }) => number;
+}
+
 export interface EffortFromSpineResult {
   efforts: WorkspaceEffortOutput[];
   edges: DependencyEdgeOutput[];
@@ -216,6 +230,7 @@ export async function generateEffortsFromSpine(
   config: EffortFromSpineConfig,
   llm: SpineLLM,
   emit: EmitFn = noopEmit,
+  reviewer: EffortFromSpineReviewerDeps = {},
 ): Promise<EffortFromSpineResult> {
   const { spine, problemTitle, diff, workspace, projectDir } = config;
   const useSynthesis = config.useEffortSynthesis !== false;
@@ -365,7 +380,14 @@ export async function generateEffortsFromSpine(
       try {
         const synth = await synthesizeEffort(
           { node, spine, paperReads, predecessorNodes, successorNodes, problemTitle, projectDir },
-          { llm, emitLog: (m) => emit({ type: "log", message: m }) },
+          {
+            llm,
+            emitLog: (m) => emit({ type: "log", message: m }),
+            reviewerLlm: reviewer.reviewerLlm,
+            writerModel: reviewer.writerModel,
+            reviewerModel: reviewer.reviewerModel,
+            estimateCost: reviewer.estimateCost,
+          },
         );
         synthId = synth.effortId;
       } catch (err) {

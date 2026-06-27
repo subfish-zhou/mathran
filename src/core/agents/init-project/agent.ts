@@ -499,7 +499,6 @@ async function runInitAgentSpine(
   const searchArxiv = ctx.searchArxiv ?? ((q, n) => realSearchArxiv(q, n));
   const fetchArxivById = ctx.fetchArxivById ?? ((id: string) => realFetchArxivById(id));
   const rateDelay = ctx.rateDelayMs ?? ARXIV_RATE_DELAY;
-  const spineLLM = makeSpineLLM(llm, model);
 
   // [Task 37] Resolve, warn-on-identical, and persist the writer/reviewer
   // model pair. Resolution honours explicit config > env > persisted settings >
@@ -519,14 +518,35 @@ async function runInitAgentSpine(
     reviewerModel: modelPair.reviewerModel,
   });
 
-  // [Task 38] LLM cost accounting. Wrap the base SpineLLM per phase so calls
-  // and (estimated) tokens are attributed to writer / reviewer / plan roles.
+  // ── LLMs ──────────────────────────────────────────────────────────────────
+  // Two SpineLLMs over the SAME provider but with DIFFERENT model strings, so
+  // the reader/writer path uses `writerModel` and the review-loop uses
+  // `reviewerModel`. `spineLLM` (writer-equivalent) is kept under its legacy
+  // name so the rest of the file stays terse; `spineReviewerLLM` is new.
+  //
+  // Dogfood run 2 caught a wiring bug: the prior `spineLLM = makeSpineLLM(llm, model)`
+  // path used only `ctx.model` (the original "default" model), so even after
+  // resolveModelPair returned distinct writer/reviewer models, every call (writer
+  // AND reviewer) hit the same underlying model. We now route them properly.
+  const spineLLM = makeSpineLLM(llm, modelPair.writerModel);
+  const spineReviewerLLM = makeSpineLLM(llm, modelPair.reviewerModel);
+
+  // [Task 38] LLM cost accounting. Wrap the base SpineLLMs per phase so calls
+  // and (estimated) tokens are attributed to writer / reviewer / reader / plan
+  // roles. The reader path used to be metered post-hoc via PaperRead stats,
+  // but the reader never measured token counts so cost came out as $0; we now
+  // wrap it inline like writer/reviewer. The post-hoc addReaderStats fold-in
+  // is dropped at the report site to avoid double-counting calls.
   const accounting = new LlmAccounting(modelPair.writerModel, modelPair.reviewerModel);
   const planLLM = accounting.wrap(spineLLM, "build_spine", "plan");
-  const effortsLLM = accounting.wrap(spineLLM, "build_efforts", "writer");
-  const wikiLLM = accounting.wrap(spineLLM, "spine_wiki", "writer");
-  const reviewLLM = accounting.wrap(spineLLM, "review_refine", "reviewer");
-  const verifyLLM = accounting.wrap(spineLLM, "verify", "reviewer");
+  const effortsWriterLLM = accounting.wrap(spineLLM, "build_efforts", "writer");
+  const effortsReviewerLLM = accounting.wrap(spineReviewerLLM, "build_efforts_review", "reviewer");
+  const wikiWriterLLM = accounting.wrap(spineLLM, "spine_wiki", "writer");
+  const wikiReviewerLLM = accounting.wrap(spineReviewerLLM, "spine_wiki_review", "reviewer");
+  const readerLLM = accounting.wrap(spineLLM, "read_and_explore", "reader");
+  const priorArtLLM = accounting.wrap(spineLLM, "prior_art_discovery", "reader");
+  // Legacy aliases — keep so existing usages (build_spine pipeline) keep working.
+  const wikiLLM = wikiWriterLLM;
 
   // Forward spine pipeline events into the runs ledger as logs (fire-and-forget;
   // appendLog is failure-isolated and never throws).
@@ -578,7 +598,7 @@ async function runInitAgentSpine(
             tags: problem.tags,
             slug,
           },
-          llm: spineLLM,
+          llm: priorArtLLM,
         });
       } catch (err) {
         await appendLog(projectDir, runId, "prior_art", `discoverPriorArt failed (continuing): ${errMsg(err)}`);
@@ -646,8 +666,8 @@ async function runInitAgentSpine(
         },
         seedPaperIds: seedResult.ingested,
         priorArt,
-        llm: spineLLM,
-        modelName: model ?? "",
+        llm: readerLLM,
+        modelName: modelPair.writerModel,
       },
       {
         fetchArxivById: (id: string) => fetchArxivById(id),
@@ -716,8 +736,13 @@ async function runInitAgentSpine(
     const effortResult = input.aiInit.enableWorkspace
       ? await generateEffortsFromSpine(
           { spine, projectDir, workspace, problemTitle: problem.title },
-          effortsLLM,
+          effortsWriterLLM,
           emit,
+          {
+            reviewerLlm: effortsReviewerLLM,
+            writerModel: modelPair.writerModel,
+            reviewerModel: modelPair.reviewerModel,
+          },
         )
       : { efforts: [], edges: [] };
     summary.effortsCreated = effortResult.efforts.length;
@@ -771,7 +796,10 @@ async function runInitAgentSpine(
           problem,
           mathStatus: input.problem.mathStatus,
           projectDir,
-          llm: wikiLLM,
+          llm: wikiWriterLLM,
+          reviewerLlm: wikiReviewerLLM,
+          writerModel: modelPair.writerModel,
+          reviewerModel: modelPair.reviewerModel,
           emit,
         })
       : [];
@@ -818,12 +846,12 @@ async function runInitAgentSpine(
     }
 
     // ── final report (Task 38) ─────────────────────────────────────────────
-    // Fold reader stats already captured on persisted PaperReads into the
-    // accounting (the reading loop's own LLM calls are tracked there, so we
-    // don't double-count via the SpineLLM wrappers).
-    for (const r of loopResult.reads) {
-      accounting.addReaderStats("read_and_explore", r.totalLlmCalls ?? 0, r.totalTokensIn ?? 0, r.totalTokensOut ?? 0);
-    }
+    // Reader calls are tracked inline via the wrapped `readerLLM` SpineLLM
+    // (see Phase 2 wiring above). The legacy post-hoc `accounting.addReaderStats`
+    // fold-in was removed because it relied on `PaperRead.totalTokensIn/Out`
+    // fields the reader never populated (always 0), so the dollar figure for
+    // the reader path was always $0 in the report. Inline wrapping prices
+    // every actual call instead.
     const report = await buildInitReport({
       runId,
       projectSlug: slug,
@@ -1052,6 +1080,11 @@ async function runWikiSynthesis(args: {
   mathStatus?: string;
   projectDir: string;
   llm: ReturnType<typeof makeSpineLLM>;
+  /** Writer-reviewer dual-model wiring; omit to skip the review loop. */
+  reviewerLlm?: ReturnType<typeof makeSpineLLM>;
+  writerModel?: string;
+  reviewerModel?: string;
+  estimateCost?: (model: string, tokens: { in: number; out: number }) => number;
   emit: (e: SpinePipelineEvent) => void;
 }): Promise<WikiPageOutput[]> {
   const emitLog = (m: string): void => args.emit({ type: "log", message: m });
@@ -1080,7 +1113,14 @@ async function runWikiSynthesis(args: {
       problem: { title: args.problem.title, formalStatement: args.problem.formalStatement, mathStatus: args.mathStatus },
       projectDir: args.projectDir,
     },
-    { llm: args.llm, emitLog },
+    {
+      llm: args.llm,
+      reviewerLlm: args.reviewerLlm,
+      writerModel: args.writerModel,
+      reviewerModel: args.reviewerModel,
+      estimateCost: args.estimateCost,
+      emitLog,
+    },
   );
 
   return result.pages.map((p) => ({
@@ -1169,7 +1209,14 @@ export async function resumeInitAgent(
     return runInitAgent(input, ctx);
   }
 
-  const spineLLM = makeSpineLLM(ctx.llm, ctx.model);
+  // Resume reuses the persisted writer/reviewer model pair so a re-run after
+  // partial completion uses the same dual-model setup as the original run.
+  const modelPair = await resolveModelPair(
+    { writerModel: input.aiInit.writerModel, reviewerModel: input.aiInit.reviewerModel },
+    projectDir,
+  );
+  const spineLLM = makeSpineLLM(ctx.llm, modelPair.writerModel);
+  const spineReviewerLLM = makeSpineLLM(ctx.llm, modelPair.reviewerModel);
   const emit = (e: SpinePipelineEvent): void => {
     const msg = e.type === "log" ? e.message : e.type;
     void appendLog(projectDir, runId, "spine", msg, e as unknown as Record<string, unknown>);
@@ -1209,6 +1256,11 @@ export async function resumeInitAgent(
         { spine, projectDir, workspace: ctx.workspace, problemTitle: problem.title },
         spineLLM,
         emit,
+        {
+          reviewerLlm: spineReviewerLLM,
+          writerModel: modelPair.writerModel,
+          reviewerModel: modelPair.reviewerModel,
+        },
       );
       efforts = effortResult.efforts;
       await writeCheckpoint(projectDir, runId, "build_efforts", { efforts: efforts.length });
@@ -1233,6 +1285,9 @@ export async function resumeInitAgent(
         mathStatus: input.problem.mathStatus,
         projectDir,
         llm: spineLLM,
+        reviewerLlm: spineReviewerLLM,
+        writerModel: modelPair.writerModel,
+        reviewerModel: modelPair.reviewerModel,
         emit,
       });
       await writeCheckpoint(projectDir, runId, "spine_wiki", { wikiPages: pages.map((p) => p.slug) });

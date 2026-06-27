@@ -300,4 +300,76 @@ describe("buildSpineFromReads", () => {
     );
     expect(extractionCalls).toBe(2); // 25 + 2
   });
+
+  it("falls back to skim/survey-derived nodes when LLM extracts 0 candidates (Issue #3 from dogfood-run-2)", async () => {
+    // Repro: 3 reads with NO mainResults (abstract-only / weak / survey-only),
+    // matching the dogfood-run-2 corpus. The LLM extraction returns 0 nodes;
+    // the fallback should pull from skim.mainContribution + surveyOutline.
+    const reads: PaperRead[] = [
+      // (a) Non-survey paper with a contribution sentence.
+      makeRead({
+        paperId: "abstract-only-paper",
+        read: undefined, // no mainResults at all
+        skim: {
+          oneLineSummary: "Improves Chen's bound by 0.01.",
+          mainContribution: "Sharpens the constant in Chen's theorem from 0.67 to 0.68.",
+          sectionOutline: [],
+          decision: "study",
+          decisionReason: "topically relevant abstract-only paper",
+        },
+        passesCompleted: ["skim"],
+      }),
+      // (b) Survey with an outline (no mainResults).
+      makeRead({
+        paperId: "survey-paper",
+        isSurvey: true,
+        read: undefined,
+        surveyDistillation: {
+          coveredSubAreas: ["circle method", "sieve theory"],
+          keyReferences: [],
+          surveyAuthorOpinion: "x",
+          surveyOutline: [
+            { heading: "Circle method foundations", summary: "Hardy-Littlewood arcs setup." },
+            { heading: "Sieve methods", summary: "Brun and Selberg sieves." },
+          ],
+        },
+      }),
+    ];
+
+    // LLM extraction returns 0 nodes; assembly is trivial.
+    const llm = fakeLlm({ nodes: [] }, { global_thesis: "t", eras: [], edges: [], threads: [], open_questions: [] });
+
+    const spine = await buildSpineFromReads(
+      { problem: baseProblem, reads, paperNodes: [], priorArt: null },
+      { llm },
+    );
+
+    // Fallback produced ≥ 3 shallow nodes (1 contribution + 2 survey outline entries).
+    expect(spine.nodes.length).toBeGreaterThanOrEqual(3);
+    // Every fallback node is marked depth: "incremental" so callers know it's thin.
+    for (const n of spine.nodes) expect(n.depth).toBe("incremental");
+    // Verbatim contribution sentence survived.
+    expect(spine.nodes.some((n) => n.statement.includes("0.68"))).toBe(true);
+    // Survey outline entries became nodes.
+    expect(spine.nodes.some((n) => n.title === "Circle method foundations")).toBe(true);
+    expect(spine.nodes.some((n) => n.title === "Sieve methods")).toBe(true);
+    // paperIds attribute the node to its source PaperRead.
+    expect(spine.nodes.find((n) => n.title === "Circle method foundations")?.paperIds).toEqual(["survey-paper"]);
+  });
+
+  it("fallback returns empty spine when ALL reads also have empty skim.mainContribution and no surveyOutline", async () => {
+    const reads: PaperRead[] = [
+      makeRead({
+        paperId: "empty",
+        read: undefined,
+        skim: { oneLineSummary: "", mainContribution: "", sectionOutline: [], decision: "study", decisionReason: "" },
+      }),
+    ];
+    const llm = fakeLlm({ nodes: [] }, { global_thesis: "t", eras: [], edges: [], threads: [], open_questions: [] });
+    const spine = await buildSpineFromReads(
+      { problem: baseProblem, reads, paperNodes: [], priorArt: null },
+      { llm },
+    );
+    expect(spine.nodes).toHaveLength(0);
+  });
 });

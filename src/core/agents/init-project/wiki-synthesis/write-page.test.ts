@@ -124,4 +124,50 @@ describe("writeWikiPage", () => {
     const llm: SpineLLM = async () => "x";
     await expect(writeWikiPage(baseInput(99), { llm })).rejects.toThrow(/out of range/);
   });
+
+  it("sanitizes hallucinated citations (replaces @paper-read:<unknown> with external-reference marker)", async () => {
+    // The LLM cites two papers — one real (paper-2 is in eightPaperReads()), one
+    // invented (chen-1973 is NOT). The real anchor must survive verbatim; the
+    // invented anchor must be replaced with an [external-reference: …] marker.
+    const llm: SpineLLM = async () =>
+      "## Overview\n\nReal cite @paper-read:paper-2#mainResult-1, invented cite @paper-read:chen-1973#mainResult-1, invented effort @ws:ghost-effort#thm-1.";
+    const res = await writeWikiPage(baseInput(0), { llm });
+    // Real anchor preserved verbatim.
+    expect(res.content).toContain("@paper-read:paper-2#mainResult-1");
+    // Invented anchors replaced.
+    expect(res.content).not.toContain("@paper-read:chen-1973#mainResult-1");
+    expect(res.content).not.toContain("@ws:ghost-effort#thm-1");
+    expect(res.content).toContain('[external-reference: paper "chen-1973"');
+    expect(res.content).toContain('[external-reference: effort "ghost-effort"');
+    // Page still has ≥1 real citation anchor → no NEEDS-CITATIONS banner.
+    expect(res.content).not.toContain("NEEDS-CITATIONS");
+  });
+
+  it("prompt surfaces the full allowlist of citable @paper-read: and @ws: ids", () => {
+    // Issue #2 fix: the prompt must show the writer the complete list of
+    // available paper-ids and effort-ids so it can't plead ignorance when
+    // post-validation replaces an invented anchor.
+    const plan = threePagePlan();
+    const prompt = buildWikiPageWritePrompt({
+      plan,
+      page: plan.pages[1]!,
+      spine: emptySpine(),
+      reads: eightPaperReads(),
+      effortDocuments: fiveEffortDocs(),
+      previouslyWrittenPageSummaries: [],
+      problem,
+    });
+    expect(prompt).toContain("ALLOWLIST OF CITABLE IDS");
+    expect(prompt).toContain("AVAILABLE @paper-read: IDS");
+    // Every real paper-id from the fixture must appear in the allowlist.
+    for (const r of eightPaperReads()) {
+      expect(prompt).toContain(`- ${r.paperId}`);
+    }
+    // Every real effort-id from the fixture must appear in the allowlist.
+    for (const id of fiveEffortDocs().keys()) {
+      expect(prompt).toContain(`- ${id}`);
+    }
+    // Rule 6 must explicitly warn about post-hoc replacement.
+    expect(prompt).toMatch(/external-reference[^\n]*citation needed/);
+  });
 });

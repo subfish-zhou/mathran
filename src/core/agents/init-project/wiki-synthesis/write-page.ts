@@ -76,6 +76,46 @@ export function countCitationAnchors(content: string): number {
   return ws + pr;
 }
 
+/**
+ * Strip / mark citation anchors that point to ids not in the actual corpus.
+ * Dogfood run 2 caught the wiki writer inventing `@paper-read:chen-1973` and
+ * `@paper-read:iwaniec-kowalski-2004` when the prompt's available reads were
+ * thin — the writer fell back to its training knowledge instead of obeying
+ * "do not invent ids". This is the post-validation safety net: we replace the
+ * anchor with an external-reference marker and add the cited title to the
+ * page's unresolvedCitations summary (caller's responsibility).
+ *
+ * Returns `{ content, fabricated }` where `fabricated` is the set of ids the
+ * writer invented (caller can log / report). Anchors pointing to *real* ids
+ * are left untouched. The replacement marker is opt-in: callers that want the
+ * raw fabricated text can simply not call this.
+ */
+export function sanitizeCitations(
+  content: string,
+  allowed: { effortIds: Set<string>; paperIds: Set<string> },
+): { content: string; fabricated: { effortIds: string[]; paperIds: string[] } } {
+  const badEfforts = new Set<string>();
+  const badPapers = new Set<string>();
+
+  // Replace @paper-read:<bad-id>#<anchor> with an external-ref marker.
+  let out = content.replace(PAPER_READ_REF, (match, id: string, _anchor: string) => {
+    if (allowed.paperIds.has(id)) return match;
+    badPapers.add(id);
+    return `[external-reference: paper "${id}" — not in this corpus, citation needed]`;
+  });
+  // Same for @ws:<bad-id>[#anchor]
+  out = out.replace(WS_REF, (match, id: string) => {
+    if (allowed.effortIds.has(id)) return match;
+    badEfforts.add(id);
+    return `[external-reference: effort "${id}" — not in this corpus, citation needed]`;
+  });
+
+  return {
+    content: out,
+    fabricated: { effortIds: [...badEfforts], paperIds: [...badPapers] },
+  };
+}
+
 const REVIEW_BANNER =
   "> [AI-GENERATED] [NEEDS-CITATIONS] This page was generated without any traceable `@ws:` or `@paper-read:` citation anchors and requires human review.";
 
@@ -113,6 +153,25 @@ export async function writeWikiPage(
   }
 
   let content = stripWrappingFence(body);
+
+  // Post-validation safety net (Issue #2 from dogfood-run-2-report): if the
+  // writer invents `@paper-read:X#…` or `@ws:X#…` whose X is not in the actual
+  // corpus, replace the anchor with an external-reference marker so the page
+  // doesn't carry a fake provenance trail. We log the fabricated ids; callers
+  // can fold them into the run report's unresolvedCitations.
+  const allowedPaperIds = new Set(input.reads.map((r) => r.paperId));
+  const allowedEffortIds = new Set(input.effortDocuments.keys());
+  const { content: sanitized, fabricated } = sanitizeCitations(content, {
+    effortIds: allowedEffortIds,
+    paperIds: allowedPaperIds,
+  });
+  if (fabricated.paperIds.length > 0 || fabricated.effortIds.length > 0) {
+    log(
+      `Wiki page "${page.slug}" had fabricated citations — sanitized: ` +
+        `papers=[${fabricated.paperIds.join(", ")}] efforts=[${fabricated.effortIds.join(", ")}]`,
+    );
+  }
+  content = sanitized;
 
   const anchors = countCitationAnchors(content);
   if (anchors === 0) {

@@ -14,7 +14,7 @@ import type { WikiPlan, WikiPlanPage } from "../wiki-plan/index.js";
 import type { NarrativeSpine } from "../spine/types.js";
 import type { PaperRead } from "../../../paper-graph/types.js";
 
-export const WIKI_PAGE_WRITE_PROMPT_VERSION = "v1";
+export const WIKI_PAGE_WRITE_PROMPT_VERSION = "v2";
 
 /** Combined budget for cited effort documents injected into a single prompt. */
 export const EFFORT_DOC_BUDGET_BYTES = 30_000;
@@ -65,6 +65,22 @@ export function buildWikiPageWritePrompt(input: WikiPageWritePromptInput): strin
   const effortBlock = buildEffortBlock(page, effortDocuments);
   const readsBlock = buildReadsBlock(page, reads);
 
+  // Issue #2 from dogfood-run-2-report: writer fabricated `@paper-read:chen-1973`
+  // and `@paper-read:iwaniec-kowalski-2004` even though the prompt said "don't
+  // invent ids". Surface the entire allowlist of valid ids explicitly so the
+  // writer cannot plead ignorance. Post-validation in write-page.ts will catch
+  // anything that slips through anyway, but the explicit list is the primary
+  // defense (post-validation just leaves an `[external-reference: ...]` marker).
+  const allowedPaperIds = reads.map((r) => r.paperId);
+  const allowedEffortIds = [...effortDocuments.keys()];
+  const allowlistBlock = [
+    "AVAILABLE @paper-read: IDS (cite ONLY these — there are no others):",
+    allowedPaperIds.length > 0 ? allowedPaperIds.map((id) => `  - ${id}`).join("\n") : "  (none — do NOT cite any @paper-read:X)",
+    "",
+    "AVAILABLE @ws: EFFORT IDS (cite ONLY these — there are no others):",
+    allowedEffortIds.length > 0 ? allowedEffortIds.map((id) => `  - ${id}`).join("\n") : "  (none — do NOT cite any @ws:X)",
+  ].join("\n");
+
   const statusLine = problem.mathStatus ? `\nKnown math status: ${problem.mathStatus}` : "";
 
   return `You are the editor writing ONE page of a self-organized mathematics research wiki.
@@ -92,19 +108,29 @@ ${effortBlock}
 ## Cited paper-reads (cite these for results that come from the literature)
 ${readsBlock}
 
+## ALLOWLIST OF CITABLE IDS — cite ONLY ids from these lists
+${allowlistBlock}
+
 ## HARD RULES (the page will be rejected if violated)
 1. EVERY mathematical claim MUST carry a traceable citation anchor: either
    \`@ws:<effort-id>#<anchor>\` (for an effort listed above) OR
    \`@paper-read:<paper-id>#mainResult-N\` (for a cited paper-read result).
    A sentence asserting a theorem, bound, or construction with no anchor is forbidden.
 2. NEVER write vague claims like "improved the bound" or "made progress" — always
-   give the actual new bound / statement in LaTeX (e.g. "reduced the exponent to $7/12 + \\varepsilon$").
+   give the actual new bound / statement in LaTeX (e.g. "reduced the exponent to $7/12 + \\\\varepsilon$").
 3. Use the page's coreSections as the top-level "## " headings, in the given order.
    You may add "### " sub-headings freely.
 4. Naturally cross-reference the relatedPageSlugs via prose, using \`[[slug]]\` link syntax
    (e.g. "the circle-method machinery is developed in [[circle-method]]").
 5. Match the audience: ${page.audience}.
-6. Do not invent effort ids or paper ids. Only cite ids that appear above.
+6. DO NOT INVENT effort ids or paper ids. The ALLOWLIST above is exhaustive — any
+   id you cite that is not in the allowlist will be replaced post-hoc with an
+   \`[external-reference: …, citation needed]\` marker AND the page will be flagged.
+   If a result comes from a paper not in your corpus, do NOT make up an id — write
+   the claim as a natural-prose reference (e.g. "Chen (1973) showed …") WITHOUT
+   the \`@paper-read:\` anchor syntax. Such prose-only references are acceptable
+   when the paper is universally known to the field; they will be reported as
+   unresolvedCitations in the run report.
 7. Do not restate proofs already covered on a previously-written page; link to that page instead.
 
 ## Output

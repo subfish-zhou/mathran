@@ -135,8 +135,20 @@ export async function buildSpineFromReads(
   }
 
   if (candidates.length === 0) {
-    log("No spine node candidates extracted");
-    return emptySpine(input.problem.title);
+    // Issue #3 from dogfood-run-2-report: with only abstract-only / weak reads,
+    // mainResults is often empty so the LLM extracts no candidate nodes and the
+    // spine is empty — wiki then gets 0 effort docs to cite. Fall back to a
+    // SHALLOW spine derived from `skim.mainContribution` and
+    // `surveyDistillation.surveyOutline` so downstream synthesis has something
+    // to point at. These nodes are explicitly marked depth: "incremental" so
+    // callers can tell the spine is thin.
+    log("LLM extraction produced 0 candidates — falling back to skim/survey-derived nodes");
+    candidates.push(...synthesizeShallowCandidatesFromReads(usableReads));
+    if (candidates.length === 0) {
+      log("Fallback also produced 0 candidates — returning empty spine");
+      return emptySpine(input.problem.title);
+    }
+    log(`Shallow fallback added ${candidates.length} candidate node(s)`);
   }
 
   // De-duplicate candidate ids (keep first, merge paperIds/edges).
@@ -361,6 +373,76 @@ function dedupeCandidatesById(candidates: ExtractedCandidate[]): ExtractedCandid
     existing.suggestedEdges.push(...c.suggestedEdges);
   }
   return [...byId.values()];
+}
+
+/**
+ * Issue #3 (dogfood-run-2): shallow-corpus fallback. When the node-extraction
+ * LLM call produced zero candidates — typically because every PaperRead has
+ * empty `read.mainResults` (abstract-only or survey-only reads) — synthesize
+ * candidate nodes deterministically from what the reader DID capture:
+ *
+ *   • `skim.mainContribution` — one shallow milestone node per non-survey paper
+ *     whose contribution sentence is non-empty.
+ *   • `surveyDistillation.surveyOutline[]` — one background node per outline
+ *     entry of every survey, attributed to that survey's paperId.
+ *
+ * These nodes are marked `depth: "incremental"` so the wiki/effort synthesizers
+ * (and the user reading the report) can tell the spine is thin and was rescued
+ * rather than freshly extracted. Statement bytes come from the source PaperRead
+ * fields — never from an LLM call. No new LLM calls happen in the fallback.
+ */
+function synthesizeShallowCandidatesFromReads(reads: PaperRead[]): ExtractedCandidate[] {
+  const out: ExtractedCandidate[] = [];
+
+  for (const r of reads) {
+    // (a) Survey outline → background nodes.
+    const outline = r.surveyDistillation?.surveyOutline ?? [];
+    for (const entry of outline) {
+      const heading = entry.heading?.trim() ?? "";
+      if (!heading) continue;
+      const title = heading.slice(0, 200);
+      const statement = (entry.summary ?? "").trim() || heading;
+      out.push({
+        node: {
+          id: slugify(`${r.paperId}-${title}`, `shallow-${out.length}`),
+          // Survey-outline sub-areas are background material → closest SpineNodeType is "foundation".
+          type: "foundation",
+          title,
+          year: undefined,
+          authors: undefined,
+          statement,
+          significance: `Sub-area covered by survey "${r.skim?.oneLineSummary ?? r.paperId}".`,
+          proofIdea: undefined,
+          paperIds: [r.paperId],
+          depth: "incremental",
+        },
+        suggestedEdges: [],
+      });
+    }
+
+    // (b) Skim's mainContribution → shallow milestone per non-survey paper.
+    if (r.isSurvey) continue;
+    const contribution = (r.skim?.mainContribution ?? "").trim();
+    if (!contribution) continue;
+    const title = (r.skim?.oneLineSummary ?? r.paperId).slice(0, 200);
+    out.push({
+      node: {
+        id: slugify(`${r.paperId}-contribution`, `shallow-${out.length}`),
+        type: "milestone",
+        title,
+        year: undefined,
+        authors: undefined,
+        statement: contribution,
+        significance: `Contribution recorded from a shallow read of ${r.paperId} (mainResults not extracted).`,
+        proofIdea: undefined,
+        paperIds: [r.paperId],
+        depth: "incremental",
+      },
+      suggestedEdges: [],
+    });
+  }
+
+  return out;
 }
 
 // ── Survey structural prior (§7.2) ──────────────────────────────────────────
