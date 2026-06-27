@@ -139,7 +139,7 @@ function makeInput(overrides: Partial<InitAgentInput> = {}): InitAgentInput {
         abstract: "Bounded gaps proof.",
       },
     ],
-    aiInit: { enableWiki: true, enableWorkspace: true, searchDepth: "standard", useSpine: true },
+    aiInit: { enableWiki: true, enableWorkspace: true, useSpine: true },
     ...overrides,
   };
 }
@@ -238,7 +238,7 @@ describe("runInitAgent — Spine-First pipeline (useSpine=true)", () => {
   it("respects enableWorkspace=false / enableWiki=false", async () => {
     await createRun(projectDir, { runId: "run-spine01" });
     const input = makeInput({
-      aiInit: { enableWiki: false, enableWorkspace: false, searchDepth: "standard", useSpine: true },
+      aiInit: { enableWiki: false, enableWorkspace: false, useSpine: true },
     });
     const result = await runInitAgent(input, ctx());
     expect(result.summary.effortsCreated).toBe(0);
@@ -250,7 +250,7 @@ describe("runInitAgent — Spine-First pipeline (useSpine=true)", () => {
   it("useSpine=false still runs the v1a path (mode undefined, deep_crawl phase)", async () => {
     await createRun(projectDir, { runId: "run-spine01" });
     const input = makeInput({
-      aiInit: { enableWiki: true, enableWorkspace: true, searchDepth: "standard", useSpine: false },
+      aiInit: { enableWiki: true, enableWorkspace: true, useSpine: false },
     });
     const result = await runInitAgent(input, ctx());
     expect(result.mode).toBeUndefined();

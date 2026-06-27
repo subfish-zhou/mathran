@@ -91,7 +91,7 @@ describe("POST /api/agent/init-project", () => {
       body: JSON.stringify({
         problem: { title: "Goldbach Conjecture", description: "Every even > 2 is a sum of two primes.", tags: ["number-theory"] },
         seedReferences: ["arXiv:1234.5678"],
-        aiInit: { enableWiki: true, enableWorkspace: true, searchDepth: "quick" },
+        aiInit: { enableWiki: true, enableWorkspace: true },
       }),
     });
     expect(res.status).toBe(202);
@@ -131,7 +131,7 @@ describe("POST /api/agent/init-project", () => {
         problem: { title: "Seed Pdfs Project" },
         seedReferences: [],
         seedPdfs: ["/tmp/uploads/a-paper.pdf", "/tmp/uploads/b-notes.tex", 42, ""],
-        aiInit: { enableWiki: true, enableWorkspace: true, searchDepth: "quick" },
+        aiInit: { enableWiki: true, enableWorkspace: true },
       }),
     });
     expect(res.status).toBe(202);
@@ -154,7 +154,7 @@ describe("POST /api/agent/init-project", () => {
       body: JSON.stringify({
         problem: { title: "Skip AI Project" },
         seedReferences: [],
-        aiInit: { enableWiki: false, enableWorkspace: false, searchDepth: "standard" },
+        aiInit: { enableWiki: false, enableWorkspace: false },
       }),
     });
     expect(res.status).toBe(201);
@@ -393,7 +393,7 @@ async function makeInterruptedRun(slug: string, runId: string): Promise<string> 
     input: {
       problem: { title: "Twin Prime Conjecture", tags: ["number-theory"] },
       seedReferences: [],
-      aiInit: { enableWiki: true, enableWorkspace: true, searchDepth: "standard", useSpine: true },
+      aiInit: { enableWiki: true, enableWorkspace: true, useSpine: true },
     },
   });
   await writeCheckpoint(projectDir, runId, "spine_wiki", { wikiPages: ["twin-primes"] });

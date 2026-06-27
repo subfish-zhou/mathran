@@ -28,7 +28,7 @@ export interface AiInitOptions {
   noWiki?: boolean;
   /** Skip the workspace (effort) phase. */
   noWorkspace?: boolean;
-  /** Search depth: 'shallow' | 'standard' | 'deep'. */
+  /** @deprecated Removed in v3; ignored. Retained only to emit a deprecation warning. */
   depth?: "shallow" | "standard" | "deep";
   /** Use the spine-first pipeline (the modern default). */
   useSpine?: boolean;
@@ -190,6 +190,10 @@ function fmtPhase(e: PhaseEvent, startWall: number): string {
 export async function runAiInit(name: string, opts: AiInitOptions): Promise<number> {
   const serveUrl = (opts.serveUrl ?? DEFAULT_SERVE_URL).replace(/\/$/, "");
 
+  if (opts.depth !== undefined) {
+    console.warn("[deprecated] --depth flag is deprecated and ignored as of v3; remove from your command.");
+  }
+
   // Liveness probe — confirm serve is up before constructing a project.
   try {
     await new Promise<void>((resolve, reject) => {
@@ -224,7 +228,6 @@ export async function runAiInit(name: string, opts: AiInitOptions): Promise<numb
       useSpine: opts.useSpine ?? true,
       enableWiki: opts.noWiki ? false : true,
       enableWorkspace: opts.noWorkspace ? false : true,
-      searchDepth: opts.depth ?? "standard",
     },
   };
 
