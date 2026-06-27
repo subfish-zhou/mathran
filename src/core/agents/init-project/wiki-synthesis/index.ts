@@ -13,8 +13,14 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { writeWikiPage, type WikiPageWriteResult } from "./write-page.js";
+import { extractWorkspaceRefs as _extractWorkspaceRefs } from "./write-page.js";
 import { buildWikiIndex } from "./build-index.js";
 import { errMsg, type SpineLLM } from "../spine/llm.js";
+import {
+  reviewLoop,
+  DEFAULT_REVIEW_LOOP_BUDGET,
+  type ReviewLoopBudget,
+} from "../review-loop/index.js";
 import type { WikiPlan } from "../wiki-plan/index.js";
 import type { NarrativeSpine } from "../spine/types.js";
 import type { PaperRead } from "../../../paper-graph/types.js";
@@ -50,7 +56,19 @@ export interface WikiSynthesisInput {
 }
 
 export interface WikiSynthesisDeps {
+  /** Writer model: drafts each page. */
   llm: SpineLLM;
+  /**
+   * Reviewer model — SEPARATE from the writer (§6.7). When provided, each page
+   * is run through the writer-reviewer review loop after drafting, with the
+   * audience hint taken from the WikiPlan page. When omitted, the loop is
+   * skipped (back-compat).
+   */
+  reviewerLlm?: SpineLLM;
+  writerModel?: string;
+  reviewerModel?: string;
+  reviewBudget?: ReviewLoopBudget;
+  estimateCost?: (model: string, tokens: { in: number; out: number }) => number;
   emitLog?: (m: string) => void;
 }
 
@@ -81,6 +99,7 @@ export async function synthesizeWiki(
 
   const previouslyWrittenPageSummaries: Array<{ slug: string; title: string; summary: string }> = [];
   const pages: WikiPageWriteResult[] = [];
+  const planBySlug = new Map(input.plan.pages.map((p) => [p.slug, p]));
 
   for (let pageIndex = 0; pageIndex < order.length; pageIndex++) {
     const page = await writeWikiPage(
@@ -95,6 +114,8 @@ export async function synthesizeWiki(
       },
       { llm: deps.llm, emitLog: log },
     );
+
+    await maybeReview(input, deps, page, planBySlug.get(page.slug)?.audience, log);
 
     await persistPage(input.projectDir, page);
     pages.push(page);
@@ -114,6 +135,54 @@ export async function synthesizeWiki(
 
   log(`Wiki synthesis complete: ${pages.length} pages + _index.md`);
   return { pagesWritten: pages.length, indexPath, pages };
+}
+
+// ── Review loop ──────────────────────────────────────────────────────────────
+
+/**
+ * Run the writer-reviewer loop on a freshly-written page IN PLACE (mutating
+ * `page.content`/`page.workspaceRefs`) when a separate reviewer model is
+ * supplied. The audience hint comes from the WikiPlan page. Never throws —
+ * a loop failure leaves the original draft untouched.
+ */
+async function maybeReview(
+  input: WikiSynthesisInput,
+  deps: WikiSynthesisDeps,
+  page: WikiPageWriteResult,
+  audienceHint: string | undefined,
+  log: (m: string) => void,
+): Promise<void> {
+  if (!deps.reviewerLlm) return;
+  try {
+    const result = await reviewLoop(
+      {
+        artifactKind: "wiki-page",
+        artifactTitle: page.title,
+        artifactSlug: page.slug,
+        initialContent: page.content,
+        sourcePaperReads: input.reads,
+        topic: input.problem.title,
+        audienceHint,
+        writerModel: deps.writerModel ?? "writer",
+        reviewerModel: deps.reviewerModel ?? "reviewer",
+      },
+      deps.reviewBudget ?? DEFAULT_REVIEW_LOOP_BUDGET,
+      {
+        writerLlm: deps.llm,
+        reviewerLlm: deps.reviewerLlm,
+        emitLog: log,
+        estimateCost: deps.estimateCost,
+      },
+    );
+    page.content = result.finalContent;
+    page.workspaceRefs = _extractWorkspaceRefs(result.finalContent);
+    log(
+      `[wiki-synthesis] review "${page.slug}": ${result.finalVerdict} ` +
+        `(${result.revisionHistory.length - 1} rewrite(s), $${result.totalCostUsd.toFixed(3)})`,
+    );
+  } catch (err) {
+    log(`[wiki-synthesis] review "${page.slug}" failed: ${errMsg(err)}`);
+  }
 }
 
 // ── Persistence ──────────────────────────────────────────────────────────────

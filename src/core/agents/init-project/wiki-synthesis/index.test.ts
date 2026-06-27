@@ -83,4 +83,53 @@ describe("synthesizeWiki (fs integration)", () => {
     const res = await synthesizeWiki({ ...baseInput(), plan }, { llm });
     expect(res.pagesWritten).toBe(3);
   });
+
+  it("runs the writer-reviewer loop per page when a reviewer model is supplied", async () => {
+    const writerLlm: SpineLLM = async (prompt) => {
+      // The rewriter prompt is distinguishable from the page-writer prompt.
+      if (prompt.includes("You are the writer revising")) {
+        return "## Rewritten\n\nClearer now @ws:effort-1#thm-1 and @paper-read:paper-1#mainResult-1.";
+      }
+      return "## Draft\n\nClaim @ws:effort-1#thm-1 and @paper-read:paper-1#mainResult-1.";
+    };
+
+    const reviewedSlugs: string[] = [];
+    const reviewerLlm: SpineLLM = async (prompt) => {
+      const slug = /DOCUMENT TITLE ──\n(.+)/.exec(prompt)?.[1] ?? "";
+      // Reject the very first page once to force a rewrite; approve everything else.
+      const firstReject = reviewedSlugs.length === 0;
+      reviewedSlugs.push(slug);
+      if (firstReject) {
+        return JSON.stringify({
+          verdict: "rewrite_requested",
+          overallReaderExperience: "Confusing.",
+          issues: [{ location: "p1", severity: "blocks-understanding", kind: "vague", what_you_experienced: "x", what_would_help: "y" }],
+          verdict_reasoning: "needs work",
+        });
+      }
+      return JSON.stringify({ verdict: "approve", overallReaderExperience: "Good.", issues: [], verdict_reasoning: "ok" });
+    };
+
+    const res = await synthesizeWiki(baseInput(), {
+      llm: writerLlm,
+      reviewerLlm,
+      writerModel: "openai/gpt-5.5",
+      reviewerModel: "anthropic/opus-4.8",
+    });
+    expect(res.pagesWritten).toBe(3);
+
+    // The first page's persisted content reflects the rewrite.
+    const order = threePagePlan().pageOrder;
+    const firstPage = await fs.readFile(path.join(wikiDir(projectDir), `${order[0]}.md`), "utf-8");
+    expect(firstPage).toContain("Rewritten");
+    // every page was reviewed at least once
+    expect(reviewedSlugs.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("skips the review loop when no reviewer model is supplied (page content unchanged)", async () => {
+    const llm: SpineLLM = async () => "## Draft\n\nClaim @ws:effort-1#thm-1.";
+    const res = await synthesizeWiki(baseInput(), { llm });
+    expect(res.pagesWritten).toBe(3);
+    expect(res.pages[0]!.content).toContain("Draft");
+  });
 });
