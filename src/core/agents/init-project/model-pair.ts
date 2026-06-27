@@ -26,8 +26,22 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AiInitConfig } from "./types.js";
 
+/**
+ * Hard defaults for the dual-model pair (DESIGN-REFERENCE §6.7). These are
+ * aspirational — they assume the user has `openai` and `anthropic` providers
+ * configured. When neither is present, `resolveModelPair` falls back to an
+ * empty string instead, which the ModelRouter then resolves via its own
+ * `defaultModel` setting (e.g. `copilot` for copilot-only users).
+ */
 export const DEFAULT_WRITER_MODEL = "openai/gpt-5.5";
 export const DEFAULT_REVIEWER_MODEL = "anthropic/opus-4.8";
+
+/**
+ * Sentinel "let the provider decide" model string. ModelRouter resolves "" by
+ * routing to its own `defaultModel` or the first configured provider — which
+ * is exactly what unconfigured users need.
+ */
+const PROVIDER_DEFAULT_MODEL = "";
 
 export interface ModelPair {
   writerModel: string;
@@ -62,22 +76,46 @@ export async function loadModelPair(projectDir: string): Promise<Partial<ModelPa
 /**
  * Resolve the effective writer/reviewer pair from config + env + persisted
  * settings. Pure aside from reading the project settings file.
+ *
+ * `contextDefault` (the user's currently-configured model from ctx.model) is
+ * used as the FINAL fallback before the hard-coded provider-prefixed defaults.
+ * This prevents wiring `"openai/gpt-5.5"` (the W4b-δ design default) into an
+ * environment that only has the `copilot` provider configured — dogfood run 3
+ * caught exactly this: with no MATHRAN_*_MODEL env vars and no persisted
+ * settings, the agent emitted `ModelRouter: unknown provider "openai"` for
+ * every wiki page and every review-loop call. Falling back to the user's
+ * actual configured model keeps the run unblocked; the user can still opt
+ * into a distinct dual-model setup via env or CLI flags.
+ *
+ * When `contextDefault` is undefined (no model configured at all), we fall
+ * through to the historical hard defaults — those still work for users who
+ * have an openai/anthropic-routed provider, and they're a better signal in
+ * the run report than an empty string.
  */
 export async function resolveModelPair(
   config: Pick<AiInitConfig, "writerModel" | "reviewerModel">,
   projectDir: string,
+  contextDefault?: string,
 ): Promise<ResolvedModelPair> {
   const persisted = await loadModelPair(projectDir);
+  // Fallback ladder: explicit context default (ctx.model) > "let provider decide" ("") .
+  // The historical hard defaults (openai/gpt-5.5, anthropic/opus-4.8) are NEVER
+  // auto-injected — they only kick in when the user has explicitly opted in
+  // via MATHRAN_*_MODEL env vars, AiInitConfig, or persisted settings. This
+  // change is the run-3 patch: previously, a user with only `copilot` configured
+  // would have `openai/gpt-5.5` injected as the writer model, the ModelRouter
+  // would throw `unknown provider "openai"`, and every wiki page would fail.
+  const fallback = contextDefault || PROVIDER_DEFAULT_MODEL;
   const writerModel =
     config.writerModel ||
     process.env.MATHRAN_WRITER_MODEL ||
     persisted.writerModel ||
-    DEFAULT_WRITER_MODEL;
+    fallback;
   const reviewerModel =
     config.reviewerModel ||
     process.env.MATHRAN_REVIEWER_MODEL ||
     persisted.reviewerModel ||
-    DEFAULT_REVIEWER_MODEL;
+    fallback;
   return { writerModel, reviewerModel, identical: writerModel === reviewerModel };
 }
 

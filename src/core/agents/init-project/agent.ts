@@ -507,6 +507,7 @@ async function runInitAgentSpine(
   const modelPair = await resolveModelPair(
     { writerModel: input.aiInit.writerModel, reviewerModel: input.aiInit.reviewerModel },
     projectDir,
+    model,
   );
   if (modelPair.identical) {
     console.warn(IDENTICAL_MODELS_WARNING);
@@ -1214,6 +1215,7 @@ export async function resumeInitAgent(
   const modelPair = await resolveModelPair(
     { writerModel: input.aiInit.writerModel, reviewerModel: input.aiInit.reviewerModel },
     projectDir,
+    ctx.model,
   );
   const spineLLM = makeSpineLLM(ctx.llm, modelPair.writerModel);
   const spineReviewerLLM = makeSpineLLM(ctx.llm, modelPair.reviewerModel);

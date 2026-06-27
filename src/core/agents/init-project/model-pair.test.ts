@@ -24,11 +24,39 @@ afterEach(async () => {
 });
 
 describe("resolveModelPair", () => {
-  it("applies the gpt-5.5 / opus-4.8 defaults when unset", async () => {
+  it("falls back to empty-string sentinel (provider-default) when nothing is configured", async () => {
+    // Hard defaults (gpt-5.5 / opus-4.8) used to fire here, but they were
+    // injecting a broken `openai/...` model into copilot-only environments
+    // (dogfood run 3). Now the sentinel is "" and the ModelRouter picks.
     const pair = await resolveModelPair({}, projectDir);
-    expect(pair.writerModel).toBe(DEFAULT_WRITER_MODEL);
-    expect(pair.reviewerModel).toBe(DEFAULT_REVIEWER_MODEL);
-    expect(pair.identical).toBe(false);
+    expect(pair.writerModel).toBe("");
+    expect(pair.reviewerModel).toBe("");
+    expect(pair.identical).toBe(true);
+  });
+
+  it("uses contextDefault (the user's ctx.model) when no other source is set", async () => {
+    const pair = await resolveModelPair({}, projectDir, "copilot/claude-sonnet-4");
+    expect(pair.writerModel).toBe("copilot/claude-sonnet-4");
+    expect(pair.reviewerModel).toBe("copilot/claude-sonnet-4");
+    expect(pair.identical).toBe(true);
+  });
+
+  it("MATHRAN_*_MODEL env overrides beat contextDefault", async () => {
+    process.env.MATHRAN_WRITER_MODEL = "envw/w";
+    process.env.MATHRAN_REVIEWER_MODEL = "envr/r";
+    const pair = await resolveModelPair({}, projectDir, "copilot/anything");
+    expect(pair.writerModel).toBe("envw/w");
+    expect(pair.reviewerModel).toBe("envr/r");
+  });
+
+  it("explicit config beats env, contextDefault, and defaults", async () => {
+    process.env.MATHRAN_WRITER_MODEL = "envw/w";
+    const pair = await resolveModelPair(
+      { writerModel: "cfg/writer" },
+      projectDir,
+      "copilot/anything",
+    );
+    expect(pair.writerModel).toBe("cfg/writer");
   });
 
   it("honours explicit config over defaults", async () => {
