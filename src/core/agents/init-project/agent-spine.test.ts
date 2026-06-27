@@ -160,6 +160,13 @@ function ctx(extra: Partial<InitAgentContext> = {}): InitAgentContext {
     // 2026-06-26 — no enrichment in spine tests for the same reason as
     // agent.test.ts (offline-safe).
     fetchArxivById: async () => null,
+    // Reading loop drives the reader; keep it offline by failing the source
+    // fetch so each paper degrades to an abstract-only read.
+    fetchArxivSource: async (arxivId: string) => ({
+      status: "no-source" as const,
+      arxivId,
+      error: "offline test stub",
+    }),
     ...extra,
   };
 }
@@ -185,7 +192,8 @@ describe("runInitAgent — Spine-First pipeline (useSpine=true)", () => {
     const ledger = await readRunLedger(projectDir, "run-spine01");
     expect(ledger?.run.status).toBe("completed");
     const phaseNames = ledger?.phases.map((p) => p.phase) ?? [];
-    expect(phaseNames).toContain("explore_graph");
+    expect(phaseNames).toContain("prior_art_discovery");
+    expect(phaseNames).toContain("read_and_explore");
     expect(phaseNames).toContain("build_spine");
     expect(phaseNames).toContain("build_efforts");
     expect(phaseNames).toContain("spine_wiki");

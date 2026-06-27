@@ -47,8 +47,8 @@ import { buildSpine, readSpine } from "./spine/builder.js";
 import { generateEffortsFromSpine } from "./spine/effort-from-spine.js";
 import { generateWikiFromSpine, wikiDir, extractWorkspaceRefs } from "./spine/wiki-from-spine.js";
 import { addRelation, type RelationType } from "../../effort/store.js";
-import { explorePaperGraph } from "./spine/explore-pipeline.js";
-import { CITATION_MAX_DEPTH, CITATION_MAX_NODES, type NeighborPaper } from "./citation-explorer.js";
+import { type NeighborPaper } from "./citation-explorer.js";
+import { runReadingLoop, type PriorArtCorpus } from "./reading-loop.js";
 import {
   reviewAndRefinePages,
   verifyPages,
@@ -90,6 +90,27 @@ export interface InitAgentContext {
    * tests inject a fake. Default: graph-only BFS.
    */
   fetchNeighbors?: (paper: PaperNode) => Promise<NeighborPaper[]>;
+  /**
+   * Reader source-fetch seams (Phase D). The reading loop drives the 3-pass
+   * reader, which loads each paper's full source from arxiv. Tests inject a
+   * stub so the pipeline runs offline; production defaults to the real
+   * fetchArxivSource / pdftotext.
+   */
+  fetchArxivSource?: typeof import("../../paper-graph/arxiv-source.js").fetchArxivSource;
+  runPdfToText?: (pdfPath: string) => Promise<string | null>;
+  /**
+   * Prior-art discovery seam (Phase D, Task 19). The real implementation lives
+   * in `./prior-art/index.js` (W3-α) and is wired here at merge; injecting it
+   * keeps this module decoupled from the concurrently-developed prior-art
+   * package and lets tests run without network. When absent, the pipeline
+   * proceeds with `priorArt: null` (surveys simply aren't promoted).
+   */
+  discoverPriorArt?: (args: {
+    workspace: string;
+    projectDir: string;
+    problem: { title: string; formalStatement: string; tags: string[]; slug: string };
+    llm: import("./spine/llm.js").SpineLLM;
+  }) => Promise<PriorArtCorpus | null>;
 }
 
 
@@ -504,9 +525,44 @@ async function runInitAgentSpine(
   };
 
   try {
-    // ── Phase 1: explore_graph ────────────────────────────────────────────
+    // ── Phase 1a: prior_art_discovery ─────────────────────────────────────
+    // DESIGN-REFERENCE Part 3 / §7.1: before the reading loop, look for
+    // surveys / Bourbaki / MathOverflow expositions. These are promoted to the
+    // front of the reading queue (max priority). Failure-isolated: any error
+    // degrades to priorArt:null and the loop simply doesn't promote surveys.
     throwIfAborted();
-    await appendPhase(projectDir, runId, "explore_graph", "start");
+    await appendPhase(projectDir, runId, "prior_art_discovery", "start");
+    let priorArt: PriorArtCorpus | null = null;
+    if (ctx.discoverPriorArt) {
+      try {
+        priorArt = await ctx.discoverPriorArt({
+          workspace,
+          projectDir,
+          problem: {
+            title: problem.title,
+            formalStatement: problem.formalStatement,
+            tags: problem.tags,
+            slug,
+          },
+          llm: spineLLM,
+        });
+      } catch (err) {
+        await appendLog(projectDir, runId, "prior_art", `discoverPriorArt failed (continuing): ${errMsg(err)}`);
+        priorArt = null;
+      }
+    }
+    await writeCheckpoint(projectDir, runId, "prior_art_discovery", {
+      surveys: priorArt?.surveys.length ?? 0,
+      expositoryAnswers: priorArt?.expositoryAnswers.length ?? 0,
+    });
+    await appendPhase(projectDir, runId, "prior_art_discovery", "end", {
+      surveys: priorArt?.surveys.length ?? 0,
+      expositoryAnswers: priorArt?.expositoryAnswers.length ?? 0,
+    });
+
+    // ── Phase 1b: read_and_explore ────────────────────────────────────────
+    throwIfAborted();
+    await appendPhase(projectDir, runId, "read_and_explore", "start");
     const seeds: CrawledResource[] = [];
     // [Design-Audit D-3 2026-06-26] Parallel enrich (same as the
     // non-spine path) — 3-wide concurrency keeps us under arxiv's
@@ -539,35 +595,65 @@ async function runInitAgentSpine(
     const keywords = [input.problem.title, ...(input.problem.tags ?? [])]
       .filter((k): k is string => typeof k === "string" && k.trim().length > 0)
       .slice(0, KEYWORD_CAP);
+    void keywords; // retained for downstream/patrol use; reading loop is biblio-driven
 
-    const explore = await explorePaperGraph(
+    // The reading loop (Phase D, Task 18) replaces the citation-graph BFS: it
+    // reads each paper (skim→read→audit), harvests its bibliography into new
+    // candidates, prioritises surveys, and converges naturally.
+    const loopResult = await runReadingLoop(
       {
-        projectDir,
         workspace,
-        seeds: seedResult.ingested,
-        keywords,
-        mode: "deep",
-        maxDepth: CITATION_MAX_DEPTH,
-        maxPapers: CITATION_MAX_NODES,
-        problem: { title: problem.title, formalStatement: problem.formalStatement, tags: problem.tags },
+        projectDir,
+        problem: {
+          title: problem.title,
+          formalStatement: problem.formalStatement,
+          tags: problem.tags,
+          slug,
+        },
+        seedPaperIds: seedResult.ingested,
+        priorArt,
+        llm: spineLLM,
+        modelName: model ?? "",
       },
-      { llm: spineLLM, searchArxiv, fetchNeighbors: ctx.fetchNeighbors, rateDelayMs: rateDelay, emit },
+      {
+        fetchArxivById: (id: string) => fetchArxivById(id),
+        searchArxivByTitle: async (q, max) => {
+          const res = await searchArxiv(q, max);
+          return res
+            .filter((r): r is CrawledResource & { arxivId: string } => typeof r.arxivId === "string")
+            .map((r) => ({ arxivId: r.arxivId, title: r.title, authors: r.authors, year: r.year, abstract: r.abstract }));
+        },
+        rateDelayMs: rateDelay,
+        fetchArxivSource: ctx.fetchArxivSource,
+        runPdfToText: ctx.runPdfToText,
+        emit,
+      },
     );
-    summary.papersDiscovered = explore.discoveredPaperIds.length;
-    summary.papersRelevant = explore.relevantPaperIds.length;
-    summary.resourcesFound = explore.discoveredPaperIds.length;
 
-    const spinePaperIds =
-      explore.relevantPaperIds.length > 0 ? explore.relevantPaperIds : explore.discoveredPaperIds;
+    const rejectedSet = new Set(loopResult.rejectedPaperIds);
+    // Downstream (build_spine) consumes a flat list of relevant paper ids. The
+    // richer ReadingLoopResult (PaperReads, surveys, unresolved) is rewired into
+    // the spine builder by W3-γ (Task 20). For now: all successfully-read papers
+    // minus the hard-deleted (rejected) ones.
+    const spinePaperIds = loopResult.reads.map((r) => r.paperId).filter((id) => !rejectedSet.has(id));
 
-    await writeCheckpoint(projectDir, runId, "explore_graph", {
+    summary.papersDiscovered = loopResult.reads.length + loopResult.rejectedPaperIds.length;
+    summary.papersRelevant = spinePaperIds.length;
+    summary.resourcesFound = loopResult.reads.length;
+
+    await writeCheckpoint(projectDir, runId, "read_and_explore", {
       seedPapers: seedResult.ingested.length,
-      discovered: explore.discoveredPaperIds.length,
-      relevant: explore.relevantPaperIds.length,
+      read: loopResult.reads.length,
+      rejected: loopResult.rejectedPaperIds.length,
+      unresolved: loopResult.unresolvedCitations.length,
+      convergence: loopResult.convergence.reason,
+      rounds: loopResult.convergence.totalRoundsRun,
     });
-    await appendPhase(projectDir, runId, "explore_graph", "end", {
-      discovered: explore.discoveredPaperIds.length,
-      relevant: explore.relevantPaperIds.length,
+    await appendPhase(projectDir, runId, "read_and_explore", "end", {
+      read: loopResult.reads.length,
+      relevant: spinePaperIds.length,
+      rejected: loopResult.rejectedPaperIds.length,
+      convergence: loopResult.convergence.reason,
     });
 
     // ── Phase 2: build_spine ──────────────────────────────────────────────
@@ -729,7 +815,7 @@ async function runInitAgentSpine(
     return {
       projectSlug: slug,
       wikiPages,
-      crawledResources: explore.discoveredPaperIds.length,
+      crawledResources: loopResult.reads.length,
       seedPapers: seedResult.ingested.length,
       mode: "spine",
       summary,
