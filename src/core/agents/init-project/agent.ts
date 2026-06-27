@@ -592,28 +592,42 @@ async function runInitAgentSpine(
     // surveys / Bourbaki / MathOverflow expositions. These are promoted to the
     // front of the reading queue (max priority). Failure-isolated: any error
     // degrades to priorArt:null and the loop simply doesn't promote surveys.
+    //
+    // ctx.discoverPriorArt is an optional injection seam (used by tests to
+    // stub the network calls); when absent we use the real implementation
+    // from ./prior-art/index.ts. Without this default the production CLI
+    // path silently skipped prior-art discovery entirely — caught in
+    // dogfood-run-7 when canonical-landmarks logs never appeared.
     throwIfAborted();
     await appendPhase(projectDir, runId, "prior_art_discovery", "start");
     let priorArt: PriorArtCorpus | null = null;
-    if (ctx.discoverPriorArt) {
-      try {
-        priorArt = await ctx.discoverPriorArt({
-          workspace,
-          projectDir,
-          problem: {
-            title: problem.title,
-            formalStatement: problem.formalStatement,
-            tags: problem.tags,
-            backgroundSummary: input.problem.backgroundSummary,
-            mathStatus: input.problem.mathStatus,
-            slug,
-          },
-          llm: priorArtLLM,
+    const discoverFn =
+      ctx.discoverPriorArt ??
+      (async (args) => {
+        const { discoverPriorArt: realDiscover } = await import("./prior-art/index.js");
+        return realDiscover(args.problem, {
+          workspace: args.workspace,
+          llm: args.llm,
+          emitLog: (m) => void appendLog(args.projectDir, runId, "prior_art", m),
         });
-      } catch (err) {
-        await appendLog(projectDir, runId, "prior_art", `discoverPriorArt failed (continuing): ${errMsg(err)}`);
-        priorArt = null;
-      }
+      });
+    try {
+      priorArt = (await discoverFn({
+        workspace,
+        projectDir,
+        problem: {
+          title: problem.title,
+          formalStatement: problem.formalStatement,
+          tags: problem.tags,
+          backgroundSummary: input.problem.backgroundSummary,
+          mathStatus: input.problem.mathStatus,
+          slug,
+        },
+        llm: priorArtLLM,
+      })) as PriorArtCorpus | null;
+    } catch (err) {
+      await appendLog(projectDir, runId, "prior_art", `discoverPriorArt failed (continuing): ${errMsg(err)}`);
+      priorArt = null;
     }
     await writeCheckpoint(projectDir, runId, "prior_art_discovery", {
       surveys: priorArt?.surveys.length ?? 0,
@@ -919,6 +933,7 @@ async function runInitAgentSpine(
       reads: loopResult.reads,
       efforts: effortResult.efforts,
       unresolvedCitations: loopResult.unresolvedCitations,
+      priorArt,
       convergence: loopResult.convergence,
     });
     await persistInitReport(projectDir, runId, report);
@@ -959,6 +974,11 @@ interface BuildReportArgs {
   reads: PaperRead[];
   efforts: WorkspaceEffortOutput[];
   unresolvedCitations: Array<{ citedTitle?: string; whyImportant: string }>;
+  /**
+   * Prior-art corpus (or null when discovery didn't run or no provider was
+   * configured). Used for canon-resolution reporting.
+   */
+  priorArt: PriorArtCorpus | null;
   convergence: { reason: string; totalRoundsRun: number };
 }
 
@@ -985,7 +1005,7 @@ async function collectRevisionCounts(projectDir: string, efforts: WorkspaceEffor
 async function buildInitReport(args: BuildReportArgs): Promise<InitAgentReport> {
   const {
     runId, projectSlug, projectDir, writerModel, reviewerModel,
-    accounting, reads, efforts, unresolvedCitations, convergence,
+    accounting, reads, efforts, unresolvedCitations, priorArt, convergence,
   } = args;
 
   // Revisions summary — driven by per-effort revisionHistory persisted by the
@@ -1021,6 +1041,17 @@ async function buildInitReport(args: BuildReportArgs): Promise<InitAgentReport> 
       citedTitle: u.citedTitle ?? "(untitled)",
       whyImportant: u.whyImportant,
     })),
+    unresolvedCanonicalLandmarks: (() => {
+      const canon = priorArt?.canonicalLandmarks ?? [];
+      const doiOnly = canon
+        .filter((c) => !c.arxivId && c.doi)
+        .map((c) => ({ title: c.title, authors: c.authors, year: c.year ?? c.crossrefYear, doi: c.doi!, why: c.why }));
+      const unresolved = canon
+        .filter((c) => !c.arxivId && !c.doi)
+        .map((c) => ({ title: c.title, authors: c.authors, year: c.year, venue: c.venue, why: c.why }));
+      if (doiOnly.length === 0 && unresolved.length === 0) return undefined;
+      return { doiOnly, unresolved };
+    })(),
     convergenceSummary: { reason: convergence.reason, rounds: convergence.totalRoundsRun },
     fieldTooLargeTripped: reads.some((r) => r.truncated),
   };

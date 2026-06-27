@@ -127,6 +127,19 @@ export interface InitAgentReport {
     maxRevisionsAcrossArtifacts: number;
   };
   unresolvedCitations: Array<{ citedTitle: string; whyImportant: string }>;
+  /**
+   * Canonical landmark papers the LLM named that we could NOT resolve to an
+   * arxiv id (and thus could NOT auto-ingest into the paper-graph). Split into:
+   *   - doiOnly: resolved via Crossref to a DOI, the user can fetch the PDF.
+   *   - unresolved: neither arxiv nor Crossref matched — user must source it
+   *     manually from the venue.
+   * Empty when canonical-landmarks discovery succeeded for every entry, or
+   * when the discovery step itself returned nothing (e.g. LLM timeout).
+   */
+  unresolvedCanonicalLandmarks?: {
+    doiOnly: Array<{ title: string; authors: string[]; year?: number; doi: string; why: string }>;
+    unresolved: Array<{ title: string; authors: string[]; year?: number; venue?: string; why: string }>;
+  };
   convergenceSummary: { reason: string; rounds: number };
   fieldTooLargeTripped: boolean;
 }

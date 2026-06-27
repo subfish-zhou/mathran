@@ -167,6 +167,10 @@ function ctx(extra: Partial<InitAgentContext> = {}): InitAgentContext {
       arxivId,
       error: "offline test stub",
     }),
+    // Stub prior-art discovery so tests don't hit real arxiv/Crossref. The
+    // production default (when this is undefined) reaches out to the network
+    // for canonical-landmarks discovery, which times out under vitest.
+    discoverPriorArt: async () => null,
     ...extra,
   };
 }

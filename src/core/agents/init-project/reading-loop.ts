@@ -58,6 +58,25 @@ export interface PriorArtCorpus {
     excerpt: string;
     confidence: number;
   }>;
+  /**
+   * Canonical landmark papers proposed by the LLM and resolved via arxiv +
+   * Crossref. The full shape lives in `prior-art/canonical-landmarks-search.ts`;
+   * this loose type is the structural projection the reading loop / report
+   * consume. Optional + permissive because two PriorArtCorpus declarations
+   * coexist (this one + prior-art/index.ts) and the field flows opaquely
+   * between them.
+   */
+  canonicalLandmarks?: Array<{
+    title: string;
+    authors: string[];
+    year?: number;
+    venue?: string;
+    why: string;
+    arxivId?: string;
+    doi?: string;
+    crossrefVenue?: string;
+    crossrefYear?: number;
+  }>;
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
