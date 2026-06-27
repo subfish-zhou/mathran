@@ -105,7 +105,7 @@ describe("generateEffortsFromSpine (fs integration)", () => {
     const llm: SpineLLM = async () => "## Survey\n\nDetailed technical content here.";
     const events: string[] = [];
     const result = await generateEffortsFromSpine(
-      { spine: smallSpine(pid!), projectDir, workspace, problemTitle: "Lonely Runner" },
+      { spine: smallSpine(pid!), projectDir, workspace, problemTitle: "Lonely Runner", useEffortSynthesis: false },
       llm,
       (e) => events.push(e.type),
     );
@@ -149,7 +149,7 @@ describe("generateEffortsFromSpine (fs integration)", () => {
       throw new Error("llm should not be called for effort docs");
     };
     const result = await generateEffortsFromSpine(
-      { spine: smallSpine(pid!), projectDir, workspace, problemTitle: "LR" },
+      { spine: smallSpine(pid!), projectDir, workspace, problemTitle: "LR", useEffortSynthesis: false },
       llm,
     );
     expect(result.efforts.length).toBe(3);

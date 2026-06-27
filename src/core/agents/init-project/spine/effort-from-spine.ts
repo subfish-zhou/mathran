@@ -29,6 +29,9 @@ import { EFFORT_LAYOUT, attachReference } from "../../../effort/store.js";
 // init pipeline that may still want a one-shot doc-style summary
 // (none in mathran today; kept for API stability).
 import { errMsg, noopEmit, type SpineLLM, type EmitFn } from "./llm.js";
+import { getPaperRead } from "../../../paper-graph/reads.js";
+import { synthesizeEffort } from "../effort-synthesis/index.js";
+import type { PaperRead } from "../../../paper-graph/types.js";
 import type {
   NarrativeSpine,
   SpineNode,
@@ -60,6 +63,14 @@ export interface EffortFromSpineConfig {
   problemTitle: string;
   /** Only generate efforts for a specific spine diff (patrol incremental) */
   diff?: SpineDiff;
+  /**
+   * v3 (Task 27): node efforts are synthesized as a 4-piece set
+   * (document.md / README.md / notes / scratch) via
+   * `synthesizeEffort`. Set to `false` (the `--no-effort-synthesis`
+   * debug flag) to fall back to the legacy stub-writer that only
+   * scaffolds an empty work-log document.md. Defaults to `true`.
+   */
+  useEffortSynthesis?: boolean;
 }
 
 export interface EffortFromSpineResult {
@@ -207,6 +218,7 @@ export async function generateEffortsFromSpine(
   emit: EmitFn = noopEmit,
 ): Promise<EffortFromSpineResult> {
   const { spine, problemTitle, diff, workspace, projectDir } = config;
+  const useSynthesis = config.useEffortSynthesis !== false;
   const efforts: WorkspaceEffortOutput[] = [];
   const edges: DependencyEdgeOutput[] = [];
 
@@ -332,6 +344,71 @@ export async function generateEffortsFromSpine(
     // the node statement / significance for that downstream use.
     const document = `${node.title}\n\n${node.statement}\n\n${node.significance}`;
 
+    // v3 (Task 27): when effort synthesis is enabled (default), the
+    // node effort is generated as a real 4-piece set via
+    // synthesizeEffort, which owns the directory layout, document.md,
+    // README.md, notes/agent-reading-notes.md and scratch/. We then
+    // register its returned id so the edge-mapping below stays
+    // consistent and skip the legacy stub writeEffort().
+    if (useSynthesis) {
+      const predecessorNodes = spine.edges
+        .filter((e) => e.to === node.id)
+        .map((e) => spine.nodes.find((n) => n.id === e.from))
+        .filter((n): n is SpineNode => n != null);
+      const successorNodes = spine.edges
+        .filter((e) => e.from === node.id)
+        .map((e) => spine.nodes.find((n) => n.id === e.to))
+        .filter((n): n is SpineNode => n != null);
+      const paperReads = await loadPaperReads(workspace, node.paperIds);
+
+      let synthId: string;
+      try {
+        const synth = await synthesizeEffort(
+          { node, spine, paperReads, predecessorNodes, successorNodes, problemTitle, projectDir },
+          { llm, emitLog: (m) => emit({ type: "log", message: m }) },
+        );
+        synthId = synth.effortId;
+      } catch (err) {
+        emit({ type: "log", message: `[spine-efforts] synthesizeEffort(${node.id}) failed: ${errMsg(err)}; falling back to stub` });
+        synthId = reserveEffortId(slugify(node.title, "node-effort"));
+        const fallbackEffort: WorkspaceEffortOutput = {
+          id: synthId, type: mapNodeTypeToEffortType(node.type), title: node.title,
+          description: node.significance, status: mapNodeTypeToStatus(node.type),
+          subject: node.statement.slice(0, 200), sources: papers.map(paperToResource),
+          document, tags: buildNodeTags(node, thread), difficultyEstimate: estimateNodeDifficulty(node),
+          year: node.year, era: era?.name, spineNodeId: node.id, spineThreadId: thread?.id,
+          abstract: node.significance, formalStatement: node.statement,
+          narrativeRole: mapNodeTypeToNarrativeRole(node.type),
+          deadEndReason: node.type === "dead_end" ? node.significance : undefined,
+        };
+        await writeEffort(projectDir, workspace, fallbackEffort);
+      }
+      usedEffortIds.add(synthId);
+      spineToEffort.set(node.id, synthId);
+      efforts.push({
+        id: synthId,
+        type: mapNodeTypeToEffortType(node.type),
+        title: node.title,
+        description: node.significance,
+        status: mapNodeTypeToStatus(node.type),
+        subject: node.statement.slice(0, 200),
+        sources: papers.map(paperToResource),
+        document,
+        tags: buildNodeTags(node, thread),
+        difficultyEstimate: estimateNodeDifficulty(node),
+        year: node.year,
+        era: era?.name,
+        spineNodeId: node.id,
+        spineThreadId: thread?.id,
+        abstract: node.significance,
+        formalStatement: node.statement,
+        narrativeRole: mapNodeTypeToNarrativeRole(node.type),
+        deadEndReason: node.type === "dead_end" ? node.significance : undefined,
+      });
+      emit({ type: "effort_created", effortId: synthId, title: node.title, fromSpineNode: node.id });
+      continue;
+    }
+
     const effortId = reserveEffortId(slugify(node.title, "node-effort"));
     spineToEffort.set(node.id, effortId);
 
@@ -432,6 +509,20 @@ async function loadPaperMetadata(workspace: string, paperIds: string[]): Promise
       url: p.url ?? undefined,
       fullText,
     });
+  }
+  return out;
+}
+
+/** Load persisted PaperReads for the given paper ids (skips missing). */
+async function loadPaperReads(workspace: string, paperIds: string[]): Promise<PaperRead[]> {
+  const out: PaperRead[] = [];
+  for (const id of paperIds) {
+    try {
+      const read = await getPaperRead(workspace, id);
+      if (read) out.push(read);
+    } catch {
+      // ignore — a missing/corrupt read just means no notes for that paper
+    }
   }
   return out;
 }
