@@ -714,10 +714,31 @@ async function runInitAgentSpine(
     // ── Phase 2: build_spine ──────────────────────────────────────────────
     throwIfAborted();
     await appendPhase(projectDir, runId, "build_spine", "start", { papers: spinePaperIds.length });
+    // v3 read-driven path: pass the reads + priorArt + mathStatus through so
+    // buildSpine routes into buildSpineFromReads (which knows how to splice
+    // verbatim statements out of PaperReadMainResult and how to fall back to
+    // a shallow skim/survey-derived spine when mainResults are all empty).
+    // Without readsContext the legacy raw-.tex path runs and the shallow-
+    // fallback never fires — caught in dogfood run 4.
     const spine = await buildSpine(
       { projectDir, workspace, paperIds: spinePaperIds, mode: "full", problem, signal: ctx.signal },
       planLLM,
       emit,
+      {
+        reads: loopResult.reads,
+        paperNodes: [],
+        // The reading-loop module has its own PriorArtCorpus shape with extra
+        // source variants (annual-review / lecture-notes-pdf) that the spine
+        // builder's prior-art import doesn't know about. The cast is safe — the
+        // builder only reads `surveys[*]` shallowly for structural priors and
+        // tolerates unknown source values.
+        priorArt: priorArt as Parameters<typeof buildSpine>[3] extends infer P
+          ? P extends { priorArt: infer Q }
+            ? Q
+            : never
+          : never,
+        mathStatus: input.problem.mathStatus,
+      },
     );
     summary.spineNodes = spine.nodes.length;
     summary.conceptsExtracted = spine.nodes.length;
