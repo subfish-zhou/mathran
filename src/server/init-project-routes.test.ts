@@ -439,12 +439,11 @@ describe("POST /api/agent/init-project/:runId/resume", () => {
 
     const ledger = await waitForStatus(runId, "completed", 6000);
     expect(ledger.run.status).toBe("completed");
-    // the verify phase (after the checkpoint) re-ran and stamped the page
-    const page = await fs.readFile(
-      path.join(workspace, "projects", slug, "wiki", "twin-primes.md"),
-      "utf-8",
+    // the post-checkpoint link_review phase re-ran (replaces the old verify pass)
+    const ranLinkReview = ledger.phases.some(
+      (p: any) => p.phase === "link_review" && p.event === "end",
     );
-    expect(page).toContain("verification: verified");
+    expect(ranLinkReview).toBe(true);
   });
 
   it("does not re-run phases at or before the checkpoint", async () => {
@@ -464,6 +463,6 @@ describe("POST /api/agent/init-project/:runId/resume", () => {
     // spine_wiki (and earlier) are skipped; only later phases carry resumed:true
     expect(resumedPhases).not.toContain("spine_wiki");
     expect(resumedPhases).not.toContain("build_efforts");
-    expect(resumedPhases).toContain("review_refine");
+    expect(resumedPhases).toContain("link_review");
   });
 });
