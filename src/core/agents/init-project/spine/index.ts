@@ -28,13 +28,6 @@ export {
   type EffortFromSpineResult,
 } from "./effort-from-spine.js";
 export {
-  generateWikiFromSpine,
-  patchWikiFromSpineDiff,
-  extractWorkspaceRefs,
-  wikiDir,
-  type WikiFromSpineConfig,
-} from "./wiki-from-spine.js";
-export {
   explorePaperGraph,
   type ExplorePipelineDeps,
 } from "./explore-pipeline.js";

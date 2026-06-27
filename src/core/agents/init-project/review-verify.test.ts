@@ -11,7 +11,7 @@ import {
   type ReviewVerifyConfig,
   type ReviewProblem,
 } from "./review-verify.js";
-import { wikiDir } from "./spine/wiki-from-spine.js";
+import { wikiDir } from "./wiki-synthesis/index.js";
 import type { SpineLLM } from "./spine/llm.js";
 import type {
   WikiPageOutput,

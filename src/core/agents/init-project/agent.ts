@@ -19,7 +19,10 @@ import {
   ingestSeedPapersForProject,
   ingestPaper,
   associatePaperToProject,
+  listPaperReadIds,
+  readPaperReadFile,
   type PaperNodeInput,
+  type PaperRead,
 } from "../../paper-graph/index.js";
 import {
   appendPhase,
@@ -45,7 +48,8 @@ import type {
 import { makeSpineLLM } from "./spine/llm.js";
 import { buildSpine, readSpine } from "./spine/builder.js";
 import { generateEffortsFromSpine } from "./spine/effort-from-spine.js";
-import { generateWikiFromSpine, wikiDir, extractWorkspaceRefs } from "./spine/wiki-from-spine.js";
+import { synthesizeWiki, wikiDir, extractWorkspaceRefs } from "./wiki-synthesis/index.js";
+import { outlineWikiPages, persistWikiPlan } from "./wiki-plan/index.js";
 import { addRelation, type RelationType } from "../../effort/store.js";
 import { type NeighborPaper } from "./citation-explorer.js";
 import { runReadingLoop, type PriorArtCorpus } from "./reading-loop.js";
@@ -728,19 +732,18 @@ async function runInitAgentSpine(
     // ── Phase 4: spine_wiki ───────────────────────────────────────────────
     throwIfAborted();
     await appendPhase(projectDir, runId, "spine_wiki", "start");
-    const wikiProblem = { ...problem, mathStatus: input.problem.mathStatus };
     const pages = input.aiInit.enableWiki
-      ? await generateWikiFromSpine(
-          {
-            spine,
-            projectDir,
-            problem: wikiProblem,
-            paperIds: spinePaperIds,
-            workspaceEfforts: effortResult.efforts,
-          },
-          spineLLM,
+      ? await runWikiSynthesis({
+          spine,
+          reads: loopResult.reads,
+          priorArt,
+          efforts: effortResult.efforts,
+          problem,
+          mathStatus: input.problem.mathStatus,
+          projectDir,
+          llm: spineLLM,
           emit,
-        )
+        })
       : [];
     const wikiPages = pages.map((p) => p.slug);
     summary.wikiPagesGenerated = wikiPages.length;
@@ -853,7 +856,7 @@ export interface ResumeOptions {
 
 export class ResumeError extends Error {}
 
-/** Reconstruct minimal efforts (id-only) from the persisted efforts/ dir. */
+/** Reconstruct minimal efforts (id + document.md) from the persisted efforts/ dir. */
 async function reloadEfforts(projectDir: string): Promise<WorkspaceEffortOutput[]> {
   const effortsRoot = path.join(projectDir, "efforts");
   let entries: import("node:fs").Dirent[];
@@ -862,20 +865,95 @@ async function reloadEfforts(projectDir: string): Promise<WorkspaceEffortOutput[
   } catch {
     return [];
   }
-  return entries
-    .filter((d) => d.isDirectory())
-    .map((d) => ({
-      id: d.name,
-      type: "REFERENCE",
-      title: d.name,
-      description: "",
-      status: "DRAFT",
-      subject: "",
-      sources: [],
-      document: "",
-      tags: [],
-      difficultyEstimate: "MODERATE",
-    })) as WorkspaceEffortOutput[];
+  const dirs = entries.filter((d) => d.isDirectory());
+  return Promise.all(
+    dirs.map(async (d) => {
+      let document = "";
+      try {
+        document = await fs.readFile(path.join(effortsRoot, d.name, "document.md"), "utf-8");
+      } catch {
+        /* no document.md — leave empty */
+      }
+      return {
+        id: d.name,
+        type: "REFERENCE",
+        title: d.name,
+        description: "",
+        status: "DRAFT",
+        subject: "",
+        sources: [],
+        document,
+        tags: [],
+        difficultyEstimate: "MODERATE",
+      } as WorkspaceEffortOutput;
+    }),
+  );
+}
+
+/** Reload all persisted PaperReads for a workspace (resume path). */
+async function reloadReads(workspace: string): Promise<PaperRead[]> {
+  let ids: string[];
+  try {
+    ids = await listPaperReadIds(workspace);
+  } catch {
+    return [];
+  }
+  const reads = await Promise.all(ids.map((id) => readPaperReadFile(workspace, id)));
+  return reads.filter((r): r is PaperRead => r != null);
+}
+
+/**
+ * Wiki synthesis (v3): outline an LLM-decided WikiPlan, then write each page
+ * sequentially with cross-references and citation enforcement, persisting to
+ * `<project>/wiki/<slug>.md` plus a `_index.md` TOC. Replaces the legacy
+ * fixed-5-page `generateWikiFromSpine`.
+ */
+async function runWikiSynthesis(args: {
+  spine: import("./spine/types.js").NarrativeSpine;
+  reads: PaperRead[];
+  priorArt: PriorArtCorpus | null;
+  efforts: WorkspaceEffortOutput[];
+  problem: { title: string; formalStatement: string; description: string; tags: string[] };
+  mathStatus?: string;
+  projectDir: string;
+  llm: ReturnType<typeof makeSpineLLM>;
+  emit: (e: SpinePipelineEvent) => void;
+}): Promise<WikiPageOutput[]> {
+  const emitLog = (m: string): void => args.emit({ type: "log", message: m });
+
+  const plan = await outlineWikiPages(
+    {
+      problem: { ...args.problem, mathStatus: args.mathStatus },
+      spine: args.spine,
+      reads: args.reads,
+      priorArt: args.priorArt as Parameters<typeof outlineWikiPages>[0]["priorArt"],
+    },
+    { llm: args.llm, emitLog },
+  );
+  await persistWikiPlan(args.projectDir, plan);
+
+  const effortDocuments = new Map<string, string>(
+    args.efforts.map((e) => [e.id, e.document ?? ""]),
+  );
+
+  const result = await synthesizeWiki(
+    {
+      plan,
+      spine: args.spine,
+      reads: args.reads,
+      effortDocuments,
+      problem: { title: args.problem.title, formalStatement: args.problem.formalStatement, mathStatus: args.mathStatus },
+      projectDir: args.projectDir,
+    },
+    { llm: args.llm, emitLog },
+  );
+
+  return result.pages.map((p) => ({
+    slug: p.slug,
+    title: p.title,
+    content: p.content,
+    workspaceRefs: p.workspaceRefs,
+  }));
 }
 
 /** Reconstruct wiki pages from persisted wiki/*.md (frontmatter-aware). */
@@ -883,7 +961,7 @@ async function reloadPages(projectDir: string): Promise<WikiPageOutput[]> {
   const dir = wikiDir(projectDir);
   let files: string[];
   try {
-    files = (await fs.readdir(dir)).filter((f) => f.endsWith(".md"));
+    files = (await fs.readdir(dir)).filter((f) => f.endsWith(".md") && !f.startsWith("_"));
   } catch {
     return [];
   }
@@ -1011,17 +1089,17 @@ export async function resumeInitAgent(
       pages = await reloadPages(projectDir);
     } else if (input.aiInit.enableWiki) {
       await appendPhase(projectDir, runId, "spine_wiki", "start", { resumed: true });
-      pages = await generateWikiFromSpine(
-        {
-          spine,
-          projectDir,
-          problem: { ...problem, mathStatus: input.problem.mathStatus },
-          paperIds: spine.nodes.flatMap((n) => n.paperIds),
-          workspaceEfforts: efforts,
-        },
-        spineLLM,
+      pages = await runWikiSynthesis({
+        spine,
+        reads: await reloadReads(ctx.workspace),
+        priorArt: null,
+        efforts,
+        problem,
+        mathStatus: input.problem.mathStatus,
+        projectDir,
+        llm: spineLLM,
         emit,
-      );
+      });
       await writeCheckpoint(projectDir, runId, "spine_wiki", { wikiPages: pages.map((p) => p.slug) });
       await appendPhase(projectDir, runId, "spine_wiki", "end", { wikiPages: pages.length });
     } else {

@@ -17,7 +17,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { extractSpineJSON, errMsg, noopEmit, type SpineLLM, type EmitFn } from "./spine/llm.js";
-import { extractWorkspaceRefs, wikiDir } from "./spine/wiki-from-spine.js";
+import { extractWorkspaceRefs, wikiDir } from "./wiki-synthesis/index.js";
 import type { WikiPageOutput, WorkspaceEffortOutput, NarrativeSpine } from "./spine/types.js";
 
 const REFINE_THRESHOLD = 7;
