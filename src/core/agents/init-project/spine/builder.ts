@@ -21,6 +21,9 @@ import { getPaper, listCitations } from "../../../paper-graph/index.js";
 import { fetchArxivSource } from "../../../paper-graph/arxiv-source.js";
 import { buildNodeExtractionPrompt, buildSpineAssemblyPrompt } from "./prompts.js";
 import { extractSpineJSON, errMsg, noopEmit, type SpineLLM, type EmitFn } from "./llm.js";
+import { buildSpineFromReads } from "../synthesis/build-spine-from-reads.js";
+import type { PaperRead, PaperNode } from "../../../paper-graph/types.js";
+import type { PriorArtCorpus } from "../prior-art/index.js";
 import type {
   NarrativeSpine,
   SpineNode,
@@ -31,6 +34,22 @@ import type {
   SpineNodeCandidate,
   SpineBuilderConfig,
 } from "./types.js";
+
+/**
+ * v3 read-driven build context. When supplied to {@link buildSpine}, the
+ * builder delegates to {@link buildSpineFromReads} (high-density PaperRead
+ * distillations + PriorArtCorpus structural prior) instead of the legacy
+ * raw-`.tex` path. Kept as an optional 4th argument so existing callers and
+ * `spine/types.ts` (stable) are untouched; W3-β's `agent.ts` passes this
+ * through once the reading loop has produced reads.
+ */
+export interface BuildSpineReadsContext {
+  reads: PaperRead[];
+  paperNodes: PaperNode[];
+  priorArt: PriorArtCorpus | null;
+  /** Optional status hint forwarded to the read-driven spine prompts. */
+  mathStatus?: string;
+}
 
 interface BuilderPaper {
   id: string;
@@ -81,7 +100,41 @@ export async function buildSpine(
   config: SpineBuilderConfig,
   llm: SpineLLM,
   emit: EmitFn = noopEmit,
+  readsContext?: BuildSpineReadsContext,
 ): Promise<NarrativeSpine> {
+  // ── v3 path: build from high-density PaperReads when available. ──
+  // The legacy raw-.tex path below is preserved unchanged for backward
+  // compatibility (Batch 4 removes it).
+  if (readsContext && readsContext.reads.length > 0) {
+    emit({
+      type: "log",
+      message: `Building spine from ${readsContext.reads.length} PaperReads (v3 read-driven path)`,
+    });
+    const spine = await buildSpineFromReads(
+      {
+        problem: {
+          title: config.problem.title,
+          formalStatement: config.problem.formalStatement,
+          description: config.problem.description,
+          tags: config.problem.tags,
+          mathStatus: readsContext.mathStatus,
+        },
+        reads: readsContext.reads,
+        paperNodes: readsContext.paperNodes,
+        priorArt: readsContext.priorArt,
+      },
+      { llm, emitLog: (message) => emit({ type: "log", message }) },
+    );
+    await writeSpine(config.projectDir, spine);
+    emit({
+      type: "spine_assembled",
+      nodeCount: spine.nodes.length,
+      edgeCount: spine.edges.length,
+      threadCount: spine.threads.length,
+    });
+    return spine;
+  }
+
   emit({ type: "log", message: `Building spine from ${config.paperIds.length} papers (mode=${config.mode})` });
 
   // ── Step 1: Batch Node Extraction ──

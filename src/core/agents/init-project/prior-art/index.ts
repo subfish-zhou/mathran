@@ -28,13 +28,13 @@ export interface PriorArtSurvey {
   source: "arxiv" | "bourbaki" | "mathoverflow";
   confidence: number;
   why: string;
-  rawHit: ArxivSurveyHit | BourbakiHit | MathOverflowHit;
+  rawHit?: ArxivSurveyHit | BourbakiHit | MathOverflowHit;
 }
 
 export interface PriorArtCorpus {
   surveys: PriorArtSurvey[];
-  expositoryAnswers: MathOverflowHit[]; // separate to bibliography page rendering
-  discoveredAt: string;
+  expositoryAnswers: MathOverflowHit[];
+  discoveredAt?: string;
 }
 
 export interface DiscoverPriorArtDeps {

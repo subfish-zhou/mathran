@@ -6,6 +6,7 @@
  */
 
 import type { NarrativeSpine, SpineNode, SpineThread, SpineOpenQuestion } from "./types.js";
+import type { PaperRead } from "../../../paper-graph/types.js";
 
 // ============================================================
 //  Phase 1: Paper Relevance Scoring
@@ -509,4 +510,127 @@ Use standard academic citation format. Include arXiv IDs where available.
 Start with: > [AI-GENERATED] This content was automatically generated and requires human review.
 
 Output ONLY the markdown content.`;
+}
+
+// ============================================================
+//  v3: Spine from PaperReads (high-density distillations)
+// ============================================================
+//
+// These prompts replace raw-.tex node extraction with the agent's own
+// multi-pass PaperRead distillations. The crucial property is that
+// SpineNode.statement is taken VERBATIM from PaperReadMainResult.statement
+// (the read pass already captured it with no `\cdots` truncation); the
+// LLM only chooses WHICH statement and HOW to organize — it never
+// re-types or paraphrases the LaTeX. The extraction prompt asks the model
+// to echo `sourcePaperId` + `sourceResultLabel` so the caller can splice
+// the verbatim statement back in from the read corpus.
+
+export function buildSpineNodeExtractionFromReadsPrompt(
+  problem: { title: string; formalStatement: string; mathStatus?: string },
+  reads: PaperRead[],
+): string {
+  const readDetails = reads.map((r) => {
+    const body = r.read;
+    const mainResults = (body?.mainResults ?? []).map((m, i) =>
+      `    [result ${i}] label="${m.label}" (where: ${m.whereInPaper})
+      statement: ${m.statement}
+      noveltyVsPrior: ${m.noveltyVsPrior}`
+    ).join("\n");
+    const techniques = (body?.keyTechniques ?? []).map((t) => t.name).join(", ");
+    const deps = (body?.technicalDependencies ?? [])
+      .map((d) => `${d.claim} (${d.source})`)
+      .join("; ");
+    return `### Paper [${r.paperId}] — role: ${body?.role ?? "unknown"}
+One-line: ${r.skim.oneLineSummary}
+Main contribution: ${r.skim.mainContribution}
+Main results (statements are VERBATIM — copy exactly, do not edit):
+${mainResults || "    (none extracted)"}
+Proof strategy: ${body?.proofStrategy ?? "(none)"}
+Novel contributions: ${body?.novelContributions ?? "(none)"}
+Key techniques: ${techniques || "(none)"}
+Technical dependencies: ${deps || "(none)"}`;
+  }).join("\n\n");
+
+  return `You are extracting Narrative-Spine nodes from a corpus of carefully-read papers about "${problem.title}".
+
+PROBLEM STATEMENT: ${problem.formalStatement.slice(0, 800)}
+STATUS: ${problem.mathStatus ?? "OPEN"}
+
+Each paper below comes with its MAIN RESULTS already transcribed verbatim from the source (no truncation, full LaTeX). Your job is to decide which results deserve to be spine nodes and to classify/connect them.
+
+PAPERS (read distillations):
+${readDetails}
+
+For each genuinely important result, technique, or barrier, emit ONE spine node. Not every paper needs a node; group papers that present the same result.
+
+CRITICAL — VERBATIM STATEMENTS:
+- Do NOT paraphrase, shorten, or "clean up" any mathematical statement.
+- For "statement", copy the EXACT statement string from the relevant "[result i]" above.
+- ALSO set "sourcePaperId" to that paper's id and "sourceResultLabel" to that result's label, so the statement can be verified. If a node summarizes a non-theorem contribution with no precise statement, set "statement" to "" and omit the source fields.
+
+For each node, provide:
+- "id": a slug like "author-year-brief-description"
+- "type": one of "foundation" | "milestone" | "technique_origin" | "refinement" | "barrier" | "bridge" | "dead_end" | "open_direction"
+- "title": e.g., "Hardy (1914): Infinitely many zeros on the critical line"
+- "year": integer (if known)
+- "authors": array of key author names
+- "statement": the VERBATIM LaTeX statement copied from above
+- "sourcePaperId": the paper id the statement was copied from
+- "sourceResultLabel": the result label the statement was copied from
+- "significance": 2-3 sentences on why this matters for the problem
+- "proof_idea": 1-2 sentences on the key proof technique (optional)
+- "paper_ids": array of paper ids this node derives from
+- "depth": "foundational" | "major" | "incremental"
+- "suggested_edges": [{"target": "node-id", "type": "enables|improves|generalizes|applies_technique|contradicts|reveals_barrier", "context": "one sentence"}]
+
+Output JSON: {"nodes": [...]}
+Output ONLY valid JSON.`;
+}
+
+export function buildSpineAssemblyFromReadsPrompt(
+  problem: { title: string; formalStatement: string },
+  candidateNodes: Array<{ id: string; title: string; year?: number; type: string; depth: string }>,
+  surveyStructuralPriors: Array<{ surveyTitle: string; outline: string[] }>,
+): string {
+  const candidateList = candidateNodes.map((c) =>
+    `- [${c.id}] (${c.type}, ${c.year ?? "?"}, depth=${c.depth}): ${c.title}`
+  ).join("\n");
+
+  const priors = surveyStructuralPriors.length > 0
+    ? `\nExisting surveys consulted for structural prior:\n${surveyStructuralPriors
+        .map((s) => `  - "${s.surveyTitle}" divides this field into: ${s.outline.length > 0 ? s.outline.join(" | ") : "(no outline captured)"}`)
+        .join("\n")}\nYou MAY use these as priors when grouping nodes into threads, but override them when the corpus suggests a better organization.\n`
+    : "";
+
+  return `You are assembling a Narrative Spine for the mathematical problem "${problem.title}".
+
+PROBLEM: ${problem.formalStatement.slice(0, 800)}
+${priors}
+SPINE NODES (already extracted — organize these, do not invent new statements):
+${candidateList}
+
+Organize these nodes into the structural story of the problem. Output a JSON object with this EXACT structure:
+{
+  "global_thesis": "One sentence capturing the central tension/story of this problem",
+  "eras": [
+    { "name": "Era Name (start_year-end_year)", "start_year": 1859, "end_year": 1950, "summary": "What happened (2-3 sentences)", "node_ids": ["node-id-1"] }
+  ],
+  "edges": [
+    { "from": "node-id-1", "to": "node-id-2", "type": "enables|improves|generalizes|applies_technique|contradicts|reveals_barrier", "context": "One sentence" }
+  ],
+  "threads": [
+    { "id": "thread-slug", "name": "Research Thread Name", "description": "What this line pursues (1-2 sentences)", "node_ids": ["node-id-1"], "status": "active|stalled|converged|dead_end", "current_frontier": "Best known result (LaTeX)", "barrier": "What blocks progress" }
+  ],
+  "open_questions": [
+    { "title": "Open Question Title", "statement": "Precise statement in LaTeX", "related_node_ids": ["node-id-1"], "barrier": "What's blocking", "partial_progress": "Known partial results" }
+  ]
+}
+
+RULES:
+- Every node id must appear in at least one era and at least one thread.
+- Eras in chronological order; thread node_ids in chronological order.
+- Edges capture the most important relationships (not every pair).
+- Threads capture distinct research directions, not just eras.
+
+Output ONLY valid JSON.`;
 }
