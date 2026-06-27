@@ -77,7 +77,23 @@ describe("buildAuditPrompt", () => {
     expect(prompt).toContain("circle method");
     expect(prompt).toContain("RED FLAGS");
     expect(prompt).toContain("ternary Goldbach");
-    expect(AUDIT_PROMPT_VERSION).toBe("v1");
+    expect(AUDIT_PROMPT_VERSION).toBe("v2");
+  });
+
+  it("includes the TOPICAL FIT step and off_topic instructions", () => {
+    const input: AuditInput = {
+      paper: paper(),
+      read: legitRead(),
+      sourceKind: "tex",
+      problemTitle: "Binary Goldbach Conjecture",
+    };
+    const prompt = buildAuditPrompt(input);
+    // Topical fit must be Step 1 and instruct the LLM how to use off_topic.
+    expect(prompt).toContain("TOPICAL FIT");
+    expect(prompt).toContain("off_topic");
+    expect(prompt).toContain("WRONG FIELD");
+    // The output schema must offer off_topic as a verdict.
+    expect(prompt).toMatch(/"verdict":\s*"trusted"\s*\|\s*"warn"\s*\|\s*"rejected"\s*\|\s*"off_topic"/);
   });
 
   it("adds the OCR caveat only for pdf-text sources", () => {
@@ -168,5 +184,40 @@ describe("auditPaper", () => {
     );
     expect(out.verdict).toBe("warn");
     expect(out.flags).toContain("llm_error");
+  });
+
+  it("preserves off_topic verdict even when score is high (topical fit is orthogonal to rigor)", async () => {
+    // A 10/10 internally rigorous physics paper on a Goldbach project must STAY off_topic.
+    const out = await auditPaper(
+      { paper: paper(), read: legitRead(), sourceKind: "tex", problemTitle: "Binary Goldbach Conjecture" },
+      {
+        llm: mockLLM(
+          JSON.stringify({
+            verdict: "off_topic",
+            score: 10,
+            flags: ["high_energy_physics", "not_number_theory"],
+            reason: "Paper measures B-meson fragmentation fractions; unrelated to additive number theory.",
+          }),
+        ),
+      },
+    );
+    expect(out.verdict).toBe("off_topic");
+    expect(out.flags).toContain("high_energy_physics");
+  });
+
+  it("preserves off_topic verdict when score is omitted", async () => {
+    const out = await auditPaper(
+      { paper: paper(), read: legitRead(), sourceKind: "tex", problemTitle: "Binary Goldbach Conjecture" },
+      {
+        llm: mockLLM(
+          JSON.stringify({
+            verdict: "off_topic",
+            flags: ["bibliometrics", "not_mathematics"],
+            reason: "Citation-counting methodology paper.",
+          }),
+        ),
+      },
+    );
+    expect(out.verdict).toBe("off_topic");
   });
 });

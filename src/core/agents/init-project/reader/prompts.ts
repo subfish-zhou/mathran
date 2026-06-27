@@ -271,7 +271,7 @@ export function buildReadRegimeCPrompt(
   ].join("\n");
 }
 
-export const AUDIT_PROMPT_VERSION = "v1";
+export const AUDIT_PROMPT_VERSION = "v2";
 
 /**
  * Input to {@link buildAuditPrompt}. Structurally compatible with `AuditInput`
@@ -357,7 +357,7 @@ export function buildAuditPrompt(input: BuildAuditPromptInput): string {
       ? `\nIMPORTANT — SOURCE IS PDF/OCR TEXT: formula chaos, broken LaTeX, and garbled symbols are EXPECTED artifacts of text extraction. Do NOT penalize the paper for them. Judge PROSE and STRUCTURE only.`
       : "";
 
-  return `You are a SENIOR REFEREE for a top mathematics journal. You are auditing an AI agent's DISTILLATION of a paper — i.e. you judge whether the agent's recorded understanding reflects genuine, rigorous mathematics, or whether the paper is likely pseudo-mathematics ("crank" work). You are NOT re-deriving the proofs; you are assessing plausibility and rigor signals in the distillation.
+  return `You are a SENIOR REFEREE for a top mathematics journal. You are auditing an AI agent's DISTILLATION of a paper. You decide whether the distilled paper is (a) genuine rigorous mathematics, (b) likely pseudo-mathematics ("crank" work), or (c) internally fine but on the WRONG TOPIC for the project. You are NOT re-deriving the proofs; you are assessing plausibility signals in the distillation AND topical fit to the target problem.
 
 ## Target problem context
 The agent is studying this paper while working on: "${problemTitle}".
@@ -371,6 +371,31 @@ ${paper.arxivId ? `arXiv:   ${paper.arxivId}\n` : ""}Source kind: ${sourceKind}$
 ## The agent's distillation (this is what you audit)
 ${fmtReadBody(input)}
 
+## Step 1 — TOPICAL FIT check (do this FIRST)
+Before judging rigor, ask: is this paper plausibly RELEVANT to "${problemTitle}"?
+Use the agent's distilled mainResults, novelContributions, techniques, and dependencies.
+
+A paper is OFF_TOPIC when it is internally fine but in the WRONG FIELD or about a DIFFERENT problem:
+- A particle-physics measurement (B-meson decays, fragmentation fractions, detector calibration)
+  pulled in by chance while studying a number-theory problem like Goldbach.
+- A bibliometrics / citation-analysis methodology paper showing up in a math reading queue.
+- A biology / chemistry / engineering paper.
+- A pure-math paper from a DIFFERENT subfield (algebraic geometry distillation while target problem is in analytic number theory) where its results have NO plausible bearing on the target.
+
+If OFF_TOPIC: set verdict = "off_topic" and STOP. Do NOT score for rigor (score is irrelevant
+for off-topic papers). Set flags to short snake_case tags naming the actual topic (e.g.
+\`["high_energy_physics", "not_number_theory"]\` or \`["bibliometrics", "not_mathematics"]\`).
+The reason field must NAME the actual field the paper belongs to AND why it's not related to
+"${problemTitle}".
+
+A paper is NOT off-topic just because:
+- It is technical / specialized (most relevant papers are).
+- It addresses a closely-related sub-question (refinements, generalizations, weaker variants).
+- It is a survey or expository piece in the right field.
+- It uses techniques from a neighboring area (analytic number theory often borrows from harmonic analysis / probability / combinatorics — that's NOT off-topic).
+When in doubt, prefer "trusted" / "warn" over "off_topic". Off-topic is for clear field mismatch.
+
+## Step 2 — RIGOR check (only if topical fit passed)
 ## Watch-list — RED FLAGS (raise the alarm when you see these)
 - Sweeping claims but NO precise theorem statement is extractable.
 - \`technicalDependencies\` is EMPTY for a paper claiming a major / hard result.
@@ -385,16 +410,17 @@ Multiple co-occurring red flags ⇒ likely crank.
 - A SHORT paper, if its result is genuinely tight / narrow.
 - OCR / PDF formula artifacts — judge prose and structure only for pdf-text sources.
 
-## Scoring
+## Scoring (rigor verdicts only — off_topic does NOT use score)
 - "rejected" (score 0-3): use ONLY when MULTIPLE severe defects co-occur (e.g. no extractable statements AND elementary-proof-of-famous-problem AND empty dependencies).
 - "warn"     (score 4-6): concerning but salvageable — some rigor signals present, some missing.
 - "trusted"  (score 7-10): default; precise statements, named techniques, plausible dependencies.
+- "off_topic" (score omitted or 0): paper is internally fine but NOT about "${problemTitle}". The reading loop will keep the read but stop harvesting citations from this paper.
 
 ## Output — STRICT JSON only, no prose around it
 {
-  "verdict": "trusted" | "warn" | "rejected",
-  "score": <integer 0-10>,
+  "verdict": "trusted" | "warn" | "rejected" | "off_topic",
+  "score": <integer 0-10, or 0 when verdict=off_topic>,
   "flags": ["short_snake_case_tag", ...],
-  "reason": "<= 500 chars; cite the SPECIFIC distillation issues that drove the verdict"
+  "reason": "<= 500 chars; cite the SPECIFIC distillation issues that drove the verdict; for off_topic, name the actual field and why it's unrelated to the target problem"
 }`;
 }

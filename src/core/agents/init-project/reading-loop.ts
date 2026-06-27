@@ -258,6 +258,22 @@ export async function runReadingLoop(
       continue;
     }
 
+    // ── Off-topic papers are KEPT but NOT harvested. Treat as empty-novelty.  ─
+    // (Audit determined the paper is internally fine but unrelated to the
+    // project's target problem — descending its citation graph would walk into
+    // an unrelated field. Keep the read so the user can see what was visited;
+    // skip survey distillation, skip biblio harvest, and count this round as
+    // empty so the convergence-K can trip and stop the off-topic walk.)
+    if (read.audit?.verdict === "off_topic") {
+      consecutiveEmptyRounds++;
+      const flagStr = read.audit.flags?.length ? ` [${read.audit.flags.join(",")}]` : "";
+      emit({
+        type: "log",
+        message: `[reading-loop] paper_off_topic: "${node.title}"${flagStr} — kept, no harvest (consecutiveEmptyRounds=${consecutiveEmptyRounds}/${K})`,
+      });
+      continue;
+    }
+
     // ── Discarded skims: kept as a read, but no biblio harvest. ───────────────
     if (read.skim.decision === "discard") {
       log(`[reading-loop] skim → discard for "${node.title}"; no harvest`);

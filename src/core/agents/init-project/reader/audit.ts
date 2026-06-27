@@ -36,7 +36,7 @@ interface RawAudit {
   reason?: unknown;
 }
 
-const VALID_VERDICTS = new Set(["trusted", "warn", "rejected"]);
+const VALID_VERDICTS = new Set(["trusted", "warn", "rejected", "off_topic"]);
 
 function clampScore(raw: unknown): number | undefined {
   const n = typeof raw === "number" ? raw : Number(raw);
@@ -58,14 +58,21 @@ function normalizeFlags(raw: unknown): string[] {
 /**
  * Map a verdict + score onto the canonical RigorVerdict, reconciling
  * disagreements between the two (e.g. an LLM that says "trusted" with score 2).
+ *
+ * Note on "off_topic": this is ORTHOGONAL to rigor. A paper can be internally
+ * solid (high score) but about the wrong field. We trust the LLM's verdict label
+ * here and do NOT let score override it: a 10/10 rigorous physics paper for a
+ * Goldbach project is still off_topic.
  */
 function reconcileVerdict(
   verdict: string | undefined,
   score: number | undefined,
-): "trusted" | "warn" | "rejected" {
-  const v = verdict && VALID_VERDICTS.has(verdict) ? (verdict as "trusted" | "warn" | "rejected") : undefined;
+): "trusted" | "warn" | "rejected" | "off_topic" {
+  const v = verdict && VALID_VERDICTS.has(verdict) ? (verdict as "trusted" | "warn" | "rejected" | "off_topic") : undefined;
+  // off_topic is topical, not a rigor signal — preserve it verbatim regardless of score.
+  if (v === "off_topic") return "off_topic";
   if (score === undefined) return v ?? "warn";
-  // Score is the more objective signal; let it correct an inconsistent label.
+  // Score is the more objective rigor signal; let it correct an inconsistent rigor label.
   if (score <= 3) return "rejected";
   if (score <= 6) return v === "rejected" ? "warn" : v ?? "warn";
   // score >= 7

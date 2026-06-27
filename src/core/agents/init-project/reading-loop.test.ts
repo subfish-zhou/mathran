@@ -58,7 +58,7 @@ function makeRead(
   opts: {
     novel?: string;
     cites?: PaperReadOutgoingCitation[];
-    verdict?: "trusted" | "warn" | "rejected" | "skipped";
+    verdict?: "trusted" | "warn" | "rejected" | "off_topic" | "skipped";
     decision?: "study" | "skim_sufficient" | "discard";
     isSurvey?: boolean;
     withBody?: boolean;
@@ -271,5 +271,32 @@ describe("runReadingLoop", () => {
     expect(krRead).toBeDefined();
     const krNode = await getPaper(workspace, "arxiv-kr-1");
     expect(krNode).not.toBeNull();
+  });
+
+  it("(h) does NOT harvest the bibliography of an off-topic paper, and counts it as empty-novelty", async () => {
+    const seedId = await ingest({ arxivId: "seed-h", title: "Seed H (will be off-topic)" });
+    const deps: ReadingLoopDeps = {
+      readPaper: async (node) =>
+        makeRead(node, {
+          verdict: "off_topic",
+          novel: "would-be novel but irrelevant",
+          cites: [arxivCite("phys-citation-should-not-appear")],
+        }),
+    };
+    const result = await runReadingLoop(baseConfig({ seedPaperIds: [seedId] }), deps);
+
+    // The off-topic seed itself is KEPT (so the user can see what was visited).
+    expect(result.reads.length).toBe(1);
+    expect(result.reads[0].paperId).toBe(seedId);
+    expect(result.reads[0].audit?.verdict).toBe("off_topic");
+    // It is NOT in the rejected list (off_topic ≠ rejected; not hard-deleted).
+    expect(result.rejectedPaperIds).not.toContain(seedId);
+    // The phys-citation must NOT have been queued, ingested, or read.
+    expect(result.reads.some((r) => r.arxivId === "phys-citation-should-not-appear")).toBe(false);
+    const physNode = await getPaper(workspace, "arxiv-phys-citation-should-not-appear");
+    expect(physNode).toBeNull();
+    // The off-topic round counts as empty-novelty; with only one paper the queue then exhausts.
+    expect(result.convergence.reason).toBe("queue_exhausted");
+    expect(result.convergence.consecutiveEmptyRounds).toBeGreaterThanOrEqual(1);
   });
 });

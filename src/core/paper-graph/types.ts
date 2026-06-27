@@ -87,6 +87,7 @@ export type RigorVerdict =
   | "trusted"        // passed both coarse + fine, OR exempt (seed/vendored/highly-cited)
   | "warn"           // coarse flagged but fine not yet run, OR fine found minor issues
   | "rejected"       // fine pass confirmed pseudoscience; paper will be hard-deleted
+  | "off_topic"      // paper is internally fine but NOT about the target problem; kept but not harvested for citations
   | "skipped";       // OCR-only source or rigor disabled; held with neutral trust
 
 export type QualityTier =
