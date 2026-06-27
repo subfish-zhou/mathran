@@ -220,11 +220,26 @@ export async function runProjectPlan(
   const name = result.problem?.title ?? description;
   console.log(`[init-agent] Starting init for "${name}" ...`);
   const { runAiInit } = await import("./ai-init.js");
+  // Forward the FULL formalized problem to ai-init so downstream phases (canonical-
+  // landmarks discovery, prior-art, reading-loop) see real grounding context.
+  // Without `refinedProblem` the background is dropped on the floor here just
+  // like in the runAiInit re-entry path. Same fix as ai-init.ts/runPlanPhase.
+  const refinedProblem = result.problem
+    ? {
+        title: result.problem.title,
+        formalStatement: result.problem.formalStatement,
+        description: result.problem.description,
+        backgroundSummary: result.problem.background,
+        tags: result.problem.tags,
+        mathStatus: result.problem.mathStatus,
+      }
+    : undefined;
   return runAiInit(name, {
     serveUrl: opts.serveUrl,
     seeds: seeds || undefined,
     depth: opts.depth,
     useSpine: true,
     autoPlan: false,
+    refinedProblem,
   });
 }

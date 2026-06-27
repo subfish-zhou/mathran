@@ -61,6 +61,21 @@ export interface AiInitOptions {
   configPath?: string;
   /** Skip the Plan Agent confirm prompt (== answering "yes"). */
   yes?: boolean;
+  /**
+   * Pre-formalized problem (set by project-plan.ts → runAiInit handoff). When
+   * present, ai-init skips its own plan-phase and uses this directly so the
+   * background / formalStatement / tags / mathStatus from the Plan Agent are
+   * not dropped on the floor between the two commands. The shape mirrors what
+   * runPlanPhase produces internally.
+   */
+  refinedProblem?: {
+    title: string;
+    formalStatement?: string;
+    description?: string;
+    backgroundSummary?: string;
+    tags?: string[];
+    mathStatus?: "OPEN" | "PARTIALLY_SOLVED" | "SOLVED" | "DISPUTED";
+  };
   /** Writer model for the writer-reviewer loop (default openai/gpt-5.5). */
   writerModel?: string;
   /** Reviewer model for the writer-reviewer loop (default anthropic/opus-4.8). */
@@ -350,8 +365,14 @@ export async function runAiInit(name: string, opts: AiInitOptions): Promise<numb
   // Plan Agent runs in-process (no serve needed). Skipped when `project plan`
   // already ran it (autoPlan === false) or when seeds were given explicitly.
   let problemTitle = name;
-  let refinedProblem: RefinedProblem | undefined;
-  if (seeds.length === 0 && opts.autoPlan !== false) {
+  let refinedProblem: RefinedProblem | undefined = opts.refinedProblem;
+  // Skip plan-phase entirely if a refined problem was handed in (project-plan.ts
+  // path); otherwise run plan-phase to get one. `autoPlan: false` from the
+  // project-plan handoff means "don't re-run plan-agent" but we still want to
+  // honor any refined problem they passed us.
+  if (refinedProblem) {
+    problemTitle = refinedProblem.title;
+  } else if (seeds.length === 0 && opts.autoPlan !== false) {
     const planExit = await runPlanPhase(name, opts);
     if (planExit.abort) return planExit.code;
     seeds = planExit.seeds;
