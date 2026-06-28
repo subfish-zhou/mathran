@@ -650,6 +650,43 @@ async function runInitAgentSpine(
       expositoryAnswers: priorArt?.expositoryAnswers.length ?? 0,
     });
 
+    // ── Phase 1a': hypothesis_spine (Layer 3, 2026-06-28) ──────────────────
+    // Build what the LLM EXPECTS the field's spine to look like, BEFORE any
+    // reads. Reconcile against the real spine after build_spine. Failure-
+    // isolated: throw / garbage / empty → EMPTY_HYPOTHESIS_SPINE and the
+    // pipeline continues as if Layer 3 didn't exist.
+    throwIfAborted();
+    await appendPhase(projectDir, runId, "hypothesis_spine", "start");
+    const hypothesisSpineLLM = accounting.wrap(spineLLM, "hypothesis_spine", "writer");
+    const { buildHypothesisSpine: hsBuild } = await import("./hypothesis-spine/index.js");
+    const hypothesisSpine = await hsBuild(
+      { llm: hypothesisSpineLLM, emitLog: (m) => emit({ type: "log", message: m }) },
+      {
+        problemTitle: problem.title,
+        problemStatement: problem.formalStatement,
+        problemTags: problem.tags,
+        priorArt,
+      },
+    );
+    await appendLog(projectDir, runId, "hypothesis_spine", `${hypothesisSpine.nodes.length} hypothesis node(s)`, {
+      thesis: hypothesisSpine.globalThesis.slice(0, 200),
+      eras: hypothesisSpine.eras.length,
+      threads: hypothesisSpine.threads.length,
+    });
+    // Persist for downstream debugging + so reconcile can re-load on resume.
+    try {
+      const hsPath = path.join(projectDir, ".mathran", "hypothesis-spine.json");
+      await fs.mkdir(path.dirname(hsPath), { recursive: true });
+      await fs.writeFile(hsPath, JSON.stringify(hypothesisSpine, null, 2) + "\n", "utf8");
+    } catch (err) {
+      await appendLog(projectDir, runId, "hypothesis_spine", `persist failed: ${errMsg(err)}`);
+    }
+    await appendPhase(projectDir, runId, "hypothesis_spine", "end", {
+      nodes: hypothesisSpine.nodes.length,
+      eras: hypothesisSpine.eras.length,
+      threads: hypothesisSpine.threads.length,
+    });
+
     // ── Phase 1b: read_and_explore ────────────────────────────────────────
     throwIfAborted();
     await appendPhase(projectDir, runId, "read_and_explore", "start");
@@ -894,6 +931,47 @@ async function runInitAgentSpine(
       nodes: spine.nodes.length,
       threads: spine.threads.length,
     });
+
+    // ── Phase 2b: reconcile_spine (Layer 3, 2026-06-28) ────────────────────
+    // Reconcile the hypothesis spine (built pre-reads) against the actually-
+    // synthesized spine. Marks each hypothesis node verified / refined /
+    // falsified / unread and persists the reconciliation summary into the
+    // hypothesis-spine.json + the run report. Failure-isolated.
+    let reconciliationSummary: import("./hypothesis-spine/index.js").SpineReconciliationSummary | null = null;
+    if (hypothesisSpine.nodes.length > 0) {
+      throwIfAborted();
+      await appendPhase(projectDir, runId, "reconcile_spine", "start");
+      try {
+        const { reconcileSpines } = await import("./hypothesis-spine/index.js");
+        const r = reconcileSpines({
+          hypothesis: hypothesisSpine,
+          realSpine: spine,
+          readPaperIds: new Set(loopResult.reads.map((rd) => rd.paperId)),
+          rejectedPaperIds: new Set(loopResult.rejectedPaperIds),
+        });
+        reconciliationSummary = r.summary;
+        const hsPath = path.join(projectDir, ".mathran", "hypothesis-spine.json");
+        try {
+          await fs.writeFile(hsPath, JSON.stringify(r.reconciled, null, 2) + "\n", "utf8");
+        } catch (err) {
+          await appendLog(projectDir, runId, "reconcile_spine", `persist failed: ${errMsg(err)}`);
+        }
+        await appendLog(
+          projectDir, runId, "reconcile_spine",
+          `verified=${r.summary.verified} refined=${r.summary.refined} falsified=${r.summary.falsified} unread=${r.summary.unread} / ${r.summary.totalHypothesisNodes}`,
+          { details: r.summary.details.slice(0, 50) },
+        );
+      } catch (err) {
+        await appendLog(projectDir, runId, "reconcile_spine", `reconcile failed: ${errMsg(err)}`);
+      }
+      await appendPhase(projectDir, runId, "reconcile_spine", "end", {
+        verified: reconciliationSummary?.verified ?? 0,
+        refined: reconciliationSummary?.refined ?? 0,
+        falsified: reconciliationSummary?.falsified ?? 0,
+        unread: reconciliationSummary?.unread ?? 0,
+        total: reconciliationSummary?.totalHypothesisNodes ?? 0,
+      });
+    }
 
     // ── Phase 3: build_efforts ────────────────────────────────────────────
     throwIfAborted();
