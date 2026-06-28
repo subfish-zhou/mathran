@@ -59,6 +59,13 @@ export interface ReviewLoopConfig {
   writerModel: string;
   /** Routing label for the reviewer model (SEPARATE from writerModel). */
   reviewerModel: string;
+  /**
+   * When true, the reviewer prompt switches to a self-review preamble that
+   * compensates for the well-known weakness of single-model self-review.
+   * Forward this from the orchestrator when `modelPair.identical` is true.
+   * See reviewer.ts.ReviewArtifactInput.selfReviewMode for the rationale.
+   */
+  selfReviewMode?: boolean;
 }
 
 export interface ReviewRevision {
@@ -100,6 +107,7 @@ function reviewInput(config: ReviewLoopConfig, content: string): ReviewArtifactI
     artifactContent: content,
     topic: config.topic,
     audienceHint: config.audienceHint,
+    selfReviewMode: config.selfReviewMode,
   };
 }
 

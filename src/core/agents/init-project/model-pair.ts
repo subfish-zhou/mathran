@@ -151,6 +151,18 @@ export async function persistModelPair(projectDir: string, pair: ModelPair): Pro
   }
 }
 
-/** The identical-model warning text (DESIGN-REFERENCE §6.7). */
+/**
+ * The identical-model warning text (DESIGN-REFERENCE §6.7).
+ *
+ * When this fires, the orchestrator ALSO forwards `selfReviewMode: true` to
+ * every review-loop call so the reviewer prompt switches into a
+ * self-review-compensation framing (see review-loop/reviewer.ts). This is
+ * NOT a substitute for true dual-model review — it merely prevents the
+ * silent rubber-stamping observed in dogfood-run-d79c820c42b7 with a single
+ * copilot model self-reviewing every effort.
+ */
 export const IDENTICAL_MODELS_WARNING =
-  "[warn] writer and reviewer models are identical; self-review is weaker than dual-model review.";
+  "[warn] writer and reviewer models are identical — self-review is structurally weaker than dual-model review.\n" +
+  "        The reviewer prompt will be switched to self-review mode (extra-skeptical framing) as a partial mitigation.\n" +
+  "        For best results, configure a SECOND provider/model via --writer-model / --reviewer-model CLI flags,\n" +
+  "        MATHRAN_WRITER_MODEL / MATHRAN_REVIEWER_MODEL env vars, or settings.json initProject.{writerModel,reviewerModel}.";

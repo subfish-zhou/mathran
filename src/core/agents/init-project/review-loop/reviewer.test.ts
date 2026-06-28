@@ -185,6 +185,22 @@ describe("reviewer prompt", () => {
     const p = buildReviewerPrompt(input({ artifactContent: long }));
     expect(p).toContain(long);
   });
+
+  it("omits the self-review preamble by default (dual-model is the assumed setup)", () => {
+    const p = buildReviewerPrompt(input());
+    expect(p).not.toContain("SELF-REVIEW MODE");
+    expect(p).not.toContain("THE SAME underlying model");
+  });
+
+  it("injects a self-review preamble when selfReviewMode=true (dogfood-run-d79c820c42b7 mitigation)", () => {
+    const p = buildReviewerPrompt(input({ selfReviewMode: true }));
+    expect(p).toContain("SELF-REVIEW MODE");
+    expect(p).toContain("THE SAME underlying model");
+    expect(p).toContain("Compensation rules");
+    // The preamble must precede the normal "Your goal: read this document"
+    // framing, not replace it — both should be present.
+    expect(p.indexOf("SELF-REVIEW MODE")).toBeLessThan(p.indexOf("Your goal:"));
+  });
 });
 
 describe("normalizeVerdict", () => {

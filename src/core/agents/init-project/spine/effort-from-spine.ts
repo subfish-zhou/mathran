@@ -85,6 +85,12 @@ export interface EffortFromSpineReviewerDeps {
   reviewerLlm?: SpineLLM;
   writerModel?: string;
   reviewerModel?: string;
+  /**
+   * Forwarded to EffortSynthesisDeps.selfReviewMode and
+   * ThreadSurveyDeps.selfReviewMode so the reviewer prompt switches into
+   * self-review mode when writer === reviewer.
+   */
+  selfReviewMode?: boolean;
   estimateCost?: (model: string, tokens: { in: number; out: number }) => number;
 }
 
@@ -307,6 +313,7 @@ export async function generateEffortsFromSpine(
           reviewerLlm: reviewer.reviewerLlm,
           writerModel: reviewer.writerModel ?? "",
           reviewerModel: reviewer.reviewerModel ?? "",
+          selfReviewMode: reviewer.selfReviewMode,
           estimateCost: reviewer.estimateCost,
           emitLog: (m) => emit({ type: "log", message: m }),
         });
@@ -409,6 +416,7 @@ export async function generateEffortsFromSpine(
             reviewerLlm: reviewer.reviewerLlm,
             writerModel: reviewer.writerModel,
             reviewerModel: reviewer.reviewerModel,
+            selfReviewMode: reviewer.selfReviewMode,
             estimateCost: reviewer.estimateCost,
           },
         );

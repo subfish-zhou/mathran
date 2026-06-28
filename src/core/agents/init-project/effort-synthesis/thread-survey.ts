@@ -35,6 +35,8 @@ export interface ThreadSurveyDeps {
   reviewerLlm: SpineLLM;
   writerModel: string;
   reviewerModel: string;
+  /** Forwarded to reviewLoop when writer === reviewer; see reviewer.ts. */
+  selfReviewMode?: boolean;
   emitLog?: (m: string) => void;
   estimateCost?: (model: string, tokens: { in: number; out: number }) => number;
 }
@@ -114,6 +116,7 @@ export async function synthesizeThreadSurvey(
       audienceHint: `senior researcher in ${input.problemTitle}`,
       writerModel: deps.writerModel,
       reviewerModel: deps.reviewerModel,
+      selfReviewMode: deps.selfReviewMode,
     },
     DEFAULT_REVIEW_LOOP_BUDGET,
     {

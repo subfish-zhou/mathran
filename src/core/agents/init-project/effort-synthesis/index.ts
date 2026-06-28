@@ -57,6 +57,13 @@ export interface EffortSynthesisDeps {
   writerModel?: string;
   /** Routing label for the reviewer model (cost estimation only). */
   reviewerModel?: string;
+  /**
+   * When true, the writer and reviewer point at the same underlying model.
+   * Forwarded to reviewLoop → buildReviewerPrompt which prepends an explicit
+   * self-review preamble that tells the reviewer to be extra skeptical.
+   * See review-loop/reviewer.ts.ReviewArtifactInput.selfReviewMode.
+   */
+  selfReviewMode?: boolean;
   /** Override the default per-artifact review budget (3 revisions / $5). */
   reviewBudget?: ReviewLoopBudget;
   estimateCost?: (model: string, tokens: { in: number; out: number }) => number;
@@ -221,6 +228,7 @@ export async function synthesizeEffort(
           audienceHint: documentAudience(node.depth),
           writerModel,
           reviewerModel,
+          selfReviewMode: deps.selfReviewMode,
         },
         budget,
         loopDeps,
@@ -248,6 +256,7 @@ export async function synthesizeEffort(
           audienceHint: "graduate-student-entering-field",
           writerModel,
           reviewerModel,
+          selfReviewMode: deps.selfReviewMode,
         },
         budget,
         loopDeps,

@@ -50,6 +50,20 @@ export interface ReviewArtifactInput {
   topic: string;
   /** e.g. "graduate-student-entering-field" from the WikiPlan. */
   audienceHint?: string;
+  /**
+   * When `true`, the writer and reviewer are the SAME underlying model
+   * (self-review), which is a known weaker setup per DESIGN-REFERENCE §6.7.
+   * The reviewer prompt switches to an extra-skeptical framing that explicitly
+   * acknowledges the conflict and asks the reviewer to assume nothing the
+   * writer left implicit. Defaults to false (true dual-model review).
+   *
+   * Caught in dogfood-run-d79c820c42b7: with writerModel=reviewerModel='' both
+   * pointing to copilot's same default, the reviewer rubber-stamped wide
+   * swaths of effort docs that had real prose-quality issues. Adding a
+   * self-review preamble is a cheap mitigation when dual-model isn't
+   * available.
+   */
+  selfReviewMode?: boolean;
 }
 
 export interface ReviewArtifactDeps {

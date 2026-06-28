@@ -48,11 +48,45 @@ export function buildReviewerPrompt(input: ReviewArtifactInput): string {
     ? `\nThe intended audience for this document is: ${input.audienceHint}. Read it as a member of that audience would.\n`
     : "\n";
 
+  // When the writer and reviewer are the same underlying model (set by the
+  // orchestrator when modelPair.identical), inject an explicit self-review
+  // preamble. This is a cheap mitigation for the well-known failure mode
+  // where a single model rubber-stamps its own draft (the writer's word
+  // choices feel "natural" to the reviewer because it WOULD HAVE written
+  // them itself). The preamble names the conflict and asks the reviewer to
+  // compensate. Not a substitute for true dual-model review — just a guard
+  // for copilot-only / single-provider environments.
+  const selfReviewPreamble = input.selfReviewMode
+    ? `
+⚠️  SELF-REVIEW MODE ⚠️
+You are reviewing a draft that was written by THE SAME underlying model
+you are now running on. This is structurally weaker than dual-model review,
+because language you would HAVE WRITTEN tends to feel "right" to you even
+when a different reader would have struggled.
+
+Compensation rules — apply these AS YOU READ:
+- Assume NOTHING the writer left implicit. If a step is "obvious to the writer",
+  ask whether it is obvious to the stated audience. If not, flag 'skips-steps'.
+- Treat every appeal to authority ("standard sieve theory", "by Bombieri-
+  Vinogradov", "as is well-known") as a candidate 'unsupported' issue unless
+  the document gives the reader a way to verify it (a citation, a derivation,
+  or a sentence of context).
+- Suspect your own first impression of "this reads fine". When you would
+  approve, scan once more SPECIFICALLY for: notation defined before use,
+  proof steps that move from claim to claim without intermediate justification,
+  and statements that assume the reader already knows the answer.
+- It is OK — expected, even — to request rewrites on documents that on a
+  surface read seem competent. The bar is "an attentive grad student finishes
+  with the intended understanding without frustration", not "the writer's
+  internal logic is consistent with itself".
+
+`
+    : "";
+
   return `You are reading a ${docType} on ${input.topic}. You are an attentive 
 graduate student in this field, intelligent and patient, but not 
 pre-loaded with the specialized knowledge of this exact subfield.
-${audienceLine}
-Your goal: read this document carefully from top to bottom, as a 
+${audienceLine}${selfReviewPreamble}Your goal: read this document carefully from top to bottom, as a 
 reader trying to learn. Track your experience honestly:
 
 - Where did you understand easily?
