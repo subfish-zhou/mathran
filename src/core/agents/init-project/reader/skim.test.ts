@@ -118,4 +118,46 @@ describe("skimPaper", () => {
     const skim = await skimPaper(makePaper(), makeSource(), { llm });
     expect(skim.decision).toBe("study");
   });
+
+  it("includes the target-problem topic anchor when problemTitle is provided", async () => {
+    // dogfood-run-d79c820c42b7: physics / mechanics papers harvested from
+    // number-theory ancestors burned full read+audit cycles before being
+    // tagged off_topic. The skim prompt now gets a problemTitle anchor so it
+    // can `discard` at ~$0.002 instead of paying a regime-B/A read.
+    let capturedPrompt = "";
+    const llm: SpineLLM = vi.fn(async (prompt: string) => {
+      capturedPrompt = prompt;
+      return JSON.stringify({
+        oneLineSummary: "x",
+        mainContribution: "y",
+        sectionOutline: [],
+        decision: "discard",
+        decisionReason: "wrong subfield",
+      });
+    });
+    await skimPaper(makePaper(), makeSource(), {
+      llm,
+      problemTitle: "Binary Goldbach Conjecture",
+    });
+    expect(capturedPrompt).toContain("TARGET PROBLEM");
+    expect(capturedPrompt).toContain("Binary Goldbach Conjecture");
+    expect(capturedPrompt).toContain("TOPIC-RELEVANCE GUIDANCE");
+  });
+
+  it("omits the topic-anchor block when problemTitle is missing (back-compat)", async () => {
+    let capturedPrompt = "";
+    const llm: SpineLLM = vi.fn(async (prompt: string) => {
+      capturedPrompt = prompt;
+      return JSON.stringify({
+        oneLineSummary: "x",
+        mainContribution: "y",
+        sectionOutline: [],
+        decision: "study",
+        decisionReason: "",
+      });
+    });
+    await skimPaper(makePaper(), makeSource(), { llm });
+    expect(capturedPrompt).not.toContain("TARGET PROBLEM");
+    expect(capturedPrompt).not.toContain("TOPIC-RELEVANCE GUIDANCE");
+  });
 });

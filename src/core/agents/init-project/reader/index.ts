@@ -147,7 +147,7 @@ export async function readPaper(paper: PaperNode, ctx: ReadPaperCtx): Promise<Pa
   // ── 2. Skim ────────────────────────────────────────────────────────────────
   let skim: PaperReadSkim;
   try {
-    skim = await skimPaper(paper, source, { llm, emitLog });
+    skim = await skimPaper(paper, source, { llm, emitLog, problemTitle });
     totalLlmCalls += 1;
     passesCompleted.push("skim");
   } catch (err) {

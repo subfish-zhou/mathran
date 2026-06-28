@@ -22,6 +22,18 @@ export interface SkimDeps {
   llm: SpineLLM;
   /** When the source has section markers, use them as outline; else, parse outline from text. */
   emitLog?: (message: string) => void;
+  /**
+   * Optional: the target problem's title. When provided, the skim LLM is told
+   * "this paper was harvested from a citation graph rooted at <problem>;
+   * decide whether the abstract / intro is even in the right mathematical
+   * subfield". Without this, the skim has no topic anchor and can recommend
+   * `study` for off-topic harvest stragglers (e.g. Lattice QCD / mechanics /
+   * probability-history papers harvested from number-theory ancestors), which
+   * burn full read+audit cycles before being caught downstream by audit.
+   * Caught in dogfood-run-d79c820c42b7: 3 physics + 1 probability-history
+   * paper read+audited at full cost just to be `kept, no harvest`.
+   */
+  problemTitle?: string;
 }
 
 type RawSkim = Partial<PaperReadSkim> & Record<string, unknown>;
@@ -68,7 +80,7 @@ export async function skimPaper(
   const conclusionExcerpt = conclusionExcerptOf(source.text);
   const outline = (source.sectionMarkers ?? []).map((m) => ({ level: m.level, title: m.title }));
 
-  const prompt = buildSkimPrompt(paper, source.kind, outline, introExcerpt, conclusionExcerpt);
+  const prompt = buildSkimPrompt(paper, source.kind, outline, introExcerpt, conclusionExcerpt, deps.problemTitle);
 
   let reply: string;
   try {

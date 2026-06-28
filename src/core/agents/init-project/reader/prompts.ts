@@ -27,6 +27,7 @@ export function buildSkimPrompt(
   outline: Array<{ title: string; level: 1 | 2 | 3 }>,
   introExcerpt: string,
   conclusionExcerpt: string,
+  problemTitle?: string,
 ): string {
   const authors = paper.authors.length > 0 ? paper.authors.join(", ") : "(unknown authors)";
   const year = paper.year != null ? String(paper.year) : "(unknown year)";
@@ -44,6 +45,26 @@ export function buildSkimPrompt(
         "rely on prose meaning and be conservative in your decision.\n"
       : "";
 
+  // When the caller supplies a problem title, anchor the skim to it so an
+  // abstract that's clearly in an unrelated mathematical subfield (or in
+  // physics / engineering / unrelated humanities) gets `discard`'d at this
+  // ~$0.002 stage instead of paying a full read+audit (~$0.20+ regime B/A).
+  // See dogfood-run-d79c820c42b7: Lattice QCD / LHCb / mechanics / Poisson's
+  // probabilité judiciaire papers were harvested from number-theory ancestors
+  // and read in full before audit caught them as off_topic.
+  const topicAnchorBlock = problemTitle
+    ? [
+        "",
+        "## TARGET PROBLEM (this paper was harvested from a citation graph rooted at this problem)",
+        problemTitle,
+        "",
+        "TOPIC-RELEVANCE GUIDANCE (read carefully):",
+        "- If the abstract / intro is clearly in an UNRELATED mathematical subfield (or in physics, engineering, biology, ML, social sciences, history, etc.) with no plausible technique or result that would be cited by work on the target problem, recommend `discard` with `decisionReason` naming the actual subfield.",
+        "- Citation-graph harvesting CAN drift far from topic — do not assume the paper is relevant just because something cited it. An analytic-number-theory paper might cite a random-matrix-theory or QCD paper for one analogy; that doesn't make the cited paper itself part of the target problem's lineage.",
+        "- This is a CHEAP guard at the skim stage, before paying a full read. When unsure between `discard` and `skim_sufficient`, prefer `discard` only when there is NO mathematical content connection at all; when there's any plausible (even indirect) technical link to the target problem, prefer `skim_sufficient`.",
+      ].join("\n")
+    : "";
+
   return [
     "You are a mathematics research assistant performing PASS 1 of 3 (a SKIM) over a paper.",
     "Your job is to form a fast, high-level impression and decide how much further effort the paper warrants.",
@@ -53,6 +74,7 @@ export function buildSkimPrompt(
     `Authors: ${authors}`,
     `Year: ${year}`,
     `Source kind: ${sourceKind}`,
+    topicAnchorBlock,
     "",
     "## ABSTRACT",
     abstract,
@@ -70,7 +92,7 @@ export function buildSkimPrompt(
     "Decide one of three verdicts:",
     '  - "study"           = a core milestone / technique-origin paper that warrants a full read.',
     '  - "skim_sufficient" = relevant but supporting; this skim is enough for downstream synthesis.',
-    '  - "discard"         = not relevant to the problem, or already subsumed by other work.',
+    '  - "discard"         = not relevant to the problem, OR in an unrelated mathematical subfield / non-math field.',
     "",
     "Respond with a SINGLE JSON object (no prose, no markdown fences) matching exactly this shape:",
     "{",
