@@ -25,6 +25,11 @@ import type { SpineLLM } from "./spine/llm.js";
 import { extractSpineJSON, errMsg } from "./spine/llm.js";
 import type { SpinePipelineEvent } from "./spine/types.js";
 import {
+  EMPTY_PLAN as RP_EMPTY_PLAN,
+  REPLAN_CADENCE_DEFAULT as RP_REPLAN_CADENCE_DEFAULT,
+  nextPlannedPaperId as rpNextPlannedPaperId,
+} from "./reading-plan/index.js";
+import {
   getPaper,
   ingestPaper,
   paperGraphDir,
@@ -57,6 +62,30 @@ export interface ReadingLoopConfig {
   llm: SpineLLM;
   modelName: string;
   promptVersion?: string;
+  /**
+   * Layer 2 (2026-06-28) — optional planner-driven reading order. When
+   * supplied, the loop pops the next planned paperId ahead of the bare
+   * priority queue. A null `plan` or an exhausted plan falls back to the
+   * priority queue. See reading-plan/ for the planner.
+   */
+  plan?: import("./reading-plan/index.js").ReadingPlan;
+  /**
+   * Layer 2 — when supplied, the loop calls back into the planner every
+   * `replanCadence` reads (default REPLAN_CADENCE_DEFAULT) so it can refine
+   * the plan based on what was just read + what was just harvested.
+   *
+   * The callback receives the current set of read paperIds and the current
+   * queue; it returns a new plan (or the same plan unchanged when nothing
+   * needs to change). Throwing here is non-fatal: the loop logs + carries on
+   * with the prior plan.
+   */
+  replan?: (args: {
+    readPaperIds: string[];
+    queuedPaperIds: string[];
+    previousPlan: import("./reading-plan/index.js").ReadingPlan;
+  }) => Promise<import("./reading-plan/index.js").ReadingPlan>;
+  /** Re-plan after every N reads. Defaults to REPLAN_CADENCE_DEFAULT. */
+  replanCadence?: number;
 }
 
 export interface ReadingLoopUnresolvedCitation {
@@ -246,6 +275,16 @@ export async function runReadingLoop(
   // ── Main loop ──────────────────────────────────────────────────────────────
   let reason: ReadingLoopResult["convergence"]["reason"] = "queue_exhausted";
 
+  // Layer 2: plan + replan bookkeeping. `currentPlan` evolves across the run
+  // — set from config.plan at start, then replaced by each successful replan
+  // callback. `readsSinceReplan` triggers the next callback. We do NOT short-
+  // circuit convergence on plan-exhaustion (the queue may still hold useful
+  // harvest the planner ignored on purpose); the existing K-empty convergence
+  // and circuit breaker still gate exit.
+  const replanCadenceCfg = Math.max(1, config.replanCadence ?? RP_REPLAN_CADENCE_DEFAULT);
+  let currentPlan: import("./reading-plan/index.js").ReadingPlan = config.plan ?? RP_EMPTY_PLAN;
+  let readsSinceReplan = 0;
+
   for (;;) {
     if (queue.length === 0) {
       reason = "queue_exhausted";
@@ -264,19 +303,34 @@ export async function runReadingLoop(
 
     totalRounds++;
 
-    // Pick the highest-priority candidate; within the same priority band,
-    // pick the EARLIEST year (Brun 1920 before Chen 1973 within `canon`).
-    // Missing year sorts last so it never starves a dated entry.
-    let bestIdx = 0;
-    for (let i = 1; i < queue.length; i++) {
-      const cand = queue[i];
-      const best = queue[bestIdx];
-      if (cand.priority > best.priority) {
-        bestIdx = i;
-      } else if (cand.priority === best.priority) {
-        const candYear = cand.year ?? Number.POSITIVE_INFINITY;
-        const bestYear = best.year ?? Number.POSITIVE_INFINITY;
-        if (candYear < bestYear) bestIdx = i;
+    // Layer 2: if a plan exists and proposes a paperId currently in the
+    // queue, honour it. Otherwise fall back to the bare priority pick.
+    let bestIdx = -1;
+    const plannedPaperId = currentPlan.narrativeArcs.length > 0
+      ? rpNextPlannedPaperId(currentPlan, new Set(reads.keys()))
+      : null;
+    if (plannedPaperId) {
+      const idx = queue.findIndex((c) => c.paperId === plannedPaperId);
+      if (idx >= 0) {
+        bestIdx = idx;
+        log(`[reading-loop] plan v${currentPlan.planVersion} → pop "${plannedPaperId}"`);
+      }
+    }
+    if (bestIdx < 0) {
+      // Pick the highest-priority candidate; within the same priority band,
+      // pick the EARLIEST year (Brun 1920 before Chen 1973 within `canon`).
+      // Missing year sorts last so it never starves a dated entry.
+      bestIdx = 0;
+      for (let i = 1; i < queue.length; i++) {
+        const cand = queue[i];
+        const best = queue[bestIdx];
+        if (cand.priority > best.priority) {
+          bestIdx = i;
+        } else if (cand.priority === best.priority) {
+          const candYear = cand.year ?? Number.POSITIVE_INFINITY;
+          const bestYear = best.year ?? Number.POSITIVE_INFINITY;
+          if (candYear < bestYear) bestIdx = i;
+        }
       }
     }
     const candidate = queue.splice(bestIdx, 1)[0];
@@ -534,6 +588,28 @@ export async function runReadingLoop(
           attemptedResolutions: ["arxiv: no search seam"],
           status: "unresolved",
         });
+      }
+    }
+
+    // Layer 2 — re-plan tick. Fire AFTER harvest (so the planner sees the
+    // newly-ingested candidates) but BEFORE the next pop. config.replan is
+    // optional; absent it the plan never changes after construction.
+    readsSinceReplan++;
+    if (config.replan && readsSinceReplan >= replanCadenceCfg) {
+      readsSinceReplan = 0;
+      try {
+        const next = await config.replan({
+          readPaperIds: Array.from(reads.keys()),
+          queuedPaperIds: queue.map((q) => q.paperId),
+          previousPlan: currentPlan,
+        });
+        // Only adopt the new plan if it actually differs (planVersion changed)
+        // so a no-op replan call doesn't churn logs.
+        if (next.planVersion !== currentPlan.planVersion) {
+          currentPlan = next;
+        }
+      } catch (err) {
+        log(`[reading-loop] replan callback failed (${errMsg(err)}) — carry v${currentPlan.planVersion}`);
       }
     }
   }

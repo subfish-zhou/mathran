@@ -471,4 +471,139 @@ describe("runReadingLoop", () => {
       expect(["seed", "survey-keyref", "harvest"]).toContain(row.discoveredBy);
     }
   });
+
+  it("(l) [Layer 2] when a plan is supplied, the loop pops papers in plan order, NOT priority/year order", async () => {
+    // Seed 3 papers chronologically AGAINST the order the plan wants. Without
+    // the plan: queue picks earliest-year first (s1 → s2 → s3). With the
+    // plan: pops in the LLM-supplied arc order (s3 → s1 → s2).
+    const s1 = await ingest({ arxivId: "l-1900", title: "1900", year: 1900 });
+    const s2 = await ingest({ arxivId: "l-1950", title: "1950", year: 1950 });
+    const s3 = await ingest({ arxivId: "l-2020", title: "2020", year: 2020 });
+
+    const order: string[] = [];
+    const deps: ReadingLoopDeps = {
+      readPaper: async (node) => {
+        order.push(node.id);
+        return makeRead(node, { novel: "novel", cites: [] });
+      },
+    };
+
+    const { EMPTY_PLAN } = await import("./reading-plan/index.js");
+    const plan = {
+      ...EMPTY_PLAN,
+      planVersion: 1,
+      narrativeArcs: [{
+        name: "Trace it backwards",
+        rationale: "modern first then ancestry",
+        steps: [
+          { paperId: s3, purpose: "modern frontier" },
+          { paperId: s1, purpose: "first foundations" },
+          { paperId: s2, purpose: "filling the gap" },
+        ],
+      }],
+      expectedTotalReads: 3,
+      producedAt: "2026-06-28T00:00:00Z",
+    };
+
+    await runReadingLoop(baseConfig({ seedPaperIds: [s1, s2, s3], plan }), deps);
+    expect(order).toEqual([s3, s1, s2]);
+  });
+
+  it("(m) [Layer 2] when the plan is exhausted, the loop falls back to the priority queue for remaining candidates", async () => {
+    // 4 seeds, plan covers only 2 of them. Loop should read those 2 in plan
+    // order, then fall through to year-asc priority for the other 2.
+    const a = await ingest({ arxivId: "m-1910", title: "1910", year: 1910 });
+    const b = await ingest({ arxivId: "m-1960", title: "1960", year: 1960 });
+    const c = await ingest({ arxivId: "m-1990", title: "1990", year: 1990 });
+    const d = await ingest({ arxivId: "m-2010", title: "2010", year: 2010 });
+
+    const order: string[] = [];
+    const deps: ReadingLoopDeps = {
+      readPaper: async (node) => {
+        order.push(node.id);
+        return makeRead(node, { novel: "novel", cites: [] });
+      },
+    };
+
+    const { EMPTY_PLAN } = await import("./reading-plan/index.js");
+    const plan = {
+      ...EMPTY_PLAN,
+      planVersion: 1,
+      narrativeArcs: [{
+        name: "Plan-covered slice",
+        rationale: "",
+        steps: [
+          { paperId: d, purpose: "" },
+          { paperId: b, purpose: "" },
+        ],
+      }],
+      expectedTotalReads: 2,
+      producedAt: "x",
+    };
+
+    await runReadingLoop(baseConfig({ seedPaperIds: [a, b, c, d], plan }), deps);
+    // First two: plan order. Next two: priority-fallback (year-asc within band).
+    expect(order.slice(0, 2)).toEqual([d, b]);
+    expect(order.slice(2)).toEqual([a, c]);
+  });
+
+  it("(n) [Layer 2] replan callback is invoked at the configured cadence", async () => {
+    const seeds = await Promise.all([1, 2, 3, 4, 5].map((i) =>
+      ingest({ arxivId: `n-${i}`, title: `S${i}` }),
+    ));
+    const deps: ReadingLoopDeps = {
+      readPaper: async (node) => makeRead(node, { novel: "novel", cites: [] }),
+    };
+
+    const replanInvocations: Array<{ readCount: number; queueCount: number }> = [];
+    const { EMPTY_PLAN } = await import("./reading-plan/index.js");
+    let nextVersion = 2;
+    await runReadingLoop(
+      baseConfig({
+        seedPaperIds: seeds,
+        plan: { ...EMPTY_PLAN, planVersion: 1, producedAt: "x" },
+        replanCadence: 2, // every 2 reads
+        replan: async (args) => {
+          replanInvocations.push({
+            readCount: args.readPaperIds.length,
+            queueCount: args.queuedPaperIds.length,
+          });
+          // Always return a NEW version so the loop adopts the (still-empty) plan.
+          return { ...EMPTY_PLAN, planVersion: nextVersion++, producedAt: "x" };
+        },
+      }),
+      deps,
+    );
+    // 5 reads at cadence=2 → callbacks after read 2 and read 4. (Read 5 doesn't
+    // trigger another because readsSinceReplan is 1 at loop exit.)
+    expect(replanInvocations.length).toBe(2);
+    expect(replanInvocations[0].readCount).toBe(2);
+    expect(replanInvocations[1].readCount).toBe(4);
+  });
+
+  it("(o) [Layer 2] when replan throws, the loop logs and carries the prior plan (no abort)", async () => {
+    const seeds = await Promise.all([1, 2, 3].map((i) =>
+      ingest({ arxivId: `o-${i}`, title: `S${i}` }),
+    ));
+    const deps: ReadingLoopDeps = {
+      readPaper: async (node) => makeRead(node, { novel: "novel", cites: [] }),
+    };
+    const { EMPTY_PLAN } = await import("./reading-plan/index.js");
+    let replanCalls = 0;
+    const r = await runReadingLoop(
+      baseConfig({
+        seedPaperIds: seeds,
+        plan: { ...EMPTY_PLAN, planVersion: 1, producedAt: "x" },
+        replanCadence: 1,
+        replan: async () => {
+          replanCalls++;
+          throw new Error("planner down");
+        },
+      }),
+      deps,
+    );
+    // The loop runs to completion even though every replan throws.
+    expect(r.reads.length).toBe(3);
+    expect(replanCalls).toBeGreaterThanOrEqual(1);
+  });
 });

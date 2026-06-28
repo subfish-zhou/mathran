@@ -21,6 +21,7 @@ import {
   associatePaperToProject,
   listPaperReadIds,
   readPaperReadFile,
+  getPaper,
   type PaperNodeInput,
   type PaperRead,
 } from "../../paper-graph/index.js";
@@ -686,6 +687,68 @@ async function runInitAgentSpine(
       .slice(0, KEYWORD_CAP);
     void keywords; // retained for downstream/patrol use; reading loop is biblio-driven
 
+    // Layer 2 (2026-06-28): generate an INITIAL reading plan from the canon
+    // + survey + seed candidate set BEFORE reading begins. The plan is then
+    // honoured by the reading-loop's pop logic (next-in-plan ahead of bare
+    // priority). Failure-isolated: a thrown / unparseable / empty plan
+    // returns EMPTY_PLAN and the loop falls back to the priority queue.
+    const plannerLLM = accounting.wrap(spineLLM, "read_and_explore", "plan");
+    const plannerInitialCandidates: import("./reading-plan/index.js").PlannerCandidate[] = [];
+    for (const pid of seedResult.ingested) {
+      const node = await getPaper(workspace, pid).catch(() => null);
+      if (!node) continue;
+      plannerInitialCandidates.push({
+        paperId: pid,
+        title: node.title,
+        authors: node.authors,
+        year: node.year,
+        isSurvey: node.isSurvey === true,
+        whyOnQueue: "user-supplied seed",
+        priorityBand: "seed",
+      });
+    }
+    for (const s of priorArt?.surveys ?? []) {
+      const pid = s.paperId;
+      if (!pid) continue;
+      if (plannerInitialCandidates.some((c) => c.paperId === pid)) continue;
+      plannerInitialCandidates.push({
+        paperId: pid,
+        title: s.title,
+        authors: s.authors ?? [],
+        year: s.year,
+        isSurvey: true,
+        whyOnQueue: s.why ?? "survey",
+        priorityBand: "survey",
+      });
+    }
+    for (const c of priorArt?.canonicalLandmarks ?? []) {
+      if (!c.arxivId) continue;
+      const pid = `arxiv-${c.arxivId}`;
+      if (plannerInitialCandidates.some((cc) => cc.paperId === pid)) continue;
+      plannerInitialCandidates.push({
+        paperId: pid,
+        title: c.title,
+        authors: c.authors,
+        year: c.year,
+        isSurvey: false,
+        whyOnQueue: c.why,
+        priorityBand: "canon",
+      });
+    }
+    const { generateInitialPlan, reviseReadingPlan } = await import("./reading-plan/index.js");
+    const initialPlan = await generateInitialPlan(
+      { llm: plannerLLM, emitLog: (m) => emit({ type: "log", message: m }) },
+      {
+        problemTitle: problem.title,
+        problemStatement: problem.formalStatement,
+        problemTags: problem.tags,
+        remainingCandidates: plannerInitialCandidates,
+      },
+    );
+    await appendLog(projectDir, runId, "reading_plan", `v${initialPlan.planVersion}: ${initialPlan.narrativeArcs.length} arc(s)`, {
+      arcs: initialPlan.narrativeArcs.map((a) => ({ name: a.name, steps: a.steps.length })),
+    });
+
     // The reading loop (Phase D, Task 18) replaces the citation-graph BFS: it
     // reads each paper (skim→read→audit), harvests its bibliography into new
     // candidates, prioritises surveys, and converges naturally.
@@ -703,6 +766,52 @@ async function runInitAgentSpine(
         priorArt,
         llm: readerLLM,
         modelName: modelPair.writerModel,
+        plan: initialPlan,
+        // Re-plan callback: every REPLAN_CADENCE_DEFAULT reads the loop
+        // refreshes the plan with current reads + queued candidates. Failure-
+        // isolated inside the loop (a throw here is logged and the prior plan
+        // is carried).
+        replan: async (args) => {
+          const remainingCandidates: import("./reading-plan/index.js").PlannerCandidate[] = [];
+          for (const pid of args.queuedPaperIds) {
+            const node = await getPaper(workspace, pid).catch(() => null);
+            if (!node) continue;
+            remainingCandidates.push({
+              paperId: pid,
+              title: node.title,
+              authors: node.authors,
+              year: node.year,
+              isSurvey: node.isSurvey === true,
+              whyOnQueue: "queued for read",
+              priorityBand: "harvest",
+            });
+          }
+          const priorReads: import("./reading-plan/index.js").PlannerPriorRead[] = [];
+          for (const pid of args.readPaperIds) {
+            const node = await getPaper(workspace, pid).catch(() => null);
+            if (!node) continue;
+            priorReads.push({
+              paperId: pid,
+              title: node.title,
+              firstAuthor: node.authors[0] ?? "",
+              year: node.year,
+              oneLineSummary: node.abstract?.slice(0, 200) ?? "",
+              mainContribution: "",
+            });
+          }
+          return reviseReadingPlan(
+            { llm: plannerLLM, emitLog: (m) => emit({ type: "log", message: m }) },
+            {
+              problemTitle: problem.title,
+              problemStatement: problem.formalStatement,
+              problemTags: problem.tags,
+              remainingCandidates,
+              priorReads,
+              previousPlan: args.previousPlan,
+              replanReason: `${priorReads.length} reads complete, ${remainingCandidates.length} candidates remain`,
+            },
+          );
+        },
       },
       {
         fetchArxivById: (id: string) => fetchArxivById(id),
