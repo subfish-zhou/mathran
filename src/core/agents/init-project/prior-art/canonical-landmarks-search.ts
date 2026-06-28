@@ -123,7 +123,20 @@ export interface CanonicalLandmarksOptions {
 
 const DEFAULT_CROSSREF_UA = "mathran/0.1 (https://github.com/subfish-zhou/mathran)";
 
-async function defaultCrossrefSearch(
+/**
+ * Default Crossref bibliographic-search client used by canonical-landmarks
+ * AND by reading-loop harvest fallback (when arxiv title search returns 0
+ * hits). Exported so the reading-loop's `unresolvedCitations` path can
+ * try one more resolver before giving up on a real reference.
+ *
+ * Caught in dogfood-run-d79c820c42b7: 55 unresolvedCitations were all
+ * `\\ref{lmm:…}` style true references (real lemma/theorem source papers,
+ * not garbage). Arxiv title search returned 0 hits for many because the
+ * cited works were pre-arxiv classics (Chen 1973 / Vinogradov 1937 / older
+ * Springer reprints / French/Russian originals) that arxiv doesn't index;
+ * Crossref does. Adding this fallback recovers a measurable fraction.
+ */
+export async function defaultCrossrefSearch(
   query: { title?: string; author?: string; bibliographic?: string; rows?: number },
   userAgent: string = DEFAULT_CROSSREF_UA,
 ): Promise<CrossrefWork[]> {

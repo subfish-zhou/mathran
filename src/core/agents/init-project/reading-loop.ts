@@ -65,6 +65,14 @@ export interface ReadingLoopUnresolvedCitation {
   whyImportant: string;
   attemptedResolutions: string[];
   status: "unresolved";
+  /**
+   * When Crossref returned a hit (DOI / venue), populate these so the run
+   * report can split "fully unresolved" from "DOI-only, fetchable from
+   * publisher". Mirrors the unresolvedCanonicalLandmarks doiOnly/unresolved
+   * split in the report.
+   */
+  doi?: string;
+  venue?: string;
 }
 
 export interface ReadingLoopResult {
@@ -85,6 +93,20 @@ export interface ReadingLoopDeps {
     query: string,
     max: number,
   ) => Promise<Array<{ arxivId: string; title: string; authors: string[]; year?: number; abstract?: string }>>;
+  /**
+   * Fallback resolver for harvested citations that arxiv title search couldn't
+   * find. Defaults to {@link defaultCrossrefSearch} from canonical-landmarks-
+   * search (the same client that pre-arxiv canon resolution uses). Tests can
+   * inject a stub; pass `() => Promise.resolve([])` to disable the fallback.
+   *
+   * Why: dogfood-run-d79c820c42b7 left 55 unresolvedCitations, almost all of
+   * which were real `\\ref{lmm:...}` references to pre-arxiv classics
+   * (1973/1937/older Springer reprints / French/Russian originals) that
+   * arxiv simply doesn't index. Crossref does — without this fallback the
+   * report buries the references as "unresolved" and the wiki bibliography
+   * is forced to invent or omit them.
+   */
+  searchCrossref?: import("./prior-art/canonical-landmarks-search.js").CrossrefSearchFn;
   fetchArxivSource?: typeof import("../../paper-graph/arxiv-source.js").fetchArxivSource;
   runPdfToText?: (pdfPath: string) => Promise<string | null>;
   rateDelayMs?: number;
@@ -141,6 +163,15 @@ export async function runReadingLoop(
   const readPaper = deps.readPaper ?? realReadPaper;
   const fetchArxivById = deps.fetchArxivById;
   const searchArxivByTitle = deps.searchArxivByTitle;
+  // Lazy-import the real Crossref client (kept lazy because it's only used
+  // when an arxiv title search misses, which is the rare path; avoiding the
+  // import keeps the cold-start cost on the happy path unchanged).
+  const searchCrossref =
+    deps.searchCrossref ??
+    (async (q) => {
+      const { defaultCrossrefSearch } = await import("./prior-art/canonical-landmarks-search.js");
+      return defaultCrossrefSearch(q);
+    });
   const K = CONVERGENCE_K_DEFAULT;
 
   const queue: QueueEntry[] = [];
@@ -423,13 +454,48 @@ export async function runReadingLoop(
           }
           continue;
         }
+        // Arxiv missed — try Crossref before giving up. dogfood-run-
+        // d79c820c42b7 had 55 unresolved citations, most pre-arxiv classics
+        // that Crossref indexes (Chen 1973, Vinogradov 1937, Springer reprints,
+        // foreign-language originals). Crossref only gives us a DOI + title,
+        // no PDF — so we CANNOT push it into the read queue (no source to
+        // skim/read/audit). What we CAN do is record the resolution in
+        // attemptedResolutions so the run report can surface "55 unresolved
+        // — of which 30 have a DOI you can fetch from the venue" instead of
+        // a blanket "55 unresolved" with no path forward.
+        const attempted = ["arxiv: 0 hits"];
+        let resolvedDoi: string | undefined;
+        let resolvedAuthors: string[] | undefined;
+        let resolvedYear: number | undefined;
+        let resolvedVenue: string | undefined;
+        try {
+          const crossrefHits = await searchCrossref({
+            title: citation.citedTitle,
+            author: citation.citedAuthors?.[0],
+            rows: 3,
+          });
+          if (crossrefHits.length > 0) {
+            const top = crossrefHits[0]!;
+            resolvedDoi = top.doi;
+            resolvedAuthors = top.authors.length > 0 ? top.authors : undefined;
+            resolvedYear = top.year;
+            resolvedVenue = top.venue;
+            attempted.push(`crossref: doi=${top.doi}`);
+          } else {
+            attempted.push("crossref: 0 hits");
+          }
+        } catch (err) {
+          attempted.push(`crossref: error (${errMsg(err)})`);
+        }
         unresolved.push({
           citedTitle: citation.citedTitle,
-          citedAuthors: citation.citedAuthors,
-          citedYear: citation.citedYear,
+          citedAuthors: resolvedAuthors ?? citation.citedAuthors,
+          citedYear: resolvedYear ?? citation.citedYear,
           whyImportant: citation.contextInThisPaper,
-          attemptedResolutions: ["arxiv: 0 hits"],
+          attemptedResolutions: attempted,
           status: "unresolved",
+          ...(resolvedDoi ? { doi: resolvedDoi } : {}),
+          ...(resolvedVenue ? { venue: resolvedVenue } : {}),
         });
         continue;
       }

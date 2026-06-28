@@ -215,6 +215,10 @@ describe("runReadingLoop", () => {
     const seedId = await ingest({ arxivId: "seed-f", title: "Seed F" });
     const deps: ReadingLoopDeps = {
       searchArxivByTitle: async () => [], // 0 hits
+      // Stub Crossref to also return nothing so this test stays focused on the
+      // "no resolver hit" path. A separate test exercises the Crossref-hit
+      // path (`(f2) Crossref fallback ...`).
+      searchCrossref: async () => [],
       readPaper: async (node) =>
         makeRead(node, {
           novel: "novel",
@@ -230,8 +234,78 @@ describe("runReadingLoop", () => {
     expect(u.citedAuthors).toEqual(["J. Chen"]);
     expect(u.citedYear).toBe(1973);
     expect(u.whyImportant).toBe("Chen's theorem is essential");
-    expect(u.attemptedResolutions).toEqual(["arxiv: 0 hits"]);
+    expect(u.attemptedResolutions).toEqual(["arxiv: 0 hits", "crossref: 0 hits"]);
     expect(u.status).toBe("unresolved");
+    expect(u.doi).toBeUndefined();
+  });
+
+  it("(f2) Crossref fallback resolves a DOI when arxiv misses (dogfood-run-d79c820c42b7 fix)", async () => {
+    // Real-world flavor: harvest finds a `\\ref{lmm:Chen73}` reference; arxiv
+    // doesn't index Chen 1973; Crossref returns the 1984 reprint DOI. Report
+    // surfaces the DOI so the user can fetch the PDF from the venue instead
+    // of staring at a blanket "unresolved".
+    const seedId = await ingest({ arxivId: "seed-f2", title: "Seed F2" });
+    let crossrefCalls = 0;
+    const deps: ReadingLoopDeps = {
+      searchArxivByTitle: async () => [],
+      searchCrossref: async (q) => {
+        crossrefCalls++;
+        expect(q.title).toBe("Chen 1973");
+        expect(q.author).toBe("J. Chen");
+        return [
+          {
+            doi: "10.1142/9789812776600_0021",
+            title: "On the representation of a large even integer as the sum of a prime and the product of at most two primes",
+            authors: ["J. R. Chen"],
+            year: 1984,
+            venue: "World Scientific Selected Works",
+            citationCount: 42,
+          },
+        ];
+      },
+      readPaper: async (node) =>
+        makeRead(node, {
+          novel: "novel",
+          cites: [
+            { citedTitle: "Chen 1973", citedAuthors: ["J. Chen"], citedYear: 1973, contextInThisPaper: "Chen's theorem", importanceToThisPaper: "essential" },
+          ],
+        }),
+    };
+    const result = await runReadingLoop(baseConfig({ seedPaperIds: [seedId] }), deps);
+    expect(crossrefCalls).toBe(1);
+    expect(result.unresolvedCitations).toHaveLength(1);
+    const u = result.unresolvedCitations[0];
+    expect(u.doi).toBe("10.1142/9789812776600_0021");
+    expect(u.venue).toBe("World Scientific Selected Works");
+    // Crossref's authoritative authors/year overwrite the harvester's guess.
+    expect(u.citedAuthors).toEqual(["J. R. Chen"]);
+    expect(u.citedYear).toBe(1984);
+    expect(u.attemptedResolutions).toEqual([
+      "arxiv: 0 hits",
+      "crossref: doi=10.1142/9789812776600_0021",
+    ]);
+  });
+
+  it("(f3) Crossref error is recorded in attemptedResolutions, not thrown", async () => {
+    const seedId = await ingest({ arxivId: "seed-f3", title: "Seed F3" });
+    const deps: ReadingLoopDeps = {
+      searchArxivByTitle: async () => [],
+      searchCrossref: async () => {
+        throw new Error("crossref 503");
+      },
+      readPaper: async (node) =>
+        makeRead(node, {
+          novel: "novel",
+          cites: [
+            { citedTitle: "Some classic", contextInThisPaper: "needed", importanceToThisPaper: "essential" },
+          ],
+        }),
+    };
+    const result = await runReadingLoop(baseConfig({ seedPaperIds: [seedId] }), deps);
+    expect(result.unresolvedCitations).toHaveLength(1);
+    expect(result.unresolvedCitations[0]!.attemptedResolutions[1]).toContain("crossref: error");
+    expect(result.unresolvedCitations[0]!.attemptedResolutions[1]).toContain("crossref 503");
+    expect(result.unresolvedCitations[0]!.doi).toBeUndefined();
   });
 
   it("(g) runs survey distillation for high-confidence surveys and promotes key references", async () => {
