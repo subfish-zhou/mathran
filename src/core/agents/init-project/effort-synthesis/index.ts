@@ -66,7 +66,13 @@ export interface EffortSynthesisDeps {
 export interface EffortDocumentRevision {
   revisionNumber: number;
   timestamp: string;
-  reviewerVerdict: "approve" | "rewrite_requested";
+  /**
+   * `approve` / `rewrite_requested` — normal reviewer verdicts.
+   * `reviewer_broken` — reviewer returned unparseable JSON or threw mid-call
+   * (after a strict-format retry). The artifact was kept and surfaced for
+   * human review with the failure mode named, instead of silently approved.
+   */
+  reviewerVerdict: "approve" | "rewrite_requested" | "reviewer_broken";
   reviewerNotes: string;
 }
 

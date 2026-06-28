@@ -148,3 +148,49 @@ describe("reviewLoop — cost accounting", () => {
     expect(result.finalContent).toBe(config().initialContent);
   });
 });
+
+describe("reviewLoop — reviewer_broken short-circuit", () => {
+  it("short-circuits to reviewer_broken without rewriting when reviewer returns unparseable output (after retry)", async () => {
+    // Reviewer always returns prose → reviewer.ts retries with strict-format
+    // reminder, fails again, returns verdict='reviewer_broken'.
+    let reviewCalls = 0;
+    const reviewerLlm: SpineLLM = async () => {
+      reviewCalls++;
+      return "Sorry, I can't review this right now.";
+    };
+    let writerCalls = 0;
+    const writerLlm: SpineLLM = async () => {
+      writerCalls++;
+      return "should not be called";
+    };
+
+    const result = await reviewLoop(config(), noBudget, { writerLlm, reviewerLlm });
+
+    // dogfood-run-d79c820c42b7 fix: NEVER silent-approve. NEVER spin the loop
+    // when the reviewer can't render an opinion. Short-circuit honestly.
+    expect(result.finalVerdict).toBe("reviewer_broken");
+    expect(writerCalls).toBe(0); // no rewrite attempted
+    expect(reviewCalls).toBe(2); // one initial + one strict-format retry, both inside reviewArtifact
+    expect(result.finalContent).toBe(config().initialContent); // draft preserved
+    expect(result.revisionHistory).toHaveLength(1);
+    expect(result.revisionHistory[0]!.reviewerVerdict.verdict).toBe("reviewer_broken");
+  });
+
+  it("short-circuits to reviewer_broken when reviewer throws on the very first call", async () => {
+    const reviewerLlm: SpineLLM = async () => {
+      throw new Error("provider 500");
+    };
+    let writerCalls = 0;
+    const writerLlm: SpineLLM = async () => {
+      writerCalls++;
+      return "should not be called";
+    };
+
+    const result = await reviewLoop(config(), noBudget, { writerLlm, reviewerLlm });
+
+    expect(result.finalVerdict).toBe("reviewer_broken");
+    expect(writerCalls).toBe(0);
+    expect(result.revisionHistory).toHaveLength(1);
+    expect(result.revisionHistory[0]!.reviewerVerdict.verdictReasoning).toContain("provider 500");
+  });
+});

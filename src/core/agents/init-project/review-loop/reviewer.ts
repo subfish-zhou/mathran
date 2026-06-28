@@ -34,7 +34,7 @@ export interface ReviewIssue {
 }
 
 export interface ReviewerVerdict {
-  verdict: "approve" | "rewrite_requested";
+  verdict: "approve" | "rewrite_requested" | "reviewer_broken";
   overallReaderExperience: string;
   issues: ReviewIssue[];
   verdictReasoning: string;
@@ -177,12 +177,21 @@ export async function reviewArtifact(
     }
 
     if (!parsed) {
-      emit(`[review-loop] reviewer "${input.artifactSlug}" still unparseable after retry; accepting`);
+      // dogfood-run-d79c820c42b7: reviewer returned unparseable JSON 13×; retry
+      // recovered 8; 5 still unparseable after strict-format reminder slipped
+      // through as silent `approve`s — quality gate effectively bypassed for
+      // those artifacts. Returning `approve` is dangerous (it claims the
+      // reviewer was satisfied when in fact it broke). Returning
+      // `rewrite_requested` would spin the loop with a reviewer that can't
+      // judge anything. New `reviewer_broken` verdict tells review-loop to
+      // surface this honestly via `flagged_persistent` without further
+      // rewrites — preserving the writer's draft AND a truthful audit trail.
+      emit(`[review-loop] reviewer "${input.artifactSlug}" still unparseable after retry; flagging as reviewer_broken (no silent-approve)`);
       return {
-        verdict: "approve",
-        overallReaderExperience: "(reviewer output could not be parsed after retry; accepted by default)",
+        verdict: "reviewer_broken",
+        overallReaderExperience: "(reviewer output could not be parsed after one retry with strict-format reminder; verdict unknown, draft kept as-is)",
         issues: [],
-        verdictReasoning: "Reviewer response was not valid JSON after one retry with strict-format reminder.",
+        verdictReasoning: "Reviewer response was not valid JSON after one retry with strict-format reminder. This is a reviewer-model failure mode, not a verdict on the artifact; see review-loop logs for raw replies.",
       };
     }
     const verdict = normalizeVerdict(parsed);
@@ -191,10 +200,14 @@ export async function reviewArtifact(
     );
     return verdict;
   } catch (err) {
-    emit(`[review-loop] reviewer "${input.artifactSlug}" failed: ${errMsg(err)}; accepting`);
+    // Same reasoning as the unparseable-after-retry branch above: a thrown
+    // exception (timeout / network / provider 500) means the reviewer never
+    // judged this artifact, so we cannot truthfully report `approve`. Surface
+    // as reviewer_broken so review-loop can short-circuit to flagged_persistent.
+    emit(`[review-loop] reviewer "${input.artifactSlug}" failed: ${errMsg(err)}; flagging as reviewer_broken`);
     return {
-      verdict: "approve",
-      overallReaderExperience: "(reviewer call failed; accepted by default)",
+      verdict: "reviewer_broken",
+      overallReaderExperience: "(reviewer call threw an exception; verdict unknown, draft kept as-is)",
       issues: [],
       verdictReasoning: `Reviewer call failed: ${errMsg(err)}`,
     };

@@ -71,7 +71,14 @@ export interface ReviewRevision {
 
 export interface ReviewLoopResult {
   finalContent: string;
-  finalVerdict: "approve" | "flagged_persistent";
+  /**
+   * `approve` — reviewer was satisfied.
+   * `flagged_persistent` — reviewer kept requesting rewrites until budget/maxRevisions ran out (the writer's last draft is kept).
+   * `reviewer_broken` — reviewer returned unparseable JSON or threw after one strict-format retry. Distinct from
+   *                     `flagged_persistent` because no opinion on the artifact was ever rendered. The artifact is
+   *                     surfaced for human review with that fact made explicit, instead of silently approved.
+   */
+  finalVerdict: "approve" | "flagged_persistent" | "reviewer_broken";
   revisionHistory: ReviewRevision[];
   totalCostUsd: number;
   totalReviewerLlmCalls: number;
@@ -157,6 +164,22 @@ export async function reviewLoop(
       return {
         finalContent: currentContent,
         finalVerdict: "approve",
+        revisionHistory,
+        totalCostUsd,
+        totalReviewerLlmCalls,
+        totalWriterLlmCalls,
+      };
+    }
+
+    // (b') reviewer broken → short-circuit. Do NOT rewrite (the writer has
+    // nothing to act on without a verdict) and do NOT silent-approve. Surface
+    // honestly so the artifact appears in the human-review queue with the
+    // failure mode named explicitly. See reviewer.ts for the rationale.
+    if (verdict.verdict === "reviewer_broken") {
+      emit(`[review-loop] "${config.artifactSlug}" reviewer_broken at revision ${revisionNumber} — short-circuiting (no rewrite, no silent approve)`);
+      return {
+        finalContent: currentContent,
+        finalVerdict: "reviewer_broken",
         revisionHistory,
         totalCostUsd,
         totalReviewerLlmCalls,

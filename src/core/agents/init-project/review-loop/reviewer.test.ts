@@ -114,14 +114,18 @@ describe("reviewArtifact — multiple severities", () => {
 });
 
 describe("reviewArtifact — robustness", () => {
-  it("accepts by default when the LLM returns unparseable output (after retry)", async () => {
+  it("flags reviewer_broken (not silent-approve) when the LLM returns unparseable output after retry", async () => {
     let calls = 0;
     const llm: SpineLLM = async () => {
       calls++;
       return "I'm sorry, I can't do that.";
     };
     const verdict = await reviewArtifact(input(), llm);
-    expect(verdict.verdict).toBe("approve");
+    // dogfood-run-d79c820c42b7 fix: previously this branch silent-approved the
+    // artifact (claiming the reviewer was satisfied when in fact it broke);
+    // now it surfaces as reviewer_broken so review-loop can short-circuit
+    // honestly. See reviewer.ts comment block.
+    expect(verdict.verdict).toBe("reviewer_broken");
     expect(verdict.issues).toHaveLength(0);
     expect(calls).toBe(2); // first try + retry, both failed
     expect(verdict.verdictReasoning).toContain("after one retry");
@@ -147,12 +151,14 @@ describe("reviewArtifact — robustness", () => {
     expect(verdict.overallReaderExperience).toBe("Recovered on retry.");
   });
 
-  it("accepts by default when the LLM throws", async () => {
+  it("flags reviewer_broken (not silent-approve) when the LLM throws", async () => {
     const llm: SpineLLM = async () => {
       throw new Error("boom");
     };
     const verdict = await reviewArtifact(input(), llm);
-    expect(verdict.verdict).toBe("approve");
+    // Same fix class as the unparseable-after-retry case: a thrown reviewer
+    // means no verdict was rendered, so the artifact must surface, not pass.
+    expect(verdict.verdict).toBe("reviewer_broken");
     expect(verdict.verdictReasoning).toContain("boom");
   });
 });
