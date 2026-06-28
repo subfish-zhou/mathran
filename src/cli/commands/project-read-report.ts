@@ -143,6 +143,28 @@ function renderReadReport(data: ReadReportData): string {
   lines.push(`  reviewed=${r.artifactsReviewed} approved=${r.artifactsApproved} flagged=${r.artifactsFlaggedPersistent} reviewer_broken=${r.artifactsReviewerBroken}`);
   lines.push(`  avg=${r.avgRevisionsPerArtifact} max=${r.maxRevisionsAcrossArtifacts}`);
 
+  // 2026-06-28 (fix #2 from run-13-audit): surface spine quality with a
+  // red-flag header at high shallow ratios so users notice when the run's
+  // spine was rescued rather than freshly extracted. ≥80% shallow with
+  // any llm_error reason almost always means "retry this run, the LLM
+  // call flaked"; ≥80% shallow with no llm_error means "your corpus is
+  // genuinely thin".
+  const sq = report.spineQuality;
+  if (sq) {
+    lines.push("");
+    if (sq.shallowFraction >= 0.8) {
+      lines.push(`Spine quality: ⚠ ${sq.shallowNodes}/${sq.totalNodes} nodes shallow (${Math.round(sq.shallowFraction * 100)}%)`);
+    } else {
+      lines.push(`Spine quality: ${sq.shallowNodes}/${sq.totalNodes} nodes shallow (${Math.round(sq.shallowFraction * 100)}%)`);
+    }
+    if (sq.shallowNodes > 0) {
+      lines.push(`  reasons: llm_error=${sq.shallowByReason.llm_error} parse_error=${sq.shallowByReason.parse_error} no_candidates=${sq.shallowByReason.no_candidates}`);
+      if (sq.shallowByReason.llm_error > 0) {
+        lines.push(`  hint: shallowNodes include LLM transient failures — re-running often produces a much better spine.`);
+      }
+    }
+  }
+
   return lines.join("\n");
 }
 

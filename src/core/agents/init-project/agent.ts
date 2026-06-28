@@ -1137,6 +1137,7 @@ async function runInitAgentSpine(
       unresolvedCitations: loopResult.unresolvedCitations,
       priorArt,
       convergence: loopResult.convergence,
+      spine,
       wikiPageReviewSummaries,
     });
     await persistInitReport(projectDir, runId, report);
@@ -1183,6 +1184,11 @@ interface BuildReportArgs {
    */
   priorArt: PriorArtCorpus | null;
   convergence: { reason: string; totalRoundsRun: number };
+  /**
+   * The actually-synthesized narrative spine. Used to compute spineQuality
+   * (shallowFallback breakdown) in the report.
+   */
+  spine: import("./spine/types.js").NarrativeSpine;
   /**
    * Wiki review summaries (slug + revisionCount + finalVerdict) produced by
    * wiki-synthesis. Empty when the reviewer wasn't wired, or when the wiki
@@ -1260,6 +1266,7 @@ async function buildInitReport(args: BuildReportArgs): Promise<InitAgentReport> 
   const {
     runId, projectSlug, projectDir, writerModel, reviewerModel,
     accounting, reads, efforts, unresolvedCitations, priorArt, convergence,
+    spine,
     wikiPageReviewSummaries,
   } = args;
 
@@ -1299,6 +1306,27 @@ async function buildInitReport(args: BuildReportArgs): Promise<InitAgentReport> 
       avgRevisionsPerArtifact: Math.round(avgRevisionsPerArtifact * 100) / 100,
       maxRevisionsAcrossArtifacts,
     },
+    spineQuality: (() => {
+      // 2026-06-28 (fix #2 from run-13-audit): roll shallowFallback reasons
+      // into a top-level report block. CLI tooling and humans both need to
+      // tell "the LLM call failed, retry this run" apart from "the corpus
+      // was thin, the spine is what it is".
+      const total = spine.nodes.length;
+      const breakdown = { llm_error: 0, parse_error: 0, no_candidates: 0 };
+      let shallow = 0;
+      for (const n of spine.nodes) {
+        if (n.shallowFallback) {
+          shallow++;
+          breakdown[n.shallowFallback] = (breakdown[n.shallowFallback] ?? 0) + 1;
+        }
+      }
+      return {
+        totalNodes: total,
+        shallowNodes: shallow,
+        shallowFraction: total > 0 ? Math.round((shallow / total) * 1000) / 1000 : 0,
+        shallowByReason: breakdown,
+      };
+    })(),
     unresolvedCitations: unresolvedCitations.map((u) => ({
       citedTitle: u.citedTitle ?? "(untitled)",
       whyImportant: u.whyImportant,
@@ -1428,6 +1456,7 @@ async function persistInitReport(projectDir: string, runId: string, report: Init
 function printInitReport(report: InitAgentReport): void {
   const a = report.llmAccounting;
   const r = report.revisionsSummary;
+  const sq = report.spineQuality;
   const phaseLines: string[] = [];
   const entries = Object.entries(a.breakdownByPhase).sort((x, y) => y[1].estimatedUsd - x[1].estimatedUsd);
   for (const [phase, stat] of entries) {
@@ -1435,6 +1464,16 @@ function printInitReport(report: InitAgentReport): void {
   }
   const canonNote = report.unresolvedCanonicalLandmarks
     ? `  canon to vendor: ${report.unresolvedCanonicalLandmarks.doiOnly.length} DOI-only, ${report.unresolvedCanonicalLandmarks.unresolved.length} unresolved (see canon-to-vendor.md)`
+    : "";
+  // 2026-06-28 (fix #2 from run-13-audit): the end-of-run summary line for
+  // spine quality. Includes the ⚠ glyph at ≥80% shallow so the user sees
+  // it without scrolling to the JSON.
+  const shallowPct = sq && sq.totalNodes > 0 ? Math.round(sq.shallowFraction * 100) : 0;
+  const spineLine = sq
+    ? `  spine quality: ${sq.shallowFraction >= 0.8 ? "⚠ " : ""}${sq.shallowNodes}/${sq.totalNodes} shallow (${shallowPct}%)` +
+      (sq.shallowNodes > 0
+        ? ` [llm_error=${sq.shallowByReason.llm_error} parse_error=${sq.shallowByReason.parse_error} no_candidates=${sq.shallowByReason.no_candidates}]`
+        : "")
     : "";
   const lines = [
     "",
@@ -1444,6 +1483,7 @@ function printInitReport(report: InitAgentReport): void {
     `  estimated cost: $${a.estimatedTotalUsd.toFixed(4)} total`,
     ...(phaseLines.length > 0 ? ["  cost by phase:", ...phaseLines] : []),
     `  revisions: reviewed=${r.artifactsReviewed} approved=${r.artifactsApproved} flagged=${r.artifactsFlaggedPersistent} reviewer_broken=${r.artifactsReviewerBroken} avg=${r.avgRevisionsPerArtifact} max=${r.maxRevisionsAcrossArtifacts}`,
+    spineLine,
     `  convergence: ${report.convergenceSummary.reason} (${report.convergenceSummary.rounds} rounds)`,
     `  unresolved citations: ${report.unresolvedCitations.length}`,
     canonNote,

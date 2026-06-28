@@ -24,7 +24,7 @@ import {
   buildSpineNodeExtractionFromReadsPrompt,
   buildSpineAssemblyFromReadsPrompt,
 } from "../spine/prompts.js";
-import { extractSpineJSON, errMsg, type SpineLLM } from "../spine/llm.js";
+import { extractSpineJSON, errMsg, callLLMWithRetry, type SpineLLM } from "../spine/llm.js";
 import type {
   NarrativeSpine,
   SpineNode,
@@ -120,8 +120,20 @@ export async function buildSpineFromReads(
   // ── 3a. Node extraction (batched if > NODE_EXTRACTION_BATCH papers) ──
   const candidates: ExtractedCandidate[] = [];
   const batches = chunk(usableReads, NODE_EXTRACTION_BATCH);
+  // Track which failure mode (if any) made the extraction loop produce zero
+  // structured candidates so the eventual shallowFallback reason is precise.
+  // - "llm_error" fires when every batch *threw* (HTTP / network).
+  // - "parse_error" fires when at least one batch returned non-empty text
+  //   but extractSpineJSON couldn't recover a `nodes` array from any reply.
+  // - "no_candidates" fires when every parse succeeded but emitted [].
+  // Wins in priority order: llm_error > parse_error > no_candidates, so we
+  // record the worst-case across batches.
+  let batchesThrew = 0;
+  let batchesParsedNothing = 0;
+  let batchesParsedEmpty = 0;
+
   for (let i = 0; i < batches.length; i++) {
-    const batch = batches[i]!;
+    const batch = batches[i];
     log(`Node extraction batch ${i + 1}/${batches.length} (${batch.length} papers)`);
     const prompt = buildSpineNodeExtractionFromReadsPrompt(
       {
@@ -142,19 +154,34 @@ export async function buildSpineFromReads(
       // years lost, downstream prose quality collapses). Letting the provider
       // use its model cap (128K for gpt-5.5) is the same fix shipped for
       // canonical-landmarks-search.ts (c246c45) and review-loop/reviewer.ts.
-      const raw = await deps.llm(prompt, { temperature: 0.2 });
+      //
+      // 2026-06-28 (fix #1 from run-13-audit): wrap in callLLMWithRetry so a
+      // single transient HTTP 502 / 503 / 429 / timeout doesn't wipe the
+      // entire spine (Run 13: one Copilot 502 → all 32 nodes shallow).
+      // Defaults: 3 attempts, 1s / 2s / 4s backoff. A hard-fail 400 still
+      // throws on the first attempt — we only retry the listed transient
+      // shapes.
+      const raw = await callLLMWithRetry(
+        deps.llm,
+        prompt,
+        { temperature: 0.2 },
+        { log: (m) => log(m), label: `spine-extract:batch${i + 1}/${batches.length}` },
+      );
       const parsed = extractSpineJSON<{ nodes?: Array<Record<string, unknown>> }>(raw);
       if (parsed && Array.isArray(parsed.nodes)) {
+        if (parsed.nodes.length === 0) batchesParsedEmpty++;
         for (const rawNode of parsed.nodes) {
           candidates.push(coerceCandidate(rawNode, candidates.length, statementIndex));
         }
       } else {
+        batchesParsedNothing++;
         log(
           `Node extraction batch ${i + 1} returned no parseable nodes (raw length=${raw?.length ?? 0}); first 200 chars: ${(raw ?? "").slice(0, 200).replace(/\n/g, " ")}`,
         );
       }
     } catch (err) {
-      log(`Node extraction batch ${i + 1} failed: ${errMsg(err)}`);
+      batchesThrew++;
+      log(`Node extraction batch ${i + 1} failed after retries: ${errMsg(err)}`);
     }
   }
 
@@ -166,13 +193,35 @@ export async function buildSpineFromReads(
     // `surveyDistillation.surveyOutline` so downstream synthesis has something
     // to point at. These nodes are explicitly marked depth: "incremental" so
     // callers can tell the spine is thin.
-    log("LLM extraction produced 0 candidates — falling back to skim/survey-derived nodes");
-    candidates.push(...synthesizeShallowCandidatesFromReads(usableReads));
+    //
+    // 2026-06-28 (fix #2 from run-13-audit): pick a precise reason for the
+    // shallowFallback stamp. llm_error wins if any batch threw, then
+    // parse_error if any batch returned text we couldn't decode, then
+    // no_candidates as the residual "model just had nothing to say" case.
+    const fallbackReason: "llm_error" | "parse_error" | "no_candidates" =
+      batchesThrew > 0
+        ? "llm_error"
+        : batchesParsedNothing > 0
+          ? "parse_error"
+          : "no_candidates";
+    log(
+      `LLM extraction produced 0 candidates (${batchesThrew} threw, ` +
+        `${batchesParsedNothing} parsed nothing, ${batchesParsedEmpty} parsed empty) ` +
+        `— falling back to skim/survey-derived nodes [reason=${fallbackReason}]`,
+    );
+    const shallow = synthesizeShallowCandidatesFromReads(usableReads);
+    // Stamp the reason on every shallow candidate so the run report can show
+    // per-node which failure path produced it. (All nodes share the same
+    // reason in practice because the fallback is a single decision point.)
+    for (const c of shallow) {
+      c.node.shallowFallback = fallbackReason;
+    }
+    candidates.push(...shallow);
     if (candidates.length === 0) {
       log("Fallback also produced 0 candidates — returning empty spine");
       return emptySpine(input.problem.title);
     }
-    log(`Shallow fallback added ${candidates.length} candidate node(s)`);
+    log(`Shallow fallback added ${candidates.length} candidate node(s) [reason=${fallbackReason}]`);
   }
 
   // De-duplicate candidate ids (keep first, merge paperIds/edges).
@@ -446,7 +495,7 @@ function synthesizeShallowCandidatesFromReads(reads: PaperRead[]): ExtractedCand
           proofIdea: undefined,
           paperIds: [r.paperId],
           depth: "incremental",
-          shallowFallback: true,
+          shallowFallback: "no_candidates",
         },
         suggestedEdges: [],
       });
@@ -469,7 +518,7 @@ function synthesizeShallowCandidatesFromReads(reads: PaperRead[]): ExtractedCand
         proofIdea: undefined,
         paperIds: [r.paperId],
         depth: "incremental",
-        shallowFallback: true,
+        shallowFallback: "no_candidates",
       },
       suggestedEdges: [],
     });

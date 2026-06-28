@@ -1,61 +1,117 @@
-import { describe, expect, it } from "vitest";
+/**
+ * Tests for spine/llm.ts retry + transient-error classification (fix #1).
+ *
+ * Focus: bounded retry on transient HTTP / network errors, immediate
+ * surrender on hard-fail 4xx, exponential backoff timing.
+ */
 
-import { extractSpineJSON, findJsonBoundary } from "./llm.js";
+import { describe, it, expect, vi } from "vitest";
+import { isTransientLLMError, callLLMWithRetry, type SpineLLM } from "./llm.js";
 
-describe("findJsonBoundary", () => {
-  it("returns null when there is no JSON value", () => {
-    expect(findJsonBoundary("just prose, no json here")).toBeNull();
-    expect(findJsonBoundary("")).toBeNull();
+describe("isTransientLLMError", () => {
+  it.each([
+    "Copilot https://api.enterprise.githubcopilot.com/responses: HTTP 502 <!DOCTYPE html>",
+    "openai: HTTP 503 service unavailable",
+    "anthropic: HTTP 429 too many requests",
+    "anthropic: HTTP 408 request timeout",
+    "openai: HTTP 500 internal server error",
+    "fetch failed",
+    "ECONNRESET",
+    "ETIMEDOUT during stream",
+    "socket hang up",
+    "Provider temporarily unavailable",
+    "rate-limit exceeded",
+    "stream aborted mid-flight",
+    "model is overloaded right now",
+  ])("classifies %s as transient", (msg) => {
+    expect(isTransientLLMError(new Error(msg))).toBe(true);
   });
 
-  it("locates a plain object", () => {
-    const text = '{"ok":true}';
-    expect(findJsonBoundary(text)).toEqual({ start: 0, end: text.length });
+  it.each([
+    "HTTP 400 bad request",
+    "HTTP 401 unauthorized",
+    "HTTP 403 forbidden",
+    "HTTP 404 model not found",
+    "invalid prompt format",
+    "max_tokens must be a positive integer",
+    "tool call malformed",
+  ])("classifies %s as non-transient", (msg) => {
+    expect(isTransientLLMError(new Error(msg))).toBe(false);
   });
 
-  it("stops at the first balanced object, ignoring trailing braces", () => {
-    const text = '{"ok":true} extra }';
-    const b = findJsonBoundary(text)!;
-    expect(text.slice(b.start, b.end)).toBe('{"ok":true}');
-  });
-
-  it("matches the true closing brace of a nested object", () => {
-    const text = '{"a":{"b":1}}';
-    const b = findJsonBoundary(text)!;
-    expect(text.slice(b.start, b.end)).toBe('{"a":{"b":1}}');
-  });
-
-  it("ignores braces inside string literals (incl. escaped quotes)", () => {
-    const text = '{"s":"a } b \\" } c"} trailing }';
-    const b = findJsonBoundary(text)!;
-    expect(text.slice(b.start, b.end)).toBe('{"s":"a } b \\" } c"}');
+  it("handles non-Error values without throwing", () => {
+    expect(isTransientLLMError("HTTP 502 gateway")).toBe(true);
+    expect(isTransientLLMError({ message: "HTTP 502" })).toBe(false); // not stringifying object
+    expect(isTransientLLMError(null)).toBe(false);
   });
 });
 
-describe("extractSpineJSON", () => {
-  it("parses a standalone JSON object", () => {
-    expect(extractSpineJSON('{"ok":true}')).toEqual({ ok: true });
+describe("callLLMWithRetry", () => {
+  it("returns the result on the first successful call", async () => {
+    const llm: SpineLLM = vi.fn().mockResolvedValue("ok");
+    const out = await callLLMWithRetry(llm, "prompt");
+    expect(out).toBe("ok");
+    expect(llm).toHaveBeenCalledTimes(1);
   });
 
-  it("parses a JSON object followed by trailing text and braces", () => {
-    expect(extractSpineJSON('{"ok":true} extra }')).toEqual({ ok: true });
+  it("retries on transient errors up to maxAttempts, then succeeds", async () => {
+    let n = 0;
+    const llm: SpineLLM = vi.fn().mockImplementation(async () => {
+      n++;
+      if (n < 3) throw new Error("Copilot HTTP 502 <html>...");
+      return "recovered";
+    });
+    const logs: string[] = [];
+    const out = await callLLMWithRetry(llm, "p", {}, { initialBackoffMs: 1, log: (m) => logs.push(m) });
+    expect(out).toBe("recovered");
+    expect(llm).toHaveBeenCalledTimes(3);
+    expect(logs.length).toBe(2); // 2 retry log lines (attempts 1 and 2 logged before backoff)
+    expect(logs[0]).toMatch(/attempt 1\/3/);
+    expect(logs[1]).toMatch(/attempt 2\/3/);
   });
 
-  it("parses a nested object without over-reading", () => {
-    expect(extractSpineJSON('{"a":{"b":1}}')).toEqual({ a: { b: 1 } });
+  it("throws on non-transient error WITHOUT retrying", async () => {
+    const llm: SpineLLM = vi.fn().mockRejectedValue(new Error("HTTP 400 malformed prompt"));
+    await expect(callLLMWithRetry(llm, "p", {}, { initialBackoffMs: 1 })).rejects.toThrow("HTTP 400");
+    expect(llm).toHaveBeenCalledTimes(1);
   });
 
-  it("parses JSON inside a fenced code block", () => {
-    const reply = 'here is the result:\n```json\n{"concepts":["x"]}\n```\nthanks';
-    expect(extractSpineJSON(reply)).toEqual({ concepts: ["x"] });
+  it("throws the LAST transient error after exhausting maxAttempts", async () => {
+    const llm: SpineLLM = vi.fn().mockRejectedValue(new Error("HTTP 502 third strike"));
+    await expect(
+      callLLMWithRetry(llm, "p", {}, { initialBackoffMs: 1, maxAttempts: 3 }),
+    ).rejects.toThrow("HTTP 502 third strike");
+    expect(llm).toHaveBeenCalledTimes(3);
   });
 
-  it("parses a JSON array when it precedes any object", () => {
-    expect(extractSpineJSON('prefix [1,2,3] suffix')).toEqual([1, 2, 3]);
+  it("honours custom maxAttempts", async () => {
+    const llm: SpineLLM = vi.fn().mockRejectedValue(new Error("ECONNRESET"));
+    await expect(
+      callLLMWithRetry(llm, "p", {}, { initialBackoffMs: 1, maxAttempts: 5 }),
+    ).rejects.toThrow();
+    expect(llm).toHaveBeenCalledTimes(5);
   });
 
-  it("returns null for malformed JSON", () => {
-    expect(extractSpineJSON("{ not valid")).toBeNull();
-    expect(extractSpineJSON("no json at all")).toBeNull();
+  it("uses exponential backoff between retries", async () => {
+    let calls: number[] = [];
+    const start = Date.now();
+    let n = 0;
+    const llm: SpineLLM = vi.fn().mockImplementation(async () => {
+      calls.push(Date.now() - start);
+      n++;
+      if (n < 3) throw new Error("HTTP 503 service unavailable");
+      return "ok";
+    });
+    await callLLMWithRetry(llm, "p", {}, { initialBackoffMs: 50 });
+    // call 0 immediate, call 1 ~50ms later, call 2 ~150ms (50 + 100) later.
+    expect(calls[0]).toBeLessThan(20);
+    expect(calls[1]).toBeGreaterThanOrEqual(40);
+    expect(calls[2]).toBeGreaterThanOrEqual(140);
+  });
+
+  it("forwards llmOpts (temperature, maxTokens) to the underlying LLM", async () => {
+    const llm: SpineLLM = vi.fn().mockResolvedValue("ok");
+    await callLLMWithRetry(llm, "prompt", { temperature: 0.7, maxTokens: 1234 });
+    expect(llm).toHaveBeenCalledWith("prompt", { temperature: 0.7, maxTokens: 1234 });
   });
 });

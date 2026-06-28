@@ -60,15 +60,32 @@ export interface SpineNode {
   effortIds: string[];
   depth: SpineNodeDepth;
   /**
-   * Set true when the node was produced by the shallow-fallback path in
-   * buildSpineFromReads (LLM extracted 0 candidates, so we synthesized one
-   * incremental-depth node per skim.mainContribution / surveyOutline entry).
-   * Downstream filters that normally skip `incremental` nodes treat these as
-   * eligible — without that override, a shallow-fallback run would produce a
-   * spine but 0 efforts and 0 wiki citations, defeating the fallback's purpose.
-   * Caught in dogfood-run-5: 11 nodes, 0 efforts, 0 spine citations in wiki.
+   * Set when the node was produced by the shallow-fallback path in
+   * buildSpineFromReads (LLM did not return any structured candidates, so
+   * we synthesized one incremental-depth node per skim.mainContribution /
+   * surveyOutline entry). Downstream filters that normally skip
+   * `incremental` nodes treat these as eligible — without that override,
+   * a shallow-fallback run would produce a spine but 0 efforts and 0 wiki
+   * citations, defeating the fallback's purpose. Caught in dogfood-run-5:
+   * 11 nodes, 0 efforts, 0 spine citations in wiki.
+   *
+   * 2026-06-28 (fix #2 from run-13-audit): widened from boolean to a
+   * discriminated string so the report tells "the LLM truly extracted
+   * nothing" (parse_error / no_candidates) apart from "the LLM call HTTP-
+   * failed and we never got a structured response" (llm_error). Old
+   * callers (`if (node.shallowFallback)` etc.) still work because any
+   * non-empty string is truthy.
+   *
+   *   - "llm_error"      — every extraction batch threw (HTTP / network /
+   *                        timeout). Run 13 build_spine hit this via a
+   *                        single Copilot HTTP 502.
+   *   - "parse_error"    — at least one batch returned a non-empty reply
+   *                        but extractSpineJSON returned null on all of
+   *                        them. Includes mid-JSON truncation.
+   *   - "no_candidates"  — at least one batch parsed cleanly but emitted
+   *                        zero candidate nodes (e.g. abstracts-only set).
    */
-  shallowFallback?: boolean;
+  shallowFallback?: "llm_error" | "parse_error" | "no_candidates";
 }
 
 export interface SpineEdge {

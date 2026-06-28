@@ -145,6 +145,25 @@ export interface InitAgentReport {
     maxRevisionsAcrossArtifacts: number;
   };
   /**
+   * Spine-quality summary. Counts how many spine nodes came from the
+   * full LLM extraction path vs the shallow-fallback path, broken down by
+   * fallback reason. A high `shallowNodes / totalNodes` ratio means the
+   * spine was rescued rather than freshly extracted — downstream prose
+   * quality usually drops sharply in that regime.
+   *
+   * 2026-06-28 (fix #2 from run-13-audit): added so the CLI can red-flag
+   * runs where ≥80% of nodes are shallow. Pre-fix the same `boolean`
+   * flag conflated "LLM call HTTP-failed" with "LLM had nothing to say",
+   * making it impossible to tell from the report whether to retry the
+   * run or accept the spine.
+   */
+  spineQuality: {
+    totalNodes: number;
+    shallowNodes: number;
+    shallowFraction: number;
+    shallowByReason: { llm_error: number; parse_error: number; no_candidates: number };
+  };
+  /**
    * Citations the reading loop tried to resolve but could not ingest as a
    * full PaperRead. Each entry includes `attemptedResolutions` (what was
    * tried) and, when Crossref returned a match, a `doi` (and optionally

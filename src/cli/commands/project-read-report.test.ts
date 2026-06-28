@@ -65,6 +65,12 @@ const SAMPLE_REPORT: InitAgentReport = {
     avgRevisionsPerArtifact: 0.4,
     maxRevisionsAcrossArtifacts: 2,
   },
+  spineQuality: {
+    totalNodes: 12,
+    shallowNodes: 0,
+    shallowFraction: 0,
+    shallowByReason: { llm_error: 0, parse_error: 0, no_candidates: 0 },
+  },
   unresolvedCitations: [{ citedTitle: "Chen 1966", whyImportant: "the key sieve bound" }],
   convergenceSummary: { reason: "natural", rounds: 3 },
   fieldTooLargeTripped: false,
