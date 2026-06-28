@@ -357,7 +357,7 @@ export async function runInitAgent(
     let concepts: Array<{ name: string; importance?: number }> = [];
     try {
       const prompt = buildConceptExtractionPrompt(input.problem, seeds, wikiSummary);
-      const reply = await llmComplete(llm, model, prompt, { temperature: 0.2, maxTokens: 1500 });
+      const reply = await llmComplete(llm, model, prompt, { temperature: 0.2 });
       await appendLog(projectDir, runId, "llm_call", "concept extraction", { chars: reply.length });
       const parsed = extractJSON<{ concepts?: Array<{ name: string; importance?: number }>; search_queries?: string[] }>(reply);
       concepts = parsed?.concepts ?? [];

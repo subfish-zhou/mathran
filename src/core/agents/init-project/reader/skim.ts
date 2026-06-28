@@ -84,7 +84,11 @@ export async function skimPaper(
 
   let reply: string;
   try {
-    reply = await deps.llm(prompt, { temperature: 0.1, maxTokens: 1500 });
+    // Drop the hardcoded 1500-token cap. Skim output is short JSON but the
+    // sectionOutline array can grow with long papers and a 1500-token cap
+    // can truncate mid-array, triggering studyFallback for the whole paper.
+    // Same fix class as spine/wiki/reviewer maxTokens drops.
+    reply = await deps.llm(prompt, { temperature: 0.1 });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     deps.emitLog?.(`skimPaper: LLM call failed, falling back to "study" (${msg})`);

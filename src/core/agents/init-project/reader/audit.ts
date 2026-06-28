@@ -94,7 +94,13 @@ export async function auditPaper(input: AuditInput, deps: AuditDeps): Promise<Ri
   let reply: string;
   try {
     const prompt = buildAuditPrompt(input);
-    reply = await llm(prompt, { temperature: 0, maxTokens: 1200 });
+    // Drop the hardcoded 1200-token cap. Audit output is a short JSON
+    // (verdict + flags[] + reason + pass) but a long flags array OR a
+    // multi-sentence reason can occasionally hit the cap mid-JSON and trigger
+    // the warn fallback. Letting the provider use its model cap is harmless
+    // (audit prompts won't generate tens of thousands of tokens) and removes
+    // one more silent-failure surface. Same fix class as spine/wiki/reviewer.
+    reply = await llm(prompt, { temperature: 0 });
   } catch (err) {
     emitLog?.(`[audit] LLM call failed: ${errMsg(err)}`);
     return {

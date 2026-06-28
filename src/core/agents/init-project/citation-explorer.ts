@@ -251,7 +251,7 @@ async function scoreRelevance(
     tags: problem.tags,
   });
   try {
-    const raw = await llm(prompt, { temperature: 0, maxTokens: 1500 });
+    const raw = await llm(prompt, { temperature: 0 });
     const parsed = extractSpineJSON<Array<{ index?: number; id?: string; score?: number }>>(raw);
     if (Array.isArray(parsed)) {
       const out: Array<{ id: string; score: number }> = [];

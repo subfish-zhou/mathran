@@ -626,7 +626,12 @@ async function distillSurvey(
   if (!read.read) return null;
   try {
     const prompt = buildSurveyDistillationPrompt(node, read.read, problemTitle);
-    const raw = await llm(prompt, { temperature: 0, maxTokens: 2500 });
+    // No maxTokens override — survey distillation emits a JSON tree with
+    // potentially long arrays (coveredSubAreas, keyReferences with whyHighlighted
+    // text, surveyOutline). A 30+ heading survey can blow past 2500 mid-array
+    // and the JSON parser then drops the whole distillation silently (returns
+    // null). Same fix class as spine/wiki/reviewer maxTokens drops.
+    const raw = await llm(prompt, { temperature: 0 });
     const parsed = extractSpineJSON<{
       coveredSubAreas?: unknown;
       keyReferences?: unknown;
