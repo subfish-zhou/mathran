@@ -83,6 +83,33 @@ Compensation rules — apply these AS YOU READ:
 `
     : "";
 
+  // Render prior-round verdicts as a "issues already addressed" block so the
+  // reviewer doesn't re-flag the same things every rewrite round. Fix #4 from
+  // run-13-audit: Run 13 spent $11+ on review-loop churn where each round
+  // produced 15-20 NEW objections instead of converging — the reviewer was
+  // stateless, so even when a rewrite addressed the previous issues the next
+  // round invented fresh ones.
+  const priorVerdicts = input.priorVerdicts ?? [];
+  const priorVerdictsBlock =
+    priorVerdicts.length === 0
+      ? ""
+      : `\n── Issues already raised on earlier drafts of this artifact ──\n` +
+        priorVerdicts
+          .map((v, idx) => {
+            const lines = v.issues
+              .slice(0, 20) // keep prompt bounded; the worst churn round capped at 30
+              .map((iss, j) => `    ${j + 1}. [${iss.severity}/${iss.kind}] ${iss.what_you_experienced} (loc=${iss.location})`)
+              .join("\n");
+            return `  Round ${idx + 1} (${v.verdict}): ${v.overallReaderExperience}\n${lines}`;
+          })
+          .join("\n\n") +
+        `\n\n` +
+        `RULES for using the above:\n` +
+        `  - If the writer's current draft has clearly fixed an issue from a prior round, DO NOT re-flag it.\n` +
+        `  - Do NOT invent fresh objections at the same priority while there are unresolved blockers from earlier rounds — finish what was raised before opening new fronts.\n` +
+        `  - You ARE free to flag GENUINELY new defects: things you only notice because earlier issues were addressed, or actual regressions introduced by the rewriter.\n` +
+        `  - If the artifact now reads well to an attentive grad student, APPROVE. The goal is convergence, not perfection.\n`;
+
   return `You are reading a ${docType} on ${input.topic}. You are an attentive 
 graduate student in this field, intelligent and patient, but not 
 pre-loaded with the specialized knowledge of this exact subfield.
@@ -114,7 +141,7 @@ ${input.artifactTitle}
 ${input.artifactContent}
 
 ── END OF DOCUMENT ──
-
+${priorVerdictsBlock}
 Output:
 {
   "verdict": "approve" | "rewrite_requested",

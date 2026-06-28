@@ -64,6 +64,26 @@ export interface ReviewArtifactInput {
    * available.
    */
   selfReviewMode?: boolean;
+  /**
+   * Verdicts from previous review rounds on THIS artifact, in chronological
+   * order. Pre-fix (run-13-audit #4): the reviewer was stateless across
+   * rewrite rounds, so it would flag NEW 15-20 issues each round even
+   * though the rewriter had visibly addressed the prior ones. 155
+   * rewrite_requested events / 57 artifacts / many at 4× rewrites with
+   * fresh issue lists every round chewed through $11+ in pure churn.
+   *
+   * The reviewer prompt now renders these as a "Issues already raised on
+   * earlier drafts" block with a directive not to re-flag any issue the
+   * rewriter has addressed and not to invent new objections at the same
+   * priority while old ones remain unresolved. The reviewer is still
+   * free to flag GENUINELY new defects — this only suppresses the
+   * round-by-round drift on the same artifact.
+   *
+   * Empty/undefined on the first review (revision 0). Loop accumulates
+   * one entry per completed review and replays the entire list each
+   * subsequent round.
+   */
+  priorVerdicts?: ReviewerVerdict[];
 }
 
 export interface ReviewArtifactDeps {

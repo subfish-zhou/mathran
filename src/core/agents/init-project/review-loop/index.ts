@@ -99,7 +99,11 @@ export interface ReviewLoopDeps {
   estimateCost?: (model: string, tokens: { in: number; out: number }) => number;
 }
 
-function reviewInput(config: ReviewLoopConfig, content: string): ReviewArtifactInput {
+function reviewInput(
+  config: ReviewLoopConfig,
+  content: string,
+  priorVerdicts: ReviewerVerdict[],
+): ReviewArtifactInput {
   return {
     artifactKind: config.artifactKind,
     artifactTitle: config.artifactTitle,
@@ -108,6 +112,7 @@ function reviewInput(config: ReviewLoopConfig, content: string): ReviewArtifactI
     topic: config.topic,
     audienceHint: config.audienceHint,
     selfReviewMode: config.selfReviewMode,
+    priorVerdicts,
   };
 }
 
@@ -145,13 +150,18 @@ export async function reviewLoop(
   let totalReviewerLlmCalls = 0;
   let totalWriterLlmCalls = 0;
   const revisionHistory: ReviewRevision[] = [];
+  // Accumulate prior-round verdicts so the reviewer prompt can dedup issues
+  // across rewrite rounds. Fix #4 from run-13-audit.
+  const priorVerdicts: ReviewerVerdict[] = [];
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
     // (a) review the current draft.
-    const verdict = await reviewArtifact(reviewInput(config, currentContent), deps.reviewerLlm, {
-      emitLog: emit,
-    });
+    const verdict = await reviewArtifact(
+      reviewInput(config, currentContent, priorVerdicts),
+      deps.reviewerLlm,
+      { emitLog: emit },
+    );
     totalReviewerLlmCalls++;
     totalCostUsd += costOf(config.reviewerModel, {
       in: estimateTokens(currentContent.length) + 400,
@@ -165,6 +175,14 @@ export async function reviewLoop(
       costUsdSoFar: totalCostUsd,
       timestamp: new Date().toISOString(),
     });
+
+    // Record this verdict for the NEXT round's prior-verdicts dedup. We do
+    // this AFTER the revisionHistory push so the loop's per-round state
+    // stays in sync, and only when the verdict carries actionable feedback
+    // (not on reviewer_broken — that has no issues to suppress).
+    if (verdict.verdict === "rewrite_requested") {
+      priorVerdicts.push(verdict);
+    }
 
     // (b) approved → done.
     if (verdict.verdict === "approve") {

@@ -201,6 +201,76 @@ describe("reviewer prompt", () => {
     // framing, not replace it — both should be present.
     expect(p.indexOf("SELF-REVIEW MODE")).toBeLessThan(p.indexOf("Your goal:"));
   });
+
+  // ── fix #4 from run-13-audit: priorVerdicts dedup block ──
+
+  it("omits the prior-verdicts block on the first review (no rounds yet)", () => {
+    const p = buildReviewerPrompt(input());
+    expect(p).not.toContain("Issues already raised on earlier drafts");
+  });
+
+  it("renders the prior-verdicts block when priorVerdicts is non-empty, including severity + kind + location", () => {
+    const p = buildReviewerPrompt(input({
+      priorVerdicts: [
+        {
+          verdict: "rewrite_requested",
+          overallReaderExperience: "Confusing in the middle.",
+          issues: [
+            { location: "§2 ¶3", severity: "blocks-understanding", kind: "unsupported",
+              what_you_experienced: "Claim 'Bombieri-Vinogradov' invoked without citation",
+              what_would_help: "Add a citation or a one-sentence statement." },
+            { location: "§3 ¶1", severity: "annoying", kind: "notation",
+              what_you_experienced: "Symbol π(x) used before definition",
+              what_would_help: "Define it." },
+          ],
+          verdictReasoning: "Two structural issues; rest is fine.",
+        },
+      ],
+    }));
+    expect(p).toContain("Issues already raised on earlier drafts");
+    expect(p).toContain("Confusing in the middle");
+    expect(p).toContain("[blocks-understanding/unsupported]");
+    expect(p).toContain("Claim 'Bombieri-Vinogradov' invoked without citation");
+    expect(p).toContain("loc=§2 ¶3");
+    // Dedup-directive rules must also appear so the reviewer knows what
+    // to do with the block (not just see it).
+    expect(p).toContain("DO NOT re-flag");
+    expect(p).toContain("APPROVE");
+  });
+
+  it("renders MULTIPLE rounds in chronological order", () => {
+    const p = buildReviewerPrompt(input({
+      priorVerdicts: [
+        { verdict: "rewrite_requested", overallReaderExperience: "Round-1 reaction.",
+          issues: [{ location: "x", severity: "annoying", kind: "vague",
+                     what_you_experienced: "early issue", what_would_help: "fix" }],
+          verdictReasoning: "" },
+        { verdict: "rewrite_requested", overallReaderExperience: "Round-2 reaction.",
+          issues: [{ location: "y", severity: "annoying", kind: "vague",
+                     what_you_experienced: "later issue", what_would_help: "fix" }],
+          verdictReasoning: "" },
+      ],
+    }));
+    expect(p).toContain("Round 1 (rewrite_requested): Round-1 reaction.");
+    expect(p).toContain("Round 2 (rewrite_requested): Round-2 reaction.");
+    expect(p.indexOf("Round 1")).toBeLessThan(p.indexOf("Round 2"));
+  });
+
+  it("caps each round's issues at 20 items (prompt-bloat protection)", () => {
+    const manyIssues = Array.from({ length: 30 }, (_, i) => ({
+      location: `loc-${i}`, severity: "annoying" as const, kind: "vague" as const,
+      what_you_experienced: `issue-${i}`, what_would_help: "fix",
+    }));
+    const p = buildReviewerPrompt(input({
+      priorVerdicts: [{ verdict: "rewrite_requested", overallReaderExperience: "lots",
+                        issues: manyIssues, verdictReasoning: "" }],
+    }));
+    // First 20 must appear, the remaining 10 must not.
+    expect(p).toContain("issue-0");
+    expect(p).toContain("issue-19");
+    expect(p).not.toContain("issue-20");
+    expect(p).not.toContain("issue-29");
+  });
 });
 
 describe("normalizeVerdict", () => {
