@@ -214,6 +214,38 @@ async function writeEffort(
       path.join(dir, "document.md"),
       effortFrontmatter(e) + body + "\n",
     );
+    // 2026-06-28 (dogfood-run-d79c820c42b7 fix): also write a minimal
+    // README.md so every effort (NODE via synthesizeEffort AND THREAD /
+    // legacy-stub via writeEffort) has the same 4-piece layout
+    // (document.md + README.md + notes/ + scratch/). Previously THREAD
+    // efforts (type=REFERENCE) and writeEffort-fallback efforts shipped
+    // without a README, breaking the documented invariant and surprising
+    // anyone navigating efforts/<id>/ uniformly.
+    //
+    // README.md is the "agent-to-human reading guide" — for the legacy
+    // stub path we don't have writer/reviewer-generated prose, so we
+    // populate a short scaffold that explains what this effort is and
+    // points at document.md as the work surface. Better than 404.
+    const readmeBody = [
+      `# ${escMd(e.title)} — Reading Guide`,
+      ``,
+      `> [Auto-generated scaffold by mathran init agent — ${new Date().toISOString()}]`,
+      `>`,
+      `> This effort was scaffolded from ${e.spineNodeId ? `spine node \`${e.spineNodeId}\`` : e.spineThreadId ? `spine thread \`${e.spineThreadId}\`` : "(unknown source)"}.`,
+      ``,
+      `## What this effort covers`,
+      ``,
+      escMd(e.description ?? e.abstract ?? e.subject ?? "(no description available)"),
+      ``,
+      `## Where to start`,
+      ``,
+      `- \`document.md\` — main work surface (read first)`,
+      refSummaries.length > 0 ? `- \`references/\` — auto-attached source papers (${refSummaries.length} item${refSummaries.length === 1 ? "" : "s"})` : "- \`references/\` — empty (no auto-attached sources)",
+      `- \`notes/\` — your own notes and intermediate work`,
+      `- \`scratch/\` — throwaway space; not touched by the agent`,
+      ``,
+    ].join("\n");
+    await atomicWriteFile(path.join(dir, "README.md"), readmeBody);
     await atomicWriteFile(path.join(dir, "effort.json"), JSON.stringify(e, null, 2) + "\n");
   } catch (err) {
     // eslint-disable-next-line no-console

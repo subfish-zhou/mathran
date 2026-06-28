@@ -440,4 +440,35 @@ describe("runReadingLoop", () => {
     // Exits via queue_exhausted, NOT natural, because the counter never tripped.
     expect(result.convergence.reason).toBe("queue_exhausted");
   });
+
+  it("(k) every read paper is associated with the project (dogfood-run-d79c820c42b7 fix)", async () => {
+    // Pre-fix: associatePaperToProject was only called by the legacy v1
+    // arxiv-crawl path in agent.ts (not in v3). Run-d79c820c42b7 had 21 reads
+    // + 33 ingested papers but only 3 entries in associations.jsonl (the 3
+    // seeds, written by the separate seed-ingestion helper). Downstream UI /
+    // `mathran project papers` / wiki bibliography would miss every paper
+    // the loop actually read.
+    const s1 = await ingest({ arxivId: "k-seed-1", title: "Seed 1" });
+    const s2 = await ingest({ arxivId: "k-seed-2", title: "Seed 2" });
+    const deps: ReadingLoopDeps = {
+      readPaper: async (node) => makeRead(node, { novel: "novel", cites: [] }),
+    };
+    await runReadingLoop(baseConfig({ seedPaperIds: [s1, s2] }), deps);
+
+    // associations.jsonl should now contain BOTH seeds (and nothing else
+    // since no harvest fired).
+    const assocPath = path.join(projectDir, ".mathran", "papers", "associations.jsonl");
+    const assocRaw = await fs.readFile(assocPath, "utf-8");
+    const lines = assocRaw.trim().split("\n").filter((l) => l.length > 0);
+    expect(lines.length).toBe(2);
+    const paperIds = lines.map((l) => JSON.parse(l).paperId);
+    expect(paperIds).toContain(s1);
+    expect(paperIds).toContain(s2);
+    // discoveredBy taxonomy is informational; the key invariant is that
+    // SOMETHING coherent went into the file, not a specific string.
+    for (const l of lines) {
+      const row = JSON.parse(l);
+      expect(["seed", "survey-keyref", "harvest"]).toContain(row.discoveredBy);
+    }
+  });
 });

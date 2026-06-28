@@ -28,6 +28,7 @@ import {
   getPaper,
   ingestPaper,
   paperGraphDir,
+  associatePaperToProject,
   type PaperNodeInput,
 } from "../../paper-graph/index.js";
 import { deletePaperRead, writePaperRead } from "../../paper-graph/reads.js";
@@ -288,6 +289,30 @@ export async function runReadingLoop(
       continue;
     }
     nodeById.set(candidate.paperId, node);
+
+    // Attach this paper to the project so downstream UI / `mathran project
+    // papers` / wiki bibliography see every paper we actually engaged with,
+    // not just the user-supplied seeds. Run-d79c820c42b7 caught the gap: 21
+    // reads + 33 ingested papers, but only 3 entries in associations.jsonl
+    // because the v3 reading-loop never called this — only the legacy v1
+    // arxiv-crawl path did, and it doesn't run in v3.
+    // Best-effort: a failure here is not worth aborting the read for.
+    try {
+      // Coarse discovery taxonomy based on priority band.
+      const discoveredBy =
+        candidate.priority >= PRIORITY_SEED
+          ? "seed"
+          : candidate.priority >= PRIORITY_SURVEY_KEYREF
+            ? "survey-keyref"
+            : "harvest";
+      await associatePaperToProject(config.projectDir, candidate.paperId, {
+        discoveredBy,
+        depth: candidate.priority >= PRIORITY_SEED ? 0 : 1,
+        relevanceScore: candidate.priority >= PRIORITY_CANON ? 1 : 0.6,
+      });
+    } catch (err) {
+      log(`[reading-loop] associatePaperToProject(${candidate.paperId}) failed: ${errMsg(err)}`);
+    }
 
     // Defensively flag surveys (should already be set during prior-art ingest).
     const isSurvey = node.isSurvey || surveyConfidence.has(candidate.paperId);
