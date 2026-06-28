@@ -112,7 +112,14 @@ function renderReadReport(data: ReadReportData): string {
 
   lines.push(`Unresolved citations (${report.unresolvedCitations.length}):`);
   for (const u of report.unresolvedCitations) {
-    lines.push(`  - ${u.citedTitle}: ${u.whyImportant}`);
+    // doi/venue come from the Crossref harvest fallback (reading-loop.ts).
+    // Surface them so the user has a concrete fetch hint instead of just a
+    // title — "go to the venue, here's the DOI" beats "good luck finding it".
+    const suffix =
+      u.doi
+        ? ` [DOI: ${u.doi}${u.venue ? `, ${u.venue}` : ""}]`
+        : "";
+    lines.push(`  - ${u.citedTitle}${suffix}: ${u.whyImportant}`);
   }
   if (report.unresolvedCitations.length === 0) lines.push("  (none)");
   lines.push("");
@@ -133,7 +140,7 @@ function renderReadReport(data: ReadReportData): string {
   const r = report.revisionsSummary;
   lines.push("");
   lines.push("Revisions:");
-  lines.push(`  reviewed=${r.artifactsReviewed} approved=${r.artifactsApproved} flagged=${r.artifactsFlaggedPersistent}`);
+  lines.push(`  reviewed=${r.artifactsReviewed} approved=${r.artifactsApproved} flagged=${r.artifactsFlaggedPersistent} reviewer_broken=${r.artifactsReviewerBroken}`);
   lines.push(`  avg=${r.avgRevisionsPerArtifact} max=${r.maxRevisionsAcrossArtifacts}`);
 
   return lines.join("\n");

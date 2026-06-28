@@ -61,6 +61,7 @@ const SAMPLE_REPORT: InitAgentReport = {
     artifactsReviewed: 5,
     artifactsApproved: 4,
     artifactsFlaggedPersistent: 1,
+    artifactsReviewerBroken: 0,
     avgRevisionsPerArtifact: 0.4,
     maxRevisionsAcrossArtifacts: 2,
   },

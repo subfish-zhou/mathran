@@ -1236,7 +1236,7 @@ function printInitReport(report: InitAgentReport): void {
     `  LLM calls: writer=${a.writerCallsTotal} reviewer=${a.reviewerCallsTotal} reader=${a.readerCallsTotal} plan=${a.planAgentCalls}`,
     `  estimated cost: $${a.estimatedTotalUsd.toFixed(4)} total`,
     ...(phaseLines.length > 0 ? ["  cost by phase:", ...phaseLines] : []),
-    `  revisions: reviewed=${r.artifactsReviewed} approved=${r.artifactsApproved} flagged=${r.artifactsFlaggedPersistent} avg=${r.avgRevisionsPerArtifact} max=${r.maxRevisionsAcrossArtifacts}`,
+    `  revisions: reviewed=${r.artifactsReviewed} approved=${r.artifactsApproved} flagged=${r.artifactsFlaggedPersistent} reviewer_broken=${r.artifactsReviewerBroken} avg=${r.avgRevisionsPerArtifact} max=${r.maxRevisionsAcrossArtifacts}`,
     `  convergence: ${report.convergenceSummary.reason} (${report.convergenceSummary.rounds} rounds)`,
     `  unresolved citations: ${report.unresolvedCitations.length}`,
     canonNote,
