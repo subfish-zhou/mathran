@@ -111,13 +111,23 @@ Rules:
 - Produce between 3 and 10 sections (inclusive).
 - Each section MUST cite at least one source in "mustCite": either a paper-read (kind:"paper-read", id from ${JSON.stringify(readIds)}) OR a predecessor effort (kind:"effort", id from ${JSON.stringify(predIds)}).
 - "anchor" must be url-safe (lowercase, hyphens, no spaces).
-- "narrativeRole" must be one of: core_technique, milestone, bridge, barrier, refinement, foundational, dead_end, open_direction, background.
+- "narrativeRole" must be ONE of the following, preferring the verb-first roles whenever they describe what move this effort makes:
+    • opens_thread       — this paper STARTS a new line of attack / introduces a technique
+    • refines_constant   — this paper TIGHTENS a bound, constant, or proof produced by a predecessor
+    • unifies_approaches — this paper TIES together two previously-separate lines
+    • closes_thread      — this paper KILLS a thread (proves it can't reach the target, or supersedes it)
+    • reveals_barrier    — this paper SHOWS WHY further progress is blocked along this line
+    • open_direction     — this paper SUGGESTS a direction whose verdict is still open
+  (Back-compat noun-shapes also accepted: core_technique, application, generalization, background, dead_end.
+  Pick a noun-shape ONLY when no verb above honestly fits.)
+
+Choose the verb that a working number-theorist would use when telling a colleague "this paper does X" in one verb.
 
 Output ONLY JSON of this exact shape:
 {
   "title": "string",
   "thesis": "1-2 sentence statement of what this effort is",
-  "narrativeRole": "core_technique",
+  "narrativeRole": "opens_thread",
   "sections": [
     {
       "heading": "string",

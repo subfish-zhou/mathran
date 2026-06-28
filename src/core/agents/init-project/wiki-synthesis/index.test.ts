@@ -132,4 +132,31 @@ describe("synthesizeWiki (fs integration)", () => {
     expect(res.pagesWritten).toBe(3);
     expect(res.pages[0]!.content).toContain("Draft");
   });
+
+  it("5.2: appends a Prev/Next + Related-pages nav footer to every page", async () => {
+    // threePagePlan() has pageOrder: ["overview", "circle-method", "bibliography"]
+    // and overview.relatedPageSlugs includes "circle-method".
+    const llm: SpineLLM = async () =>
+      "## S\n\nBody @ws:effort-1#thm-1 and @paper-read:paper-1#mainResult-1.";
+    await synthesizeWiki(baseInput(), { llm });
+
+    const overview = await fs.readFile(path.join(wikiDir(projectDir), "overview.md"), "utf-8");
+    const circle = await fs.readFile(path.join(wikiDir(projectDir), "circle-method.md"), "utf-8");
+    const biblio = await fs.readFile(path.join(wikiDir(projectDir), "bibliography.md"), "utf-8");
+
+    // Continue-reading section exists on every page.
+    expect(overview).toContain("## Continue reading");
+    expect(circle).toContain("## Continue reading");
+    expect(biblio).toContain("## Continue reading");
+
+    // First page: only Next, no Previous.
+    expect(overview).not.toContain("← Previous:");
+    expect(overview).toContain("Next: [Title circle-method](circle-method.md) →");
+    // Middle page: BOTH Prev and Next.
+    expect(circle).toContain("← Previous: [Title overview](overview.md)");
+    expect(circle).toContain("Next: [Title bibliography](bibliography.md) →");
+    // Last page: only Previous, no Next.
+    expect(biblio).toContain("← Previous: [Title circle-method](circle-method.md)");
+    expect(biblio).not.toContain("Next: ");
+  });
 });

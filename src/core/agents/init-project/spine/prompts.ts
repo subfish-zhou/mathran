@@ -161,15 +161,24 @@ ${candidateList}
 
 Assemble these candidates into a complete Narrative Spine. The spine tells the story of this problem's research history.
 
+CRITICAL — ERA NAMES ARE NARRATIVE ARCS, NOT DATE BRACKETS:
+- Each era \`name\` MUST describe the intellectual move the era represents — what changed in how researchers attacked the problem.
+- BAD names: "1920-1973", "Modern era (2000-2020)", "Early period", "Sieve era 1950-1970".
+- GOOD names: "First-wave combinatorial sieve", "Large-sieve breakthrough and dispersion", "Circle-method ternary breakthrough", "Post-Helfgott computational frontier", "Parity-barrier era".
+- The (start_year-end_year) bracket is a SEPARATE field; DO NOT duplicate it in \`name\`.
+- A reader who only sees the era names should already learn the methodological story.
+
+Same principle for THREAD names: name the research move, not the topic ("Sieve approach to 1+2", "Bombieri-Vinogradov-style mean values for moduli"), not noun-clumps ("Sieve methods", "Distribution of primes").
+
 Output a JSON object with this EXACT structure:
 {
   "global_thesis": "One sentence capturing the central tension/story of this problem",
   "eras": [
     {
-      "name": "Era Name (start_year-end_year)",
+      "name": "Narrative arc name describing the intellectual move (NO date bracket)",
       "start_year": 1859,
       "end_year": 1950,
-      "summary": "What happened in this era (2-3 sentences)",
+      "summary": "What changed in this era — what move the field made (2-3 sentences)",
       "node_ids": ["node-id-1", "node-id-2"]
     }
   ],
@@ -184,7 +193,7 @@ Output a JSON object with this EXACT structure:
   "threads": [
     {
       "id": "thread-slug",
-      "name": "Research Thread Name",
+      "name": "Research thread name describing the intellectual move (verb-first if possible)",
       "description": "What this line of research pursues (1-2 sentences)",
       "node_ids": ["node-id-1", "node-id-3"],
       "status": "active|stalled|converged|dead_end",
@@ -609,17 +618,28 @@ ${priors}
 SPINE NODES (already extracted — organize these, do not invent new statements):
 ${candidateList}
 
-Organize these nodes into the structural story of the problem. Output a JSON object with this EXACT structure:
+Organize these nodes into the structural story of the problem.
+
+CRITICAL — ERA NAMES ARE NARRATIVE ARCS, NOT DATE BRACKETS:
+- Each era \`name\` MUST describe the intellectual move the era represents.
+- BAD names: "1920-1973", "Modern era", "Sieve era 1950-1970".
+- GOOD names: "First-wave combinatorial sieve", "Large-sieve breakthrough and dispersion", "Circle-method ternary breakthrough".
+- The (start_year-end_year) bracket is a SEPARATE field; DO NOT duplicate it in \`name\`.
+- A reader who only sees the era names should already learn the methodological story.
+
+Same principle for THREAD names: name the research move, not the topic.
+
+Output a JSON object with this EXACT structure:
 {
   "global_thesis": "One sentence capturing the central tension/story of this problem",
   "eras": [
-    { "name": "Era Name (start_year-end_year)", "start_year": 1859, "end_year": 1950, "summary": "What happened (2-3 sentences)", "node_ids": ["node-id-1"] }
+    { "name": "Narrative arc describing the intellectual move (NO date bracket)", "start_year": 1859, "end_year": 1950, "summary": "What move the field made (2-3 sentences)", "node_ids": ["node-id-1"] }
   ],
   "edges": [
     { "from": "node-id-1", "to": "node-id-2", "type": "enables|improves|generalizes|applies_technique|contradicts|reveals_barrier", "context": "One sentence" }
   ],
   "threads": [
-    { "id": "thread-slug", "name": "Research Thread Name", "description": "What this line pursues (1-2 sentences)", "node_ids": ["node-id-1"], "status": "active|stalled|converged|dead_end", "current_frontier": "Best known result (LaTeX)", "barrier": "What blocks progress" }
+    { "id": "thread-slug", "name": "Research thread name describing the intellectual move", "description": "What this line pursues (1-2 sentences)", "node_ids": ["node-id-1"], "status": "active|stalled|converged|dead_end", "current_frontier": "Best known result (LaTeX)", "barrier": "What blocks progress" }
   ],
   "open_questions": [
     { "title": "Open Question Title", "statement": "Precise statement in LaTeX", "related_node_ids": ["node-id-1"], "barrier": "What's blocking", "partial_progress": "Known partial results" }

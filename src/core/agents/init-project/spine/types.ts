@@ -236,11 +236,46 @@ export type EffortStatus = "REFERENCE" | "DEAD_END" | "DRAFT" | "VERIFIED";
 
 export type EffortDifficulty = "MODERATE" | "HARD" | "VERY_HARD";
 
+/**
+ * What narrative move this effort makes within the spine.
+ *
+ * 5.3 (2026-06-28) — Verb-first vocabulary added. The old noun-shaped
+ * roles (`background`, `core_technique`, `application`, …) describe
+ * what KIND of thing this effort is; the new verb-shaped roles describe
+ * what MOVE the underlying paper makes within the field. Wiki / effort
+ * docs / threads reading more like a story when each effort can be
+ * tagged with a verb-shape.
+ *
+ * Both noun- and verb-shaped values are accepted (back-compat for any
+ * persisted effort.json on disk) but new efforts should prefer the
+ * verb-shaped ones when the underlying spine-node `type` maps cleanly
+ * to a move:
+ *
+ *   spine type        → preferred narrativeRole
+ *   foundation        → opens_thread          (verb: starts a line)
+ *   technique_origin  → opens_thread
+ *   milestone         → opens_thread OR refines_constant (depending)
+ *   refinement        → refines_constant      (verb: tightens a bound/proof)
+ *   bridge            → unifies_approaches    (verb: ties two lines)
+ *   barrier           → reveals_barrier       (verb: shows a wall)
+ *   dead_end          → closes_thread         (verb: ends a line)
+ *   open_direction    → open_direction        (kept; semantically already verby)
+ *
+ * Free-form strings from older runs/disk are tolerated by downstream
+ * consumers; only the prompt-side enum is constrained.
+ */
 export type EffortNarrativeRole =
+  // ── Verb-first (preferred) ──
+  | "opens_thread"
+  | "refines_constant"
+  | "unifies_approaches"
+  | "closes_thread"
+  | "reveals_barrier"
+  | "open_direction"
+  // ── Noun-first (back-compat) ──
   | "background"
   | "core_technique"
   | "application"
-  | "open_direction"
   | "generalization"
   | "dead_end";
 

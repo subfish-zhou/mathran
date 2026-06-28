@@ -60,7 +60,10 @@ describe("repairOutline (invariant enforcement)", () => {
       {
         title: "T",
         thesis: "th",
-        narrativeRole: "bridge",
+        // 5.3: "bridge" was never a valid EffortNarrativeRole — only landed
+        // here via the prompt vocab / VALID_ROLES bug fixed in this commit.
+        // Replaced with the verb-first equivalent.
+        narrativeRole: "unifies_approaches",
         sections: [{ heading: "Only", anchor: "only", purpose: "p", targetParagraphs: 1, mustCite: [] }],
       },
       node,
@@ -83,7 +86,7 @@ describe("repairOutline (invariant enforcement)", () => {
       mustCite: [{ kind: "paper-read" as const, id: "2401.00001" }],
     }));
     const repaired = repairOutline(
-      { title: "T", thesis: "th", narrativeRole: "milestone", sections: many },
+      { title: "T", thesis: "th", narrativeRole: "opens_thread", sections: many },
       node,
       [read],
       [],

@@ -19,7 +19,22 @@
 
 import type { SpineLLM } from "../spine/llm.js";
 import type { SpineNode, SpineThread, SpineEra } from "../spine/types.js";
+import type { PaperRead } from "../../../paper-graph/types.js";
 import { reviewLoop, DEFAULT_REVIEW_LOOP_BUDGET, estimateCost as defaultEstimateCost } from "../review-loop/index.js";
+import { buildPriorReadsBlock } from "../reader/prompts.js";
+
+/**
+ * Minimal paper-metadata shape consumed by buildSurveyPrompt's prior-reads
+ * adapter. Both PaperNode (paper-graph) and PaperMeta (spine/effort-from-spine
+ * internal type) satisfy this structurally, so the caller doesn't have to
+ * convert between them.
+ */
+export interface ThreadSurveyPaperMeta {
+  id: string;
+  title: string;
+  authors: string[];
+  year?: number;
+}
 
 export interface ThreadSurveyInput {
   thread: SpineThread;
@@ -28,6 +43,20 @@ export interface ThreadSurveyInput {
   problemTitle: string;
   /** `<workspace>/projects/<slug>` — used for review-loop logging context. */
   projectDir: string;
+  /**
+   * 5.4 (2026-06-28) — paper-reads + paper-metadata behind the thread's
+   * spine nodes, in chronological order. Injected into the survey prompt as
+   * the same "prior reads you have already absorbed" block that the reader
+   * sees per-paper, so the survey writer can frame the story across the
+   * thread's lineage (Brun 1920 → Selberg 1950 → Chen 1973) instead of
+   * treating each spine-node as an isolated fact.
+   *
+   * paperReads / paperNodes are parallel arrays — entry i in paperReads has
+   * its metadata (title/authors/year) at entry i in paperNodes. Missing
+   * paperNode is tolerated (the entry then falls back to bare paperId).
+   */
+  paperReads?: PaperRead[];
+  paperNodes?: ThreadSurveyPaperMeta[];
 }
 
 export interface ThreadSurveyDeps {
@@ -42,7 +71,7 @@ export interface ThreadSurveyDeps {
 }
 
 function buildSurveyPrompt(input: ThreadSurveyInput): string {
-  const { thread, threadNodes, era, problemTitle } = input;
+  const { thread, threadNodes, era, problemTitle, paperReads, paperNodes } = input;
   const nodeBlock = threadNodes
     .map((n, i) => {
       const yr = n.year != null ? ` (${n.year})` : "";
@@ -55,6 +84,30 @@ function buildSurveyPrompt(input: ThreadSurveyInput): string {
       ].filter(Boolean).join("\n");
     })
     .join("\n\n");
+
+  // 5.4: build chronological prior-reads block from the thread's paper-reads,
+  // same shape as the reader's lineage block (12-cap, sorted by year). The
+  // adapter pulls title/firstAuthor/year from the parallel paperNodes array
+  // (PaperReadSkim doesn't carry these). When the paperNodes array is missing
+  // we still emit an entry with the bare paperId so structure is preserved.
+  const priorReadsBlock = paperReads && paperReads.length > 0
+    ? buildPriorReadsBlock(
+        paperReads.map((r, idx) => {
+          const node = paperNodes?.[idx];
+          return {
+            paperId: r.paperId,
+            title: node?.title ?? r.paperId,
+            firstAuthor: node?.authors?.[0] ?? "",
+            year: node?.year,
+            oneLineSummary: r.skim?.oneLineSummary ?? "",
+            mainContribution:
+              r.read?.mainResults?.[0]?.statement ??
+              r.skim?.mainContribution ??
+              undefined,
+          };
+        }),
+      )
+    : "";
 
   return [
     `You are writing a SURVEY MARKDOWN for a spine "thread" — a coherent`,
@@ -70,6 +123,7 @@ function buildSurveyPrompt(input: ThreadSurveyInput): string {
     thread.barrier ? `BARRIER: ${thread.barrier}` : "",
     era ? `ERA: ${era.name} (${era.startYear ?? "?"}-${era.endYear ?? "?"}) — ${era.summary}` : "",
     ``,
+    priorReadsBlock,
     `NODES IN THIS THREAD:`,
     nodeBlock || "(no nodes — surface this as 'no resolved results yet')",
     ``,
@@ -78,6 +132,9 @@ function buildSurveyPrompt(input: ThreadSurveyInput): string {
     `  2. A short story arc walking through the nodes in order: how each one`,
     `     advances the thread, what it builds on, what it leaves open. Use the`,
     `     statements / significance verbatim where they're already clean.`,
+    paperReads && paperReads.length > 0
+      ? `     LINEAGE: when a node's underlying paper appears in the PRIOR READS block above, frame it as building-on / refining its chronological predecessors there ("extends X 1965", "tightens the constant of Y 1973").`
+      : "",
     `  3. ONE closing paragraph: where the thread stands now (frontier),`,
     `     what's blocking the next step (barrier), what kind of result would`,
     `     mark genuine progress.`,
@@ -86,7 +143,8 @@ function buildSurveyPrompt(input: ThreadSurveyInput): string {
     `  - Be HONEST about what you don't know. If the supplied nodes don't show`,
     `    a proof strategy, say so — do NOT invent one.`,
     `  - Do NOT fabricate citations. The only ground truth you have is the`,
-    `    nodes above. Refer to results by node title, not by paper id.`,
+    `    nodes above and the prior-reads block. Refer to results by node title`,
+    `    or by [author year] from the prior-reads block.`,
     `  - Keep total length 400-1200 words. This is a survey, not a textbook chapter.`,
     `  - Output the markdown body ONLY — no frontmatter, no code fence, no preamble.`,
   ]

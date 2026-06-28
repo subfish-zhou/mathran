@@ -1155,6 +1155,17 @@ async function writeCanonToVendor(projectDir: string, priorArt: PriorArtCorpus |
   const unresolved = canon.filter((c) => !c.arxivId && !c.doi);
   if (doiOnly.length === 0 && unresolved.length === 0) return;
 
+  // 5.5 (2026-06-28) — canon-to-vendor is a small pedagogical timeline, not
+  // an alphabetical bibliography. The LLM emits canon in roughly priority
+  // order which is essentially random; sorting by year makes the doc
+  // walk the reader from the field's first foundational works toward the
+  // modern frontier. Within a year we keep insertion order so the LLM's
+  // priority signal still leaks through.
+  const byYear = (c: { year?: number; crossrefYear?: number }): number =>
+    c.year ?? c.crossrefYear ?? 9999;
+  const doiOnlySorted = doiOnly.slice().sort((a, b) => byYear(a) - byYear(b));
+  const unresolvedSorted = unresolved.slice().sort((a, b) => byYear(a) - byYear(b));
+
   const lines: string[] = [];
   lines.push("# Canonical landmarks to vendor manually");
   lines.push("");
@@ -1164,28 +1175,37 @@ async function writeCanonToVendor(projectDir: string, priorArt: PriorArtCorpus |
     "Vendor the PDFs yourself so they can be referenced from efforts and the wiki.",
   );
   lines.push("");
+  lines.push(
+    "**Read order**: entries within each section are sorted by publication year, " +
+    "so the list doubles as a small pedagogical timeline — start at the top to walk " +
+    "the field's lineage from its first foundational works toward the modern frontier.",
+  );
+  lines.push("");
   lines.push("Generated: " + new Date().toISOString());
   lines.push("");
 
-  if (doiOnly.length > 0) {
-    lines.push("## DOI resolved — fetch from publisher");
+  if (doiOnlySorted.length > 0) {
+    lines.push("## DOI resolved — fetch from publisher (in chronological reading order)");
     lines.push("");
     lines.push("These have a Crossref / DOI record. Follow the link, log in to the venue if needed, and download the PDF.");
     lines.push("");
-    for (const c of doiOnly) {
+    for (const c of doiOnlySorted) {
       const yr = c.year ?? c.crossrefYear ?? "?";
       const venue = c.venue ?? c.crossrefVenue ?? "?";
       const authors = c.authors.length > 0 ? c.authors.join(", ") : "(unknown authors)";
-      lines.push(`- **${c.title}** (${yr}, ${venue})`);
+      lines.push(`- **[${yr}] ${c.title}** — _${venue}_`);
       lines.push(`  - Authors: ${authors}`);
       lines.push(`  - DOI: https://doi.org/${c.doi}`);
-      lines.push(`  - Why canon: ${c.why}`);
+      // 5.5: lead with the verb-shaped narrative move (`c.why` is the LLM's
+      // one-sentence "this is the step that …"). Bold-label it so the reader
+      // sees the role before they decide whether to chase the link.
+      lines.push(`  - **Role in the lineage**: ${c.why}`);
       lines.push("");
     }
   }
 
-  if (unresolved.length > 0) {
-    lines.push("## Fully unresolved — find manually");
+  if (unresolvedSorted.length > 0) {
+    lines.push("## Fully unresolved — find manually (in chronological reading order)");
     lines.push("");
     lines.push(
       "Neither arxiv nor Crossref returned a match. Usually pre-arxiv classics in foreign languages " +
@@ -1193,13 +1213,13 @@ async function writeCanonToVendor(projectDir: string, priorArt: PriorArtCorpus |
       "Use Google Scholar, the venue's archive, or a librarian.",
     );
     lines.push("");
-    for (const c of unresolved) {
+    for (const c of unresolvedSorted) {
       const yr = c.year ?? "?";
       const venue = c.venue ?? "?";
       const authors = c.authors.length > 0 ? c.authors.join(", ") : "(unknown authors)";
-      lines.push(`- **${c.title}** (${yr}, ${venue})`);
+      lines.push(`- **[${yr}] ${c.title}** — _${venue}_`);
       lines.push(`  - Authors: ${authors}`);
-      lines.push(`  - Why canon: ${c.why}`);
+      lines.push(`  - **Role in the lineage**: ${c.why}`);
       lines.push("");
     }
   }

@@ -331,6 +331,21 @@ export async function generateEffortsFromSpine(
     // statement / significance / role so the user has a coherent reading
     // entry-point per thread rather than just "see node A, node B, …".
     // Failure-isolated: any LLM error degrades to the legacy scaffold body.
+    //
+    // 5.4 (2026-06-28): also load the paper-reads behind this thread's nodes
+    // + their PaperNode metadata, then forward them so the survey writer can
+    // frame the lineage. Sort by year ascending so the prior-reads block is
+    // chronological (matches the reader's expectation and layer-1 ordering).
+    const threadPaperIds = [...new Set(threadNodes.flatMap((n) => n.paperIds))];
+    const threadPaperReads = await loadPaperReads(workspace, threadPaperIds);
+    const threadPaperReadsSorted = threadPaperReads.slice().sort((a, b) => {
+      const na = papers.find((p) => p.id === a.paperId)?.year ?? 9999;
+      const nb = papers.find((p) => p.id === b.paperId)?.year ?? 9999;
+      return na - nb;
+    });
+    const threadPaperNodesSorted = threadPaperReadsSorted
+      .map((r) => papers.find((p) => p.id === r.paperId))
+      .filter((p): p is NonNullable<typeof p> => p != null);
     let document = `Survey of ${thread.name}. ${thread.description}`;
     if (useSynthesis && reviewer.reviewerLlm) {
       try {
@@ -340,6 +355,8 @@ export async function generateEffortsFromSpine(
           era,
           problemTitle,
           projectDir,
+          paperReads: threadPaperReadsSorted,
+          paperNodes: threadPaperNodesSorted,
         }, {
           llm,
           reviewerLlm: reviewer.reviewerLlm,
@@ -372,7 +389,16 @@ export async function generateEffortsFromSpine(
       era: era?.name,
       spineThreadId: thread.id,
       abstract: thread.description,
-      narrativeRole: thread.status === "dead_end" ? "dead_end" : "core_technique",
+      // 5.3: verb-first roles. A thread that died = closes_thread; a thread
+      // that's stalled-but-alive = reveals_barrier (it explains why progress
+      // got stuck); a thread still actively explored or converged = opens_thread
+      // (the thread NAMES a research move that's actively in play).
+      narrativeRole:
+        thread.status === "dead_end"
+          ? "closes_thread"
+          : thread.status === "stalled"
+            ? "reveals_barrier"
+            : "opens_thread",
       referenceKind: "thread_survey",
       includedPaperIds: paperIds,
       includedSpineNodeIds: thread.nodeIds,
@@ -765,16 +791,19 @@ function extractTopicTags(text: string, limit: number): string[] {
 }
 
 function mapNodeTypeToNarrativeRole(nodeType: SpineNode["type"]): WorkspaceEffortOutput["narrativeRole"] {
+  // 5.3 (2026-06-28): prefer verb-first vocabulary that names the MOVE the
+  // underlying paper makes in the field, not the abstract category of result.
+  // See spine/types.ts.EffortNarrativeRole docstring for the rationale.
   switch (nodeType) {
-    case "foundation": return "background";
-    case "milestone": return "core_technique";
-    case "technique_origin": return "core_technique";
-    case "refinement": return "application";
-    case "barrier": return "open_direction";
-    case "bridge": return "generalization";
-    case "dead_end": return "dead_end";
-    case "open_direction": return "open_direction";
-    default: return "background";
+    case "foundation":         return "opens_thread";
+    case "technique_origin":   return "opens_thread";
+    case "milestone":          return "opens_thread";
+    case "refinement":         return "refines_constant";
+    case "bridge":             return "unifies_approaches";
+    case "barrier":            return "reveals_barrier";
+    case "dead_end":           return "closes_thread";
+    case "open_direction":     return "open_direction";
+    default:                   return "opens_thread";
   }
 }
 

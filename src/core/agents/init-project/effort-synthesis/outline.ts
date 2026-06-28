@@ -15,19 +15,13 @@
 import { slugify } from "../../../../lib/slug.js";
 import { extractSpineJSON, errMsg, type SpineLLM } from "../spine/llm.js";
 import { buildEffortOutlinePrompt } from "./prompts.js";
-import type { NarrativeSpine, SpineNode } from "../spine/types.js";
+import type { NarrativeSpine, SpineNode, EffortNarrativeRole } from "../spine/types.js";
 import type { PaperRead } from "../../../paper-graph/types.js";
 
-export type EffortNarrativeRole =
-  | "core_technique"
-  | "milestone"
-  | "bridge"
-  | "barrier"
-  | "refinement"
-  | "foundational"
-  | "dead_end"
-  | "open_direction"
-  | "background";
+// Re-export so existing imports `from "./outline.js"` keep working without
+// having to chase down the canonical source. The canonical definition lives
+// in spine/types.ts (where it's part of WorkspaceEffortOutput).
+export type { EffortNarrativeRole };
 
 export interface EffortOutlineCitation {
   kind: "paper-read" | "effort";
@@ -50,33 +44,56 @@ export interface EffortOutline {
   sections: EffortOutlineSection[];
 }
 
-const VALID_ROLES: ReadonlySet<EffortNarrativeRole> = new Set([
-  "core_technique",
-  "milestone",
-  "bridge",
-  "barrier",
-  "refinement",
-  "foundational",
-  "dead_end",
+// 5.3 (2026-06-28) — VALID_ROLES must MATCH the union in spine/types.ts.
+// Previously this set listed strings (`milestone`, `foundational`, `barrier`,
+// `bridge`, `refinement`) that aren't members of `EffortNarrativeRole` and
+// only landed in JSON because `outline.ts` cast through `as`. The LLM was
+// being told (via prompt) it could choose those strings; they then survived
+// validation here because the runtime set agreed, but they would never
+// type-check against `WorkspaceEffortOutput.narrativeRole`. The fix: the
+// runtime set IS the prompt vocabulary IS the type union. New verb-first
+// roles (5.3) are listed first to bias the LLM toward picking them.
+const VALID_ROLES: ReadonlySet<EffortNarrativeRole> = new Set<EffortNarrativeRole>([
+  // ── Verb-first (preferred — see types.ts docstring) ──
+  "opens_thread",
+  "refines_constant",
+  "unifies_approaches",
+  "closes_thread",
+  "reveals_barrier",
   "open_direction",
+  // ── Noun-first (back-compat with persisted effort.json on disk) ──
   "background",
+  "core_technique",
+  "application",
+  "generalization",
+  "dead_end",
 ]);
 
 const MIN_SECTIONS = 3;
 const MAX_SECTIONS = 10;
 
-/** Map a spine node type onto the closest effort narrative role. */
+/**
+ * Map a spine node type onto the closest effort narrative role.
+ *
+ * 5.3 (2026-06-28): same verb-first taxonomy as
+ * spine/effort-from-spine.ts.mapNodeTypeToNarrativeRole. Kept duplicated
+ * here on purpose: outline.ts is the source of truth for what role the
+ * LLM-generated outline starts from when the model doesn't provide one,
+ * effort-from-spine.ts is the source of truth for the legacy stub path.
+ * Both need to land on the same verbs for the wiki/effort narrative to
+ * stay coherent across paths.
+ */
 function defaultRoleForNode(node: SpineNode): EffortNarrativeRole {
   switch (node.type) {
-    case "foundation": return "foundational";
-    case "milestone": return "milestone";
-    case "technique_origin": return "core_technique";
-    case "refinement": return "refinement";
-    case "barrier": return "barrier";
-    case "bridge": return "bridge";
-    case "dead_end": return "dead_end";
-    case "open_direction": return "open_direction";
-    default: return "background";
+    case "foundation":         return "opens_thread";
+    case "technique_origin":   return "opens_thread";
+    case "milestone":          return "opens_thread";
+    case "refinement":         return "refines_constant";
+    case "bridge":             return "unifies_approaches";
+    case "barrier":            return "reveals_barrier";
+    case "dead_end":           return "closes_thread";
+    case "open_direction":     return "open_direction";
+    default:                   return "opens_thread";
   }
 }
 
