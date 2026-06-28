@@ -67,6 +67,11 @@ export interface WikiSynthesisDeps {
   reviewerLlm?: SpineLLM;
   writerModel?: string;
   reviewerModel?: string;
+  /**
+   * When true, the writer and reviewer point at the same underlying model.
+   * Forwarded to reviewLoop → buildReviewerPrompt's self-review preamble.
+   */
+  selfReviewMode?: boolean;
   reviewBudget?: ReviewLoopBudget;
   estimateCost?: (model: string, tokens: { in: number; out: number }) => number;
   emitLog?: (m: string) => void;
@@ -76,6 +81,25 @@ export interface WikiSynthesisResult {
   pagesWritten: number;
   indexPath: string;
   pages: WikiPageWriteResult[];
+  /**
+   * One entry per page that went through the writer-reviewer loop, in the
+   * same {revisionCount, finalVerdict} shape that `efforts/<id>/effort.json`
+   * persists. Empty when no reviewer was configured.
+   *
+   * Pages that errored out of the loop (caught in maybeReview) are NOT in
+   * this list — they're handled like "review didn't run" and don't pollute
+   * the verdict accounting. Use the run logs to find them.
+   *
+   * Sourced by agent.ts → buildInitReport so the run report's
+   * `revisionsSummary` can aggregate effort + wiki review verdicts together
+   * (the report previously hard-coded `pageRevisions=[]` and lied to users
+   * about flagged/persistent counts).
+   */
+  pageReviewSummaries: Array<{
+    slug: string;
+    revisionCount: number;
+    finalVerdict: "approve" | "flagged_persistent" | "reviewer_broken";
+  }>;
 }
 
 export function wikiDir(projectDir: string): string {
@@ -99,6 +123,7 @@ export async function synthesizeWiki(
 
   const previouslyWrittenPageSummaries: Array<{ slug: string; title: string; summary: string }> = [];
   const pages: WikiPageWriteResult[] = [];
+  const pageReviewSummaries: WikiSynthesisResult["pageReviewSummaries"] = [];
   const planBySlug = new Map(input.plan.pages.map((p) => [p.slug, p]));
 
   for (let pageIndex = 0; pageIndex < order.length; pageIndex++) {
@@ -115,7 +140,8 @@ export async function synthesizeWiki(
       { llm: deps.llm, emitLog: log },
     );
 
-    await maybeReview(input, deps, page, planBySlug.get(page.slug)?.audience, log);
+    const review = await maybeReview(input, deps, page, planBySlug.get(page.slug)?.audience, log);
+    if (review) pageReviewSummaries.push(review);
 
     await persistPage(input.projectDir, page);
     pages.push(page);
@@ -134,7 +160,7 @@ export async function synthesizeWiki(
   await atomicWrite(indexPath, indexMarkdown.endsWith("\n") ? indexMarkdown : indexMarkdown + "\n");
 
   log(`Wiki synthesis complete: ${pages.length} pages + _index.md`);
-  return { pagesWritten: pages.length, indexPath, pages };
+  return { pagesWritten: pages.length, indexPath, pages, pageReviewSummaries };
 }
 
 // ── Review loop ──────────────────────────────────────────────────────────────
@@ -144,6 +170,12 @@ export async function synthesizeWiki(
  * `page.content`/`page.workspaceRefs`) when a separate reviewer model is
  * supplied. The audience hint comes from the WikiPlan page. Never throws —
  * a loop failure leaves the original draft untouched.
+ *
+ * Returns a structured summary (slug + revisionCount + finalVerdict) so the
+ * orchestrator can roll wiki review verdicts into the run report alongside
+ * effort revisions. Returns `undefined` when no reviewer was configured OR
+ * when the loop threw before producing a verdict — in both cases the page is
+ * NOT counted in revisionsSummary (use logs to find the thrown case).
  */
 async function maybeReview(
   input: WikiSynthesisInput,
@@ -151,8 +183,8 @@ async function maybeReview(
   page: WikiPageWriteResult,
   audienceHint: string | undefined,
   log: (m: string) => void,
-): Promise<void> {
-  if (!deps.reviewerLlm) return;
+): Promise<WikiSynthesisResult["pageReviewSummaries"][number] | undefined> {
+  if (!deps.reviewerLlm) return undefined;
   try {
     const result = await reviewLoop(
       {
@@ -165,6 +197,7 @@ async function maybeReview(
         audienceHint,
         writerModel: deps.writerModel ?? "writer",
         reviewerModel: deps.reviewerModel ?? "reviewer",
+        selfReviewMode: deps.selfReviewMode,
       },
       deps.reviewBudget ?? DEFAULT_REVIEW_LOOP_BUDGET,
       {
@@ -180,8 +213,16 @@ async function maybeReview(
       `[wiki-synthesis] review "${page.slug}": ${result.finalVerdict} ` +
         `(${result.revisionHistory.length - 1} rewrite(s), $${result.totalCostUsd.toFixed(3)})`,
     );
+    return {
+      slug: page.slug,
+      // revisionHistory length includes the initial draft review; rewrites = length - 1.
+      // We report length as "total reviews run" to match how effort.json stores it.
+      revisionCount: result.revisionHistory.length,
+      finalVerdict: result.finalVerdict,
+    };
   } catch (err) {
     log(`[wiki-synthesis] review "${page.slug}" failed: ${errMsg(err)}`);
+    return undefined;
   }
 }
 

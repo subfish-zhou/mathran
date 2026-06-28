@@ -798,6 +798,7 @@ async function runInitAgentSpine(
             reviewerLlm: effortsReviewerLLM,
             writerModel: modelPair.writerModel,
             reviewerModel: modelPair.reviewerModel,
+            selfReviewMode: modelPair.identical,
           },
         )
       : { efforts: [], edges: [] };
@@ -869,7 +870,7 @@ async function runInitAgentSpine(
     // ── Phase 4: spine_wiki ───────────────────────────────────────────────
     throwIfAborted();
     await appendPhase(projectDir, runId, "spine_wiki", "start");
-    const pages = input.aiInit.enableWiki
+    const wikiOut = input.aiInit.enableWiki
       ? await runWikiSynthesis({
           spine,
           reads: loopResult.reads,
@@ -882,9 +883,12 @@ async function runInitAgentSpine(
           reviewerLlm: wikiReviewerLLM,
           writerModel: modelPair.writerModel,
           reviewerModel: modelPair.reviewerModel,
+          selfReviewMode: modelPair.identical,
           emit,
         })
-      : [];
+      : { pages: [] as WikiPageOutput[], pageReviewSummaries: [] as import("./wiki-synthesis/index.js").WikiSynthesisResult["pageReviewSummaries"] };
+    const pages = wikiOut.pages;
+    const wikiPageReviewSummaries = wikiOut.pageReviewSummaries;
     const wikiPages = pages.map((p) => p.slug);
     summary.wikiPagesGenerated = wikiPages.length;
     await writeCheckpoint(projectDir, runId, "spine_wiki", { wikiPages });
@@ -946,6 +950,7 @@ async function runInitAgentSpine(
       unresolvedCitations: loopResult.unresolvedCitations,
       priorArt,
       convergence: loopResult.convergence,
+      wikiPageReviewSummaries,
     });
     await persistInitReport(projectDir, runId, report);
     printInitReport(report);
@@ -984,32 +989,83 @@ interface BuildReportArgs {
   accounting: LlmAccounting;
   reads: PaperRead[];
   efforts: WorkspaceEffortOutput[];
-  unresolvedCitations: Array<{ citedTitle?: string; whyImportant: string }>;
+  unresolvedCitations: Array<{ citedTitle?: string; whyImportant: string; doi?: string; venue?: string }>;
   /**
    * Prior-art corpus (or null when discovery didn't run or no provider was
    * configured). Used for canon-resolution reporting.
    */
   priorArt: PriorArtCorpus | null;
   convergence: { reason: string; totalRoundsRun: number };
+  /**
+   * Wiki review summaries (slug + revisionCount + finalVerdict) produced by
+   * wiki-synthesis. Empty when the reviewer wasn't wired, or when the wiki
+   * phase was resumed (the prior run's summaries weren't persisted to disk).
+   * Used to roll wiki review verdicts into revisionsSummary alongside the
+   * per-effort documentRevisions read from disk.
+   */
+  wikiPageReviewSummaries: import("./wiki-synthesis/index.js").WikiSynthesisResult["pageReviewSummaries"];
 }
 
 /**
- * Scan persisted effort.json files for a `revisionHistory` array (populated by
- * the writer-reviewer loop, W4b-γ). Forward-compatible: returns an empty list
- * today and reflects real revision counts once that loop lands. Never throws.
+ * Per-revision verdict shape used by `summarizeRevisions`. Sourced from
+ * `effort.json.documentRevisions[*].reviewerVerdict` and from the
+ * `pageReviewSummaries[*].finalVerdict` collected in-process by the
+ * wiki-synthesis pass.
  */
-async function collectRevisionCounts(projectDir: string, efforts: WorkspaceEffortOutput[]): Promise<number[]> {
-  const counts: number[] = [];
+type ArtifactReviewSummary = {
+  /** Total reviewer calls run for this artifact (initial draft + rewrites). */
+  revisionCount: number;
+  /** Final verdict reported by review-loop. */
+  finalVerdict: "approve" | "flagged_persistent" | "reviewer_broken";
+};
+
+/**
+ * Scan persisted effort.json files for the per-effort `documentRevisions`
+ * array that review-loop populates (see effort-synthesis/index.ts:66
+ * EffortDocumentRevision schema). Never throws.
+ *
+ * Final verdict heuristic for effort docs:
+ *   - last revision verdict='approve'           → approve
+ *   - last revision verdict='reviewer_broken'   → reviewer_broken
+ *   - otherwise (verdict='rewrite_requested' on the last revision = budget
+ *     ran out without an approve)                → flagged_persistent
+ *
+ * This matches how review-loop/index.ts.reviewLoop computes its own
+ * finalVerdict, so effort + wiki summaries align in revisionsSummary.
+ *
+ * Bug history: this function previously read `revisionHistory` (the
+ * in-memory ReviewLoopResult field), but effort.json stores the array under
+ * `documentRevisions` (see EffortDocumentRevision[]). The mismatch silently
+ * collapsed every report to avgRevisions=0 / maxRevisions=0 / flagged=0
+ * regardless of how the review loop actually went. Caught in
+ * dogfood-run-d79c820c42b7 (12 efforts, real verdicts split 7 approve /
+ * 5 flagged_persistent; report falsely showed 17 approve / 0 flagged /
+ * avgRevisions=0).
+ */
+async function collectEffortReviewSummaries(
+  projectDir: string,
+  efforts: WorkspaceEffortOutput[],
+): Promise<ArtifactReviewSummary[]> {
+  const summaries: ArtifactReviewSummary[] = [];
   for (const eff of efforts) {
     try {
       const raw = await fs.readFile(path.join(projectDir, "efforts", eff.id, "effort.json"), "utf-8");
-      const parsed = JSON.parse(raw) as { revisionHistory?: unknown };
-      if (Array.isArray(parsed.revisionHistory)) counts.push(parsed.revisionHistory.length);
+      const parsed = JSON.parse(raw) as {
+        documentRevisions?: Array<{ reviewerVerdict?: string }>;
+      };
+      const revs = Array.isArray(parsed.documentRevisions) ? parsed.documentRevisions : [];
+      if (revs.length === 0) continue;
+      const lastVerdict = revs[revs.length - 1]?.reviewerVerdict;
+      let finalVerdict: ArtifactReviewSummary["finalVerdict"];
+      if (lastVerdict === "approve") finalVerdict = "approve";
+      else if (lastVerdict === "reviewer_broken") finalVerdict = "reviewer_broken";
+      else finalVerdict = "flagged_persistent"; // rewrite_requested on last rev = budget exhausted
+      summaries.push({ revisionCount: revs.length, finalVerdict });
     } catch {
-      /* no effort.json or no revisionHistory — skip */
+      /* no effort.json or no documentRevisions — skip */
     }
   }
-  return counts;
+  return summaries;
 }
 
 /** Assemble the comprehensive InitAgentReport from run artifacts. */
@@ -1017,22 +1073,29 @@ async function buildInitReport(args: BuildReportArgs): Promise<InitAgentReport> 
   const {
     runId, projectSlug, projectDir, writerModel, reviewerModel,
     accounting, reads, efforts, unresolvedCitations, priorArt, convergence,
+    wikiPageReviewSummaries,
   } = args;
 
-  // Revisions summary — driven by per-effort revisionHistory persisted by the
-  // writer-reviewer loop (W4b-γ). The legacy reviewAndRefinePages/verifyPages
-  // path was removed; effortRevisions is now the sole source.
-  const effortRevisions = await collectRevisionCounts(projectDir, efforts);
-  const reviewedSlugs: string[] = [];
-  const flaggedPersistent = 0;
-  const pageRevisions: number[] = [];
-  const allRevisions = [...effortRevisions, ...pageRevisions];
+  // Revisions summary — combine per-effort documentRevisions (read from disk)
+  // with in-process wiki page review summaries (passed in from the orchestrator
+  // since wiki-synthesis doesn't persist its review history to disk).
+  const effortReviewSummaries = await collectEffortReviewSummaries(projectDir, efforts);
+  const allSummaries: ArtifactReviewSummary[] = [
+    ...effortReviewSummaries,
+    ...wikiPageReviewSummaries.map((s) => ({
+      revisionCount: s.revisionCount,
+      finalVerdict: s.finalVerdict,
+    })),
+  ];
 
-  const artifactsReviewed = efforts.length + reviewedSlugs.length;
-  const artifactsApproved = Math.max(0, artifactsReviewed - flaggedPersistent);
-  const sumRevisions = allRevisions.reduce((a, b) => a + b, 0);
+  const artifactsReviewed = allSummaries.length;
+  const artifactsApproved = allSummaries.filter((s) => s.finalVerdict === "approve").length;
+  const artifactsFlaggedPersistent = allSummaries.filter((s) => s.finalVerdict === "flagged_persistent").length;
+  const artifactsReviewerBroken = allSummaries.filter((s) => s.finalVerdict === "reviewer_broken").length;
+  const revisionCounts = allSummaries.map((s) => s.revisionCount);
+  const sumRevisions = revisionCounts.reduce((a, b) => a + b, 0);
   const avgRevisionsPerArtifact = artifactsReviewed > 0 ? sumRevisions / artifactsReviewed : 0;
-  const maxRevisionsAcrossArtifacts = allRevisions.length > 0 ? Math.max(...allRevisions) : 0;
+  const maxRevisionsAcrossArtifacts = revisionCounts.length > 0 ? Math.max(...revisionCounts) : 0;
 
   return {
     runId,
@@ -1044,13 +1107,16 @@ async function buildInitReport(args: BuildReportArgs): Promise<InitAgentReport> 
     revisionsSummary: {
       artifactsReviewed,
       artifactsApproved,
-      artifactsFlaggedPersistent: flaggedPersistent,
+      artifactsFlaggedPersistent,
+      artifactsReviewerBroken,
       avgRevisionsPerArtifact: Math.round(avgRevisionsPerArtifact * 100) / 100,
       maxRevisionsAcrossArtifacts,
     },
     unresolvedCitations: unresolvedCitations.map((u) => ({
       citedTitle: u.citedTitle ?? "(untitled)",
       whyImportant: u.whyImportant,
+      ...(u.doi ? { doi: u.doi } : {}),
+      ...(u.venue ? { venue: u.venue } : {}),
     })),
     unresolvedCanonicalLandmarks: (() => {
       const canon = priorArt?.canonicalLandmarks ?? [];
@@ -1265,9 +1331,14 @@ async function runWikiSynthesis(args: {
   reviewerLlm?: ReturnType<typeof makeSpineLLM>;
   writerModel?: string;
   reviewerModel?: string;
+  /** Forwarded to reviewLoop; see review-loop/reviewer.ts. */
+  selfReviewMode?: boolean;
   estimateCost?: (model: string, tokens: { in: number; out: number }) => number;
   emit: (e: SpinePipelineEvent) => void;
-}): Promise<WikiPageOutput[]> {
+}): Promise<{
+  pages: WikiPageOutput[];
+  pageReviewSummaries: import("./wiki-synthesis/index.js").WikiSynthesisResult["pageReviewSummaries"];
+}> {
   const emitLog = (m: string): void => args.emit({ type: "log", message: m });
 
   const plan = await outlineWikiPages(
@@ -1299,17 +1370,21 @@ async function runWikiSynthesis(args: {
       reviewerLlm: args.reviewerLlm,
       writerModel: args.writerModel,
       reviewerModel: args.reviewerModel,
+      selfReviewMode: args.selfReviewMode,
       estimateCost: args.estimateCost,
       emitLog,
     },
   );
 
-  return result.pages.map((p) => ({
-    slug: p.slug,
-    title: p.title,
-    content: p.content,
-    workspaceRefs: p.workspaceRefs,
-  }));
+  return {
+    pages: result.pages.map((p) => ({
+      slug: p.slug,
+      title: p.title,
+      content: p.content,
+      workspaceRefs: p.workspaceRefs,
+    })),
+    pageReviewSummaries: result.pageReviewSummaries,
+  };
 }
 
 /** Reconstruct wiki pages from persisted wiki/*.md (frontmatter-aware). */
@@ -1454,8 +1529,13 @@ export async function resumeInitAgent(
 
     // ── spine_wiki ────────────────────────────────────────────────────────
     let pages: WikiPageOutput[];
+    let wikiPageReviewSummaries: import("./wiki-synthesis/index.js").WikiSynthesisResult["pageReviewSummaries"] = [];
     if (done("spine_wiki")) {
       pages = await reloadPages(projectDir);
+      // No review summaries available when resuming past spine_wiki: the
+      // pageReviewSummaries weren't persisted by the original run, so the
+      // resumed report's revisionsSummary will be missing wiki contributions.
+      // Effort revisions are still re-collected from disk below.
     } else if (input.aiInit.enableWiki) {
       await appendPhase(projectDir, runId, "spine_wiki", "start", { resumed: true });
       // Reload the persisted prior-art corpus so the wiki writer still has the
@@ -1466,7 +1546,7 @@ export async function resumeInitAgent(
       // which preserves the prior behaviour.
       const { loadPriorArt } = await import("./prior-art/index.js");
       const reloadedPriorArt = await loadPriorArt(ctx.workspace, slug);
-      pages = await runWikiSynthesis({
+      const wikiOut = await runWikiSynthesis({
         spine,
         reads: await reloadReads(ctx.workspace),
         priorArt: reloadedPriorArt,
@@ -1478,8 +1558,11 @@ export async function resumeInitAgent(
         reviewerLlm: spineReviewerLLM,
         writerModel: modelPair.writerModel,
         reviewerModel: modelPair.reviewerModel,
+        selfReviewMode: modelPair.identical,
         emit,
       });
+      pages = wikiOut.pages;
+      wikiPageReviewSummaries = wikiOut.pageReviewSummaries;
       await writeCheckpoint(projectDir, runId, "spine_wiki", { wikiPages: pages.map((p) => p.slug) });
       await appendPhase(projectDir, runId, "spine_wiki", "end", { wikiPages: pages.length });
     } else {

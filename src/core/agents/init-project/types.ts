@@ -119,14 +119,45 @@ export interface InitAgentReport {
     estimatedTotalUsd: number;
     breakdownByPhase: Record<string, { calls: number; estimatedUsd: number }>;
   };
+  /**
+   * Summary of how the writer-reviewer loop converged across all artifacts.
+   * Sourced from `documentRevisions` arrays in each `effort.json` plus the
+   * wiki-synthesis review history (when present).
+   *
+   * Verdict accounting tracks the THREE possible review outcomes separately:
+   *   - artifactsApproved: reviewer explicitly approved (verdict='approve').
+   *   - artifactsFlaggedPersistent: reviewer kept requesting rewrites until
+   *     the maxRevisions/cost budget ran out (verdict still 'rewrite_requested'
+   *     on the last revision). The writer's draft is kept but flagged.
+   *   - artifactsReviewerBroken: the reviewer LLM never rendered an opinion
+   *     after one strict-format retry (parser failure or thrown exception);
+   *     surfaced honestly rather than silently approved. See review-loop/
+   *     reviewer.ts for the rationale of the separate verdict class.
+   *
+   * `artifactsReviewed = approved + flaggedPersistent + reviewerBroken`.
+   */
   revisionsSummary: {
     artifactsReviewed: number;
     artifactsApproved: number;
     artifactsFlaggedPersistent: number;
+    artifactsReviewerBroken: number;
     avgRevisionsPerArtifact: number;
     maxRevisionsAcrossArtifacts: number;
   };
-  unresolvedCitations: Array<{ citedTitle: string; whyImportant: string }>;
+  /**
+   * Citations the reading loop tried to resolve but could not ingest as a
+   * full PaperRead. Each entry includes `attemptedResolutions` (what was
+   * tried) and, when Crossref returned a match, a `doi` (and optionally
+   * `venue`) so the user can fetch the source manually. The wiki bibliography
+   * uses these as a "see this reference at" hint when an `\\ref{lmm:...}`
+   * resolves to no in-corpus paper.
+   */
+  unresolvedCitations: Array<{
+    citedTitle: string;
+    whyImportant: string;
+    doi?: string;
+    venue?: string;
+  }>;
   /**
    * Canonical landmark papers the LLM named that we could NOT resolve to an
    * arxiv id (and thus could NOT auto-ingest into the paper-graph). Split into:
