@@ -143,17 +143,84 @@ function titleJaccard(a: string, b: string): number {
   return union === 0 ? 0 : inter / union;
 }
 
-const MATCH_THRESHOLD = 0.5;
+/**
+ * Reduce a paperId to a canonical token so cross-prefix matching works.
+ *
+ * Pre-fix: Run 13 reconcile matched 0/10 hypothesis nodes because the
+ * hypothesis prompt encouraged the LLM to cite canon papers by DOI
+ * (`doi:10.1007/bf02403921`) while the reading-loop later ingested the
+ * same paper under its arxiv id (`arxiv-math_0209360`). The two id
+ * spaces never intersected, so reconcile fell through to title-Jaccard
+ * which the LLM's hypothesis titles also missed (different phrasing
+ * from the real spine's promoted titles).
+ *
+ * Normalization rules:
+ *   - lowercase
+ *   - strip a leading `arxiv-`, `arxiv:`, `arxiv `, `doi:`, `crossref:`
+ *   - convert separators `[-:_./ ]` to nothing so `math_0209360` ==
+ *     `math/0209360` == `math.0209360` (arxiv old/new identifiers)
+ *
+ * Returns an empty string for an empty input (caller filters those out).
+ */
+function normalizePaperId(id: string): string {
+  if (!id) return "";
+  let s = id.trim().toLowerCase();
+  s = s.replace(/^(arxiv[-:\s]|doi:|crossref:)/, "");
+  s = s.replace(/[\s\-:_./]/g, "");
+  return s;
+}
+
+const MATCH_THRESHOLD_TITLE = 0.25;
 
 /**
  * For each hypothesis node, find the best-matching real spine node (or null).
- * Match heuristic: substring containment OR Jaccard ≥ MATCH_THRESHOLD on
- * lowercased title tokens.
+ *
+ * Two-stage match (2026-06-28, fix #3 from run-13-audit):
+ *   1. PAPER-ID INTERSECTION first. If any of hyp.expectedPaperIds shares a
+ *      normalized form with any of realNode.paperIds, that's a direct
+ *      grounding signal — much stronger than title proximity. Pick whichever
+ *      real node has the largest intersection (ties → first by insertion
+ *      order). A single shared id is enough to win against a no-id match.
+ *   2. TITLE PROXIMITY fallback. If no paperId intersection exists, fall
+ *      back to title substring containment / Jaccard with a lower threshold
+ *      (0.25 vs the old 0.5) since real-spine titles are typically more
+ *      verbose than hypothesis titles ("Brun's sieve and combinatorial
+ *      sieves" vs "Brun sieve" — Jaccard 0.33).
+ *
+ * Author + year boosts apply in both stages.
  */
 function findBestMatch(
   hyp: HypothesisSpineNode,
   realNodes: SpineNode[],
 ): SpineNode | null {
+  // Stage 1: paperId intersection. Normalize once.
+  const hypIds = new Set(
+    hyp.expectedPaperIds.map(normalizePaperId).filter((s) => s.length > 0),
+  );
+  if (hypIds.size > 0) {
+    let bestByIds: { node: SpineNode; intersection: number; tieBreaker: number } | null = null;
+    for (const r of realNodes) {
+      let intersection = 0;
+      for (const rid of r.paperIds) {
+        if (hypIds.has(normalizePaperId(rid))) intersection++;
+      }
+      if (intersection === 0) continue;
+      // Tie-break with title jaccard then year-match so a 1-id tie prefers
+      // the realNode whose title also looks like the hypothesis.
+      const tieBreaker =
+        titleJaccard(hyp.title, r.title) + (hyp.year != null && r.year === hyp.year ? 0.1 : 0);
+      if (
+        bestByIds == null ||
+        intersection > bestByIds.intersection ||
+        (intersection === bestByIds.intersection && tieBreaker > bestByIds.tieBreaker)
+      ) {
+        bestByIds = { node: r, intersection, tieBreaker };
+      }
+    }
+    if (bestByIds) return bestByIds.node;
+  }
+
+  // Stage 2: title proximity (substring containment OR Jaccard ≥ threshold).
   let best: { node: SpineNode; score: number } | null = null;
   for (const r of realNodes) {
     let score = 0;
@@ -163,11 +230,10 @@ function findBestMatch(
       score = Math.max(score, 0.75);
     }
     score = Math.max(score, titleJaccard(hyp.title, r.title));
-    // Author + year boost when both align.
     if (hyp.year != null && r.year === hyp.year) score += 0.1;
     if (best == null || score > best.score) best = { node: r, score };
   }
-  return best && best.score >= MATCH_THRESHOLD ? best.node : null;
+  return best && best.score >= MATCH_THRESHOLD_TITLE ? best.node : null;
 }
 
 export interface ReconcileSpinesInput {

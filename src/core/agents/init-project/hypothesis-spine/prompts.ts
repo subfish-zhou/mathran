@@ -103,6 +103,7 @@ export function buildHypothesisSpinePrompt(input: BuildHypothesisSpinePromptInpu
     `  - Era names: NARRATIVE ARCS not date brackets ("First-wave combinatorial sieve" not "1920-1973").`,
     `  - Thread names: name the intellectual MOVE, not the topic.`,
     `  - expectedPaperIds MUST come from the canon / survey paperId lists above. Do NOT invent ids.`,
+    `  - When a paper has BOTH an arxiv id and a doi listed, PREFER the arxiv form (e.g. \`arxiv-1510.04145\` over \`doi:10.1145/xxx\`) because that's the id space the reading-loop uses for ingestion. Only use \`doi:...\` when no arxiv id is available.`,
     `  - 4-12 nodes, 2-5 eras, 1-4 threads, 0-5 open_questions. Stay focused.`,
     `  - When uncertain, ERR ON THE SIDE OF FEWER NODES — reconcile is more useful when each hypothesis is testable.`,
     `  - Every node id must appear in at least one era and at least one thread.`,

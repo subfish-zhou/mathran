@@ -273,4 +273,130 @@ describe("reconcileSpines", () => {
     expect(n.matchedSpineNodeId).toBe("real-1");
     expect(r.summary.refined).toBeGreaterThanOrEqual(1);
   });
+
+  // ── fix #3 from run-13-audit: paper-id intersection + cross-prefix normalization ──
+
+  it("matches by paper-id intersection even when titles are very different", () => {
+    // Hypothesis title is generic, real spine title is verbose & specific.
+    // Pre-fix this matched 0 (Jaccard 0.10 < 0.5). Post-fix the shared
+    // paper-id forces a match regardless of title.
+    const local: HypothesisSpine = {
+      ...hyp,
+      nodes: [{
+        id: "hyp-paperid", type: "milestone",
+        title: "Sieve",
+        statement: "some result that is long enough to trigger the substring-similarity check",
+        significance: "x",
+        depth: "major",
+        expectedPaperIds: ["arxiv-math_0209360"],
+        confidence: "hypothesis",
+      }],
+    };
+    const local_real: NarrativeSpine = {
+      ...realSpine,
+      nodes: [{
+        id: "real-X", type: "milestone",
+        title: "A long verbose specific title that shares no tokens with the hypothesis Sieve",
+        statement: "some result that is long enough to trigger the substring-similarity check",
+        significance: "x", paperIds: ["arxiv-math_0209360"], effortIds: [], depth: "major",
+      }],
+    };
+    const r = reconcileSpines({
+      hypothesis: local, realSpine: local_real,
+      readPaperIds: new Set(["arxiv-math_0209360"]), rejectedPaperIds: new Set(),
+    });
+    const n = r.reconciled.nodes[0];
+    expect(n.matchedSpineNodeId).toBe("real-X");
+    expect(n.confidence).toBe("verified");
+  });
+
+  it("normalizes id prefixes (doi:foo vs arxiv-foo vs raw foo) so cross-store ids match", () => {
+    // Run-13 actual case: hypothesis cites by doi, real spine has arxiv id.
+    // Pre-fix: 0 matched. Post-fix: normalized form bridges them.
+    const local: HypothesisSpine = {
+      ...hyp,
+      nodes: [{
+        id: "hyp-doi", type: "foundation", title: "Hardy-Littlewood",
+        statement: "circle-method singular series",
+        significance: "x", depth: "foundational",
+        expectedPaperIds: ["doi:10.1007/bf02403921"],
+        confidence: "hypothesis",
+      }],
+    };
+    const local_real: NarrativeSpine = {
+      ...realSpine,
+      nodes: [{
+        id: "real-Y", type: "foundation",
+        title: "Some paper that the spine builder gave a different title to",
+        statement: "circle-method singular series",
+        significance: "x",
+        paperIds: ["arxiv-10.1007/bf02403921"],
+        effortIds: [], depth: "foundational",
+      }],
+    };
+    const r = reconcileSpines({
+      hypothesis: local, realSpine: local_real,
+      readPaperIds: new Set(["arxiv-10.1007/bf02403921"]), rejectedPaperIds: new Set(),
+    });
+    expect(r.reconciled.nodes[0].matchedSpineNodeId).toBe("real-Y");
+  });
+
+  it("title-Jaccard fallback at 0.25 catches near-matches the old 0.5 threshold dropped", () => {
+    // Pre-fix Run 13: "Brun sieve and almost-prime Goldbach substitutes" vs
+    // "Brun's sieve and combinatorial sieves" — jaccard 0.33, below 0.5,
+    // not matched. Now at 0.25, this matches.
+    const local: HypothesisSpine = {
+      ...hyp,
+      nodes: [{
+        id: "hyp-near", type: "foundation",
+        title: "Brun sieve and almost-prime Goldbach substitutes",
+        statement: "sieve substitute",
+        significance: "x", depth: "foundational",
+        expectedPaperIds: [],
+        confidence: "hypothesis",
+      }],
+    };
+    const local_real: NarrativeSpine = {
+      ...realSpine,
+      nodes: [{
+        id: "real-Z", type: "foundation",
+        title: "Brun's sieve and combinatorial sieves",
+        statement: "sieve substitute",
+        significance: "x",
+        paperIds: ["arxiv-math_0209360"], effortIds: [], depth: "foundational",
+      }],
+    };
+    const r = reconcileSpines({
+      hypothesis: local, realSpine: local_real,
+      readPaperIds: new Set(), rejectedPaperIds: new Set(),
+    });
+    expect(r.reconciled.nodes[0].matchedSpineNodeId).toBe("real-Z");
+  });
+
+  it("prefers the real node with the LARGEST paper-id intersection (multi-id hypothesis)", () => {
+    const local: HypothesisSpine = {
+      ...hyp,
+      nodes: [{
+        id: "hyp-multi", type: "milestone", title: "A",
+        statement: "x", significance: "x", depth: "major",
+        expectedPaperIds: ["arxiv-A", "arxiv-B", "arxiv-C"],
+        confidence: "hypothesis",
+      }],
+    };
+    const local_real: NarrativeSpine = {
+      ...realSpine,
+      nodes: [
+        { id: "real-1id", type: "milestone", title: "x", statement: "x", significance: "x",
+          paperIds: ["arxiv-A"], effortIds: [], depth: "major" },
+        { id: "real-2ids", type: "milestone", title: "x", statement: "x", significance: "x",
+          paperIds: ["arxiv-B", "arxiv-C"], effortIds: [], depth: "major" },
+      ],
+    };
+    const r = reconcileSpines({
+      hypothesis: local, realSpine: local_real,
+      readPaperIds: new Set(["arxiv-B"]), rejectedPaperIds: new Set(),
+    });
+    // real-2ids wins on intersection size (2 vs 1).
+    expect(r.reconciled.nodes[0].matchedSpineNodeId).toBe("real-2ids");
+  });
 });
