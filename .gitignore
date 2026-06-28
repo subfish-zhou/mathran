@@ -77,3 +77,6 @@ PROMPT-W-*.md
 PROMPT-WORKER-*.md
 PROMPT-W-*.md
 DESIGN-REFERENCE.md
+
+# Hermes local workspace
+.hermes/

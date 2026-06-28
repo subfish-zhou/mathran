@@ -277,7 +277,8 @@ async function extractNodeCandidates(
     });
 
     try {
-      const raw = await llm(prompt, { temperature: 0.2, maxTokens: 4000 });
+      // No maxTokens override — see build-spine-from-reads.ts for rationale.
+      const raw = await llm(prompt, { temperature: 0.2 });
       const parsed = extractSpineJSON<{ nodes?: Array<Record<string, unknown>> }>(raw);
 
       if (parsed && Array.isArray(parsed.nodes)) {
@@ -367,7 +368,11 @@ async function assembleSpineStructure(
 
   let parsed: Record<string, unknown> = {};
   try {
-    const raw = await llm(prompt, { temperature: 0.3, maxTokens: 6000 });
+    // No maxTokens override — assembly emits the whole story over N candidate
+    // nodes; arbitrary cap silently truncates JSON. Same fix as the v3
+    // buildSpineFromReads path. See dogfood-run-d79c820c42b7 for the
+    // shallow-fallback collapse this prevents.
+    const raw = await llm(prompt, { temperature: 0.3 });
     parsed = extractSpineJSON<Record<string, unknown>>(raw) ?? {};
   } catch (err) {
     emit({ type: "log", message: `Spine assembly LLM failed: ${errMsg(err)}` });

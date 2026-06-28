@@ -433,7 +433,9 @@ export async function runInitAgent(
           instruction:
             "Write the project home page: introduce the problem, summarize its background and current status, and survey the key references and approaches found. Provide a roadmap of the research landscape.",
         }),
-        { temperature: 0.3, maxTokens: 3000 },
+        // No maxTokens — full markdown home page can be long; let the
+        // provider use its model cap. Same fix class as spine/reviewer/etc.
+        { temperature: 0.3 },
       );
       await appendLog(projectDir, runId, "llm_call", "wiki index generation", { chars: indexBody.length });
     } catch (err) {

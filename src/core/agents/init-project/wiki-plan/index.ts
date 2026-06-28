@@ -87,7 +87,11 @@ export async function outlineWikiPages(
 
   let parsed: Record<string, unknown> = {};
   try {
-    const raw = await deps.llm(prompt, { temperature: 0.4, maxTokens: 4000 });
+    // No maxTokens override — plan output is a JSON tree of N wiki pages with
+    // titles/audiences/key topics; capping at 4K silently truncates mid-array,
+    // leaves wiki-plan with fewer pages than intended. Same fix class as
+    // spine builders + reviewer + rewriter.
+    const raw = await deps.llm(prompt, { temperature: 0.4 });
     parsed = extractSpineJSON<Record<string, unknown>>(raw) ?? {};
   } catch (err) {
     log(`Wiki outline LLM failed: ${errMsg(err)}`);

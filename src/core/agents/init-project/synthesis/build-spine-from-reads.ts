@@ -132,12 +132,26 @@ export async function buildSpineFromReads(
       batch,
     );
     try {
-      const raw = await deps.llm(prompt, { temperature: 0.2, maxTokens: 6000 });
+      // No maxTokens override: the prompt above asks the LLM to emit ONE node
+      // per important result over up to NODE_EXTRACTION_BATCH=25 papers, and
+      // each node carries a verbatim LaTeX statement + 2-3-sentence
+      // significance + suggested edges. A 14-paper batch can easily blow past
+      // an arbitrary 6000-token cap mid-JSON, returning truncated output that
+      // extractSpineJSON rejects → candidates=[] → silent shallow-fallback for
+      // EVERY node in the spine (dogfood-run-d79c820c42b7: 12/12 shallow,
+      // years lost, downstream prose quality collapses). Letting the provider
+      // use its model cap (128K for gpt-5.5) is the same fix shipped for
+      // canonical-landmarks-search.ts (c246c45) and review-loop/reviewer.ts.
+      const raw = await deps.llm(prompt, { temperature: 0.2 });
       const parsed = extractSpineJSON<{ nodes?: Array<Record<string, unknown>> }>(raw);
       if (parsed && Array.isArray(parsed.nodes)) {
         for (const rawNode of parsed.nodes) {
           candidates.push(coerceCandidate(rawNode, candidates.length, statementIndex));
         }
+      } else {
+        log(
+          `Node extraction batch ${i + 1} returned no parseable nodes (raw length=${raw?.length ?? 0}); first 200 chars: ${(raw ?? "").slice(0, 200).replace(/\n/g, " ")}`,
+        );
       }
     } catch (err) {
       log(`Node extraction batch ${i + 1} failed: ${errMsg(err)}`);
@@ -185,8 +199,15 @@ export async function buildSpineFromReads(
 
   let assembly: Record<string, unknown> = {};
   try {
-    const raw = await deps.llm(assemblyPrompt, { temperature: 0.3, maxTokens: 6000 });
+    // Same maxTokens fix as node-extraction above — assembly emits an entire
+    // story (global_thesis + eras + edges + threads + open_questions) over up
+    // to 25+ candidate nodes; arbitrary 6000-token cap silently truncates the
+    // JSON and yields {} which then leaves the spine without eras/threads.
+    const raw = await deps.llm(assemblyPrompt, { temperature: 0.3 });
     assembly = extractSpineJSON<Record<string, unknown>>(raw) ?? {};
+    if (!assembly || Object.keys(assembly).length === 0) {
+      log(`Spine assembly returned no parseable JSON (raw length=${raw?.length ?? 0}); first 200 chars: ${(raw ?? "").slice(0, 200).replace(/\n/g, " ")}`);
+    }
   } catch (err) {
     log(`Spine assembly failed: ${errMsg(err)}`);
   }

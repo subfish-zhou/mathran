@@ -39,7 +39,12 @@ export async function rewriteArtifact(
   const emit = deps.emitLog ?? (() => {});
   const prompt = buildRewriterPrompt(input);
   try {
-    const raw = await writerLlm(prompt, { temperature: 0.4, maxTokens: 8000 });
+    // No maxTokens override — rewriter emits a FULL revised artifact (effort
+    // document / README / wiki page). 8K cap looks generous but a long effort
+    // doc plus the issue list can exceed it; truncated rewrites return
+    // mid-section markdown that then fails the next review pass for
+    // structural reasons (missing trailing sections), spinning the loop.
+    const raw = await writerLlm(prompt, { temperature: 0.4 });
     const rewritten = stripFullDocumentFence(raw.trim());
     if (rewritten.length === 0) {
       emit("[review-loop] rewriter returned empty content; keeping original draft");

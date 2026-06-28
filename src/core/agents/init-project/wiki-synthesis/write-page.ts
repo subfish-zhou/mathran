@@ -140,7 +140,11 @@ export async function writeWikiPage(
 
   let body: string;
   try {
-    body = (await deps.llm(prompt, { temperature: 0.3, maxTokens: 4000 })).trim();
+    // No maxTokens override — wiki pages can be long (the prompt asks for a
+    // full markdown article: intro, sections, formulas, refs). Arbitrary 4K
+    // caps quietly truncate mid-section; let the provider use the model's
+    // real ceiling. Same fix shipped for spine builders + reviewer.
+    body = (await deps.llm(prompt, { temperature: 0.3 })).trim();
   } catch (err) {
     const msg = errMsg(err);
     log(`Wiki page "${page.slug}" generation failed: ${msg}`);
