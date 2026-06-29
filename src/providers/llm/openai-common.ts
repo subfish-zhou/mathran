@@ -96,7 +96,25 @@ export function buildOpenAIParams(req: LLMRequest, model: string): any {
     stream_options: { include_usage: true },
   };
   if (req.temperature !== undefined) params.temperature = req.temperature;
-  if (req.maxTokens !== undefined) params.max_tokens = req.maxTokens;
+  // GPT-5 / o-series / Azure GPT-5 deployments dropped `max_tokens` and only
+  // accept `max_completion_tokens`. Detect by model-name pattern: anything
+  // that looks like a gpt-5*, o1*, o3*, o4*, or our Azure `gpt55` deployment
+  // gets the new parameter name. Everything else (gpt-4, gpt-4o, etc.)
+  // keeps the historical `max_tokens` for backward compatibility.
+  //
+  // 2026-06-29 (run-14 follow-up): caught by Azure deployment `gpt55`
+  // returning HTTP 400 `unsupported_parameter: 'max_tokens' is not supported
+  // with this model. Use 'max_completion_tokens' instead.`
+  if (req.maxTokens !== undefined) {
+    const m = (model || "").toLowerCase();
+    const isCompletionTokensModel =
+      /^gpt-5/.test(m) || /^o[1-9]/.test(m) || /(^|[\/-])gpt5/.test(m);
+    if (isCompletionTokensModel) {
+      params.max_completion_tokens = req.maxTokens;
+    } else {
+      params.max_tokens = req.maxTokens;
+    }
+  }
   if (req.tools && req.tools.length > 0) {
     params.tools = req.tools.map((t) => ({
       type: "function",
