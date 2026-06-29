@@ -22,6 +22,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
+import { stripFrontmatter } from "../lib/markdown.ts";
 import { detectWikiRefs, type WikiRef } from "../lib/wiki-ref-detector.ts";
 
 export interface BubbleMarkdownWithRefsProps {
@@ -123,7 +124,11 @@ export function BubbleMarkdownWithRefs(
   const rootRef = useRef<HTMLDivElement>(null);
 
   const html = useMemo(() => {
-    let refs = detectWikiRefs(props.text);
+    // 2026-06-29: peel YAML frontmatter so effort document.md / any
+    // file fetched verbatim with a `---\n…\n---` header doesn't render
+    // its metadata as a `<p>` of "id: ... title: ...".
+    const text = stripFrontmatter(props.text);
+    let refs = detectWikiRefs(text);
     // When projectSlug is missing we can't resolve relative refs, so
     // drop wiki / ws kinds and keep only paper-read (which becomes an
     // absolute arxiv/doi URL).
@@ -140,7 +145,7 @@ export function BubbleMarkdownWithRefs(
         unresolvable.add(i);
       }
     });
-    const rewritten = rewriteRefs(props.text, props.projectSlug ?? "", refs, unresolvable);
+    const rewritten = rewriteRefs(text, props.projectSlug ?? "", refs, unresolvable);
     return safeRenderMarkdown(rewritten);
   }, [props.text, props.projectSlug, props.knownPages, props.knownEfforts]);
 

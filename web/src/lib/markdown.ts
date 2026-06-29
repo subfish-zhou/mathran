@@ -23,6 +23,87 @@ import markedKatex from "marked-katex-extension";
 import "katex/dist/katex.min.css";
 
 /**
+ * Strip YAML frontmatter from the start of a markdown string. Convention:
+ *
+ *   ---
+ *   key: value
+ *   ---
+ *   # actual markdown body…
+ *
+ * Wiki pages already have frontmatter peeled off server-side (the API
+ * returns `body` + `frontmatter` separately), but effort document.md
+ * files are fetched verbatim. Without stripping, the yaml block
+ * renders as one ugly `<p>` "id: ... title: ...".
+ *
+ * Rules:
+ *   - Must start at the very first character (no leading whitespace) so
+ *     we never accidentally eat a mid-document thematic break (`---`).
+ *   - Closing `---` must live on its own line.
+ *   - If no closing fence we return the input unchanged (better an
+ *     ugly preview than a silently truncated document).
+ */
+export function stripFrontmatter(src: string): string {
+  if (!src || typeof src !== "string") return src;
+  if (!src.startsWith("---")) return src;
+  const m = src.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
+  if (!m) return src;
+  return src.slice(m[0].length);
+}
+
+/**
+ * Heading-attribute syntax: `## Heading {#my-id}` → `<h2 id="my-id">…`.
+ *
+ * Pandoc / Hugo / Jekyll / Obsidian wiki style. mathran's init-project
+ * writes these so cross-effort `@ws:effort-id#section-anchor` refs can
+ * jump to the right H2. Default marked doesn't recognise the suffix,
+ * so it renders as literal "{#section-name}" text after the heading.
+ *
+ * We register a marked extension that:
+ *  - matches `(#+\s+heading text\s+)\{#([a-z0-9._-]+)\}\s*$` on each
+ *    heading line
+ *  - emits the same HTML marked would have, but with the explicit `id`
+ *    attribute injected
+ *
+ * The `{#…}` syntax is also stripped from non-heading paragraphs the
+ * same way for symmetry (e.g. a bullet with a trailing `{#xx}` that
+ * the model emits to be link-targetable).
+ *
+ * Anchor charset matches our SAFE_SLUG_PATTERN cousin: lowercase
+ * alphanumerics, `-`, `_`, `.`.
+ */
+function preprocessHeadingAnchors(input: string): string {
+  if (!input || typeof input !== "string") return input;
+  if (!input.includes("{#")) return input; // fast path
+  // Mask code fences + inline code so we never rewrite anchor-looking
+  // text inside literal samples.
+  const placeholders: string[] = [];
+  const MASK = (s: string): string => {
+    const idx = placeholders.push(s) - 1;
+    return `\u0000ANCHORMASK_${idx}\u0000`;
+  };
+  let masked = input.replace(/```[\s\S]*?```/g, MASK);
+  masked = masked.replace(/(^|[^`])(`+)(?!`)([\s\S]*?[^`])\2(?!`)/g, (_m, pre, ticks, body) =>
+    pre + MASK(`${ticks}${body}${ticks}`),
+  );
+  // Heading line: `## title {#anchor}` → store the id by inlining an
+  // anchor placeholder marked picks up as raw HTML inside the heading.
+  // marked passes through inline raw HTML by default, and an empty
+  // `<a id="..."></a>` plus the heading text gives us the same scroll
+  // target as a real `id` attribute on `<h2>`.
+  masked = masked.replace(
+    /^(#{1,6}[ \t]+)(.+?)[ \t]+\{#([a-z0-9._-]+)\}[ \t]*$/gm,
+    (_m, hashes, text, anchor) => `${hashes}<a id="${anchor}"></a>${text}`,
+  );
+  // Stray inline `{#anchor}` outside headings: strip silently so it
+  // doesn't bleed into rendered text. The id is lost but the prose
+  // stays clean. (Could also wrap as `<a id="…"></a>` — chose strip
+  // because non-heading anchors are rare and noisy when wrong.)
+  masked = masked.replace(/[ \t]*\{#[a-z0-9._-]+\}/g, "");
+  masked = masked.replace(/\u0000ANCHORMASK_(\d+)\u0000/g, (_m, idx) => placeholders[Number(idx)]);
+  return masked;
+}
+
+/**
  * Normalise LLM-flavoured math delimiters to the `$...$` / `$$...$$`
  * forms that `marked-katex-extension` recognises.
  *
@@ -101,7 +182,7 @@ export function ensureMarkdownConfigured(): void {
   marked.use({
     hooks: {
       preprocess(markdown: string) {
-        return preprocessMath(markdown);
+        return preprocessMath(preprocessHeadingAnchors(markdown));
       },
     },
   });
