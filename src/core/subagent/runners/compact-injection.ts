@@ -34,8 +34,25 @@ export const DAEMON_USER_PREFIX = "[daemon:";
  * sync with `COMPACT_SUMMARY_PREFIX` exported from compact.ts. Hardcoded
  * here as a string literal to avoid an import cycle (compact.ts will
  * import from this file in C5).
+ *
+ * 2026-06-29 — upgraded to codex-parity handoff framing. The legacy
+ * prefix is kept in `LEGACY_COMPACT_SUMMARY_PREFIXES` so the detector
+ * still recognises summaries persisted before this change (otherwise
+ * those rounds would be re-summarised on every subsequent compaction).
  */
-export const COMPACT_SUMMARY_PREFIX = "<Previous conversation summary>\n\n";
+export const COMPACT_SUMMARY_PREFIX =
+  "<Previous conversation summary — another language model started this " +
+  "task; use it to continue without duplicating work>\n\n";
+
+/**
+ * Legacy summary prefixes recognised by the `is_summary_message` detector
+ * for back-compat with conversations that contain summary items written
+ * by older compact runners. New summaries always use the latest
+ * `COMPACT_SUMMARY_PREFIX` value above.
+ */
+const LEGACY_COMPACT_SUMMARY_PREFIXES: readonly string[] = [
+  "<Previous conversation summary>\n\n",
+];
 
 /**
  * Predicate: is this message a *real* user message — i.e. not a compaction
@@ -50,6 +67,11 @@ export function isRealUser(msg: LLMMessage): boolean {
   if (msg.role !== "user") return false;
   const c = typeof msg.content === "string" ? msg.content : "";
   if (c.startsWith(COMPACT_SUMMARY_PREFIX)) return false;
+  // back-compat: recognise pre-2026-06-29 summary prefixes so re-compaction
+  // doesn't re-summarise old summary blocks.
+  for (const legacy of LEGACY_COMPACT_SUMMARY_PREFIXES) {
+    if (c.startsWith(legacy)) return false;
+  }
   if (c.startsWith(DAEMON_USER_PREFIX)) return false;
   return true;
 }

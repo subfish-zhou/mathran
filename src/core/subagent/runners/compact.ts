@@ -44,16 +44,35 @@ export const DEFAULT_CONTEXT_WINDOW = 200_000;
 /** Soft cap on the produced summary (in tokens, advisory only). */
 export const DEFAULT_SUMMARY_TARGET_TOKENS = 1500;
 
+/**
+ * Compaction summary prompt — codex-parity handoff framing.
+ *
+ * Originally ours read "Summarize ... Key facts / Decisions / Current state /
+ * Anything committed to. Keep under 1500 tokens. Use third-person past tense."
+ * Codex (codex-rs/prompts/templates/compact/prompt.md) frames the same call
+ * as a *handoff to another LLM that will resume the task* — this framing
+ * empirically yields handoffs that the resuming model can pick up without
+ * losing track of work-in-flight. We adopt their wording verbatim and tack
+ * on the size hint that the older mathran prompt enforced.
+ *
+ * 2026-06-29: aligned with codex commit a7b6bae.
+ */
 export const COMPACT_PROMPT_HEADER =
-  "Summarize the following conversation history into a compact paragraph " +
-  "capturing:\n" +
-  "- Key facts established\n" +
-  "- Decisions made\n" +
-  "- Current state / open threads\n" +
-  "- Anything the assistant has committed to\n" +
-  "Keep under 1500 tokens. Use third-person past tense.";
+  "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff " +
+  "summary for another LLM that will resume the task.\n" +
+  "\n" +
+  "Include:\n" +
+  "- Current progress and key decisions made\n" +
+  "- Important context, constraints, or user preferences\n" +
+  "- What remains to be done (clear next steps)\n" +
+  "- Any critical data, examples, or references needed to continue\n" +
+  "\n" +
+  "Be concise, structured, and focused on helping the next LLM " +
+  "seamlessly continue the work. Keep the summary under ~1500 tokens.";
 
-export const COMPACT_SUMMARY_PREFIX = "<Previous conversation summary>\n\n";
+export const COMPACT_SUMMARY_PREFIX =
+  "<Previous conversation summary — another language model started this " +
+  "task; use it to continue without duplicating work>\n\n";
 
 export interface CompactRunnerInput {
   /** Full message history (including system). */

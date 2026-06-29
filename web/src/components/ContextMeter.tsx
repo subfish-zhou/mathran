@@ -62,6 +62,16 @@ export interface ContextMeterProps {
   warning: string | null;
   /** Percentage that the server already computed; we trust it but clamp for the bar. */
   percentage?: number;
+  /**
+   * 2026-06-29 — absolute compaction trigger in tokens, when the chat
+   * scope uses codex-parity `absoluteThresholdTokens` instead of a
+   * thresholdPct of the context window (currently azure/gpt55 — see
+   * server/serve.ts computeUsageStats). When present, this is the
+   * boundary the bar fills to 100% at, and it is also the value shown
+   * in the label after "/ … compact". Absent → fall back to the
+   * 0.75 × contextWindow heuristic.
+   */
+  compactAtTokens?: number;
   /** Optional small loading-state hint shown when no fetch has landed yet. */
   loading?: boolean;
 }
@@ -85,13 +95,21 @@ export default function ContextMeter({
   contextWindow,
   warning,
   percentage,
+  compactAtTokens,
   loading,
 }: ContextMeterProps) {
   // TODO-3 #4.G — re-anchor the meter on the compaction threshold so
   // 100% means "next send() triggers compaction". Without this rebase
   // a healthy long goal at 50% of a 922K real cap looked alarmingly
   // empty even though it was actually 67% of the way to compaction.
-  const effectiveCap = contextWindow * COMPACTION_THRESHOLD_FRACTION;
+  //
+  // 2026-06-29 — server may now send `compactAtTokens` (absolute, from
+  // codex-parity `absoluteThresholdTokens`). When present use it as
+  // the effective cap; otherwise fall back to 0.75 × contextWindow.
+  const effectiveCap =
+    typeof compactAtTokens === "number" && compactAtTokens > 0
+      ? compactAtTokens
+      : contextWindow * COMPACTION_THRESHOLD_FRACTION;
   const pct = typeof percentage === "number"
     ? percentage
     : (effectiveCap > 0 ? (tokens / effectiveCap) * 100 : 0);

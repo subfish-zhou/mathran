@@ -3480,6 +3480,7 @@ export default function ChatPanel({
               contextWindow={usage.contextWindow}
               warning={usage.warning}
               percentage={usage.percentage}
+              compactAtTokens={usage.compactAtTokens}
             />
             {/* v0.16 §8: tiny token-usage sparkline. Shows the trajectory of
                 this chat's token count across recent refreshes — lets you

@@ -23,6 +23,16 @@
 const HARDCODED_FALLBACK: Record<string, { contextWindow: number; maxOutput: number }> = {
   // === gpt-5 family ===
   "gpt-5.5":               { contextWindow: 922_000, maxOutput: 128_000 },
+  // 2026-06-29 — Mathub's Azure GPT-5.5 deployment is exposed as bare
+  // model name `gpt55` (no dot). We cap mathran's view of it at 256K
+  // even though the deployment's raw cap is 922K (verified via probe),
+  // because subfish wants compaction to trigger at 256K active context
+  // — past that the recall quality of GPT-5.5 drops noticeably and the
+  // OpenAI 272K soft-cap also kicks in 2x input / 1.5x output pricing.
+  // Setting contextWindow=256K + autoCompact threshold at 100% of cap
+  // (codex-style absolute threshold) means "compact when active ctx
+  // hits 256K" — which is what we want.
+  "gpt55":                 { contextWindow: 256_000, maxOutput: 128_000 },
   "gpt-5.4":               { contextWindow: 922_000, maxOutput: 128_000 },
   "gpt-5.4-mini":          { contextWindow: 272_000, maxOutput: 128_000 },
   "gpt-5.3-codex":         { contextWindow: 272_000, maxOutput: 128_000 },

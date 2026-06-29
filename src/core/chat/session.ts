@@ -537,6 +537,24 @@ export interface ChatSessionOptions {
     enableMidTurnPrecheck?: boolean;
     /** TODO-2 §3.2 — mid-turn trigger threshold (default thresholdPct + 0.05). */
     midTurnThresholdPct?: number;
+    /**
+     * 2026-06-29 (codex-parity) — absolute pre-turn trigger in tokens.
+     * When set, takes precedence over `thresholdPct * contextWindow`:
+     * compact when `countTokens(messages) >= absoluteThresholdTokens`.
+     * Matches codex's `model_auto_compact_token_limit` semantics
+     * (see ~/code/codex/codex-rs/core/src/session/turn.rs
+     * auto_compact_token_status). Use for cases where the user wants
+     * compaction at an explicit token count rather than a fraction of
+     * a model's nominal context window.
+     */
+    absoluteThresholdTokens?: number;
+    /**
+     * 2026-06-29 — absolute mid-turn trigger in tokens. When set with
+     * `enableMidTurnPrecheck=true`, mid-turn compaction fires when
+     * cumulative provider-reported input tokens crosses this value.
+     * Falls back to `midTurnThresholdPct * contextWindow` when unset.
+     */
+    midTurnAbsoluteThresholdTokens?: number;
   };
   /**
    * Workspace root for subagent artifacts (v0.2 §5). Required for `compact()`
@@ -2335,8 +2353,15 @@ export class ChatSession {
       return; // never crash the send path due to counting errors
     }
     if (typeof count !== "number" || !Number.isFinite(count)) return;
+    // 2026-06-29 (codex-parity) — if `absoluteThresholdTokens` is set, it
+    // takes precedence over thresholdPct*contextWindow. Aligns with
+    // codex's `model_auto_compact_token_limit` semantics
+    // (codex-rs/core/src/session/turn.rs::auto_compact_token_status).
     const window = cfg.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
-    const threshold = window * (cfg.thresholdPct ?? 0.75);
+    const threshold =
+      cfg.absoluteThresholdTokens && cfg.absoluteThresholdTokens > 0
+        ? cfg.absoluteThresholdTokens
+        : window * (cfg.thresholdPct ?? 0.75);
     if (count <= threshold) return;
     try {
       // Reset mid-turn accumulator on every pre-turn boundary — the
@@ -2379,9 +2404,13 @@ export class ChatSession {
     // Accumulate. mid-turn precheck uses *provider-reported* tokens
     // rather than countTokens — the provider's count IS the truth.
     this.cumulativeInputTokens += args.realPromptTokens;
+    // 2026-06-29 (codex-parity) — mid-turn absolute threshold takes
+    // precedence over midTurnThresholdPct*contextWindow.
     const window = cfg.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
-    const midPct = cfg.midTurnThresholdPct ?? ((cfg.thresholdPct ?? 0.75) + 0.05);
-    const threshold = window * midPct;
+    const threshold =
+      cfg.midTurnAbsoluteThresholdTokens && cfg.midTurnAbsoluteThresholdTokens > 0
+        ? cfg.midTurnAbsoluteThresholdTokens
+        : window * (cfg.midTurnThresholdPct ?? ((cfg.thresholdPct ?? 0.75) + 0.05));
     if (this.cumulativeInputTokens <= threshold) return;
     try {
       const out = await this.compactV2({

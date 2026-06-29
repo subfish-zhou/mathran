@@ -185,6 +185,14 @@ export interface UsageStats {
   contextWindow: number;
   percentage: number;
   warning: string | null;
+  /**
+   * 2026-06-29 — absolute compaction trigger in tokens (codex-parity);
+   * present when the chat scope uses `absoluteThresholdTokens` instead
+   * of thresholdPct × contextWindow. Read by ContextMeter so the bar
+   * fills to 100% at exactly this number. Absent for legacy / non-
+   * gpt55 paths — the meter falls back to 0.75 × contextWindow.
+   */
+  compactAtTokens?: number;
 }
 
 async function jsonOrThrow<T>(res: Response): Promise<T> {

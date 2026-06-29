@@ -1480,6 +1480,38 @@ export function defaultSessionFactory(
           autoRunner: autoRunPlan,
         },
       },
+      // 2026-06-29 — codex-parity auto-compaction for chat sessions.
+      // Previously ONLY goal-mode runner wired autoCompact. Plain chat
+      // (/api/chat, /api/global-chat, /api/projects/:slug/chat) had no
+      // automatic context management, so long sessions silently grew
+      // until the provider rejected the request. Now we install the
+      // same pre-turn + mid-turn auto-compact pipeline goal-mode uses,
+      // with an absolute-token threshold matching codex's
+      // `model_auto_compact_token_limit` semantics
+      // (see codex-rs/core/src/session/turn.rs::auto_compact_token_status).
+      //
+      // contextWindow / threshold land on the configured model's per-
+      // model cap via copilot-models-cache (e.g. azure/gpt55 → 256K,
+      // claude-opus-4.7 → 936K). When the cap itself is the threshold
+      // we want, we leave absoluteThresholdTokens unset and the code
+      // falls back to thresholdPct (default 0.75 = compact at 75% cap).
+      // For azure/gpt55 specifically the cap IS the trigger so we set
+      // absoluteThresholdTokens = contextWindow.
+      autoCompact: (() => {
+        const window = contextWindowForModel(resolvedModel);
+        const isGpt55 = /(^|\/)gpt55$/.test((resolvedModel ?? "").toLowerCase());
+        return {
+          enabled: true,
+          contextWindow: window,
+          // gpt55 fires at the cap; other models use 0.75 pct (legacy).
+          ...(isGpt55 ? { absoluteThresholdTokens: window } : { thresholdPct: 0.75 }),
+          keepRecentRounds: 6,
+          enableMidTurnPrecheck: true,
+          ...(isGpt55
+            ? { midTurnAbsoluteThresholdTokens: window }
+            : { midTurnThresholdPct: 0.80 }),
+        };
+      })(),
     });
   };
 }
@@ -1684,6 +1716,14 @@ export interface UsageStats {
   contextWindow: number;
   percentage: number;
   warning: string | null;
+  /**
+   * 2026-06-29 — absolute compaction trigger in tokens, when the chat
+   * scope uses codex-parity `absoluteThresholdTokens` instead of a
+   * thresholdPct of the context window. Surface this to the SPA so
+   * ContextMeter can render the right "compact at" boundary; absent
+   * when the session still uses thresholdPct (legacy / non-gpt55).
+   */
+  compactAtTokens?: number;
 }
 
 /** Build the `/usage` response payload from a conversation history. */
@@ -1698,13 +1738,27 @@ export function computeUsageStats(
   const percentage = contextWindow > 0
     ? Math.round((tokens / contextWindow) * 10000) / 100
     : 0;
+  // 2026-06-29 — for models where mathran configures absolute-threshold
+  // auto-compaction (codex-parity, currently azure/gpt55), surface the
+  // exact compaction trigger to the SPA so ContextMeter renders the
+  // right boundary. For all other models compaction is thresholdPct-
+  // based and ContextMeter falls back to its hardcoded 0.75 multiplier.
+  const isGpt55 = /(^|\/)gpt55$/.test((model ?? "").toLowerCase());
+  const compactAtTokens = isGpt55 ? contextWindow : undefined;
   let warning: string | null = null;
   if (percentage >= 90) {
     warning = "Context near limit. /compact strongly recommended.";
   } else if (percentage >= 75) {
     warning = "Context approaching limit. Consider /compact.";
   }
-  return { tokens, messages: history.length, contextWindow, percentage, warning };
+  return {
+    tokens,
+    messages: history.length,
+    contextWindow,
+    percentage,
+    warning,
+    ...(compactAtTokens !== undefined ? { compactAtTokens } : {}),
+  };
 }
 
 function registerChatScope(
