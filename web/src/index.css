@@ -70,3 +70,49 @@ body {
   color: #475569;
   margin: 0.5rem 0;
 }
+
+/* Wiki refs — three kinds rendered by BubbleMarkdownWithRefs.
+ *   .wikiref-wikilink   — [[slug]] / [[slug|label]] internal page links
+ *   .wikiref-paper-read — @paper-read:... citations to a paper
+ *   .wikiref-ws         — @ws:... citations to a workspace effort
+ *   .wikiref-broken     — wikilink / ws ref whose target doesn't exist
+ *
+ * 2026-06-29: distinguish visually so the model and the reader can spot
+ * dead links / different citation sources at a glance, without making
+ * the body text noisy.
+ */
+.md .wikiref {
+  border-bottom: 1px solid currentColor;
+  cursor: pointer;
+  text-decoration: none;
+}
+.md .wikiref-wikilink {
+  color: #1d4ed8;
+  background: #eff6ff;
+  padding: 0 0.2rem;
+  border-radius: 0.2rem;
+}
+.md .wikiref-paper-read {
+  color: #15803d;
+  background: #f0fdf4;
+  padding: 0 0.2rem;
+  border-radius: 0.2rem;
+  font-size: 0.88em;
+}
+.md .wikiref-ws {
+  color: #b45309;
+  background: #fffbeb;
+  padding: 0 0.2rem;
+  border-radius: 0.2rem;
+  font-size: 0.88em;
+}
+.md .wikiref-broken {
+  color: #94a3b8;
+  text-decoration: line-through;
+  border-bottom: 1px dotted #94a3b8;
+  cursor: not-allowed;
+  background: transparent;
+}
+.md .wikiref:hover {
+  filter: brightness(0.95);
+}

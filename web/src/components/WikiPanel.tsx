@@ -11,7 +11,8 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
+import { BubbleMarkdownWithRefs } from "./BubbleMarkdownWithRefs.tsx";
+import { WikiEditor } from "./WikiEditor.tsx";
 import {
   api,
   type WikiDiffResponse,
@@ -149,7 +150,14 @@ export default function WikiPanel({
     }
   }
 
-  const rendered = useMemo(() => (page ? safeRenderMarkdown(page.body) : ""), [page]);
+  // Set of known wiki page slugs in THIS project — passed to the
+  // BubbleMarkdownWithRefs so [[slug]] refs that don't exist render
+  // visually different (gray + dotted underline) so the model and the
+  // user can spot dead links at a glance.
+  const knownPages = useMemo(
+    () => new Set(pages.map((p) => p.page)),
+    [pages],
+  );
 
   return (
     <div className="grid h-full grid-cols-[16rem_1fr] overflow-hidden">
@@ -330,23 +338,28 @@ export default function WikiPanel({
                  * feedback for math/markdown).
                  */
                 <div className="flex h-full min-h-[24rem] flex-col gap-4 xl:flex-row">
-                  <textarea
-                    value={draft}
-                    onChange={(e) => setDraft(e.target.value)}
-                    placeholder="# markdown… (KaTeX: \\(inline\\), \\[display\\], $math$, $$display$$)"
-                    spellCheck={false}
-                    className="h-full min-h-[24rem] w-full xl:w-1/2 flex-1 resize-none rounded-md border border-slate-300 bg-slate-50 p-4 font-mono text-sm leading-relaxed outline-none focus:border-slate-500"
-                  />
-                  <div
-                    className="md max-w-none flex-1 overflow-y-auto rounded-md border border-slate-200 bg-white p-4 xl:w-1/2"
-                    aria-label="Live preview"
-                    dangerouslySetInnerHTML={{
-                      __html: safeRenderMarkdown(draft) as string,
-                    }}
+                  <div className="h-full min-h-[24rem] w-full xl:w-1/2 overflow-hidden rounded-md border border-slate-300">
+                    <WikiEditor
+                      value={draft}
+                      onChange={(next) => setDraft(next)}
+                      placeholder={'# markdown… (KaTeX: \\(inline\\), \\[display\\], $math$, $$display$$)'}
+                      className="h-full"
+                    />
+                  </div>
+                  <BubbleMarkdownWithRefs
+                    text={draft}
+                    projectSlug={projectSlug}
+                    knownPages={knownPages}
+                    className="max-w-none flex-1 overflow-y-auto rounded-md border border-slate-200 bg-white p-4 xl:w-1/2"
                   />
                 </div>
               ) : (
-                <div className="md max-w-3xl" dangerouslySetInnerHTML={{ __html: rendered as string }} />
+                <BubbleMarkdownWithRefs
+                  text={page.body}
+                  projectSlug={projectSlug}
+                  knownPages={knownPages}
+                  className="max-w-3xl"
+                />
               )}
             </div>
           </>
