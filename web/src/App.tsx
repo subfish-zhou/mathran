@@ -38,9 +38,56 @@ import EffortsPanel from "./components/EffortsPanel.tsx";
 import EffortDocumentPanel from "./components/EffortDocumentPanel.tsx";
 import ProfilePage from "./pages/ProfilePage.tsx";
 
+/**
+ * Runtime detection of the SPA's serving prefix.
+ *
+ * mathran was originally designed to live at "/". The 2026-06-29
+ * multi-user public portal (mathran-portal) mounts the same SPA behind
+ * "/mathran/" via an nginx → portal → per-user mathran-serve chain.
+ * React Router needs the right `basename` or every Link goes to the
+ * wrong URL.
+ *
+ * Detection: read the path of the <script> tag that loaded this bundle
+ * (always present as `<script src="…/assets/index-*.js">`). The portion
+ * before "/assets/" IS the SPA's mount path. Falls back to "/" when
+ * the script src is absent or unexpected — i.e. the local single-user
+ * case where the SPA lives at root.
+ *
+ * 2026-06-29 (mathran-portal landing): the previous fixed `<BrowserRouter>`
+ * with no basename made every Link absolute-to-origin, so when
+ * mathran-portal served the SPA at /mathran/, clicking "💬 Global chat"
+ * navigated the browser to https://host:3000/global-chat (= Mathub's
+ * Next.js root) instead of staying inside /mathran/.
+ */
+function detectBasename(): string {
+  if (typeof document === "undefined") return "/";
+  try {
+    // Find a <script> tag whose src looks like our bundle. Vite emits
+    // `<script type="module" src="<base>/assets/index-<hash>.js">`.
+    const scripts = Array.from(document.getElementsByTagName("script"));
+    for (const s of scripts) {
+      const src = s.getAttribute("src") || s.src || "";
+      const m = /^(.*)\/assets\/[^/]+\.js(?:$|\?)/.exec(src);
+      if (m) {
+        // Same-origin only — bail on cross-origin CDN setups.
+        try {
+          const u = new URL(src, window.location.origin);
+          if (u.origin !== window.location.origin) continue;
+        } catch {
+          /* ignore */
+        }
+        return m[1] || "/";
+      }
+    }
+  } catch {
+    /* swallow — default to "/" */
+  }
+  return "/";
+}
+
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={detectBasename()}>
       <Routes>
         <Route element={<RootLayout />}>
           <Route index element={<ProjectsPanel />} />
