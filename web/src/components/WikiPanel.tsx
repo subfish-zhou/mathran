@@ -316,11 +316,35 @@ export default function WikiPanel({
             )}
             <div className="flex-1 overflow-y-auto p-6">
               {editing ? (
-                <textarea
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  className="h-full min-h-[24rem] w-full resize-none rounded-md border border-slate-300 p-4 font-mono text-sm outline-none focus:border-slate-500"
-                />
+                /* Split view: raw markdown left, live preview right.
+                 * Same `.md` style used by view mode, KaTeX renders via
+                 * the marked-katex-extension wired in lib/markdown.ts.
+                 * Preview updates on every keystroke — `safeRenderMarkdown`
+                 * is cheap enough (marked + DOMPurify, no syntax tree
+                 * persistence) that 100KB wiki pages still feel instant.
+                 *
+                 * On screens narrower than 1100px the split flexes to
+                 * vertical so an editor on a laptop still has usable
+                 * width per pane. 2026-06-29 fix for "no way to edit"
+                 * complaint (textarea was 100% width and gave no live
+                 * feedback for math/markdown).
+                 */
+                <div className="flex h-full min-h-[24rem] flex-col gap-4 xl:flex-row">
+                  <textarea
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    placeholder="# markdown… (KaTeX: \\(inline\\), \\[display\\], $math$, $$display$$)"
+                    spellCheck={false}
+                    className="h-full min-h-[24rem] w-full xl:w-1/2 flex-1 resize-none rounded-md border border-slate-300 bg-slate-50 p-4 font-mono text-sm leading-relaxed outline-none focus:border-slate-500"
+                  />
+                  <div
+                    className="md max-w-none flex-1 overflow-y-auto rounded-md border border-slate-200 bg-white p-4 xl:w-1/2"
+                    aria-label="Live preview"
+                    dangerouslySetInnerHTML={{
+                      __html: safeRenderMarkdown(draft) as string,
+                    }}
+                  />
+                </div>
               ) : (
                 <div className="md max-w-3xl" dangerouslySetInnerHTML={{ __html: rendered as string }} />
               )}

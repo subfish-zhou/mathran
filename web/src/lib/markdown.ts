@@ -59,17 +59,30 @@ function preprocessMath(input: string): string {
   );
 
   // Display first (so `\[` doesn't get caught as `\(` afterwards).
-  masked = masked.replace(/\\\[([\s\S]*?)\\\]/g, (_m, body) => `$$${body}$$`);
+  // CRITICAL: wrap with surrounding BLANK LINES so the resulting $$
+  // block is its own markdown paragraph. Without that, an input like
+  //   `If\n\[ math \]\nthen ...`
+  // becomes `If\n$$\n math \n$$\nthen ...` — a single paragraph token
+  // in marked, and the marked-katex-extension block-level rule never
+  // matches because it requires the $$ tokens to live on their own
+  // line at paragraph-boundary level. Result: the SPA shows literal
+  // `$$ math $$` text instead of rendered KaTeX. (2026-06-29 wiki bug.)
+  masked = masked.replace(/\\\[([\s\S]*?)\\\]/g, (_m, body) => `\n\n$$\n${body.trim()}\n$$\n\n`);
   // Inline.
   masked = masked.replace(/\\\(([\s\S]*?)\\\)/g, (_m, body) => `$${body}$`);
 
   // Bare LaTeX envs not already wrapped in $$: detect a `\begin{...}` whose
   // nearest preceding non-whitespace chars are NOT `$$`. We just wrap each
-  // env in $$ pairs; KaTeX handles environments natively in display mode.
+  // env in $$ pairs and add the blanks-line guard for the same reason as
+  // above (block math must stand alone in marked).
   masked = masked.replace(
     /(^|[^$])(\\begin\{[a-zA-Z*]+\}[\s\S]*?\\end\{[a-zA-Z*]+\})(?!\$)/g,
-    (_m, pre, env) => `${pre}$$${env}$$`,
+    (_m, pre, env) => `${pre}\n\n$$\n${env}\n$$\n\n`,
   );
+
+  // Collapse 3+ consecutive newlines that might have been introduced by
+  // the wrapping above to keep diff-readability in the rendered output.
+  masked = masked.replace(/\n{3,}/g, "\n\n");
 
   // Restore code regions.
   masked = masked.replace(/\u0000CODEMASK_(\d+)\u0000/g, (_m, idx) => placeholders[Number(idx)]);

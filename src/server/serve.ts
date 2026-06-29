@@ -845,16 +845,24 @@ function stringifyFrontmatter(fm: WikiFrontmatter): string {
  * `path.join` does NOT prevent traversal when the caller controls one of the
  * inputs; we must validate before joining.
  */
-const SAFE_SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/i;
+// Slug must be 1-128 chars of [a-z0-9._-]; can start with `_` (mathran's
+// init-project writes `_index.md` as a TOC, and the SPA needs to fetch
+// it via GET /api/projects/:slug/wiki/:page). We explicitly forbid `.`
+// and `..` segments to block path traversal; any inclusion of `..` or
+// `/` is also rejected by the regex (no `/` in the char class).
+//
+// 2026-06-29: previous regex `^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/i`
+// forbade `_` as the first character, which crashed any GET on the
+// auto-generated `_index` wiki page (404→400 chain in WikiPanel).
+const SAFE_SLUG_PATTERN = /^[a-z0-9_](?:[a-z0-9._-]*[a-z0-9_])?$/i;
 const MAX_SLUG_LENGTH = 128;
 
 function isSafeSlug(value: string): boolean {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    value.length <= MAX_SLUG_LENGTH &&
-    SAFE_SLUG_PATTERN.test(value)
-  );
+  if (typeof value !== "string") return false;
+  if (value.length === 0 || value.length > MAX_SLUG_LENGTH) return false;
+  // Reject path-traversal sequences regardless of regex shape.
+  if (value === "." || value === ".." || value.includes("..")) return false;
+  return SAFE_SLUG_PATTERN.test(value);
 }
 
 function projectDirFor(workspace: string, slug: string): string {
