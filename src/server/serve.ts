@@ -233,7 +233,29 @@ const SYSTEM_PROMPT = buildBaseSystemPrompt();
 // Keyed by callId since it's globally unique per pending ask. Storing
 // the NodeJS.Timeout lets us clear it cleanly; the resolver itself is
 // closure-bound to (scope, conversationId, callId, default).
-const askTimeoutRegistry = new Map<string, NodeJS.Timeout>();
+// Pending ask_user timeouts. The Map's value is BOTH the timer (so we
+// can cancelTimeout on a /answer-ask race or a server close), AND a
+// promise that resolves once the timer's resolver callback finishes its
+// own fs work (so server.close() can wait for in-flight fs.rename to
+// land before letting the caller rm(workspace) — see ENOTEMPTY race
+// reproduced 2026-06-29 in ask-v19-timeout-* parallel tests).
+interface PendingAskTimer {
+  timer: NodeJS.Timeout;
+  /** Resolves once onFire's resolver promise settles, OR immediately
+   *  when the timer is cancelled without ever firing. Either way the
+   *  promise settles in bounded time so server.close() doesn't hang. */
+  fired: Promise<void>;
+  /** Direct handle to the resolver of `fired` — used by cancelAskTimeout
+   *  to mark a cancelled timer as "fully drained" instantly. */
+  resolveFired: () => void;
+}
+const askTimeoutRegistry = new Map<string, PendingAskTimer>();
+
+// Tracks resolver promises whose timer has ALREADY fired (so they're
+// no longer in askTimeoutRegistry). server.close() awaits this set so
+// in-flight fs.rename can finish before the workspace dir is removed.
+// Entries auto-remove themselves on settle.
+const inflightAskResolverPromises = new Set<Promise<void>>();
 
 /**
  * Phase ζ (cost meter) — dollar cost of a goal's lifetime LLM usage.
@@ -270,9 +292,12 @@ function promLabel(v: string): string {
 }
 
 function cancelAskTimeout(callId: string): void {
-  const t = askTimeoutRegistry.get(callId);
-  if (t !== undefined) {
-    clearTimeout(t);
+  const entry = askTimeoutRegistry.get(callId);
+  if (entry !== undefined) {
+    clearTimeout(entry.timer);
+    // Resolve `fired` immediately — the timer never fires and never
+    // touches fs, so anyone awaiting it (server.close) shouldn't hang.
+    entry.resolveFired();
     askTimeoutRegistry.delete(callId);
   }
 }
@@ -285,22 +310,32 @@ function scheduleAskTimeout(
   // Reschedule wipes any prior timer for the same callId so a resume
   // that immediately re-pauses on the same id can't leak handles.
   cancelAskTimeout(callId);
+  // Capture the resolver's promise so a graceful close can await it
+  // before deleting the workspace dir. We resolve the wrapper even on
+  // error so close() never hangs on a failed resolver.
+  let resolveFired!: () => void;
+  const fired = new Promise<void>((res) => { resolveFired = res; });
   const timer = setTimeout(() => {
     askTimeoutRegistry.delete(callId);
-    // Run the resolver in its own microtask so an exception inside it
-    // can't take down the libuv timer thread; we log + swallow.
-    Promise.resolve(onFire()).catch((err) => {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[mathran] ask_user timeout resolver failed for ${callId}:`,
-        err,
-      );
-    });
+    // Track this resolver so server.close() can wait on it.
+    inflightAskResolverPromises.add(fired);
+    Promise.resolve(onFire())
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[mathran] ask_user timeout resolver failed for ${callId}:`,
+          err,
+        );
+      })
+      .finally(() => {
+        resolveFired();
+        inflightAskResolverPromises.delete(fired);
+      });
   }, delayMs);
   // Keep the registry from holding the process alive past natural exit —
   // a forgotten pending ask shouldn't pin the server up.
   if (typeof timer.unref === "function") timer.unref();
-  askTimeoutRegistry.set(callId, timer);
+  askTimeoutRegistry.set(callId, { timer, fired, resolveFired });
 }
 
 /**
@@ -6424,8 +6459,14 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
       //      in-flight LLM call drain cleanly and its result/iteration
       //      step persist to disk, so a subsequent boot-resume sees
       //      consistent state.
-      //   2. mcpRegistry.shutdown() — tears down MCP server processes.
-      //   3. server.close() — closes the HTTP listener.
+      //   2. cancel ALL pending ask_user timeouts so a fire-and-forget
+      //      timer can't write back to the (about-to-be-deleted)
+      //      workspace directory after close returns. (2026-06-29:
+      //      reproducible test flake — fixed `ENOTEMPTY: rmdir
+      //      .mathran/global-chat` on parallel vitest runs of
+      //      ask-v19-timeout-* tests.)
+      //   3. mcpRegistry.shutdown() — tears down MCP server processes.
+      //   4. server.close() — closes the HTTP listener.
       void (async () => {
         if (goalDaemon) {
           try {
@@ -6434,6 +6475,21 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
             // eslint-disable-next-line no-console
             console.error("[mathran] goalDaemon.stop(30_000) error:", err);
           }
+        }
+        // Cancel every pending ask_user timer, then wait for any
+        // already-fired resolvers to finish their fs work so close()
+        // doesn't return while a timer callback is still mid-rename
+        // into the workspace dir. (2026-06-29 ENOTEMPTY fix.)
+        for (const callId of Array.from(askTimeoutRegistry.keys())) {
+          // cancelAskTimeout resolves `fired` synchronously for
+          // never-fired timers; the entry exits the registry inside it.
+          cancelAskTimeout(callId);
+        }
+        // Resolvers whose timer ALREADY fired but whose fs work is
+        // still in flight live in inflightAskResolverPromises. Wait
+        // for them (bounded — Promise.allSettled never throws).
+        if (inflightAskResolverPromises.size > 0) {
+          await Promise.allSettled(Array.from(inflightAskResolverPromises));
         }
         await mcpRegistry.shutdown();
         server.close((err?: unknown) => (err ? reject(err) : resolve()));
