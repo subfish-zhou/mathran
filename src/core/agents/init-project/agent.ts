@@ -1138,6 +1138,7 @@ async function runInitAgentSpine(
       priorArt,
       convergence: loopResult.convergence,
       spine,
+      reconciliationSummary,
       wikiPageReviewSummaries,
     });
     await persistInitReport(projectDir, runId, report);
@@ -1189,6 +1190,16 @@ interface BuildReportArgs {
    * (shallowFallback breakdown) in the report.
    */
   spine: import("./spine/types.js").NarrativeSpine;
+  /**
+   * Hypothesis-spine reconciliation summary, if Layer 3 ran. Plumbed into
+   * the report's `reconcile` block. Pass null when hypothesis-spine had no
+   * nodes (i.e. reconcile_spine phase was skipped).
+   *
+   * 2026-06-29 (fix from run-14-audit): the report had the runtime data
+   * (logged to phases.jsonl + the per-run details file) but the report
+   * itself was missing the summary block.
+   */
+  reconciliationSummary: import("./hypothesis-spine/index.js").SpineReconciliationSummary | null;
   /**
    * Wiki review summaries (slug + revisionCount + finalVerdict) produced by
    * wiki-synthesis. Empty when the reviewer wasn't wired, or when the wiki
@@ -1267,6 +1278,7 @@ async function buildInitReport(args: BuildReportArgs): Promise<InitAgentReport> 
     runId, projectSlug, projectDir, writerModel, reviewerModel,
     accounting, reads, efforts, unresolvedCitations, priorArt, convergence,
     spine,
+    reconciliationSummary,
     wikiPageReviewSummaries,
   } = args;
 
@@ -1345,6 +1357,22 @@ async function buildInitReport(args: BuildReportArgs): Promise<InitAgentReport> 
       return { doiOnly, unresolved };
     })(),
     convergenceSummary: { reason: convergence.reason, rounds: convergence.totalRoundsRun },
+    // 2026-06-29 (fix from run-14-audit): surface Layer-3 reconcile in the
+    // top-level report so downstream consumers (CLI, SPA, user audit
+    // workflow) don't have to grep phases.jsonl. Absent → reconcile_spine
+    // phase didn't run (hypothesis-spine had no nodes), distinct from
+    // "reconcile ran and found 0 verified".
+    ...(reconciliationSummary
+      ? {
+          reconcile: {
+            totalHypothesisNodes: reconciliationSummary.totalHypothesisNodes,
+            verified: reconciliationSummary.verified,
+            refined: reconciliationSummary.refined,
+            falsified: reconciliationSummary.falsified,
+            unread: reconciliationSummary.unread,
+          },
+        }
+      : {}),
     fieldTooLargeTripped: reads.some((r) => r.truncated),
   };
 }
@@ -1475,6 +1503,14 @@ function printInitReport(report: InitAgentReport): void {
         ? ` [llm_error=${sq.shallowByReason.llm_error} parse_error=${sq.shallowByReason.parse_error} no_candidates=${sq.shallowByReason.no_candidates}]`
         : "")
     : "";
+  // 2026-06-29 (fix from run-14-audit): hypothesis-vs-real spine reconcile.
+  // Absent (the field itself) → no hypothesis was generated, so nothing to
+  // print. Present → show the full breakdown so users can see how well the
+  // pre-read hypothesis tracked what the actual reading found.
+  const rc = report.reconcile;
+  const reconcileLine = rc
+    ? `  reconcile: verified=${rc.verified} refined=${rc.refined} falsified=${rc.falsified} unread=${rc.unread} / ${rc.totalHypothesisNodes}`
+    : "";
   const lines = [
     "",
     `── init report: ${report.projectSlug} (${report.runId}) ──`,
@@ -1484,6 +1520,7 @@ function printInitReport(report: InitAgentReport): void {
     ...(phaseLines.length > 0 ? ["  cost by phase:", ...phaseLines] : []),
     `  revisions: reviewed=${r.artifactsReviewed} approved=${r.artifactsApproved} flagged=${r.artifactsFlaggedPersistent} reviewer_broken=${r.artifactsReviewerBroken} avg=${r.avgRevisionsPerArtifact} max=${r.maxRevisionsAcrossArtifacts}`,
     spineLine,
+    reconcileLine,
     `  convergence: ${report.convergenceSummary.reason} (${report.convergenceSummary.rounds} rounds)`,
     `  unresolved citations: ${report.unresolvedCitations.length}`,
     canonNote,

@@ -165,6 +165,17 @@ function renderReadReport(data: ReadReportData): string {
     }
   }
 
+  // 2026-06-29 (fix from run-14-audit): hypothesis-spine reconcile. Absent
+  // (the field itself) → no hypothesis was generated. Present → render
+  // verified/refined/falsified/unread so users can see whether their
+  // pre-read hypothesis tracked reality.
+  const rc = report.reconcile;
+  if (rc) {
+    lines.push("");
+    lines.push("Hypothesis-spine reconcile:");
+    lines.push(`  verified=${rc.verified} refined=${rc.refined} falsified=${rc.falsified} unread=${rc.unread} / ${rc.totalHypothesisNodes}`);
+  }
+
   return lines.join("\n");
 }
 

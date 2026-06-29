@@ -135,12 +135,21 @@ export async function persistModelPair(projectDir: string, pair: ModelPair): Pro
     existing.initProject && typeof existing.initProject === "object"
       ? (existing.initProject as Record<string, unknown>)
       : {};
+  // 2026-06-29 (fix from run-14-audit): NEVER persist empty-string writer or
+  // reviewer model — an empty string is the "let provider decide" sentinel
+  // and writing it back into settings.json defeats the very fallback ladder
+  // that loadModelPair / resolveModelPair use to recover. Run 14's
+  // settings.json had `writerModel: ""` / `reviewerModel: ""` persisted
+  // from an earlier run that never got a concrete model, which made every
+  // subsequent run report empty-string models even after the CLI flow
+  // started passing a real default. Treat empty strings as "no change":
+  // keep the prior persisted value (or leave the field absent entirely).
   const next = {
     ...existing,
     initProject: {
       ...prevInit,
-      writerModel: pair.writerModel,
-      reviewerModel: pair.reviewerModel,
+      ...(pair.writerModel ? { writerModel: pair.writerModel } : {}),
+      ...(pair.reviewerModel ? { reviewerModel: pair.reviewerModel } : {}),
     },
   };
   try {

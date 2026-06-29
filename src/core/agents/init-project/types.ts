@@ -190,6 +190,29 @@ export interface InitAgentReport {
     doiOnly: Array<{ title: string; authors: string[]; year?: number; doi: string; why: string }>;
     unresolved: Array<{ title: string; authors: string[]; year?: number; venue?: string; why: string }>;
   };
+  /**
+   * Spine-reconciliation summary (Layer 3, 2026-06-28). Hypothesis-spine is
+   * built pre-reads as a confidence-weighted prediction of which papers /
+   * methods will show up; after the real spine is synthesized we reconcile
+   * each hypothesis node against the actually-read corpus and mark it
+   * verified / refined / falsified / unread.
+   *
+   * Present only when hypothesis-spine actually had nodes (it's an
+   * opportunistic phase that skips on empty input). Absent → "no hypothesis
+   * was generated" not "reconcile found nothing".
+   *
+   * 2026-06-29 (fix from run-14-audit): #3 ship landed the reconcile-by-
+   * paperId heuristic and `appendPhase('reconcile_spine', ...)` already
+   * recorded counts to phases.jsonl, but the report consumer never saw the
+   * data because buildInitReport wasn't passed it. Re-wired now.
+   */
+  reconcile?: {
+    totalHypothesisNodes: number;
+    verified: number;
+    refined: number;
+    falsified: number;
+    unread: number;
+  };
   convergenceSummary: { reason: string; rounds: number };
   fieldTooLargeTripped: boolean;
 }

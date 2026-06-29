@@ -175,12 +175,28 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
     // recorded in the ledger by runInitAgent itself.
     void (async () => {
       try {
+        // 2026-06-29 (fix from run-14-audit): resolve the provider's
+        // `defaultModel` and forward it as `ctx.model` so resolveModelPair's
+        // fallback ladder lands on a concrete model string instead of "".
+        // Without this, every init run with no explicit MATHRAN_*_MODEL env /
+        // CLI flag / persisted settings ended up with writerModel="" and
+        // reviewerModel="" in the run report, making cost attribution and
+        // the identical-model warning impossible to read.
+        const llm = llmFor();
+        let defaultModel: string | undefined;
+        try {
+          const d = await llm.describe();
+          defaultModel = d.defaultModel;
+        } catch {
+          /* describe() must not block run start; fall through with undefined */
+        }
         await runInitAgent(input, {
           workspace,
           projectDir,
           slug,
           runId: run.runId,
-          llm: llmFor(),
+          llm,
+          model: defaultModel,
           signal: ac.signal,
         });
       } catch {
