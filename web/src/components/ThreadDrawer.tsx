@@ -15,7 +15,7 @@
  * as it works. Stops polling once it terminates.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
+import { BubbleMarkdownWithRefs } from "./BubbleMarkdownWithRefs.tsx";
 import {
   fetchThread,
   type GoalRow,
@@ -282,11 +282,10 @@ export function ThreadDrawer({
                       }`}
                     >
                       {b.kind === "assistant" ? (
-                        <div
-                          className="md text-[13px]"
-                          dangerouslySetInnerHTML={{
-                            __html: safeRenderMarkdown(b.text || "…"),
-                          }}
+                        <BubbleMarkdownWithRefs
+                          text={b.text || "…"}
+                          projectSlug={payload?.goal.scope.projectSlug}
+                          className="text-[13px]"
                         />
                       ) : (
                         <span className="whitespace-pre-wrap text-[13px]">{b.text}</span>

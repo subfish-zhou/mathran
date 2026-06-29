@@ -36,7 +36,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
+import { BubbleMarkdownWithRefs } from "./BubbleMarkdownWithRefs.tsx";
 import {
   acceptPlan,
   createPlanRun,
@@ -54,6 +54,10 @@ export interface PlanRunOverlayProps {
   /** Default model id to pass through; the server falls back to its
    *  config default when blank. */
   defaultModel?: string | null;
+  /** Optional project slug — passed through to the plan body renderer
+   *  so [[wikilink]] / @ws refs in the plan markdown become clickable.
+   *  Omitted in global scope (the renderer falls back to plain text). */
+  projectSlug?: string;
   /** Fired on Accept; gives the host a chance to toast "Plan saved to
    *  <location>" without the overlay owning the toast UI itself. */
   onAccepted?: (info: { plan: PlanRecord; location: string }) => void;
@@ -69,6 +73,7 @@ export interface PlanRunOverlayProps {
 export default function PlanRunOverlay({
   initialObjective,
   defaultModel,
+  projectSlug,
   onAccepted,
   onRejected,
   onClose,
@@ -242,6 +247,7 @@ export default function PlanRunOverlay({
         {stage === "streaming" && (
           <StreamingStage
             body={body}
+            projectSlug={projectSlug}
             onCancel={handleCancelStreaming}
           />
         )}
@@ -252,6 +258,7 @@ export default function PlanRunOverlay({
             meta={meta}
             pending={pending}
             error={error}
+            projectSlug={projectSlug}
             onAccept={() => void handleAccept()}
             onReject={() => void handleReject()}
             onBack={() => setStage("prompt")}
@@ -352,9 +359,11 @@ function PromptStage({
 
 function StreamingStage({
   body,
+  projectSlug,
   onCancel,
 }: {
   body: string;
+  projectSlug?: string;
   onCancel: () => void;
 }) {
   return (
@@ -365,11 +374,11 @@ function StreamingStage({
           Drafting plan…
         </span>
       </p>
-      <div className="md flex-1 min-h-[200px] overflow-auto rounded border border-slate-200 bg-slate-50 p-3 text-sm">
+      <div className="flex-1 min-h-[200px] overflow-auto rounded border border-slate-200 bg-slate-50 p-3 text-sm">
         {body.length === 0 ? (
           <span className="text-slate-400">Waiting for the first token…</span>
         ) : (
-          <div dangerouslySetInnerHTML={{ __html: safeRenderMarkdown(body) }} />
+          <BubbleMarkdownWithRefs text={body} projectSlug={projectSlug} />
         )}
       </div>
       <div className="mt-3 flex justify-end">
@@ -391,6 +400,7 @@ function ReviewStage({
   meta,
   pending,
   error,
+  projectSlug,
   onAccept,
   onReject,
   onBack,
@@ -399,6 +409,7 @@ function ReviewStage({
   meta: { turns: number; truncated: boolean; aborted: boolean } | null;
   pending: "accept" | "reject" | "cancel" | null;
   error: string | null;
+  projectSlug?: string;
   onAccept: () => void;
   onReject: () => void;
   onBack: () => void;
@@ -422,11 +433,11 @@ function ReviewStage({
           </>
         )}
       </div>
-      <div className="md flex-1 min-h-[200px] overflow-auto rounded border border-slate-200 bg-slate-50 p-3 text-sm">
+      <div className="flex-1 min-h-[200px] overflow-auto rounded border border-slate-200 bg-slate-50 p-3 text-sm">
         {body.length === 0 ? (
           <span className="text-slate-400">(empty plan — try again with a sharper objective)</span>
         ) : (
-          <div dangerouslySetInnerHTML={{ __html: safeRenderMarkdown(body) }} />
+          <BubbleMarkdownWithRefs text={body} projectSlug={projectSlug} />
         )}
       </div>
 

@@ -104,10 +104,34 @@ export async function readEffortMetadata(
   if (!isSafeSlug(project) || !isSafeSlug(effort)) {
     throw new Error("invalid project or effort slug");
   }
-  const file = path.join(effortDirFor(workspace, project, effort), EFFORT_META);
+  const dir = effortDirFor(workspace, project, effort);
+  // 2026-06-29: dual-source. New init-project agents write `effort.json`
+  // (effort-from-spine.ts:249, effort-synthesis/index.ts:302) for the
+  // richer outline + revisions data. Legacy chat-tool / CLI efforts
+  // write `effort.toml`. readEffortMetadata accepts either — JSON first
+  // so the modern format wins when both exist; falls back to TOML so
+  // pre-2026 workspaces keep loading.
+  const jsonFile = path.join(dir, "effort.json");
+  try {
+    const raw = await fs.readFile(jsonFile, "utf-8");
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err: any) {
+      throw new Error(`invalid effort.json: ${err?.message ?? String(err)}`);
+    }
+    return normalizeMetadata(parsed, effort);
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") {
+      // Real error reading JSON (e.g. parse failure) — propagate.
+      if (err?.message?.includes("invalid effort.json")) throw err;
+      // Otherwise treat as missing and try TOML below.
+    }
+  }
+  const tomlFile = path.join(dir, EFFORT_META);
   let raw: string;
   try {
-    raw = await fs.readFile(file, "utf-8");
+    raw = await fs.readFile(tomlFile, "utf-8");
   } catch {
     return null;
   }

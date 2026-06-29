@@ -1,23 +1,27 @@
 /**
  * Render assistant chat text as markdown, but substitute detected
- * paper references (arXiv / DOI) with an interactive PaperCard.
+ * paper references (arXiv / DOI) with an interactive PaperCard, AND
+ * mathran-flavoured inline refs ([[wikilink]] / @paper-read / @ws)
+ * with clickable links via BubbleMarkdownWithRefs.
  *
  * The detector returns ABSOLUTE offsets into the raw text. We split
  * the text into:
  *
  *   [md chunk before ref1, <PaperCard>, md chunk between, <PaperCard>, ...]
  *
- * Each markdown chunk is rendered the same way as before (DOMPurify-
- * wrapped marked output, audited D1). Each PaperCard is a real React
- * component so its reaction buttons and state live in React-land —
- * not inside an innerHTML string where event handlers would die.
+ * Each markdown chunk is rendered via BubbleMarkdownWithRefs so wiki/
+ * paper-read/ws refs inside chat bubbles become clickable too. Each
+ * PaperCard is a real React component so its reaction buttons and
+ * state live in React-land — not inside an innerHTML string where
+ * event handlers would die.
  *
  * 2026-06-26 (user-distillation Phase 2).
+ * 2026-06-29: chunks now route through BubbleMarkdownWithRefs.
  */
 
 import { Fragment, useMemo } from "react";
 
-import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
+import { BubbleMarkdownWithRefs } from "./BubbleMarkdownWithRefs.tsx";
 import { detectPaperRefs } from "../lib/paper-detector.ts";
 import { PaperCard } from "./PaperCard.tsx";
 
@@ -28,6 +32,13 @@ export interface BubbleMarkdownWithPaperCardsProps {
   bubbleIdx?: number;
   /** Extra className applied to the wrapping div. */
   className?: string;
+  /** Project slug — when set, [[wikilink]] and @ws refs become
+   *  clickable navigation. Pass undefined in global scope (no
+   *  project context); only @paper-read links will still resolve. */
+  projectSlug?: string;
+  /** Optional: known wiki pages / efforts for broken-link detection. */
+  knownPages?: Set<string>;
+  knownEfforts?: Set<string>;
 }
 
 export function BubbleMarkdownWithPaperCards(
@@ -35,14 +46,17 @@ export function BubbleMarkdownWithPaperCards(
 ): JSX.Element {
   const refs = useMemo(() => detectPaperRefs(props.text), [props.text]);
 
-  // Fast path — no paper refs, render exactly as before.
+  // Fast path — no paper refs, render the whole bubble through
+  // BubbleMarkdownWithRefs so wiki/paper-read/ws inline refs still
+  // get clickable styling.
   if (refs.length === 0) {
     return (
-      <div
-        className={`md ${props.className ?? ""}`}
-        dangerouslySetInnerHTML={{
-          __html: safeRenderMarkdown(props.text),
-        }}
+      <BubbleMarkdownWithRefs
+        text={props.text}
+        projectSlug={props.projectSlug}
+        knownPages={props.knownPages}
+        knownEfforts={props.knownEfforts}
+        className={props.className}
       />
     );
   }
@@ -79,11 +93,12 @@ export function BubbleMarkdownWithPaperCards(
           // — skip them to keep the rendered output tight.
           if (seg.text.trim().length === 0) return null;
           return (
-            <div
+            <BubbleMarkdownWithRefs
               key={`md-${i}`}
-              dangerouslySetInnerHTML={{
-                __html: safeRenderMarkdown(seg.text),
-              }}
+              text={seg.text}
+              projectSlug={props.projectSlug}
+              knownPages={props.knownPages}
+              knownEfforts={props.knownEfforts}
             />
           );
         }

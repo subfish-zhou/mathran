@@ -11,8 +11,8 @@
  * preview, no comments overlay). That's already enough to round-trip
  * blueprint-style writing.
  */
-import { useEffect, useMemo, useState } from "react";
-import { safeRenderMarkdown } from "../lib/safe-markdown.ts";
+import { useEffect, useState } from "react";
+import { BubbleMarkdownWithRefs } from "./BubbleMarkdownWithRefs.tsx";
 import { api, type EffortSummary } from "../lib/api.ts";
 
 const STATUSES = [
@@ -101,7 +101,8 @@ export default function EffortDocumentPanel({
     }
   }
 
-  const rendered = useMemo(() => safeRenderMarkdown(doc || "_(empty document)_"), [doc]);
+  // (`rendered` removed 2026-06-29 — view mode now uses BubbleMarkdownWithRefs
+  //  directly, no separate memoised HTML needed.)
 
   return (
     <div className="flex h-full flex-col">
@@ -184,9 +185,10 @@ export default function EffortDocumentPanel({
             className="h-full w-full rounded-md border border-slate-300 bg-white p-3 font-mono text-sm"
           />
         ) : (
-          <div
-            className="md prose max-w-none"
-            dangerouslySetInnerHTML={{ __html: rendered as string }}
+          <BubbleMarkdownWithRefs
+            text={doc || "_(empty document)_"}
+            projectSlug={projectSlug}
+            className="prose max-w-none"
           />
         )}
         {!editing && versions.length > 0 && (

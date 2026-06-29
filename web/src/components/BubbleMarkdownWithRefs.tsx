@@ -26,12 +26,16 @@ import { detectWikiRefs, type WikiRef } from "../lib/wiki-ref-detector.ts";
 
 export interface BubbleMarkdownWithRefsProps {
   text: string;
-  /** Project slug — required for resolving relative refs. */
-  projectSlug: string;
+  /** Project slug for resolving relative refs ([[link]], @ws:effort).
+   *  When omitted (e.g. global chat scope), wikilinks and @ws refs
+   *  fall through to plain markdown text — only @paper-read refs are
+   *  rewritten since they resolve to external arxiv/doi URLs. */
+  projectSlug?: string;
   /** Extra className on the wrapper div. */
   className?: string;
   /** Known wiki page slugs in this project (for unresolvable greying).
-   *  Optional — when omitted, all wikilinks render normally. */
+   *  Optional — when omitted, all wikilinks render as live unless we
+   *  have no way to resolve them at all (no projectSlug). */
   knownPages?: Set<string>;
   /** Known effort slugs for greying unresolvable @ws: refs. */
   knownEfforts?: Set<string>;
@@ -119,7 +123,13 @@ export function BubbleMarkdownWithRefs(
   const rootRef = useRef<HTMLDivElement>(null);
 
   const html = useMemo(() => {
-    const refs = detectWikiRefs(props.text);
+    let refs = detectWikiRefs(props.text);
+    // When projectSlug is missing we can't resolve relative refs, so
+    // drop wiki / ws kinds and keep only paper-read (which becomes an
+    // absolute arxiv/doi URL).
+    if (!props.projectSlug) {
+      refs = refs.filter((r) => r.kind === "paper-read");
+    }
     // Detect unresolvable refs for visual indication.
     const unresolvable = new Set<number>();
     refs.forEach((r, i) => {
@@ -130,7 +140,7 @@ export function BubbleMarkdownWithRefs(
         unresolvable.add(i);
       }
     });
-    const rewritten = rewriteRefs(props.text, props.projectSlug, refs, unresolvable);
+    const rewritten = rewriteRefs(props.text, props.projectSlug ?? "", refs, unresolvable);
     return safeRenderMarkdown(rewritten);
   }, [props.text, props.projectSlug, props.knownPages, props.knownEfforts]);
 

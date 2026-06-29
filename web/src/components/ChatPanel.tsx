@@ -3802,6 +3802,11 @@ export default function ChatPanel({
                             text={row.bubble.text}
                             conversationId={conversationId ?? undefined}
                             bubbleIdx={i}
+                            projectSlug={
+                              scope.kind === "project" || scope.kind === "effort"
+                                ? scope.projectSlug
+                                : undefined
+                            }
                           />
                         </>
                       ) : (
@@ -4585,6 +4590,11 @@ export default function ChatPanel({
         <PlanRunOverlay
           initialObjective={input}
           defaultModel={model || null}
+          projectSlug={
+            scope.kind === "project" || scope.kind === "effort"
+              ? scope.projectSlug
+              : undefined
+          }
           onAccepted={({ location }) => {
             // Surface the save location as a transient toast; "plan
             // mode lives outside chat history" per v0.16 §9, so we don't
