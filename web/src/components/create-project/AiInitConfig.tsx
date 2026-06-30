@@ -30,7 +30,8 @@ export interface AiInitConfigProps {
 export default function AiInitConfig({ onSubmit, onCancel, loading }: AiInitConfigProps) {
   const [title, setTitle] = useState("");
   const [searchDepth, setSearchDepth] = useState<"quick" | "standard" | "deep">("standard");
-  const [useSpine, setUseSpine] = useState(true);
+  // 2026-06-30 — useSpine forced true; v1a path removed.
+  const useSpine = true;
   const [enableWiki, setEnableWiki] = useState(true);
   const [seedReferences, setSeedReferences] = useState<string[]>([]);
   const [files, setFiles] = useState<UploadedFile[]>([]);
@@ -93,11 +94,10 @@ export default function AiInitConfig({ onSubmit, onCancel, loading }: AiInitConf
         </div>
       </fieldset>
 
-      <label className="flex items-center gap-2 text-sm text-slate-700">
-        <input type="checkbox" checked={useSpine} onChange={(e) => setUseSpine(e.target.checked)} />
-        <span className="font-medium">Spine-First pipeline</span>
-        <span className="text-xs text-slate-400">— v1b: more structured (recommended)</span>
-      </label>
+      {/* 2026-06-30 — v1a toggle removed: all new projects now run the
+          Spine-First (v1b) pipeline unconditionally. The useSpine field
+          is still passed for back-compat (always true) until the server
+          drops it. */}
 
       <label className="flex items-center gap-2 text-sm text-slate-700">
         <input

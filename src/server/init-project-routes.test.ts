@@ -100,17 +100,23 @@ describe("POST /api/agent/init-project", () => {
     expect(body.runId).toMatch(/^run-/);
     expect(body.aiAssisted).toBe(true);
 
-    const ledger = await waitForStatus(body.runId, "completed");
+    // 2026-06-30 — Bumped from 4000ms after v1a removal: spine pipeline
+    // is 10 phases vs v1a's 4, takes ~7-8s under mock LLM. 15s leaves
+    // headroom while still failing fast on real regressions.
+    const ledger = await waitForStatus(body.runId, "completed", 15000);
     expect(ledger.run.status).toBe("completed");
     // ≥4 phase lines
     expect(ledger.phases.length).toBeGreaterThanOrEqual(4);
 
-    // wiki/index.md is LLM-generated, non-empty
+    // wiki/index.md is LLM-generated, non-empty.
+    // 2026-06-30 — v1a wrote "AI-GENERATED" verbatim in a header; spine
+    // wiki-synthesis doesn't include that string. Just check the file has
+    // real content + frontmatter, which is the actual contract.
     const index = await fs.readFile(
       path.join(workspace, "projects", "goldbach-conjecture", "wiki", "index.md"),
       "utf-8",
     );
-    expect(index).toContain("AI-GENERATED");
+    expect(index).toContain("title:");
     expect(index.length).toBeGreaterThan(50);
 
     // run.json status completed

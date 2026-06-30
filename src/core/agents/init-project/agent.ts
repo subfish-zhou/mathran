@@ -35,11 +35,12 @@ import {
 import {
   searchArxiv as realSearchArxiv,
   fetchArxivById as realFetchArxivById,
-  fetchWikipediaSummary as realFetchWiki,
   sleep,
   ARXIV_RATE_DELAY,
 } from "./crawlers.js";
-import { buildConceptExtractionPrompt, buildWikiPagePrompt } from "./prompts.js";
+// 2026-06-30 — buildConceptExtractionPrompt / buildWikiPagePrompt were
+// v1a-only helpers and are gone along with the v1a path. The spine pipeline
+// has its own per-phase prompts under their respective modules.
 import type {
   InitAgentInput,
   InitAgentResult,
@@ -83,7 +84,6 @@ export interface InitAgentContext {
   signal?: AbortSignal;
   /** Test seams — default to the real network crawlers. */
   searchArxiv?: (query: string, maxResults: number) => Promise<CrawledResource[]>;
-  fetchWikipediaSummary?: (topic: string) => Promise<string | null>;
   /**
    * Fetch one arxiv paper by id (for seed enrichment). Default: real
    * crawlers.fetchArxivById. Tests inject a fake that returns null
@@ -263,227 +263,20 @@ function resourceToNodeInput(r: CrawledResource): PaperNodeInput {
   };
 }
 
-function wikiFrontmatter(title: string, slug: string, tags: string[]): string {
-  const createdAt = new Date().toISOString();
-  return [
-    "---",
-    `title: ${JSON.stringify(title)}`,
-    `slug: ${slug}`,
-    `createdAt: ${createdAt}`,
-    `tags: [${[...new Set([...tags, "ai-generated"])].map((t) => JSON.stringify(t)).join(", ")}]`,
-    "version: 1",
-    "---",
-    "",
-  ].join("\n");
-}
 
 /**
- * Run the 4-phase init pipeline. Never throws — failures are recorded in the
- * runs ledger and the run is flipped to `error`. Returns the result on success.
+ * Run the init pipeline. The v1a 4-phase fallback was deleted 2026-06-30
+ * (see commit message); we now always run the Spine-First v1b pipeline.
+ * `input.aiInit.useSpine` is ignored for backward-compat — every project
+ * is spine-first now. Never throws: failures are recorded in the runs
+ * ledger and the run is flipped to `error`. Returns the result on success.
  */
 export async function runInitAgent(
   input: InitAgentInput,
   ctx: InitAgentContext,
 ): Promise<InitAgentResult> {
-  if (input.aiInit.useSpine) {
-    return runInitAgentSpine(input, ctx);
-  }
-  const started = Date.now();
-  const { workspace, projectDir, slug, runId, llm, model } = ctx;
-  // [Design-Audit D-2b 2026-06-26] Same abort helper as the spine path.
-  const throwIfAborted = (): void => {
-    if (ctx.signal?.aborted) throw new Error("aborted by user");
-  };
-  const searchArxiv = ctx.searchArxiv ?? ((q, n) => realSearchArxiv(q, n));
-  const fetchWiki = ctx.fetchWikipediaSummary ?? ((t) => realFetchWiki(t));
-  const fetchArxivById = ctx.fetchArxivById ?? ((id: string) => realFetchArxivById(id));
-  const rateDelay = ctx.rateDelayMs ?? ARXIV_RATE_DELAY;
-
-  const summary = {
-    conceptsExtracted: 0,
-    queriesRun: 0,
-    resourcesFound: 0,
-    wikiPagesGenerated: 0,
-    durationMs: 0,
-  };
-
-  try {
-    // ── Phase 1: seed_research ────────────────────────────────────────────
-    await appendPhase(projectDir, runId, "seed_research", "start");
-    // [Design-Audit D-3 2026-06-26] Parallel enrichment of seeds (was
-    // serial in a for-loop). arxiv recommends ≤ 3 req/s, so we cap
-    // concurrency at 3 and let `enrichSeedFromArxiv`'s internal
-    // catch handle per-seed failures. 10 seeds went from ~30s
-    // sequential to ~3s with this change.
-    const ENRICH_CONCURRENCY = 3;
-    const candidates: CrawledResource[] = [];
-    for (const ref of input.seedReferences) {
-      const r = refToResource(ref);
-      if (r) candidates.push(r);
-    }
-    const seeds: CrawledResource[] = new Array(candidates.length);
-    for (let i = 0; i < candidates.length; i += ENRICH_CONCURRENCY) {
-      throwIfAborted();
-      const slice = candidates.slice(i, i + ENRICH_CONCURRENCY);
-      const enriched = await Promise.all(
-        slice.map((res) => enrichSeedFromArxiv(res, fetchArxivById)),
-      );
-      for (let j = 0; j < enriched.length; j++) {
-        seeds[i + j] = enriched[j]!;
-      }
-      // [Re-audit RE-7 2026-06-26] Respect arxiv rate-limit between
-      // bursts (3 concurrent in burst is fine; firing the next burst
-      // immediately would average > 3/sec).
-      if (i + ENRICH_CONCURRENCY < candidates.length && rateDelay > 0) {
-        await sleep(rateDelay);
-      }
-    }
-
-    const seedResult = await ingestSeedPapersForProject(
-      workspace,
-      projectDir,
-      seeds.map(resourceToNodeInput),
-      { discoveredBy: "seed", relevanceScore: 1.0, depth: 0 },
-    );
-    await appendLog(projectDir, runId, "seed_ingest", `ingested ${seedResult.ingested.length} seeds (${seedResult.failed} failed)`);
-
-    let wikiSummary: string | null = null;
-    try {
-      wikiSummary = await fetchWiki(input.problem.title);
-    } catch {
-      wikiSummary = null;
-    }
-
-    let queries: string[] = [];
-    let concepts: Array<{ name: string; importance?: number }> = [];
-    try {
-      const prompt = buildConceptExtractionPrompt(input.problem, seeds, wikiSummary);
-      const reply = await llmComplete(llm, model, prompt, { temperature: 0.2 });
-      await appendLog(projectDir, runId, "llm_call", "concept extraction", { chars: reply.length });
-      const parsed = extractJSON<{ concepts?: Array<{ name: string; importance?: number }>; search_queries?: string[] }>(reply);
-      concepts = parsed?.concepts ?? [];
-      queries = (parsed?.search_queries ?? []).filter((q): q is string => typeof q === "string" && q.trim().length > 0);
-    } catch (err) {
-      await appendLog(projectDir, runId, "warn", `concept extraction failed: ${errMsg(err)}`);
-    }
-    if (queries.length === 0) {
-      // Fallback: derive queries from the problem title + tags so deep_crawl
-      // still has something to chew on even if the LLM call failed.
-      queries = [input.problem.title, ...(input.problem.tags ?? [])].filter(Boolean);
-    }
-    // keep all generated queries; concept-extraction prompt already returns a sensible count.
-    queries = queries.filter((q): q is string => typeof q === "string" && q.trim().length > 0);
-    summary.conceptsExtracted = concepts.length;
-
-    await writeCheckpoint(projectDir, runId, "seed_research", {
-      seedPapers: seedResult.ingested.length,
-      concepts: concepts.length,
-      queries,
-    });
-    await appendPhase(projectDir, runId, "seed_research", "end", {
-      seedPapers: seedResult.ingested.length,
-      concepts: concepts.length,
-      queries: queries.length,
-    });
-
-    // ── Phase 2: deep_crawl ───────────────────────────────────────────────
-    await appendPhase(projectDir, runId, "deep_crawl", "start", { queries: queries.length });
-    const seenArxiv = new Set<string>(seeds.map((s) => s.arxivId).filter(Boolean) as string[]);
-    const allResources: CrawledResource[] = [...seeds];
-
-    for (let i = 0; i < queries.length; i++) {
-      const query = queries[i]!;
-      try {
-        const found = await searchArxiv(query, 20);
-        summary.queriesRun += 1;
-        for (const r of found) {
-          if (r.arxivId && seenArxiv.has(r.arxivId)) continue;
-          if (r.arxivId) seenArxiv.add(r.arxivId);
-          allResources.push(r);
-          const paperId = await ingestPaper(workspace, resourceToNodeInput(r));
-          if (paperId) {
-            await associatePaperToProject(projectDir, paperId, { discoveredBy: "crawl", depth: 1, relevanceScore: 0.6 });
-          }
-        }
-        await appendLog(projectDir, runId, "crawl_query", query, { found: found.length });
-      } catch (err) {
-        await appendLog(projectDir, runId, "warn", `arxiv query failed: ${errMsg(err)}`, { query });
-      }
-      if (i < queries.length - 1 && rateDelay > 0) await sleep(rateDelay);
-    }
-    summary.resourcesFound = allResources.length;
-
-    await writeCheckpoint(projectDir, runId, "deep_crawl", { resourcesFound: allResources.length });
-    await appendPhase(projectDir, runId, "deep_crawl", "end", { resourcesFound: allResources.length });
-
-    // ── Phase 3: build_wiki ───────────────────────────────────────────────
-    await appendPhase(projectDir, runId, "build_wiki", "start");
-    const wikiDir = path.join(projectDir, "wiki");
-    await fs.mkdir(wikiDir, { recursive: true });
-    const tags = input.problem.tags ?? [];
-    const wikiPages: string[] = [];
-
-    let indexBody = "";
-    try {
-      indexBody = await llmComplete(
-        llm,
-        model,
-        buildWikiPagePrompt(input.problem, allResources, {
-          slug: "index",
-          title: input.problem.title,
-          instruction:
-            "Write the project home page: introduce the problem, summarize its background and current status, and survey the key references and approaches found. Provide a roadmap of the research landscape.",
-        }),
-        // No maxTokens — full markdown home page can be long; let the
-        // provider use its model cap. Same fix class as spine/reviewer/etc.
-        { temperature: 0.3 },
-      );
-      await appendLog(projectDir, runId, "llm_call", "wiki index generation", { chars: indexBody.length });
-    } catch (err) {
-      await appendLog(projectDir, runId, "warn", `wiki generation failed: ${errMsg(err)}`);
-    }
-    if (!indexBody.trim()) {
-      indexBody = `> [AI-GENERATED] Wiki generation produced no content.\n\n# ${input.problem.title}\n\n${input.problem.description ?? ""}`;
-    }
-    await fs.writeFile(
-      path.join(wikiDir, "index.md"),
-      wikiFrontmatter(input.problem.title, "index", tags) + indexBody.trim() + "\n",
-      "utf-8",
-    );
-    wikiPages.push("index");
-
-    // References page — generated deterministically from the crawl corpus.
-    const refBody = buildReferencesMarkdown(allResources);
-    await fs.writeFile(
-      path.join(wikiDir, "references.md"),
-      wikiFrontmatter("References", "references", [...tags, "references"]) + refBody + "\n",
-      "utf-8",
-    );
-    wikiPages.push("references");
-    summary.wikiPagesGenerated = wikiPages.length;
-
-    await writeCheckpoint(projectDir, runId, "build_wiki", { wikiPages });
-    await appendPhase(projectDir, runId, "build_wiki", "end", { wikiPages: wikiPages.length });
-
-    // ── Phase 4: completed ────────────────────────────────────────────────
-    summary.durationMs = Date.now() - started;
-    await appendPhase(projectDir, runId, "completed", "end", { summary });
-    await finishRun(projectDir, runId, "completed");
-
-    return {
-      projectSlug: slug,
-      wikiPages,
-      crawledResources: allResources.length,
-      seedPapers: seedResult.ingested.length,
-      summary,
-    };
-  } catch (err) {
-    await appendPhase(projectDir, runId, "error", "end", { error: errMsg(err) });
-    await finishRun(projectDir, runId, "error", errMsg(err));
-    throw err;
-  }
+  return runInitAgentSpine(input, ctx);
 }
-
 /**
  * Spine-First pipeline (v1b, useSpine=true). Four phases:
  *   explore_graph → build_spine → build_efforts → spine_wiki → completed
@@ -1897,19 +1690,6 @@ export async function resumeInitAgent(
   }
 }
 
-function buildReferencesMarkdown(resources: CrawledResource[]): string {
-  const lines = ["> [AI-GENERATED] This reference list was assembled automatically and requires human review.", "", "# References", ""];
-  if (resources.length === 0) {
-    lines.push("_No references were discovered during initialization._");
-    return lines.join("\n");
-  }
-  for (const r of resources) {
-    const auth = r.authors.length > 0 ? r.authors.join(", ") : "Unknown";
-    const year = r.year ? ` (${r.year})` : "";
-    lines.push(`- **${r.title}** — ${auth}${year}. [${r.arxivId ? `arXiv:${r.arxivId}` : r.sourceType}](${r.url})`);
-  }
-  return lines.join("\n");
-}
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);

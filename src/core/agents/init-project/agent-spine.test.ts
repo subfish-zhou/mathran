@@ -258,17 +258,4 @@ describe("runInitAgent — Spine-First pipeline (useSpine=true)", () => {
     // spine itself is still built
     expect(result.summary.spineNodes).toBeGreaterThan(0);
   });
-
-  it("useSpine=false still runs the v1a path (mode undefined, deep_crawl phase)", async () => {
-    await createRun(projectDir, { runId: "run-spine01" });
-    const input = makeInput({
-      aiInit: { enableWiki: true, enableWorkspace: true, useSpine: false },
-    });
-    const result = await runInitAgent(input, ctx());
-    expect(result.mode).toBeUndefined();
-    const ledger = await readRunLedger(projectDir, "run-spine01");
-    const phaseNames = ledger?.phases.map((p) => p.phase) ?? [];
-    expect(phaseNames).toContain("deep_crawl");
-    expect(phaseNames).not.toContain("build_spine");
-  });
 });

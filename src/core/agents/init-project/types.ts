@@ -32,8 +32,10 @@ export interface AiInitConfig {
   enableWiki: boolean;
   enableWorkspace: boolean;
   /**
-   * Opt into the Spine-First pipeline (v1b). When false (default) the v1a
-   * 4-phase path runs unchanged.
+   * @deprecated 2026-06-30 — v1a was removed; all projects now run the
+   * Spine-First v1b pipeline. This field is kept in the type only for
+   * backward-compat with old JSON request payloads (server ignores it);
+   * new callers should omit it. Will be removed in the next major.
    */
   useSpine?: boolean;
   /**
