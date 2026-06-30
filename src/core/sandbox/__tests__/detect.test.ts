@@ -51,6 +51,20 @@ describe("detectSandboxCapabilities", () => {
     expect(caps.bwrapWorks).toBe(true);
   });
 
+  it("bwrapUserns reflects whether unprivileged user namespaces are usable", () => {
+    if (process.platform !== "linux") return;
+    const caps = detectSandboxCapabilities();
+    // 2026-06-30 — bwrapUserns is a *boolean* — true on hosts where
+    // `bwrap --unshare-user` actually creates a namespace, false on
+    // Ubuntu 24.04+ default config (AppArmor blocks it). We assert the
+    // type, not a specific value, so the test passes on both kinds of
+    // host. The wrapper test uses skipIf(!sandboxAvailable) to gate the
+    // real-spawn tests off this field.
+    expect(typeof caps.bwrapUserns).toBe("boolean");
+    // Sanity check: userns implies bwrapWorks (probe gated on it).
+    if (caps.bwrapUserns) expect(caps.bwrapWorks).toBe(true);
+  });
+
   it("Landlock detection: true on Linux ≥ 6.7 (our VM is 6.14)", () => {
     if (process.platform !== "linux") return;
     const caps = detectSandboxCapabilities();

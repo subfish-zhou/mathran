@@ -3414,7 +3414,18 @@ function buildApp(
   // tool can fire-and-forget a kickoff with all deps wired.
   const scopedFactory: ScopedChatSessionFactory = ({ scope, model, conversationId }) =>
     factory({ scope, model, conversationId, autoRunGoal, autoRunPlan });
-  const sessions = new ScopedChatSessionStore(workspace, scopedFactory);
+  // 2026-06-30 — Channels v1: pass the process-level channel registry
+  // (already attached to MCP via attachMcpBridge above) so every cached
+  // session subscribes on getOrCreate and unsubscribes on evictOne/drop.
+  // MCP servers emitting `mathran/channel` notifications are now routed
+  // straight into the live session's history as user-role turns.
+  const sessions = new ScopedChatSessionStore(
+    workspace,
+    scopedFactory,
+    undefined,
+    undefined,
+    getGlobalChannelRegistry(),
+  );
 
   // Per-goal AbortControllers for in-flight rounds. POST /interrupt aborts the
   // matching controller. Single-process only — a multi-process deployment would

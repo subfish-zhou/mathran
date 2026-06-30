@@ -18,6 +18,11 @@ import {
   readManifest,
   writeManifest,
 } from "./python-venv.js";
+import {
+  spawnSandboxed,
+  type SandboxConfig,
+  type SandboxKind,
+} from "../../sandbox/index.js";
 
 export interface RunPythonToolOptions {
   workspace?: string;
@@ -25,6 +30,17 @@ export interface RunPythonToolOptions {
   conversationId?: string;
   /** Output cap per stream in bytes (default 32 KiB). */
   maxOutputBytes?: number;
+  /**
+   * 2026-06-30 — sandbox config (Bubblewrap). When `sandbox.enabled` is
+   * `false` (default) the tool falls through to a raw spawn — back-compat
+   * byte-for-byte. When enabled:
+   *   - pip install runs with the `network` profile (must reach PyPI)
+   *   - the actual `python -c <code>` runs with the configured default
+   *     profile (typically `workspace-write` — no network, workspace RW,
+   *     system RO). The venv lives under `<workspace>/.mathran/python-envs/`
+   *     so the workspace-write bind covers it automatically.
+   */
+  sandbox?: SandboxConfig;
 }
 
 const DEFAULT_TIMEOUT_SEC = 60;
@@ -37,6 +53,50 @@ export function createRunPythonTool(
   const builderWorkspace = opts.workspace;
   const conversationId = opts.conversationId;
   const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT;
+  const sandboxCfg = opts.sandbox;
+  const useSandbox = sandboxCfg !== undefined && sandboxCfg.enabled === true;
+
+  /**
+   * 2026-06-30 — sandbox-aware spawn helper. When `useSandbox` is true,
+   * route through `spawnSandboxed` with the requested profile; otherwise
+   * fall through to the existing `runProc` (raw spawn). The two
+   * SandboxResult / ProcResult shapes are compatible at the fields we
+   * read (`exit`, `stdout`, `stderr`, `timedOut`, `spawnError`), so the
+   * call sites stay unchanged.
+   */
+  async function runSandboxedOrRaw(
+    cmd: string,
+    args: string[],
+    timeoutMs: number,
+    kind: SandboxKind,
+    workspace: string,
+  ): Promise<{
+    exit: number;
+    stdout: string;
+    stderr: string;
+    timedOut: boolean;
+    spawnError: Error | null;
+  }> {
+    if (!useSandbox) {
+      return runProc(cmd, args, { timeoutMs, maxOutputBytes });
+    }
+    const r = await spawnSandboxed({
+      config: sandboxCfg!,
+      kind,
+      workspace,
+      toolName: "run_python",
+      command: cmd,
+      args,
+      spawnOpts: { timeoutMs, maxOutputBytes, env: process.env },
+    });
+    return {
+      exit: r.exit,
+      stdout: r.stdout,
+      stderr: r.stderr,
+      timedOut: r.timedOut,
+      spawnError: r.spawnError,
+    };
+  }
 
   return {
     name: "run_python",
@@ -109,10 +169,16 @@ export function createRunPythonTool(
         const manifest = await readManifest(venv.manifestPath);
         const missing = needs.filter((n) => !manifest[n]);
         if (missing.length > 0) {
-          const pip = await runProc(
+          // pip MUST have network — use the `network` profile regardless of
+          // the user's defaultProfile. The user can disable sandboxing
+          // entirely (`enabled: false`) but cannot ask pip to install
+          // packages without network.
+          const pip = await runSandboxedOrRaw(
             venv.pipBin,
             ["install", ...missing],
-            { timeoutMs: 300_000, maxOutputBytes },
+            300_000,
+            "network",
+            workspace,
           );
           if (pip.spawnError) {
             return {
@@ -133,10 +199,18 @@ export function createRunPythonTool(
         }
       }
 
-      const res = await runProc(venv.pythonBin, ["-c", code], {
+      // python -c <code> runs under the **default profile** (typically
+      // workspace-write — no network). When the user explicitly wants the
+      // python code itself to have network (e.g. fetching arxiv abstracts
+      // mid-script), they can set sandbox.defaultProfile to "network", but
+      // that's an explicit opt-in; the safe default is no network.
+      const res = await runSandboxedOrRaw(
+        venv.pythonBin,
+        ["-c", code],
         timeoutMs,
-        maxOutputBytes,
-      });
+        (sandboxCfg?.defaultProfile ?? "workspace-write") as SandboxKind,
+        workspace,
+      );
       if (res.spawnError) {
         return {
           ok: false,

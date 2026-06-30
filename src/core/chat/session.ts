@@ -1533,6 +1533,36 @@ export class ChatSession {
   }
 
   /**
+   * 2026-06-30 — subscribe this session to a Channel registry so MCP
+   * pushes (`mathran/channel` notifications) routed at `sessionId` are
+   * appended via {@link injectChannelMessage}. Returns an unsubscribe
+   * function the caller MUST invoke when the session is evicted /
+   * disposed / the process exits — otherwise the registry holds a
+   * reference to the session and keeps it alive past its useful life.
+   *
+   * Lifecycle ownership: ChatSession deliberately does NOT auto-register
+   * in the constructor — that would couple the session's lifetime to a
+   * process-level singleton and have no place to hook unregister. Hosts
+   * call this from the same scope that creates the session
+   * (chat.ts: process exit; serve.ts ScopedChatSessionStore: getOrCreate
+   * register / evictOne unregister).
+   *
+   * Idempotent: registering the same sessionId replaces the previous
+   * subscription per ChannelRegistry semantics — the session continues
+   * to receive routes after re-registration without missing messages.
+   */
+  subscribeToChannels(
+    registry: { register: (sub: { sessionId: string; deliver: (m: { content: string; source: string; role?: "user" }) => void }) => () => void },
+    sessionId: string,
+  ): () => void {
+    const unsubscribe = registry.register({
+      sessionId,
+      deliver: (m) => this.injectChannelMessage(m),
+    });
+    return unsubscribe;
+  }
+
+  /**
    * Replace the in-memory history with a hydrated copy (used by the disk-
    * backed `ScopedChatSessionStore` during session re-hydration on first
    * access after a process restart).
@@ -1888,6 +1918,7 @@ export class ChatSession {
           createRunPythonTool({
             ...(this.workspace ? { workspace: this.workspace } : {}),
             ...(convId ? { conversationId: convId } : {}),
+            ...(this.sandbox ? { sandbox: this.sandbox } : {}),
           }),
         ),
       );
@@ -1902,6 +1933,7 @@ export class ChatSession {
           createRunLatexTool({
             ...(this.workspace ? { workspace: this.workspace } : {}),
             ...(convId ? { conversationId: convId } : {}),
+            ...(this.sandbox ? { sandbox: this.sandbox } : {}),
           }),
         ),
       );

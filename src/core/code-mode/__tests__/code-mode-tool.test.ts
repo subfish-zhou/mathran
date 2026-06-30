@@ -139,10 +139,12 @@ describe("createCodeModeTool — end-to-end script execution", () => {
   }, 30_000);
 
   it("script that throws is surfaced as ok:false with the error", async () => {
-    // Need at least one bound tool from the whitelist so the runtime spins
-    // up (createCodeModeTool refuses to run with zero bound tools).
-    const readFile = makeStubReadFile({});
-    const tool = createCodeModeTool({ tools: [readFile] });
+    // 给 createCodeModeTool 至少一个 whitelisted tool — 否则它在 invoke
+    // 阶段提前 ok:false 'no tools are bound (session registered none of
+    // the whitelisted names)'，根本没机会 eval 脚本。任意 read-only stub
+    // 即可（read_file 在 DEFAULT_ALLOWED_TOOLS 里）。
+    const stub = makeStubReadFile({});
+    const tool = createCodeModeTool({ tools: [stub] });
     const result = await tool.execute(
       { script: `throw new Error("script bug");` },
       undefined as never,
@@ -152,7 +154,8 @@ describe("createCodeModeTool — end-to-end script execution", () => {
   }, 30_000);
 
   it("missing 'script' arg is rejected with a clear error", async () => {
-    const tool = createCodeModeTool({ tools: [] });
+    const stub = makeStubReadFile({});
+    const tool = createCodeModeTool({ tools: [stub] });
     const result = await tool.execute({}, undefined as never);
     expect(result.ok).toBe(false);
     expect(result.content).toMatch(/script/i);

@@ -26,7 +26,13 @@ import {
 
 const linuxOnly = process.platform === "linux";
 const caps = detectSandboxCapabilities();
-const sandboxAvailable = linuxOnly && caps.bwrapWorks;
+// 2026-06-30 — sandbox availability for real-bwrap tests requires
+// BOTH the binary works AND userns is actually usable. On Ubuntu 24.04+
+// with `kernel.apparmor_restrict_unprivileged_userns=1` the binary
+// succeeds but `--unshare-user` is blocked; without checking
+// `bwrapUserns` the test suite would fail in CI/dev VMs that haven't
+// run `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`.
+const sandboxAvailable = linuxOnly && caps.bwrapWorks && caps.bwrapUserns;
 
 function enabledConfig(): SandboxConfig {
   return { ...DEFAULT_SANDBOX_CONFIG, enabled: true };

@@ -679,6 +679,15 @@ interface SessionEntry {
   session: ChatSession;
   lastUsedMs: number;
   model?: string;
+  /**
+   * 2026-06-30 — Channels v1: when the session subscribes to the channel
+   * registry, the registry hands back an unsubscribe callback. The store
+   * stashes it here so `evictOne` / `drop` can invoke it before
+   * discarding the entry, preventing the registry from holding a dead
+   * session reference. Optional because callers that don't wire channels
+   * (CLI without server, tests) skip the subscription.
+   */
+  unsubscribeChannel?: () => void;
 }
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000;
@@ -706,12 +715,42 @@ export class ScopedChatSessionStore {
    * other evictions of the same key.
    */
   private readonly evictionLocks = new Map<string, Promise<void>>();
+  /**
+   * 2026-06-30 — Channels v1 wiring. Optional channel registry the
+   * store uses to subscribe / unsubscribe each cached session at its
+   * lifecycle boundaries. Stored as a generic `register` callback (not
+   * a hard `ChannelRegistry` type) to avoid coupling store.ts to the
+   * channels module — the registry interface is duck-typed on
+   * `register({sessionId, deliver}) => unsubscribe`. When unset (the
+   * default for CLI / tests), all channel hooks are no-ops.
+   */
+  private readonly channelRegistry?: {
+    register: (sub: {
+      sessionId: string;
+      deliver: (m: { content: string; source: string; role?: "user" }) => void;
+    }) => () => void;
+  };
+
   constructor(
     private readonly workspace: string,
     private readonly factory: ScopedChatSessionFactory,
     private readonly maxEntries: number = DEFAULT_MAX_ENTRIES,
     private readonly ttlMs: number = DEFAULT_TTL_MS,
-  ) {}
+    /**
+     * Optional channel registry. Pass `getGlobalChannelRegistry()` from
+     * `src/core/channels/` here in serve mode so MCP pushes route into
+     * live sessions. CLI / tests pass `undefined` and channels stay
+     * dormant.
+     */
+    channelRegistry?: {
+      register: (sub: {
+        sessionId: string;
+        deliver: (m: { content: string; source: string; role?: "user" }) => void;
+      }) => () => void;
+    },
+  ) {
+    if (channelRegistry) this.channelRegistry = channelRegistry;
+  }
 
   /** Expose the workspace root so route handlers can pass it into the
    *  annotations helpers without having to thread it through every layer
@@ -760,6 +799,15 @@ export class ScopedChatSessionStore {
     try {
       const entry = this.entries.get(key);
       if (!entry) return; // already evicted by a concurrent caller
+      // 2026-06-30 — Channels v1: detach the session from the channel
+      // registry BEFORE flush so a push that arrives mid-eviction goes
+      // to broadcast (or is dropped if no other live sub) rather than a
+      // stale session about to be discarded.
+      try {
+        entry.unsubscribeChannel?.();
+      } catch {
+        /* best-effort — never block eviction on registry detach */
+      }
       // Persist the latest history before dropping the cache entry. We use the
       // shared persistence helper so chat + goal stay on identical layout.
       await flushConversationHistory(
@@ -800,12 +848,28 @@ export class ScopedChatSessionStore {
       // ChatSession's internal `messages` matches what's on disk verbatim.
       session.replaceHistory(history);
     }
+    // 2026-06-30 — Channels v1: subscribe this freshly-created session
+    // to the channel registry (if wired). The returned unsubscribe is
+    // stashed on the entry so evictOne / drop can call it before the
+    // session leaves the cache.
+    let unsubscribeChannel: (() => void) | undefined;
+    if (this.channelRegistry) {
+      try {
+        unsubscribeChannel = session.subscribeToChannels(
+          this.channelRegistry,
+          conversationId,
+        );
+      } catch {
+        /* best-effort — failed subscribe shouldn't block session creation */
+      }
+    }
     this.entries.set(key, {
       scope,
       conversationId,
       session,
       lastUsedMs: Date.now(),
-      model,
+      ...(model !== undefined ? { model } : {}),
+      ...(unsubscribeChannel !== undefined ? { unsubscribeChannel } : {}),
     });
     return session;
   }
@@ -838,6 +902,19 @@ export class ScopedChatSessionStore {
   /** Drop a conversation: cache + disk file + index entry. */
   async drop(scope: ChatScope, conversationId: string): Promise<boolean> {
     const key = this.cacheKey(scope, conversationId);
+    // 2026-06-30 — Channels v1: unsubscribe the live session (if any)
+    // from the channel registry BEFORE deleting it from the cache.
+    // Otherwise the registry continues to deliver pushes into a session
+    // that's about to be GC'd, and the LLM would see stale message
+    // injection if any history is still around in memory.
+    const existing = this.entries.get(key);
+    if (existing) {
+      try {
+        existing.unsubscribeChannel?.();
+      } catch {
+        /* best-effort */
+      }
+    }
     const hadCache = this.entries.delete(key);
     const dir = scopeDir(this.workspace, scope);
     let hadFile = false;

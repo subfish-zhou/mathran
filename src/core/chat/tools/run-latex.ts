@@ -18,6 +18,11 @@ import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import type { ToolSpec, ToolExecuteContext } from "../session.js";
 import { runProc } from "./python-venv.js";
+import {
+  spawnSandboxed,
+  type SandboxConfig,
+  type SandboxKind,
+} from "../../sandbox/index.js";
 
 export interface RunLatexToolOptions {
   workspace?: string;
@@ -25,6 +30,19 @@ export interface RunLatexToolOptions {
   conversationId?: string;
   /** Output cap per stream in bytes (default 32 KiB). */
   maxOutputBytes?: number;
+  /**
+   * 2026-06-30 — sandbox config (Bubblewrap). When `sandbox.enabled` is
+   * `false` (default) the tool falls through to raw spawn. When enabled,
+   * both the `--version` probe AND the actual compile run under the
+   * configured default profile (typically `workspace-write`). TeX engines
+   * read from `/usr/share/texlive` and write to the workspace `runDir`;
+   * the system RO bind covers the former and workspace bind covers the
+   * latter.
+   *
+   * If your TeX install lives outside the default system RO binds (e.g.
+   * `~/.texlive`), add it to `sandbox.extraReadOnlyPaths` in settings.
+   */
+  sandbox?: SandboxConfig;
 }
 
 const ENGINES = ["pdflatex", "xelatex", "lualatex"] as const;
@@ -45,6 +63,59 @@ export function createRunLatexTool(opts: RunLatexToolOptions = {}): ToolSpec {
   const builderWorkspace = opts.workspace;
   const conversationId = opts.conversationId;
   const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT;
+  const sandboxCfg = opts.sandbox;
+  const useSandbox = sandboxCfg !== undefined && sandboxCfg.enabled === true;
+
+  /**
+   * 2026-06-30 — sandbox-aware proc helper. Identical pattern to the one
+   * in `run-python.ts` (cf. `runSandboxedOrRaw` there). When the sandbox
+   * is enabled, route through Bubblewrap with the configured profile;
+   * otherwise hit `runProc` (raw spawn). Both shapes share the fields
+   * the call sites read.
+   */
+  async function runSandboxedOrRaw(
+    cmd: string,
+    args: string[],
+    timeoutMs: number,
+    workspace: string,
+    cwd?: string,
+  ): Promise<{
+    exit: number;
+    stdout: string;
+    stderr: string;
+    timedOut: boolean;
+    spawnError: Error | null;
+  }> {
+    if (!useSandbox) {
+      const o: { timeoutMs: number; maxOutputBytes: number; cwd?: string } = {
+        timeoutMs,
+        maxOutputBytes,
+      };
+      if (cwd !== undefined) o.cwd = cwd;
+      return runProc(cmd, args, o);
+    }
+    const r = await spawnSandboxed({
+      config: sandboxCfg!,
+      kind: (sandboxCfg!.defaultProfile ?? "workspace-write") as SandboxKind,
+      workspace,
+      toolName: "run_latex",
+      command: cmd,
+      args,
+      spawnOpts: {
+        timeoutMs,
+        maxOutputBytes,
+        env: process.env,
+        ...(cwd !== undefined ? { cwd } : {}),
+      },
+    });
+    return {
+      exit: r.exit,
+      stdout: r.stdout,
+      stderr: r.stderr,
+      timedOut: r.timedOut,
+      spawnError: r.spawnError,
+    };
+  }
 
   return {
     name: "run_latex",
@@ -102,10 +173,12 @@ export function createRunLatexTool(opts: RunLatexToolOptions = {}): ToolSpec {
 
       // Pre-check the engine is on PATH so we fail with a friendly message
       // rather than an opaque spawn ENOENT.
-      const ver = await runProc(engine, ["--version"], {
-        timeoutMs: 10_000,
-        maxOutputBytes: 4096,
-      });
+      const ver = await runSandboxedOrRaw(
+        engine,
+        ["--version"],
+        10_000,
+        workspace,
+      );
       if (ver.spawnError || ver.exit !== 0) {
         return {
           ok: false,
@@ -132,7 +205,7 @@ export function createRunLatexTool(opts: RunLatexToolOptions = {}): ToolSpec {
         };
       }
 
-      const res = await runProc(
+      const res = await runSandboxedOrRaw(
         engine,
         [
           "-interaction=nonstopmode",
@@ -140,7 +213,9 @@ export function createRunLatexTool(opts: RunLatexToolOptions = {}): ToolSpec {
           `-output-directory=${runDir}`,
           texPath,
         ],
-        { timeoutMs, maxOutputBytes, cwd: runDir },
+        timeoutMs,
+        workspace,
+        runDir,
       );
       if (res.spawnError) {
         return {
