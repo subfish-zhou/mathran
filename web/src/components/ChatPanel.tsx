@@ -2350,11 +2350,19 @@ export default function ChatPanel({
   // /diff + checkpoint/rewind: handle the CheckpointChip actions on
   // write_file / edit_file tool cards. Targets the checkpoint by tool-call id
   // (the store keys checkpoints by it) and renders the server-formatted text.
+  //
+  // 2026-06-30 — `mode` is the new 5-option dropdown selection from
+  // CheckpointChip (code-only / code-and-conversation / conversation-only /
+  // summarize-from-here / summarize-up-to-here). Server-side /rewind parses
+  // `--mode <m>` from the args string, so we splice it in. `diff` ignores
+  // mode entirely.
   const handleCheckpointAction = useCallback(
-    async (action: "diff" | "rewind", toolCallId: string) => {
+    async (action: "diff" | "rewind", toolCallId: string, mode?: string) => {
       const cid = conversationId ?? "global";
       try {
-        const res = await postChatSlash(cid, action, toolCallId);
+        const args =
+          action === "rewind" && mode ? `${toolCallId} --mode ${mode}` : toolCallId;
+        const res = await postChatSlash(cid, action, args);
         if (action === "diff") {
           pushInfoBubble("```diff\n" + (res.text ?? "(no output)") + "\n```");
         } else {

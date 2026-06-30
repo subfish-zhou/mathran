@@ -201,6 +201,15 @@ export interface AskUserToolOptions {
    * — see module docstring.
    */
   resolver: AskUserResolver;
+  /**
+   * 2026-06-30 — Granular Approval channel `ask_user`. Returns `true` when
+   * the user wants to be prompted; `false` short-circuits the resolver and
+   * the tool returns `default` (when supplied) or `ASK_USER_GOAL_AUTO_REPLY`
+   * — the same fallback goal-mode uses. Omitted ⇒ always prompt (legacy /
+   * back-compat behavior). Wired from `ApprovalBroker.granularConfig.ask_user`
+   * by the host in `session.ts` (chat-mode and serve-mode constructors).
+   */
+  granularGate?: () => boolean;
 }
 
 const DEFAULT_ASK_USER_DESCRIPTION =
@@ -312,6 +321,18 @@ export function createAskUserTool(opts: AskUserToolOptions): ToolSpec {
       }
       if (argv.allowCustom !== undefined) {
         resolverCtx.allowCustom = argv.allowCustom;
+      }
+      // 2026-06-30 — Granular Approval `ask_user` channel: when the gate
+      // is configured AND returns false, skip the resolver entirely and
+      // return `default` if the model supplied one, else the canned
+      // goal-mode auto-reply. This is the prompt-surface kill-switch users
+      // configure via `.mathran/settings.json` `approval.granular.ask_user`.
+      if (opts.granularGate && !opts.granularGate()) {
+        const fallback =
+          typeof argv.default === "string" && argv.default.trim().length > 0
+            ? argv.default
+            : ASK_USER_GOAL_AUTO_REPLY;
+        return { ok: true, content: fallback };
       }
       const reply = await resolver(question, resolverCtx);
       // CLI / goal hosts return the raw reply; we treat an all-whitespace

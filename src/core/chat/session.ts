@@ -1653,7 +1653,21 @@ export class ChatSession {
     // goal: canned reply). Tool description / schema is host-agnostic so
     // the model sees the same affordance everywhere.
     if (cfg.ask_user && cfg.ask_user.resolver) {
-      out.push(createAskUserTool({ resolver: cfg.ask_user.resolver }));
+      // 2026-06-30 — Granular Approval channel `ask_user`: forward a gate
+      // that reads broker.granularConfig at call time (so a live settings
+      // reload — which currently restarts the session — picks up changes
+      // even without a full session rebuild). When no broker is attached
+      // (test fixtures, headless host), default to "always prompt".
+      const brokerForAskUser = this.approvalBroker;
+      const askUserGate = brokerForAskUser
+        ? () => brokerForAskUser.granularConfig.ask_user !== false
+        : undefined;
+      out.push(
+        createAskUserTool({
+          resolver: cfg.ask_user.resolver,
+          ...(askUserGate ? { granularGate: askUserGate } : {}),
+        }),
+      );
     }
     // v0.17 follow-up: propose_goal. Same resolver pattern as ask_user so
     // the SPA's existing confirmation UI is reused. The tool itself does
