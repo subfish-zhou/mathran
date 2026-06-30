@@ -718,6 +718,20 @@ export async function runReadingLoop(
             priority: PRIORITY_FRONTIER + importance,
             year: candidate.year,
           });
+          // 2026-06-30 — Cache the newly-ingested PaperNode into nodeById
+          // immediately. Without this, the NEXT frontier tick computes
+          // alreadyQueuedArxivIds via `nodeById.get(pid)?.arxivId` and misses
+          // the paper we just pushed (because the reader hasn't popped it yet
+          // to populate nodeById at line 400). Frontier's own seenAcrossTicks
+          // set catches the duplicate at arxiv-fetch time, so correctness is
+          // preserved either way, but caching here saves a redundant arxiv
+          // round-trip + a wasted LLM relevance verdict.
+          try {
+            const node = await getPaper(config.workspace, paperId);
+            if (node) nodeById.set(paperId, node);
+          } catch (err) {
+            log(`[reading-loop] frontier: cache nodeById for ${paperId} failed: ${errMsg(err)}`);
+          }
           actuallyPushed++;
         }
         frontierTotalAdded += actuallyPushed;

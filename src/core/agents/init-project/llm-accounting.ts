@@ -89,6 +89,9 @@ export class LlmAccounting {
   }
 
   private modelForRole(role: LlmRole): string {
+    // 2026-06-30 — only "reviewer" uses the reviewer model; everything
+    // else (writer / reader / plan / frontier / other) is the same primary
+    // model, so usage accounting + price computation share that pool.
     return role === "reviewer" ? this.reviewerModel : this.writerModel;
   }
 
