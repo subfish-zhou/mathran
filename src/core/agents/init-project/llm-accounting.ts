@@ -16,7 +16,7 @@
 
 import type { SpineLLM } from "./spine/llm.js";
 
-export type LlmRole = "writer" | "reviewer" | "reader" | "plan" | "other";
+export type LlmRole = "writer" | "reviewer" | "reader" | "plan" | "frontier" | "other";
 
 interface PhaseAccumulator {
   calls: number;

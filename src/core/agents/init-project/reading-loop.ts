@@ -38,6 +38,11 @@ import {
 } from "../../paper-graph/index.js";
 import { deletePaperRead, writePaperRead } from "../../paper-graph/reads.js";
 import { readPaper as realReadPaper, type ReadPaperCtx, type PriorReadSummary } from "./reader/index.js";
+import { PRIORITY_FRONTIER, FRONTIER_K_EMPTY_TO_EXHAUST } from "./frontier-expansion/types.js";
+import type {
+  FrontierCandidate,
+  FrontierVerdict,
+} from "./frontier-expansion/types.js";
 import { buildSurveyDistillationPrompt } from "./reading-loop-prompts.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -86,6 +91,28 @@ export interface ReadingLoopConfig {
   }) => Promise<import("./reading-plan/index.js").ReadingPlan>;
   /** Re-plan after every N reads. Defaults to REPLAN_CADENCE_DEFAULT. */
   replanCadence?: number;
+
+  /**
+   * 2026-06-30 — Layer 3: Frontier expansion. When supplied, the loop
+   * calls `expandFrontier` every `frontierCadence` reads (default same as
+   * replanCadence) to discover recent arXiv preprints that the seed +
+   * citation crawl might miss. The expander pushes new papers into the
+   * reading queue at PRIORITY_FRONTIER via the loop's internal `push()`.
+   *
+   * Convergence: the loop stops calling `expandFrontier` once either:
+   *   - the expander returns `exhausted: true` (fetch budget hit /
+   *     no concepts available), or
+   *   - the expander returns `addedCount: 0` for FRONTIER_K_EMPTY_TO_EXHAUST
+   *     consecutive ticks (sustained "nothing new found" signal).
+   *
+   * Failure-isolated: any throw → log + carry on with the current queue
+   * (the loop's other discovery channels still work).
+   */
+  expandFrontier?: import("./frontier-expansion/index.js").ExpandFrontierFn;
+  /** Snapshot of the spine at the moment of each frontier tick. */
+  getCurrentSpine?: () => import("./spine/types.js").NarrativeSpine | null;
+  /** Frontier expansion cadence (reads). Defaults to replanCadence. */
+  frontierCadence?: number;
 }
 
 export interface ReadingLoopUnresolvedCitation {
@@ -114,6 +141,17 @@ export interface ReadingLoopResult {
     consecutiveEmptyRounds: number;
     totalRoundsRun: number;
     circuitBreakerTripped: boolean;
+  };
+  /**
+   * 2026-06-30 — Frontier expansion summary, when an expander was wired.
+   * Tracks how many ticks ran, how many papers were added, and why the
+   * expander stopped being called. Absent when no expander was wired.
+   */
+  frontierExpansion?: {
+    ticksRun: number;
+    totalAdded: number;
+    convergence: "k-empty" | "exhausted" | "still-active";
+    exhaustionReason?: "fetch-budget-exceeded" | "all-concepts-empty" | "no-concepts";
   };
 }
 
@@ -284,6 +322,23 @@ export async function runReadingLoop(
   const replanCadenceCfg = Math.max(1, config.replanCadence ?? RP_REPLAN_CADENCE_DEFAULT);
   let currentPlan: import("./reading-plan/index.js").ReadingPlan = config.plan ?? RP_EMPTY_PLAN;
   let readsSinceReplan = 0;
+
+  // 2026-06-30 — Frontier expansion state.
+  // `frontierCadenceCfg` defaults to replanCadence so by default frontier
+  // runs right after replan (one tick → both fire on the same K-read boundary).
+  // `frontierKEmptyStreak` counts consecutive 0-add ticks; when it reaches
+  // FRONTIER_K_EMPTY_TO_EXHAUST we stop calling the expander for the rest
+  // of the run (convergence: the spine isn't producing concepts that hit
+  // arxiv).
+  // `frontierStopped` is set true once we've stopped calling expandFrontier
+  // for ANY reason (k-empty, exhausted return, or no expander wired).
+  const frontierCadenceCfg = Math.max(1, config.frontierCadence ?? replanCadenceCfg);
+  let readsSinceFrontier = 0;
+  let frontierTicksRun = 0;
+  let frontierTotalAdded = 0;
+  let frontierKEmptyStreak = 0;
+  let frontierStopped = config.expandFrontier == null;
+  let frontierExhaustionReason: "fetch-budget-exceeded" | "all-concepts-empty" | "no-concepts" | undefined;
 
   for (;;) {
     if (queue.length === 0) {
@@ -612,6 +667,89 @@ export async function runReadingLoop(
         log(`[reading-loop] replan callback failed (${errMsg(err)}) — carry v${currentPlan.planVersion}`);
       }
     }
+
+    // 2026-06-30 — Layer 3: Frontier expansion tick. Fires AFTER replan
+    // so the expander sees the latest plan + spine. Skipped once
+    // frontierStopped is true (K-empty / exhausted / not wired).
+    readsSinceFrontier++;
+    if (!frontierStopped && config.expandFrontier && readsSinceFrontier >= frontierCadenceCfg) {
+      readsSinceFrontier = 0;
+      try {
+        const spine = config.getCurrentSpine?.() ?? null;
+        const result = await config.expandFrontier({
+          readPapers: Array.from(reads.values()),
+          readNodesById: nodeById,
+          spine,
+          alreadyQueuedArxivIds: new Set(
+            queue
+              .map((q) => nodeById.get(q.paperId)?.arxivId)
+              .filter((id): id is string => typeof id === "string"),
+          ),
+          alreadyReadArxivIds: new Set(
+            Array.from(reads.values())
+              .map((r) => r.arxivId)
+              .filter((id): id is string => typeof id === "string"),
+          ),
+        });
+        frontierTicksRun++;
+
+        // Ingest each kept candidate into the paper-graph (so it has a real
+        // paperId), then push at PRIORITY_FRONTIER + the LLM-suggested
+        // importance bucket (essential/supporting/passing → fine-grained
+        // sub-priority within the FRONTIER band).
+        let actuallyPushed = 0;
+        for (const { candidate, verdict } of result.kept) {
+          const paperId = await ingestArxiv(
+            config.workspace,
+            candidate.arxivId,
+            candidate.title,
+            candidate.authors,
+            candidate.year,
+            fetchArxivById,
+            log,
+            candidate.abstract,
+          );
+          if (!paperId) continue;
+          const band = verdict.priorityBand ?? "passing";
+          const importance = IMPORTANCE_PRIORITY[band] ?? IMPORTANCE_PRIORITY.passing;
+          push({
+            paperId,
+            why: `frontier (${candidate.fromConcept}): ${verdict.reason}`,
+            priority: PRIORITY_FRONTIER + importance,
+            year: candidate.year,
+          });
+          actuallyPushed++;
+        }
+        frontierTotalAdded += actuallyPushed;
+
+        // Convergence: K-empty streak based on what the LLM kept (NOT what
+        // we actually pushed — push can fail to dedup-by-paperId but that
+        // still means the expander "found something new"). Using
+        // result.addedCount here so an LLM-kept paper that ingest fails to
+        // create still counts as forward progress.
+        if (result.addedCount === 0) {
+          frontierKEmptyStreak++;
+          if (frontierKEmptyStreak >= FRONTIER_K_EMPTY_TO_EXHAUST) {
+            log(
+              `[reading-loop] frontier: K-empty streak hit ${frontierKEmptyStreak} — ` +
+                `stopping expansion (converged on current spine)`,
+            );
+            frontierStopped = true;
+            if (!frontierExhaustionReason) frontierExhaustionReason = "all-concepts-empty";
+          }
+        } else {
+          frontierKEmptyStreak = 0;
+        }
+        if (result.exhausted) {
+          log(`[reading-loop] frontier: expander reported exhausted (${result.exhaustionReason ?? "unknown"})`);
+          frontierStopped = true;
+          frontierExhaustionReason = result.exhaustionReason;
+        }
+      } catch (err) {
+        log(`[reading-loop] frontier callback failed (${errMsg(err)}) — disabling for the rest of the run`);
+        frontierStopped = true;
+      }
+    }
   }
 
   log(
@@ -629,6 +767,23 @@ export async function runReadingLoop(
       totalRoundsRun: totalRounds,
       circuitBreakerTripped,
     },
+    // Frontier summary — undefined when no expander was wired so existing
+    // callers that don't know about frontier expansion see no extra field.
+    ...(config.expandFrontier
+      ? {
+          frontierExpansion: {
+            ticksRun: frontierTicksRun,
+            totalAdded: frontierTotalAdded,
+            convergence: (frontierStopped
+              ? frontierExhaustionReason === "fetch-budget-exceeded" ||
+                frontierExhaustionReason === "no-concepts"
+                ? "exhausted"
+                : "k-empty"
+              : "still-active") as "k-empty" | "exhausted" | "still-active",
+            ...(frontierExhaustionReason ? { exhaustionReason: frontierExhaustionReason } : {}),
+          },
+        }
+      : {}),
   };
 }
 

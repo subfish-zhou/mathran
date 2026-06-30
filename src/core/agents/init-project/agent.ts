@@ -56,6 +56,7 @@ import { outlineWikiPages, persistWikiPlan } from "./wiki-plan/index.js";
 import { addRelation, type RelationType } from "../../effort/store.js";
 import { type NeighborPaper } from "./citation-explorer.js";
 import { runReadingLoop, type PriorArtCorpus } from "./reading-loop.js";
+import { buildFrontierExpander } from "./frontier-expansion/index.js";
 import { reviewLinks, checkCompleteness } from "./link-review.js";
 import type { SpinePipelineEvent, WikiPageOutput, WorkspaceEffortOutput } from "./spine/types.js";
 import type { PaperNode } from "../../paper-graph/index.js";
@@ -579,6 +580,20 @@ async function runInitAgentSpine(
       arcs: initialPlan.narrativeArcs.map((a) => ({ name: a.name, steps: a.steps.length })),
     });
 
+    // 2026-06-30 — Frontier expander, wired into the reading-loop's Layer 3.
+    // Builds once per run, passed in via deps so the loop can call it at the
+    // configured cadence. The expander is responsible for arxiv-fetching recent
+    // preprints and LLM-filtering them; reading-loop owns ingest + push.
+    const frontierLLM = accounting.wrap(spineLLM, "read_and_explore", "frontier");
+    const frontierExpander = buildFrontierExpander({
+      llm: frontierLLM,
+      modelName: modelPair.writerModel,
+      problemTitle: problem.title,
+      problemFormalStatement: problem.formalStatement,
+      problemTags: problem.tags,
+      log: (m) => emit({ type: "log", message: m }),
+    });
+
     // The reading loop (Phase D, Task 18) replaces the citation-graph BFS: it
     // reads each paper (skim→read→audit), harvests its bibliography into new
     // candidates, prioritises surveys, and converges naturally.
@@ -597,6 +612,32 @@ async function runInitAgentSpine(
         llm: readerLLM,
         modelName: modelPair.writerModel,
         plan: initialPlan,
+        // 2026-06-30 — Frontier expansion wiring. The expander fetches recent
+        // arxiv preprints scoped to the spine's concepts and LLM-filters for
+        // relevance; the reading-loop ingests + enqueues the keepers at
+        // PRIORITY_FRONTIER. Convergence is K-empty (3 consecutive 0-add ticks)
+        // or fetch-budget (200 papers per project), whichever comes first.
+        expandFrontier: frontierExpander,
+        // Adapter: HypothesisSpine shares most fields with NarrativeSpine
+        // (globalThesis / threads / openQuestions — what frontier reads) but
+        // lacks `version`/`updatedAt`. Wrap so the type checker is happy and
+        // frontier sees the snapshot at frontier-call time.
+        getCurrentSpine: () => ({
+          version: 0,
+          updatedAt: hypothesisSpine.builtAt,
+          globalThesis: hypothesisSpine.globalThesis,
+          eras: hypothesisSpine.eras,
+          nodes: [],
+          edges: hypothesisSpine.edges,
+          threads: hypothesisSpine.threads,
+          openQuestions: hypothesisSpine.openQuestions.map((q) => ({
+            title: q.title,
+            statement: q.statement,
+            relatedNodeIds: q.relatedNodeIds,
+            barrier: q.barrier ?? "",
+            partialProgress: q.partialProgress ?? "",
+          })),
+        }),
         // Re-plan callback: every REPLAN_CADENCE_DEFAULT reads the loop
         // refreshes the plan with current reads + queued candidates. Failure-
         // isolated inside the loop (a throw here is logged and the prior plan
