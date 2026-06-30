@@ -74,6 +74,15 @@ const SYSTEM_RO_BINDS: ReadonlyArray<string> = [
   "/libx32",
   "/opt", // Lean / elan / texlive
   "/var/lib", // texlive font caches etc.
+  // 2026-06-30 — DNS resolution. On systemd-resolved hosts (Ubuntu 18+)
+  // `/etc/resolv.conf` is a symlink into `/run/systemd/resolve/stub-resolv.conf`.
+  // Without `/run` bound the symlink dangles inside the jail and every
+  // `curl https://…` returns http=000 (DNS lookup fails). With `network`
+  // profile we want curl to actually work, so bind `/run` RO. We bind the
+  // whole `/run` rather than the specific subpath because some distros
+  // park the stub elsewhere (e.g. `/run/NetworkManager/resolv.conf`) and
+  // `/run` is small (mostly pid files + tiny daemon sockets).
+  "/run",
 ];
 
 /** Expand a leading `~` to the user's home directory. */

@@ -566,6 +566,11 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
       write_file: true,
       edit_file: true,
       dispatch_subagent: true,
+      // 2026-06-30 — Codex parity: V4A apply_patch + JS code mode.
+      // serve.ts wires these the same way; mirroring here so `mathran
+      // chat` REPL has the same tool list as the SPA does.
+      apply_patch: true,
+      code_mode: { allowWrite: true, allowBash: false },
       // v0.16 §11: only wire `ask_user` when a resolver was provided
       // (interactive REPL passes one; one-shot `-p` and external scripts
       // don't — there's no human there to answer, so the tool is omitted

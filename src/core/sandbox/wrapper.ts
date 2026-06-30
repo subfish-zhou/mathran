@@ -215,7 +215,42 @@ function runWithCaps(
     let timedOut = false;
     let spawnError: Error | null = null;
     const cap = opts.maxOutputBytes;
-    const env = opts.env ?? process.env;
+    // 2026-06-30 — env sanitisation. Some env vars point to host paths
+    // that won't exist inside the jail (e.g. Hermes Agent sets
+    // SSL_CERT_FILE → ~/.hermes/.../certifi/cacert.pem; that path is
+    // outside any bind, so curl / openssl can't load it and every TLS
+    // handshake fails with "error setting certificate file"). The fix
+    // is to strip path-bearing env vars whose pointed-at path is NOT
+    // accessible inside the bind set, falling back to the system
+    // defaults shipped at `/etc/ssl/certs/`.
+    const rawEnv = opts.env ?? process.env;
+    const env: NodeJS.ProcessEnv = { ...rawEnv };
+    // Variables whose contents are filesystem paths the host expects
+    // tools to read. If the path lives outside `/usr`, `/etc`, `/lib`,
+    // or `/run`, drop the var (the jailed process can't see it) so
+    // tools fall back to system defaults at `/etc/ssl/certs/`.
+    // We deliberately don't include workspace-rooted paths here: a
+    // user-set SSL_CERT_FILE pointing into the workspace IS still
+    // visible inside the jail (workspace-write profile binds the
+    // workspace), but Hermes / Codex / OpenAI client envs that point
+    // into per-user installs (`~/.hermes`, `~/.codex`, `~/.cache/pypoetry`)
+    // are NOT.
+    const PATH_BEARING_ENV_VARS = [
+      "SSL_CERT_FILE",
+      "SSL_CERT_DIR",
+      "CURL_CA_BUNDLE",
+      "REQUESTS_CA_BUNDLE",
+      "NODE_EXTRA_CA_CERTS",
+      "PYTHONHOME",
+    ];
+    const safeRoots = ["/usr/", "/etc/", "/lib/", "/lib64/", "/run/"];
+    for (const name of PATH_BEARING_ENV_VARS) {
+      const val = env[name];
+      if (typeof val === "string" && val.length > 0) {
+        const safe = safeRoots.some((root) => val.startsWith(root));
+        if (!safe) delete env[name];
+      }
+    }
 
     const append = (which: "out" | "err", chunk: Buffer) => {
       if (which === "out") {

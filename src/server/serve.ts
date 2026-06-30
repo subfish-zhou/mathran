@@ -1526,6 +1526,23 @@ export function defaultSessionFactory(
         // separate propose_plan round.
         plan_mode: true,
 
+        // 2026-06-30 — V4A multi-file patch tool (Codex parity).
+        // Lets the model rename / patch / add / delete files in one
+        // atomic transaction with a single LLM round-trip. Goes
+        // through checkpoints + approval broker like write_file.
+        apply_patch: true,
+
+        // 2026-06-30 — Code mode meta-tool (Codex parity).
+        // Lets the model submit a JS script that calls multiple
+        // whitelisted mathran tools in one LLM round (replaces N
+        // round-trips with 1). Default whitelist = read-only tools
+        // + glob/grep/wiki readers; we opt-in to allowWrite so the
+        // script can also call write_file/edit_file/apply_patch
+        // when it needs to (still goes through approval broker per
+        // bound tool). allowBash:false — code-mode-driven bash is
+        // a too-easy lateral move; keep it tool-by-tool.
+        code_mode: { allowWrite: true, allowBash: false },
+
         // #3 Background Agents: when this session belongs to a conversation,
         // wire the shared process-local background registry + a companion
         // get_subagent_result tool so `mode: "background"` is available and the
