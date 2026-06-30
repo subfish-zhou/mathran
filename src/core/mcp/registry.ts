@@ -50,6 +50,14 @@ export interface McpRegistryOptions {
   retryDelayMs?: number;
   /** Injectable client factory (tests). Defaults to the real SDK stdio client. */
   clientFactory?: McpClientFactory;
+  /**
+   * Channels v1 — invoked for EVERY notification any managed MCP client
+   * receives that lacks a more-specific handler. The channels MCP bridge
+   * ({@link attachMcpBridge}) wires itself here at server boot. When
+   * undefined, notifications are silently dropped (the v0 behaviour —
+   * backwards compatible).
+   */
+  notificationSink?: (serverName: string, method: string, params: unknown) => void;
 }
 
 interface ManagedServer {
@@ -66,6 +74,15 @@ export class McpRegistry {
   private readonly maxRetries: number;
   private readonly retryDelayMs: number;
   private readonly clientFactory?: McpClientFactory;
+  /**
+   * Channels v1 — mutable so the bridge can attach late
+   * ({@link setNotificationSink}). Lives on the registry (not the client)
+   * because servers are reloaded / hot-added and we don't want to make
+   * every callsite re-wire its sink. The registry forwards the live
+   * pointer into each {@link makeClient} call's `onNotification`, so
+   * even servers spun up after `setNotificationSink` see pushes.
+   */
+  private notificationSink?: McpRegistryOptions["notificationSink"];
   private servers = new Map<string, ManagedServer>();
   private warnings: string[] = [];
   private initialized = false;
@@ -74,6 +91,20 @@ export class McpRegistry {
     this.maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.retryDelayMs = opts.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
     this.clientFactory = opts.clientFactory;
+    this.notificationSink = opts.notificationSink;
+  }
+
+  /**
+   * Channels v1 — install (or clear) the catch-all notification sink AFTER
+   * construction. Affects every subsequent client connect, AND is hot-
+   * applied to currently-connected clients via the indirection through
+   * `makeClient`'s closure: future {@link reload}s pick up the new sink
+   * automatically; live clients keep firing through the closure we
+   * installed when they connected, so changing the sink is observed
+   * immediately by every server.
+   */
+  setNotificationSink(sink: McpRegistryOptions["notificationSink"]): void {
+    this.notificationSink = sink;
   }
 
   /** Warnings accumulated during the last `init()` (bad config etc.). */
@@ -135,6 +166,13 @@ export class McpRegistry {
       ...(this.clientFactory ? { clientFactory: this.clientFactory } : {}),
       onCrash: (name) => {
         void this.handleCrash(name);
+      },
+      // Channels v1 — indirect through `this.notificationSink` (read at
+      // FIRE time, not construction time) so a late
+      // `setNotificationSink()` is observed by already-connected clients.
+      onNotification: (serverName, method, params) => {
+        const sink = this.notificationSink;
+        if (sink) sink(serverName, method, params);
       },
     });
   }

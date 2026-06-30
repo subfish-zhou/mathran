@@ -110,6 +110,19 @@ export interface LLMMessage {
    * conversation jsonl so historical reasoning survives a reload.
    */
   reasoning?: string;
+  /**
+   * Channels v1 (2026-06-30) — opaque side-channel metadata attached to a
+   * message that did NOT originate from the human user typing into the SPA.
+   * The canonical use today is `fromChannel: "mcp:<server>"` on a user
+   * message that was push-injected by an upstream MCP server via the
+   * `mathran/channel` notification (see {@link injectChannelMessage}).
+   *
+   * Providers MUST ignore this field — it is purely a UI / persistence
+   * artifact. The SSE bridge forwards it onto the wire so the SPA can
+   * render the bubble with a distinct style (different bg, badge etc.).
+   * Compaction preserves it the same way it preserves `reasoning`.
+   */
+  meta?: Record<string, unknown>;
 }
 
 export interface LLMRequest {

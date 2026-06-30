@@ -141,6 +141,7 @@ import {
   createEnterPlanModeTool,
 } from "./tools/plan-mode-tools.js";
 import { createGitTools } from "./tools/git-tools.js";
+import { createCodeModeTool } from "../code-mode/code-mode-tool.js";
 import { wrapMutateTool } from "../checkpoints/middleware.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import type { HookInvoker } from "../hooks/executor.js";
@@ -605,8 +606,17 @@ export interface ChatSessionOptions {
    */
   workspace?: string;
   /**
+   * 2026-06-30 — Sandbox v1 (Bubblewrap) for mutating exec tools.
+   *
+   * When supplied with `enabled: true`, `bash` / `run_python` / `run_latex`
+   * / `lean_check` route their child-process spawns through
+   * `spawnSandboxed` from `src/core/sandbox/`. When omitted or
+   * `enabled: false`, the tools fall through to raw `spawn(...)` — same
+   * behaviour as pre-2026-06-30 mathran. See `docs/sandbox.md`.
+   */
+  sandbox?: import("../sandbox/index.js").SandboxConfig;
+  /**
    * Plan-tracker bug fix (2026-06-30) — supplier of the current todo list
-   * for this conversation. ChatSession invokes this BEFORE every LLM
    * request and injects a short snapshot of unfinished items as a
    * transient `system` message at the end of `messages`, so the model
    * actually sees the in-flight plan when it's deciding what to do next.
@@ -894,6 +904,28 @@ export interface ChatSessionOptions {
      * by virtue of being workspace-scoped.
      */
     git?: boolean | { allowCommit?: boolean };
+    /**
+     * Code mode v1 — `run_code_mode` meta-tool. Lets the LLM submit a JS
+     * script that runs inside a sandboxed QuickJS VM and calls multiple
+     * mathran tools in one round trip. Default OFF — this is an opt-in
+     * power feature for token-saving, NOT a baseline capability.
+     *
+     * `true` enables it with the read-only tool whitelist (read_file, glob,
+     * grep, plus the wiki/effort read tools). Pass an object to extend the
+     * whitelist (`allowWrite` adds write/edit/apply_patch; `allowBash` adds
+     * bash + run_python) or override the 256 MiB / 60 s caps.
+     *
+     * See {@link createCodeModeTool} and `docs/code-mode.md` for details.
+     */
+    code_mode?:
+      | boolean
+      | {
+          allowWrite?: boolean;
+          allowBash?: boolean;
+          extraAllowedTools?: readonly string[];
+          memoryLimitBytes?: number;
+          timeoutMs?: number;
+        };
   };
   /**
    * Subagent scheduler the `dispatch_subagent` builtin tool dispatches into
@@ -1156,6 +1188,13 @@ export class ChatSession {
   /** TODO-2 §3.2 / C8 — compaction event observer (goal-mode wires emit). */
   private readonly onCompactionEvent?: ChatSessionOptions["onCompactionEvent"];
   private readonly workspace?: string;
+  /**
+   * 2026-06-30 — sandbox config (Bubblewrap) for mutating exec tools
+   * (bash / run_python / run_latex / lean_check). Passed through from the
+   * host (chat.ts / serve.ts) on construction; when absent or
+   * `enabled: false`, exec tools fall through to a raw spawn (back-compat).
+   */
+  private readonly sandbox?: import("../sandbox/index.js").SandboxConfig;
   /** 2026-06-30 plan-tracker bug fix — supplier of the current todo list,
    *  see {@link ChatSessionOptions.todoSnapshot} for the full rationale.
    *  Awaited and converted to a transient system reminder before every
@@ -1241,6 +1280,9 @@ export class ChatSession {
     this.toolOutputCap = opts.toolOutputCap;
     this.autoCompactCfg = opts.autoCompact;
     this.workspace = opts.workspace;
+    // 2026-06-30 — sandbox passthrough (Bubblewrap). When the host doesn't
+    // configure one, mutating tools route to raw spawn.
+    if (opts.sandbox) this.sandbox = opts.sandbox;
     this.todoSnapshot = opts.todoSnapshot;
     this.onCompactionEvent = opts.onCompactionEvent;
     this.subagentScheduler = opts.subagentScheduler;
@@ -1453,6 +1495,44 @@ export class ChatSession {
   }
 
   /**
+   * Channels v1 (2026-06-30) — inject a reverse-channel message into
+   * history. The MCP bridge calls this when an upstream server pushes a
+   * `mathran/channel` notification (Telegram bot, Sentry alert, lean
+   * compile finished, …) and the channel registry routes it to this
+   * session.
+   *
+   * v1 semantics: QUEUE mode only. The message is appended as a plain
+   * `role: "user"` turn, so the LLM sees it on its NEXT round between
+   * turns — never mid-stream. Interrupt-style delivery (abort the in-
+   * flight round + prepend a priority user message) is reserved for v2
+   * (see src/core/channels/index.ts).
+   *
+   * The injected message carries `meta.fromChannel` ("mcp:<server>")
+   * so the SSE bridge can forward it to the SPA as a distinct bubble.
+   * Provider adapters MUST ignore `meta` — see `LLMMessage.meta`.
+   *
+   * Deliberately a small, isolated method: this file is a hot spot
+   * (todoSnapshot / Granular wiring / hook v1 wrap) so Channels v1 only
+   * ADDS — never touches `runRounds` / `send` / approval / compaction
+   * paths.
+   */
+  injectChannelMessage(msg: {
+    content: string;
+    source: string;
+    role?: "user";
+  }): void {
+    if (typeof msg.content !== "string" || msg.content.length === 0) return;
+    this.messages.push({
+      role: "user",
+      content: msg.content,
+      meta: {
+        fromChannel: msg.source,
+        channelTs: Date.now(),
+      },
+    });
+  }
+
+  /**
    * Replace the in-memory history with a hydrated copy (used by the disk-
    * backed `ScopedChatSessionStore` during session re-hydration on first
    * access after a process restart).
@@ -1540,8 +1620,14 @@ export class ChatSession {
     // checks can be done with `path.relative`. When `workspace` is unset the
     // tool falls back to `ctx.workspace` and finally `process.cwd()`.
     if (cfg.bash) {
+      // 2026-06-30 — pass sandbox config to bash so v1 Bubblewrap engages
+      // when enabled. Otherwise (`enabled: false` or unset) bash falls
+      // through to raw spawn — back-compat byte-for-byte.
       out.push(
-        createBashTool(this.workspace ? { workspace: this.workspace } : {}),
+        createBashTool({
+          ...(this.workspace ? { workspace: this.workspace } : {}),
+          ...(this.sandbox ? { sandbox: this.sandbox } : {}),
+        }),
       );
     }
     if (cfg.read_file) {
@@ -1904,6 +1990,32 @@ export class ChatSession {
         ...createGitTools({
           ...(this.workspace ? { workspace: this.workspace } : {}),
           ...(gitCfg.allowCommit ? { allowCommit: true } : {}),
+        }),
+      );
+    }
+    // Code mode v1 — opt-in `run_code_mode` meta-tool. Wired LAST so the
+    // closure over `out` captures every tool registered above; the tool
+    // re-reads `out` at CALL time (we pass a thunk into createCodeModeTool)
+    // so MCP tools / other late registrations are visible too. Default off:
+    // requires explicit cfg.code_mode and at least one whitelisted tool
+    // already in the registry.
+    if (cfg.code_mode) {
+      const cmCfg = typeof cfg.code_mode === "object" ? cfg.code_mode : {};
+      out.push(
+        createCodeModeTool({
+          tools: () => this.tools,
+          ...(this.workspace ? { workspace: this.workspace } : {}),
+          ...(cmCfg.allowWrite ? { allowWrite: true } : {}),
+          ...(cmCfg.allowBash ? { allowBash: true } : {}),
+          ...(cmCfg.extraAllowedTools
+            ? { extraAllowedTools: cmCfg.extraAllowedTools }
+            : {}),
+          ...(typeof cmCfg.memoryLimitBytes === "number"
+            ? { memoryLimitBytes: cmCfg.memoryLimitBytes }
+            : {}),
+          ...(typeof cmCfg.timeoutMs === "number"
+            ? { timeoutMs: cmCfg.timeoutMs }
+            : {}),
         }),
       );
     }

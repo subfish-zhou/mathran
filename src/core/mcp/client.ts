@@ -65,6 +65,19 @@ export interface McpClientOptions {
    * `disconnect()`. The registry uses this to drive the retry/disable policy.
    */
   onCrash?: (serverName: string, error: Error) => void;
+  /**
+   * Channels v1 — fired on EVERY notification the upstream MCP server
+   * pushes that doesn't have a more-specific handler installed (i.e.
+   * we wire this onto the SDK's `fallbackNotificationHandler`). The
+   * registry uses this to forward `mathran/channel` pushes into the
+   * channels bus. Other methods are also surfaced here so callers can
+   * extend without re-wiring the bridge (e.g. future `mathran/progress`).
+   *
+   * The first arg is the upstream server's configured name (NOT its
+   * advertised name), so the channel tag stays stable across server
+   * version bumps.
+   */
+  onNotification?: (serverName: string, method: string, params: unknown) => void;
   /** Injectable client factory for tests (defaults to the real SDK). */
   clientFactory?: McpClientFactory;
 }
@@ -84,6 +97,19 @@ export interface SdkLikeClient {
   callTool(params: { name: string; arguments?: Record<string, unknown> }): Promise<unknown>;
   close(): Promise<void>;
   getServerVersion?(): { name?: string; version?: string } | undefined;
+  /**
+   * Channels v1 — set the catch-all notification handler. The real SDK
+   * exposes this via `Protocol.fallbackNotificationHandler` (a settable
+   * property, not a method). We expose both shapes structurally so
+   * test fakes can pick either: an injectable `setFallbackNotificationHandler`
+   * method, or a settable `fallbackNotificationHandler` property.
+   */
+  setFallbackNotificationHandler?: (
+    handler: (notification: { method: string; params?: unknown }) => void | Promise<void>,
+  ) => void;
+  fallbackNotificationHandler?: (
+    notification: { method: string; params?: unknown },
+  ) => void | Promise<void>;
 }
 
 export interface SdkLikeTransport {
@@ -174,6 +200,7 @@ export function flattenToolResult(result: unknown): McpCallResult {
 export class McpClient {
   readonly config: McpServerConfig;
   private readonly onCrash?: McpClientOptions["onCrash"];
+  private readonly onNotification?: McpClientOptions["onNotification"];
   private readonly factory: McpClientFactory;
 
   private client: SdkLikeClient | null = null;
@@ -188,6 +215,7 @@ export class McpClient {
   constructor(opts: McpClientOptions) {
     this.config = opts.config;
     this.onCrash = opts.onCrash;
+    this.onNotification = opts.onNotification;
     this.factory = opts.clientFactory ?? defaultMcpClientFactory;
   }
 
@@ -235,6 +263,32 @@ export class McpClient {
       transport.onerror = (err: Error) => {
         this._lastError = err?.message ?? String(err);
       };
+      // Channels v1 — wire the catch-all notification handler BEFORE the
+      // SDK handshake so we don't drop early pushes (an upstream server
+      // can emit notifications immediately after `initialize`). We try the
+      // method form first (test fakes prefer it) and fall back to the
+      // settable property (which is how the real SDK Protocol exposes it).
+      if (this.onNotification) {
+        const handler = (n: { method: string; params?: unknown }) => {
+          try {
+            this.onNotification?.(this.config.name, n.method, n.params);
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[mcp] notification handler for "${this.config.name}" threw: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }
+        };
+        if (typeof client.setFallbackNotificationHandler === "function") {
+          client.setFallbackNotificationHandler(handler);
+        } else {
+          // Settable-property form (real SDK).
+          (client as { fallbackNotificationHandler?: typeof handler }).fallbackNotificationHandler =
+            handler;
+        }
+      }
       await client.connect(transport);
       this.client = client;
       const load = this.config.load ?? ["tools", "prompts", "resources"];

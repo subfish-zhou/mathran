@@ -70,6 +70,7 @@ import { loadLayeredHooks } from "../../core/hooks/loader.js";
 import { HookInvoker } from "../../core/hooks/executor.js";
 import { loadHookV1Config } from "../../core/hooks/v1/loader.js";
 import { HookV1Runner } from "../../core/hooks/v1/index.js";
+import { loadSandboxConfig } from "../../core/sandbox/index.js";
 import { ApprovalBroker } from "../../core/chat/approval-broker.js";
 import {
   resolveApprovalConfig,
@@ -527,6 +528,15 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     settings: (layeredSettings.chat ?? {}) as ChatEffortSettings,
   });
 
+  // 2026-06-30 — Sandbox v1 (Bubblewrap) load.
+  // `loadSandboxConfig` returns DEFAULT config when settings.sandbox is
+  // absent (= disabled). Warnings (malformed entries) surface via stdout.
+  const sandboxLoaded = loadSandboxConfig(layeredSettings.sandbox);
+  for (const w of sandboxLoaded.warnings) {
+    // eslint-disable-next-line no-console
+    console.warn(`[mathran sandbox] ${w}`);
+  }
+
   const session = new ChatSession({
     llm: router,
     model,
@@ -538,6 +548,7 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     scheduler,
     approvalBroker,
     hooks: hookInvoker,
+    sandbox: sandboxLoaded.config,
     // /diff + checkpoint/rewind: snapshot write_file / edit_file mutations to
     // <workspace>/.mathran/cache/checkpoints/<conversationId>/ so `/diff` and
     // `/rewind` can inspect / roll them back.

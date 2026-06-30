@@ -103,6 +103,11 @@ import { loadLayeredHooks } from "../core/hooks/loader.js";
 import { HookInvoker } from "../core/hooks/executor.js";
 import { loadHookV1Config } from "../core/hooks/v1/loader.js";
 import { HookV1Runner } from "../core/hooks/v1/index.js";
+import { loadSandboxConfig } from "../core/sandbox/index.js";
+import {
+  attachMcpBridge,
+  getGlobalChannelRegistry,
+} from "../core/channels/index.js";
 import type { WriteProposal } from "../core/approval/diff-preview.js";
 import {
   ApprovalRegistry,
@@ -1357,6 +1362,24 @@ export function defaultSessionFactory(
             ...(v1Runner ? { v1: v1Runner } : {}),
           })
         : undefined;
+    // 2026-06-30 — Sandbox v1 (Bubblewrap) load for serve mode. We load
+    // layered settings fresh here (chat module didn't keep a `layered`
+    // binding in scope at this point) so the SandboxConfig reflects the
+    // same user→workspace→project precedence as other settings. When the
+    // settings file omits `sandbox`, `loadSandboxConfig` returns the
+    // disabled default and exec tools fall through to raw spawn.
+    const sandboxLayered = loadLayeredSettings({
+      home: os.homedir(),
+      workspace: scopedWorkspace,
+      ...(scope?.kind === "project" || scope?.kind === "effort"
+        ? { projectSlug: scope.projectSlug }
+        : {}),
+    });
+    const sandboxLoaded = loadSandboxConfig(sandboxLayered.settings.sandbox);
+    for (const w of sandboxLoaded.warnings) {
+      // eslint-disable-next-line no-console
+      console.warn(`[mathran sandbox] ${w}`);
+    }
     return new ChatSession({
       llm: router,
       model: resolvedModel,
@@ -1364,6 +1387,7 @@ export function defaultSessionFactory(
       ...(approvalResolver ? { approvalResolver } : {}),
       ...(writeProposalResolver ? { writeProposalResolver } : {}),
       ...(serveHookInvoker ? { hooks: serveHookInvoker } : {}),
+      sandbox: sandboxLoaded.config,
       // C-1: when a profile is active, thread it into the session so the
       // dispatch-level hard reject (readOnlyMode / hardRejectMutations /
       // denylistTools) fires BEFORE the broker is consulted — i.e. even a
@@ -6400,6 +6424,35 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error(`[mathran] MCP init failed: ${(err as Error)?.message ?? err}`);
+  }
+
+  // 2026-06-30 — Channels v1 wire-up. After MCP init, attach the bridge
+  // so any future connected server's `mathran/channel` notifications are
+  // forwarded into the process-level ChannelRegistry. ChatSession
+  // constructors below register themselves with the registry; the bridge
+  // resolves routing (sessionId match → direct delivery, absent →
+  // broadcast to every live session) and appends each ChannelMessage as a
+  // user-role turn. Best-effort: a failed attach logs + continues (the
+  // server still starts).
+  try {
+    const channelRegistry = getGlobalChannelRegistry();
+    attachMcpBridge(channelRegistry, mcpRegistry, {
+      onAny: (ev) => {
+        // eslint-disable-next-line no-console
+        console.debug(
+          `[mathran channels] mcp notification: server=${ev.serverName} method=${ev.method}`,
+        );
+      },
+    });
+    // eslint-disable-next-line no-console
+    console.log(
+      `[mathran] channels bridge attached (method=mathran/channel)`,
+    );
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[mathran] channels bridge attach failed: ${(err as Error)?.message ?? err}`,
+    );
   }
 
   // 2026-06-26 (H8 audit follow-up) — sweep stale `*.tmp.<hex>` files

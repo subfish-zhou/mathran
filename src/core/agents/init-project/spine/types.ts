@@ -34,6 +34,30 @@ export type SpineEdgeType =
   | "contradicts"
   | "reveals_barrier";
 
+/**
+ * Runtime whitelist of {@link SpineEdgeType} values. Used by the spine
+ * builder to coerce LLM-returned edge type strings: anything not in this
+ * set falls back to the safe default `"enables"` rather than being
+ * silently cast to an invalid enum.
+ *
+ * 2026-06-30 — mathran-bug-scan #6 fix.
+ */
+export const SPINE_EDGE_TYPES: ReadonlySet<SpineEdgeType> = new Set<SpineEdgeType>([
+  "enables",
+  "improves",
+  "generalizes",
+  "applies_technique",
+  "contradicts",
+  "reveals_barrier",
+]);
+
+export function coerceSpineEdgeType(value: unknown): SpineEdgeType {
+  if (typeof value === "string" && SPINE_EDGE_TYPES.has(value as SpineEdgeType)) {
+    return value as SpineEdgeType;
+  }
+  return "enables";
+}
+
 export type SpineThreadStatus = "active" | "stalled" | "converged" | "dead_end";
 
 export type SpineNodeDepth = "foundational" | "major" | "incremental";

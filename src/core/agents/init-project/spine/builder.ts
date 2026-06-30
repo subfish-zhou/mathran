@@ -35,6 +35,7 @@ import type {
   SpineNodeCandidate,
   SpineBuilderConfig,
 } from "./types.js";
+import { coerceSpineEdgeType } from "./types.js";
 
 /**
  * v3 read-driven build context. When supplied to {@link buildSpine}, the
@@ -332,7 +333,7 @@ function coerceCandidate(rawNode: Record<string, unknown>, index: number): Spine
     suggestedEdges: Array.isArray(rawNode.suggested_edges)
       ? (rawNode.suggested_edges as Array<Record<string, unknown>>).map((e) => ({
           targetNodeId: String(e.target ?? ""),
-          edgeType: String(e.type ?? "enables") as SpineEdge["type"],
+          edgeType: coerceSpineEdgeType(e.type),
           context: String(e.context ?? ""),
         }))
       : [],
@@ -407,7 +408,7 @@ async function assembleSpineStructure(
     .map((e) => ({
       from: String(e.from ?? ""),
       to: String(e.to ?? ""),
-      type: String(e.type ?? "enables") as SpineEdge["type"],
+      type: coerceSpineEdgeType(e.type),
       context: String(e.context ?? ""),
     }))
     .filter((e) => allNodeIds.has(e.from) && allNodeIds.has(e.to));

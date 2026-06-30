@@ -20,6 +20,11 @@ import { spawn } from "node:child_process";
 import * as path from "node:path";
 import type { ToolSpec, ToolExecuteContext } from "../session.js";
 import { formatHookBlock } from "../../hooks/executor.js";
+import {
+  spawnSandboxed,
+  type SandboxConfig,
+  type SandboxKind,
+} from "../../sandbox/index.js";
 
 export interface BashToolOptions {
   /** Hard timeout cap in ms (default 120_000, max 600_000). */
@@ -33,6 +38,14 @@ export interface BashToolOptions {
    * tool falls back to `ctx.workspace` at call time, then `process.cwd()`.
    */
   workspace?: string;
+  /**
+   * 2026-06-30 — sandbox config (Bubblewrap). When `sandbox.enabled` is
+   * `false` (default) the tool falls through to a raw `spawn("bash", ...)`
+   * — back-compat byte-for-byte. When enabled, every bash invocation is
+   * wrapped via `spawnSandboxed` with the configured profile (default
+   * `workspace-write` — no network).
+   */
+  sandbox?: SandboxConfig;
 }
 
 const DEFAULT_DEFAULT_TIMEOUT = 30_000;
@@ -187,44 +200,87 @@ export function createBashTool(opts: BashToolOptions = {}): ToolSpec {
       let exit = -1;
       let spawnError: Error | null = null;
 
-      try {
-        await new Promise<void>((resolve) => {
-          const child = spawn("bash", ["-lc", command], {
-            cwd: resolvedCwd,
+      // 2026-06-30 — sandbox v1: when `opts.sandbox?.enabled === true`, route
+      // through `spawnSandboxed` (Bubblewrap, profile `workspace-write` —
+      // workspace RW, system RO, no network, tmpfs /tmp). When disabled or
+      // unconfigured, fall through to a raw `spawn("bash", -lc, …)` so v0.12
+      // behaviour is preserved byte-for-byte.
+      const useSandbox =
+        opts.sandbox !== undefined && opts.sandbox.enabled === true;
+
+      if (useSandbox) {
+        const sandboxResult = await spawnSandboxed({
+          config: opts.sandbox!,
+          kind: opts.sandbox!.defaultProfile as SandboxKind,
+          workspace: ctx?.workspace ?? resolvedCwd ?? process.cwd(),
+          toolName: "bash",
+          command: "bash",
+          args: ["-lc", command],
+          spawnOpts: {
+            timeoutMs,
+            maxOutputBytes,
+            ...(resolvedCwd !== undefined ? { cwd: resolvedCwd } : {}),
             env: process.env,
-          });
-          const timer = setTimeout(() => {
-            timedOut = true;
-            try {
-              child.kill("SIGTERM");
-            } catch {
-              /* best-effort */
-            }
-            // Force-kill if SIGTERM is ignored.
-            setTimeout(() => {
+          },
+        });
+        // Re-shape SandboxResult → bash.ts local locals so the rest of the
+        // function stays untouched. The CappedBuffer truncation accounting
+        // is folded into sandboxResult.stdout/.stderr; we use them as-is.
+        // The headers (timeout suffix etc.) still follow.
+        const ok = sandboxResult.spawnError === null;
+        if (!ok) {
+          return {
+            ok: false,
+            content: `error: bash failed to spawn (sandbox): ${sandboxResult.spawnError!.message}`,
+          };
+        }
+        timedOut = sandboxResult.timedOut;
+        exit = sandboxResult.exit;
+        // Replace the two CappedBuffer locals' projected strings via a tiny
+        // shim. We just create a fresh CappedBuffer and write the whole
+        // captured output once — preserves the rest of the formatting code.
+        stdout.append(Buffer.from(sandboxResult.stdout, "utf-8"));
+        stderr.append(Buffer.from(sandboxResult.stderr, "utf-8"));
+      } else {
+        try {
+          await new Promise<void>((resolve) => {
+            const child = spawn("bash", ["-lc", command], {
+              cwd: resolvedCwd,
+              env: process.env,
+            });
+            const timer = setTimeout(() => {
+              timedOut = true;
               try {
-                child.kill("SIGKILL");
+                child.kill("SIGTERM");
               } catch {
                 /* best-effort */
               }
-            }, 500).unref();
-          }, timeoutMs);
-          timer.unref();
-          child.stdout.on("data", (c: Buffer) => stdout.append(c));
-          child.stderr.on("data", (c: Buffer) => stderr.append(c));
-          child.on("error", (err) => {
-            spawnError = err;
-            clearTimeout(timer);
-            resolve();
+              // Force-kill if SIGTERM is ignored.
+              setTimeout(() => {
+                try {
+                  child.kill("SIGKILL");
+                } catch {
+                  /* best-effort */
+                }
+              }, 500).unref();
+            }, timeoutMs);
+            timer.unref();
+            child.stdout.on("data", (c: Buffer) => stdout.append(c));
+            child.stderr.on("data", (c: Buffer) => stderr.append(c));
+            child.on("error", (err) => {
+              spawnError = err;
+              clearTimeout(timer);
+              resolve();
+            });
+            child.on("close", (code) => {
+              clearTimeout(timer);
+              exit = typeof code === "number" ? code : -1;
+              resolve();
+            });
           });
-          child.on("close", (code) => {
-            clearTimeout(timer);
-            exit = typeof code === "number" ? code : -1;
-            resolve();
-          });
-        });
-      } catch (err) {
-        spawnError = err instanceof Error ? err : new Error(String(err));
+        } catch (err) {
+          spawnError = err instanceof Error ? err : new Error(String(err));
+        }
       }
 
       if (spawnError) {
