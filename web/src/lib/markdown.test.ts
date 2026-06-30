@@ -17,13 +17,17 @@ describe("preprocessMath", () => {
     expect(preprocessMath("inline \\(a+b\\) ok")).toBe("inline $a+b$ ok");
   });
 
-  it("converts \\[...\\] → $$...$$", () => {
-    expect(preprocessMath("disp \\[a+b\\] ok")).toBe("disp $$a+b$$ ok");
+  it("converts \\[...\\] → block $$...$$ with surrounding blank lines", () => {
+    // 2026-06-29 wiki bug fix: 块级 `$$` 必须独占段落，否则
+    // marked-katex-extension 的 block 规则识别不到。preprocessMath
+    // 现在为 `\[...\]` 输出 `\n\n$$\n<body trim>\n$$\n\n`。
+    expect(preprocessMath("disp \\[a+b\\] ok")).toBe("disp \n\n$$\na+b\n$$\n\n ok");
   });
 
-  it("wraps bare \\begin{}…\\end{} in $$ pairs", () => {
+  it("wraps bare \\begin{}…\\end{} in block $$ pairs with surrounding blank lines", () => {
+    // 同 \[...\]：环境必须独占段落。
     const out = preprocessMath("env: \\begin{equation} F = ma \\end{equation} end");
-    expect(out).toBe("env: $$\\begin{equation} F = ma \\end{equation}$$ end");
+    expect(out).toBe("env: \n\n$$\n\\begin{equation} F = ma \\end{equation}\n$$\n\n end");
   });
 
   it("does NOT double-wrap an env already inside $$", () => {
@@ -56,8 +60,10 @@ describe("preprocessMath", () => {
   });
 
   it("handles multi-line display blocks across newlines", () => {
+    // 块级 fix 后输出 `\n\n$$\n<body trim>\n$$\n\n`；
+    // 3+ 个连续 \n 会被 collapse 成 \n\n，所以输入两边的换行被压平。
     const src = "before\n\\[\n  a^2 + b^2 = c^2\n\\]\nafter";
-    expect(preprocessMath(src)).toBe("before\n$$\n  a^2 + b^2 = c^2\n$$\nafter");
+    expect(preprocessMath(src)).toBe("before\n\n$$\na^2 + b^2 = c^2\n$$\n\nafter");
   });
 });
 

@@ -35,7 +35,7 @@ import { randomUUID } from "node:crypto";
 import { ChatSession, type ToolExecuteContext, type ToolSpec } from "../chat/session.js";
 import { contextWindowForModel } from "../../providers/llm/copilot-models-cache.js";
 import { ASK_USER_GOAL_AUTO_REPLY } from "../chat/tools/ask-user.js";
-import { createTodoWriteTool } from "../chat/tools/todo-write.js";
+import { createTodoWriteTool, loadTodos } from "../chat/tools/todo-write.js";
 import type { LLMMessage, LLMProvider } from "../providers/llm.js";
 import { contentToString } from "../providers/llm.js";
 import type { ChatEvent } from "../chat/index.js";
@@ -1169,6 +1169,11 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
   const todoTools: ToolSpec[] = [
     createTodoWriteTool({ workspace, scope: goal.scope, conversationId }),
   ];
+  // 2026-06-30 plan-tracker bug fix — capture scope into a const so the
+  // delayed todoSnapshot closure below sees a definitely-non-null value.
+  // The `goal` binding is `let` and gets re-assigned later in the
+  // function, which defeats TS' null-narrowing inside callback bodies.
+  const todoScope = goal.scope;
   const session = new ChatSession({
     llm,
     model: goal.model,
@@ -1176,6 +1181,14 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
     systemPrompt,
     toolContext,
     workspace: opts.chatWorkspace ?? opts.workspace,
+    // 2026-06-30 plan-tracker bug fix — feed the current todos to
+    // ChatSession before every LLM request. Goal mode in particular
+    // benefits because long-running goals chew through dozens of
+    // rounds; without this hook, the model writes a plan once at
+    // round 1 and never updates it. Same loadTodos call the
+    // chat-mode SSE pump uses, so the SPA panel and the prompt
+    // injection see consistent state.
+    todoSnapshot: () => loadTodos(workspace, todoScope, conversationId),
     // v0.16 §11: merge in a goal-mode `ask_user` resolver on top of any
     // caller-supplied `builtinTools`. Goal mode runs unattended — there's
     // no human at the keyboard — so the resolver returns the canned
@@ -1318,16 +1331,31 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
   let textBuf = "";
   let toolCallCount = 0;
   // Defect #1 — real token accounting. Sum provider-reported usage across
-  // every LLM round-trip in this iteration (an iteration can make many
-  // `llm.chat()` calls when the assistant chains tool calls). `usageReported`
-  // tracks whether ANY round returned a usage block; when false we fall back
-  // to counting the WHOLE message list below. `llmCallCount` counts every
-  // usage event (one per `llm.chat()` call) and doubles as the assistant-turn
-  // count (1:1 — each round pushes exactly one assistant message).
+  // Defect #1 — token accounting. Prefer the REAL token usage reported by
+  // the provider for every LLM round-trip this iteration made (covers system
+  // prompt + full history + tool calls + output). Fall back to
+  // `llm.countTokens` over the WHOLE final message list (not just the
+  // user/assistant pair) when the provider reported no usage. Defect #3 —
+  // record iteration + assistant-turn + LLM-call counters.
   let usageInputTokens = 0;
   let usageOutputTokens = 0;
   let usageReported = false;
   let llmCallCount = 0;
+  // 2026-06-30 — Goal stats 实时更新 fix（_tasks/exp-1894-bugs/REPORT.md#G）：
+  // round 进行中 `roundsRun / tokensUsed / toolCallCount` 全部 0，导致
+  //   (1) budget guard 看不到当前消耗，单 round 60+ tool 调用 / 上百万 token
+  //       不会被拦截；
+  //   (2) SPA 进度条无法显示；
+  //   (3) 中断 goal 时 disk stats 不准。
+  // 修法：在事件循环里增量 atomic write — 每个 `usage` 事件后立即把这次
+  // round-trip 的 input/output token + 1 个 llmCall 写进 stats；每个
+  // `tool-call` 事件后立即 +1 toolCallCount。round 结束的最终
+  // updateGoalStats 改为只补 `iterationsRun: 1`（不再重复 token / tool-call）。
+  // writeGoal 已经 atomic，所以并发安全；唯一代价是每事件一次 RMW（小文件）。
+  let usageInputThisRound = 0;
+  let usageOutputThisRound = 0;
+  let llmCallsThisRound = 0;
+  let toolCallsThisRound = 0;
   try {
     for await (const ev of session.send(effectiveUserMessage, {
       signal,
@@ -1342,9 +1370,33 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
           usageReported = true;
           usageInputTokens += ev.inputTokens ?? 0;
           usageOutputTokens += ev.outputTokens ?? 0;
+          // 实时增量：本次 usage 事件携带的 input + output 立即写盘。
+          const dIn = ev.inputTokens ?? 0;
+          const dOut = ev.outputTokens ?? 0;
+          usageInputThisRound += dIn;
+          usageOutputThisRound += dOut;
+          llmCallsThisRound += 1;
+          // 不 await 在 hot loop 里同步等盘，但 await 确保 errors 暴露。
+          // updateGoalStats 内部走 atomicWriteFile + RMW，并发安全。
+          await updateGoalStats(workspace, goalId, {
+            assistantTurnsTotal: 1,
+            llmCallsTotal: 1,
+            tokensUsed: dIn + dOut,
+            inputTokensUsed: dIn,
+            outputTokensUsed: dOut,
+          });
+        } else {
+          // provider 没 report usage 时仍记 llmCall（fallback token 在 round 末补）
+          llmCallsThisRound += 1;
+          await updateGoalStats(workspace, goalId, {
+            assistantTurnsTotal: 1,
+            llmCallsTotal: 1,
+          });
         }
       } else if (ev.type === "tool-call") {
         toolCallCount++;
+        toolCallsThisRound += 1;
+        await updateGoalStats(workspace, goalId, { toolCallCount: 1 });
         await appendStep(workspace, goalId, {
           kind: "tool-call",
           payload: { id: ev.id, name: ev.name, args: ev.args },
@@ -1381,6 +1433,9 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
         kind: "status",
         payload: { aborted: true, reason: "round aborted via signal" },
       });
+      // 2026-06-30 — abort 路径也补一次 iterationsRun=1，否则 round 中断后
+      // stats.roundsRun 永远不增（resume 时无法判断这是 N+1 round）。
+      await updateGoalStats(workspace, goalId, { iterationsRun: 1 });
       return { goal, text: textBuf, completed: false, exhausted: false, failed: false, aborted: true };
     }
     throw err;
@@ -1401,25 +1456,27 @@ export async function runOneIteration(opts: RunRoundOptions): Promise<RunRoundRe
   // `llm.countTokens` over the WHOLE final message list (not just the
   // user/assistant pair) when the provider reported no usage. Defect #3 —
   // record iteration + assistant-turn + LLM-call counters.
+  //
+  // 2026-06-30 fix — token / assistant-turn / tool-call 在事件循环里已经
+  // 实时增量写盘，这里只补两件事：
+  //   1. `iterationsRun: 1` —— 一个 round 结束当然 +1（事件循环没法知道
+  //      "round 结束"）
+  //   2. provider 完全没 report usage 时的 fallback token count（这种情况
+  //      事件循环里 token 字段是 0，需要用 llm.countTokens 估一次补上）
   const fullHistory = session.history();
   const fallbackTokens = llm.countTokens
     ? llm.countTokens(fullHistory)
     : Math.ceil(fullHistory.reduce((n, m) => n + contentToString(m.content).length, 0) / 4);
-  await updateGoalStats(workspace, goalId, {
-    iterationsRun: 1,
-    assistantTurnsTotal: llmCallCount,
-    llmCallsTotal: llmCallCount,
-    toolCallCount,
-    tokensUsed: usageReported ? usageInputTokens + usageOutputTokens : fallbackTokens,
-    // Phase ζ (cost meter) — persist the provider-reported input/output split
-    // so per-model $ cost is exact (pricing differs in vs out). We ONLY record
-    // a split when the provider actually reported usage; the `countTokens`
-    // fallback can't distinguish prompt from completion, so we leave the split
-    // at 0 for that iteration rather than guess (the combined `tokensUsed`
-    // still counts it). DESIGN-REFERENCE.md §5.E.
-    inputTokensUsed: usageReported ? usageInputTokens : 0,
-    outputTokensUsed: usageReported ? usageOutputTokens : 0,
-  });
+  if (!usageReported && fallbackTokens > 0) {
+    // 整个 round 没拿到一次真实 usage，把 fallback 一次性补上。
+    await updateGoalStats(workspace, goalId, {
+      iterationsRun: 1,
+      tokensUsed: fallbackTokens,
+    });
+  } else {
+    // 已经增量写过 token / assistant-turn / tool-call，这里只 +1 round。
+    await updateGoalStats(workspace, goalId, { iterationsRun: 1 });
+  }
 
   // mark_done / give_up tool calls wrap the goal (recorded on the handler
   // during session.send above — see ./tools.ts for why we can't throw).

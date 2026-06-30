@@ -1348,6 +1348,20 @@ export function defaultSessionFactory(
         ? { checkpoints: { conversationId, workspace: scopedWorkspace } }
         : {}),
       systemPrompt: buildScopedSystemPrompt(scope, scopedWorkspace),
+      // 2026-06-30 plan-tracker bug fix — feed the current todos to
+      // ChatSession before every LLM request so the model can see its
+      // own in-flight plan instead of forgetting and leaving items at
+      // `in_progress` forever. The closure mirrors the same
+      // (workspace, scope, conversationId) tuple we hand to
+      // createTodoWriteTool below. When the SPA hasn't supplied a
+      // conversationId (CLI one-shots, embed mode, …) we skip the hook
+      // — there's no per-conversation todo file to load.
+      ...(conversationId
+        ? {
+            todoSnapshot: () =>
+              loadTodos(scopedWorkspace, scope ?? { kind: "global" }, conversationId),
+          }
+        : {}),
       // v0.17 W12 — wire `todo_write` per-conversation so each thread has
       // its own persisted plan file. The factory closes over the scope +
       // conversation id so the SSE pump can find the same file after each

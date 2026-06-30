@@ -28,6 +28,19 @@ export class OpenAIAdapter implements LLMProvider {
    */
   readonly supportsVision = true;
 
+  /** OpenAI Chat Completions / Responses API accepts `tools[]`. */
+  readonly supportsToolUse = true;
+
+  /**
+   * `applyOpenAIEffort` injects `reasoning.effort` on the wire (OpenAI
+   * Responses-API path); reasoning models also stream a `reasoning_content`
+   * delta which the common stream consumer maps onto a `reasoning` chunk.
+   */
+  readonly supportsReasoning = true;
+
+  /** `streamOpenAI` emits incremental `tool-call` chunks from `tool_calls` deltas. */
+  readonly supportsStreamingTools = true;
+
   constructor(opts: OpenAIAdapterOptions) {
     this.client = new OpenAI({ apiKey: opts.apiKey, baseURL: opts.baseUrl });
     this.defaultModel = opts.defaultModel;

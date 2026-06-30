@@ -27,7 +27,7 @@ export interface SearchWebToolOptions {
 export function createSearchWebTool(opts: SearchWebToolOptions = {}): ToolSpec {
   return {
     name: "search_web",
-    riskClass: "read",
+    riskClass: "net",
     readOnly: true,
     description:
       "Search the public web for information. Returns up to `limit` results " +

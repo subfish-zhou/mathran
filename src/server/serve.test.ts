@@ -2234,8 +2234,12 @@ describe("GET /api/global-chat/:id/usage (v0.3 §19)", () => {
   });
 
   it("rejects an invalid conversation id", async () => {
-    // Slug containing path-separator-ish chars must fail isSafeSlug.
-    const res = await fetch(`${base}/api/global-chat/_leading-underscore/usage`);
+    // 2026-06-30 — 原测试用 `_leading-underscore` 当 sentinel，
+    // 但 commit `72471ae` 为了 init-project 自动生成的 `_index` slug
+    // 放开了首字符 `_`，所以 `_leading-underscore` 已经是合法 slug。
+    // 实际的安全边界由 isSafeSlug() 里 `..` 显式排除 + regex 禁 `/`
+    // 提供，这里换成真正的 path-traversal 输入来验证仍被拒。
+    const res = await fetch(`${base}/api/global-chat/..%2Fescape/usage`);
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toMatch(/invalid conversation id/i);

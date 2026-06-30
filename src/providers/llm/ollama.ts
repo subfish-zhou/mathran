@@ -32,6 +32,20 @@ export class OllamaAdapter implements LLMProvider {
    */
   readonly supportsVision = false;
 
+  /** Ollama's OpenAI-compatible /v1/chat/completions accepts `tools[]`. */
+  readonly supportsToolUse = true;
+
+  /**
+   * Ollama doesn't surface a reasoning-effort knob: the OpenAI-compatible
+   * endpoint silently drops `reasoning` and effort-style fields. Declared
+   * `false` so the router warns the user instead of pretending `/effort
+   * max` did something (audit §6).
+   */
+  readonly supportsReasoning = false;
+
+  /** `streamOpenAI` emits incremental `tool-call` chunks from `tool_calls` deltas. */
+  readonly supportsStreamingTools = true;
+
   constructor(opts: OllamaAdapterOptions = {}) {
     this.client = new OpenAI({
       apiKey: opts.apiKey ?? "ollama",

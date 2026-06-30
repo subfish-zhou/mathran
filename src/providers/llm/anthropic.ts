@@ -92,11 +92,20 @@ export function toAnthropicMessages(messages: LLMMessage[]): {
 } {
   const systemParts: string[] = [];
   const out: any[] = [];
+  let systemImageDropCount = 0;
   for (const m of messages) {
     if (m.role === "system") {
       // System turns are concatenated into Anthropic's top-level `system`
       // string. Image parts in a system turn are dropped (Anthropic doesn't
-      // accept image blocks on the system slot).
+      // accept image blocks on the system slot). We count the drops and
+      // emit a single `console.warn` after the loop so the user gets one
+      // line of feedback per request instead of N (or zero — audit §6
+      // pre-fix behaviour was a complete silent loss).
+      if (Array.isArray(m.content)) {
+        for (const p of m.content) {
+          if (p.type === "image") systemImageDropCount += 1;
+        }
+      }
       systemParts.push(contentToString(m.content));
       continue;
     }
@@ -135,6 +144,12 @@ export function toAnthropicMessages(messages: LLMMessage[]): {
     // User / assistant turn with optional multimodal content.
     out.push({ role: m.role, content: toAnthropicContentBlocks(m.content) });
   }
+  if (systemImageDropCount > 0) {
+    console.warn(
+      `[mathran] anthropic: dropped ${systemImageDropCount} image part(s) from system turn(s) — ` +
+        `Anthropic Messages API rejects image blocks on the system slot. Move the image to a user turn.`,
+    );
+  }
   return { system: systemParts.length ? systemParts.join("\n\n") : undefined, messages: out };
 }
 
@@ -150,6 +165,22 @@ export class AnthropicAdapter implements LLMProvider {
    * flattening images into text markers.
    */
   readonly supportsVision = true;
+
+  /** Anthropic Messages API accepts `tools[]` + emits `tool_use` blocks. */
+  readonly supportsToolUse = true;
+
+  /**
+   * Extended-thinking budget (`thinking: {type:'enabled', budget_tokens}`)
+   * is wired up in `applyAnthropicEffort` — Anthropic is one of the two
+   * adapters that actually honours `req.effort` on the wire.
+   */
+  readonly supportsReasoning = true;
+
+  /**
+   * `streamAnthropic` emits incremental `tool-call` chunks via
+   * `content_block_start` (id/name) + `input_json_delta` (argument bytes).
+   */
+  readonly supportsStreamingTools = true;
 
   constructor(opts: AnthropicAdapterOptions) {
     this.client = new Anthropic({ apiKey: opts.apiKey, baseURL: opts.baseUrl });

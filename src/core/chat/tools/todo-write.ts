@@ -187,6 +187,74 @@ function summarize(list: TodoList): string {
   return `${list.items.length} todos · ${parts.join(", ")}`;
 }
 
+/**
+ * Render the current TODO list as a short markdown reminder that
+ * `ChatSession` injects as a transient system message before every LLM
+ * request. This is the fix for the 2026-06-30 plan-tracker bug where the
+ * model wrote a plan once and then forgot to update statuses because no
+ * subsequent context contained the plan's live state.
+ *
+ * Returns `null` when there's nothing useful to inject:
+ *   - list is empty (the model never called `todo_write` this conversation)
+ *   - every item is `done` or `cancelled` (plan is finished — no reminder
+ *     needed, and showing a wall of ✓✓✓✓ would just waste tokens)
+ *
+ * Otherwise returns a compact reminder of the form:
+ *
+ *   Current TODO list (3 items · 1 in_progress, 1 pending, 1 done):
+ *     [done]        Locate occurrences of normal generalized cone
+ *     [in_progress] Fetch arXiv LaTeX source
+ *     [pending]     Extract definition / theorem context
+ *
+ *   Reminder: before your next action, call `todo_write` to mark the
+ *   in_progress item `done` (or `cancelled`) and the next item
+ *   `in_progress`. Keep at most ONE item in_progress at a time. When
+ *   every item is done, you don't need to mention the plan further.
+ *
+ * The wording is deliberately imperative ("call todo_write…") so the
+ * model has a concrete instruction rather than a passive observation.
+ */
+export function renderTodoSnapshot(list: TodoList | null): string | null {
+  if (!list || list.items.length === 0) return null;
+  const live = list.items.filter(
+    (it) => it.status === "pending" || it.status === "in_progress",
+  );
+  if (live.length === 0) return null;
+
+  const counts: Record<TodoStatus, number> = {
+    pending: 0,
+    in_progress: 0,
+    done: 0,
+    cancelled: 0,
+  };
+  for (const it of list.items) counts[it.status] += 1;
+  const countParts: string[] = [];
+  if (counts.in_progress) countParts.push(`${counts.in_progress} in_progress`);
+  if (counts.pending) countParts.push(`${counts.pending} pending`);
+  if (counts.done) countParts.push(`${counts.done} done`);
+  if (counts.cancelled) countParts.push(`${counts.cancelled} cancelled`);
+  const header = `Current TODO list (${list.items.length} items · ${countParts.join(", ")}):`;
+
+  // Right-pad the status tag so the text aligns visually in the prompt.
+  const tagWidth = Math.max(
+    ...list.items.map((it) => it.status.length),
+  );
+  const lines = list.items.map((it) => {
+    const tag = `[${it.status}]`.padEnd(tagWidth + 2);
+    // Truncate very long item text so the reminder stays compact.
+    const text = it.text.length > 120 ? `${it.text.slice(0, 117)}…` : it.text;
+    return `  ${tag} ${text}`;
+  });
+
+  const trailer =
+    "Reminder: before your next action, call `todo_write` to update " +
+    "statuses (pending → in_progress → done, or cancelled if scrapped). " +
+    "Keep at most ONE item in_progress at a time. Skip this reminder " +
+    "once every item is done.";
+
+  return [header, ...lines, "", trailer].join("\n");
+}
+
 /** Coerce a raw status string to a `TodoStatus`, defaulting to `pending` on
  *  anything we don't recognise. */
 function coerceStatus(raw: unknown): TodoStatus {

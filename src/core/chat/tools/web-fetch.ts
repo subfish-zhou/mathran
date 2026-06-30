@@ -44,7 +44,7 @@ export function createWebFetchTool(opts: WebFetchToolOptions = {}): ToolSpec {
 
   return {
     name: "web_fetch",
-    riskClass: "read",
+    riskClass: "net",
     readOnly: true,
     description:
       "Fetch a single URL (http/https) and return the response body as text. " +

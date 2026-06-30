@@ -2,7 +2,7 @@
  * `mathran doctor` — environment health check.
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -206,7 +206,11 @@ function checkEnvVar(varName: string): Check {
 
 function checkCommand(cmd: string, args: string[] = ["--version"]): Check {
   try {
-    const out = execSync(`${cmd} ${args.join(" ")}`, { stdio: ["ignore", "pipe", "pipe"], timeout: 5000 })
+    // 2026-06-30 — 改 execSync → execFileSync。原来 `${cmd} ${args.join(" ")}`
+    // 经过 /bin/sh，对 caller-controlled args 是 footgun（现在所有 caller 都是
+    // 硬编码字面量所以无实际利用面，但 defense-in-depth）。execFileSync 直接
+    // exec，不走 shell，不做 word-splitting / glob 展开。
+    const out = execFileSync(cmd, args, { stdio: ["ignore", "pipe", "pipe"], timeout: 5000 })
       .toString()
       .trim()
       .split("\n")[0];

@@ -124,10 +124,48 @@ export class ModelRouter implements LLMProvider {
     }
   }
 
+  /**
+   * Per-route reasoning capability lookup (audit §6 bug #190). Mirrors
+   * `routeSupportsVision`: resolves the routing string to an adapter and
+   * returns `adapter.supportsReasoning === true`. Defaults to `false` on
+   * any error (unknown provider, missing API key, adapter never set the
+   * flag) so the router warns conservatively rather than presuming
+   * support.
+   */
+  routeSupportsReasoning(modelString: string): boolean {
+    try {
+      const { providerKey } = this.resolve(modelString);
+      const adapter = this.getAdapter(providerKey);
+      return adapter.supportsReasoning === true;
+    } catch {
+      return false;
+    }
+  }
+
   async chat(req: LLMRequest): Promise<LLMResponse> {
     const { providerKey, model } = this.resolve(req.model);
     this.assertModelAllowed(providerKey, model);
     const adapter = this.getAdapter(providerKey);
+    // Audit §6 bug #190 — give the user feedback when their `/effort high`
+    // is silently dropped by an adapter that doesn't honour reasoning
+    // (Azure chat-completions, Ollama, future text-only providers). The
+    // adapter still gets the `effort` field on the request so it can
+    // ignore-or-warn as it sees fit; the router just emits one line so the
+    // user knows.
+    if (req.effort !== undefined && adapter.supportsReasoning === false) {
+      console.warn(
+        `[mathran] reasoning effort '${req.effort}' ignored by provider '${providerKey}' (no native reasoning support)`,
+      );
+    }
+    if (
+      req.tools &&
+      req.tools.length > 0 &&
+      adapter.supportsToolUse === false
+    ) {
+      console.warn(
+        `[mathran] tools[] (${req.tools.length} definition(s)) ignored by provider '${providerKey}' (no tool-use support)`,
+      );
+    }
     return adapter.chat({ ...req, model });
   }
 

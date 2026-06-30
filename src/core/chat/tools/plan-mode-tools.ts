@@ -47,12 +47,16 @@ export function createEnterPlanModeTool(opts: PlanModeToolsOptions): ToolSpec {
     readOnly: true,
     description:
       "Switch the chat session into READ-ONLY plan mode. While plan mode is " +
-      "active, only read-only tools (read_file, list_*, search_*, memory_read, " +
-      "etc.) can execute; all write / exec / mutating tools are blocked at the " +
-      "dispatcher with an 'ok: false' result so you can keep reasoning without " +
-      "mutating state. Use this to think before you act on multi-step tasks. " +
-      "Call `complete_plan` (or have the user `/exit-plan`) when ready to act. " +
-      "Pass a one-line `objective` describing what you're about to plan.",
+      "active, only read-only tools (read_file, list_*, search_*, grep, glob, " +
+      "memory_read, etc.) plus the meta-tools complete_plan / ask_user / " +
+      "todo_write can execute; ALL write / exec / mutating tools " +
+      "(write_file, edit_file, bash, run_python, run_latex, " +
+      "dispatch_subagent, propose_goal, propose_plan, …) are HARD-REJECTED " +
+      "at the dispatcher with an 'ok: false' result so you can keep " +
+      "reasoning without mutating state. Use this to think before you act " +
+      "on multi-step tasks. Call `complete_plan` (or have the user " +
+      "`/exit-plan`) when ready to act. Pass a one-line `objective` " +
+      "describing what you're about to plan.",
     parameters: {
       type: "object",
       properties: {
@@ -81,8 +85,14 @@ export function createEnterPlanModeTool(opts: PlanModeToolsOptions): ToolSpec {
         mode: "plan",
         objective,
         note:
-          "Plan mode active. Only read-only tools will execute. " +
-          "Call complete_plan when ready to act.",
+          "Plan mode active. You CANNOT call write_file, edit_file, bash, " +
+          "run_python, run_latex, dispatch_subagent, propose_goal, " +
+          "propose_plan, or any other mutating tool — calls to those will " +
+          "be hard-rejected at the dispatcher. You CAN call read-only " +
+          "investigation tools (read_file, grep, glob, search, list_*, " +
+          "memory_*) plus the meta-tools complete_plan / ask_user / " +
+          "todo_write. To implement, FIRST call complete_plan with your " +
+          "summary, THEN call write/edit/exec tools in the next round.",
       };
       return { ok: true, content: JSON.stringify(payload) };
     },

@@ -32,6 +32,20 @@ export class AzureOpenAIAdapter implements LLMProvider {
    */
   readonly supportsVision = true;
 
+  /** Azure chat-completions accepts `tools[]` (mirrors OpenAI). */
+  readonly supportsToolUse = true;
+
+  /**
+   * Azure adapter routes through `chat.completions` only (no Responses
+   * API) and never calls `applyOpenAIEffort`, so `req.effort` is dropped
+   * on the wire. Declared `false` so the router emits a `console.warn`
+   * instead of silently no-op'ing the caller's `/effort high` (audit §6).
+   */
+  readonly supportsReasoning = false;
+
+  /** `streamOpenAI` emits incremental `tool-call` chunks. */
+  readonly supportsStreamingTools = true;
+
   constructor(opts: AzureOpenAIAdapterOptions) {
     this.client = new AzureOpenAI({
       apiKey: opts.apiKey,

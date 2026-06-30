@@ -16,6 +16,24 @@ export interface CopilotAdapterOptions {
   chatFn?: typeof copilotChat;
 }
 
+/**
+ * Detect whether a Copilot model string will be routed to the Gemini
+ * chat-completions fallback inside `copilotChat`. Mirrors the negative-space
+ * routing logic in `copilot.ts`: GPT (`gpt-*` / `o[0-9]*`) goes to the
+ * Responses API, Claude (`*claude*`) goes to the Messages API, and EVERYTHING
+ * ELSE — including Gemini and any unknown model name — falls through to the
+ * chat-completions endpoint with no reasoning / tools support.
+ *
+ * Exported so `capability.test.ts` can pin the heuristic; not part of the
+ * public LLMProvider surface.
+ */
+export function isGeminiCopilotRoute(model: string): boolean {
+  if (!model) return false;
+  const isGpt = /^(gpt-|o[0-9])/.test(model);
+  const isClaude = /claude/i.test(model);
+  return !isGpt && !isClaude;
+}
+
 export class CopilotAdapter implements LLMProvider {
   protected defaultModel?: string;
   protected chatFn: typeof copilotChat;
@@ -44,6 +62,31 @@ export class CopilotAdapter implements LLMProvider {
    * collapse to `[Image: <mime>]` text via contentToString.
    */
   readonly supportsVision = true;
+
+  /** Copilot's Responses (GPT) and Messages (Claude) routes both wire tools. */
+  readonly supportsToolUse = true;
+
+  /**
+   * `copilotChat` honours reasoning on the GPT (Responses API) and Claude
+   * (Messages API) routes — both surface a `reasoning` field on the
+   * extracted response. The Gemini chat-completions fallback does NOT
+   * accept a reasoning-effort knob; the adapter cannot know which route
+   * a model resolves to ahead of time, so we declare `true` here and emit
+   * a `console.warn` from `chat()` when we can detect a Gemini route at
+   * call time (audit §6 bug #146).
+   */
+  readonly supportsReasoning = true;
+
+  /**
+   * The underlying `copilotChat` is non-streaming and emits the entire
+   * response in one shot, but the adapter still yields a single `tool-call`
+   * chunk per call followed by `done` — so from the host's perspective the
+   * tool-call surface is chunk-shape conformant (just not incremental).
+   * We declare `true` because the host only checks "did the provider emit
+   * tool-call chunks at all"; rendering granularity is a UX concern, not
+   * a wire-protocol concern.
+   */
+  readonly supportsStreamingTools = true;
 
   async chat(req: LLMRequest): Promise<LLMResponse> {
     const systemParts: string[] = [];
@@ -78,9 +121,39 @@ export class CopilotAdapter implements LLMProvider {
       }
     }
 
+    const effectiveModel = req.model || this.defaultModel || "";
+
+    // Audit §6 bug #146: Copilot Gemini path silently degrades — the
+    // chat-completions fallback inside `copilotChat` drops `reasoning`,
+    // `tools[]` (we don't pass them; see the fallback branch in
+    // copilot.ts:873) and any multimodal `ContentPart[]`. Surface a single
+    // warn at call time so the user gets feedback instead of debugging a
+    // silently-text-only response.
+    if (isGeminiCopilotRoute(effectiveModel)) {
+      if (req.effort) {
+        console.warn(
+          `[mathran] reasoning effort '${req.effort}' ignored by provider 'copilot' on Gemini route (model '${effectiveModel}': Copilot's Gemini transport is chat-completions only — no native reasoning support)`,
+        );
+      }
+      if (req.tools && req.tools.length > 0) {
+        console.warn(
+          `[mathran] tools[] ignored by provider 'copilot' on Gemini route (model '${effectiveModel}': Copilot's Gemini transport is chat-completions only — tool_calls dropped)`,
+        );
+      }
+      // Check for multimodal content that will degrade to text.
+      const hasImage = req.messages.some(
+        (m) => Array.isArray(m.content) && m.content.some((p) => p.type === "image"),
+      );
+      if (hasImage) {
+        console.warn(
+          `[mathran] image parts degraded to '[Image: <mime>]' text by provider 'copilot' on Gemini route (model '${effectiveModel}': Copilot's Gemini transport is text-only)`,
+        );
+      }
+    }
+
     const chatFn = this.chatFn;
     const cReq: CopilotChatRequest = {
-      model: req.model || this.defaultModel || "",
+      model: effectiveModel,
       messages,
       ...(systemParts.length ? { systemPrompt: systemParts.join("\n\n") } : {}),
       ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),

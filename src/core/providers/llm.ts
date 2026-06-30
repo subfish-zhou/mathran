@@ -130,7 +130,9 @@ export interface LLMRequest {
    * passthrough hint — it never affects routing or model selection. Adapters
    * that understand it inject the provider-specific "think harder" fields
    * (OpenAI `reasoning.effort`, Anthropic `thinking`); adapters that don't
-   * (Ollama, Azure, Copilot) silently ignore it.
+   * (Ollama, Azure, Copilot Gemini route) drop it on the wire but the
+   * `ModelRouter` emits a single `console.warn` per request so the user
+   * gets feedback (audit §6 bug #190 — was silently ignored before).
    */
   effort?: "low" | "medium" | "high" | "max";
   /**
@@ -191,4 +193,57 @@ export interface LLMProvider {
    * support — see `ModelRouter.supportsVision`.
    */
   supportsVision?: boolean;
+
+  /**
+   * Tool-use capability flag (audit §6 bug #190). When `true`, the provider
+   * accepts the `tools` field on an `LLMRequest` and emits `tool-call` chunks
+   * back; when `false`, the host MUST drop `tools` before calling `chat()`
+   * (or skip the tool path entirely) so the model doesn't hallucinate an
+   * empty assistant turn against a tool-call request that has no replay.
+   *
+   * Every shipped adapter (Anthropic / OpenAI / Azure / Copilot / Ollama)
+   * implements tool_calls today, so the field defaults to `true`. A future
+   * text-only or embedding-only adapter can opt out by setting it to
+   * `false`.
+   */
+  supportsToolUse?: boolean;
+
+  /**
+   * Reasoning / extended-thinking capability flag (audit §6 bug #190). When
+   * `true`, the provider understands `LLMRequest.effort` and injects its
+   * native "think harder" budget (Anthropic `thinking`, OpenAI Responses
+   * `reasoning.effort`); when `false`, the effort field is silently dropped
+   * on the wire — but the router will emit a single `console.warn` on the
+   * caller's behalf so the user gets feedback that their `/effort high` had
+   * no effect (instead of the previous silent no-op).
+   *
+   * Per-provider truth (audit §6):
+   *   - Anthropic Messages API           → true  (`thinking` block)
+   *   - OpenAI Responses API             → true  (`reasoning.effort`)
+   *   - Azure (chat-completions only)    → false (adapter never injects)
+   *   - Copilot GPT (Responses) / Claude → true
+   *   - Copilot Gemini (chat-completions)→ false (silently degraded inside
+   *                                       `copilotChat`; the adapter cannot
+   *                                       know the route ahead of time, so
+   *                                       it declares `true` and warns on
+   *                                       the Gemini fallback)
+   *   - Ollama (OpenAI-compatible)       → false
+   */
+  supportsReasoning?: boolean;
+
+  /**
+   * Streaming-tools capability flag (audit §6 bug #190). When `true`, the
+   * provider streams `tool-call` chunks incrementally (id/name first, then
+   * argument deltas) so the host can render an in-flight tool-call bubble;
+   * when `false`, the host should expect the entire tool-call to arrive as
+   * a single chunk at the end of the stream (which is still LLMResponse-
+   * shape-conformant — just less granular).
+   *
+   * Every shipped adapter streams tool calls today (Anthropic emits
+   * `content_block_start` + `input_json_delta`; OpenAI/Azure stream
+   * `tool_calls` deltas; Copilot's non-streaming adapter still emits the
+   * call as a single `tool-call` chunk before `done`), so the field
+   * defaults to `true`.
+   */
+  supportsStreamingTools?: boolean;
 }

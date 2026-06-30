@@ -322,6 +322,13 @@ export interface HookInvokerOptions {
   approvalBroker?: ApprovalBroker;
   denylist?: DenylistEntry[];
   history?: HookHistory;
+  /**
+   * Hooks v1 runner — the NEW Claude Code-style `hooks.json` subsystem
+   * (`src/core/hooks/v1/`). Threaded through here so `ChatSession` can reach
+   * it via `this.hookInvoker.v1?.…` without adding a second constructor arg.
+   * Absent when no v1 entries are configured.
+   */
+  v1?: import("./v1/index.js").HookV1Runner;
   parentEnv?: NodeJS.ProcessEnv;
 }
 
@@ -340,6 +347,11 @@ export class HookInvoker {
   private readonly denylist?: DenylistEntry[];
   readonly history: HookHistory;
   private readonly parentEnv?: NodeJS.ProcessEnv;
+  /**
+   * Hooks v1 runner (Claude Code-style `hooks.json`). Optional; absent when
+   * no v1 entries are configured. See `src/core/hooks/v1/`.
+   */
+  readonly v1?: import("./v1/index.js").HookV1Runner;
   /** Hook names to skip exactly once on their next trigger (session-only). */
   private readonly bypassOnce = new Set<string>();
 
@@ -352,6 +364,7 @@ export class HookInvoker {
     this.denylist = opts.denylist;
     this.history = opts.history ?? new HookHistory();
     this.parentEnv = opts.parentEnv;
+    if (opts.v1) this.v1 = opts.v1;
   }
 
   /** Whether hooks are enabled at all (settings master switch). */
@@ -436,7 +449,13 @@ export class HookInvoker {
         .then((results) => {
           for (const r of results) this.recordResult(r);
         })
-        .catch(() => {});
+        .catch((err) => {
+          // 2026-06-30 (mathran-bug-scan #7) — 原来 silent swallow，
+          // async hook 完全失败用户无任何信号。至少 warn 一次。
+          console.warn(
+            `[mathran] async hook execution failed: ${err && err.message ? err.message : String(err)}`,
+          );
+        });
       return { ran: [], blocked: false };
     }
 

@@ -14,7 +14,7 @@
  *   5. enter_plan_mode.execute flips the session flag.
  *   6. complete_plan.execute flips the session flag back.
  *   7. While planMode=true, calling a non-readOnly tool yields an
- *      ok:false tool-result with the "blocked in plan mode" prefix.
+ *      ok:false tool-result with the "refused in plan mode" prefix.
  *   8. While planMode=true, a readOnly tool runs normally.
  *   9. planMode=false default: any tool runs (no gate).
  *  10. The plan-mode toggle tools are themselves readOnly so they can
@@ -222,7 +222,7 @@ describe("ChatSession × plan mode", () => {
     const tr = events.find((e) => e.type === "tool-result");
     expect(tr).toBeTruthy();
     expect((tr as any).ok).toBe(false);
-    expect((tr as any).content).toContain("blocked in plan mode");
+    expect((tr as any).content).toContain("refused in plan mode");
     expect((tr as any).content).toContain("mutating");
   });
 
@@ -306,7 +306,7 @@ describe("ChatSession × plan mode", () => {
     expect(err).toBeInstanceOf(Error);
     expect(err.toolName).toBe("write_file");
     expect(err.message).toContain("write_file");
-    expect(err.message).toContain("blocked in plan mode");
+    expect(err.message).toContain("refused in plan mode");
     expect(err.name).toBe("PlanModeBlockedError");
   });
 
@@ -327,6 +327,6 @@ describe("ChatSession × plan mode", () => {
     const events = await collect(session.send("go"));
     const tr = events.find((e) => e.type === "tool-result");
     expect((tr as any).ok).toBe(false);
-    expect((tr as any).content).toContain("blocked in plan mode");
+    expect((tr as any).content).toContain("refused in plan mode");
   });
 });

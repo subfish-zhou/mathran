@@ -11,6 +11,7 @@ import {
   loadTodos,
   saveTodos,
   applyTodoPatch,
+  renderTodoSnapshot,
   type TodoList,
 } from "./todo-write.js";
 import type { ChatScope } from "../store.js";
@@ -249,5 +250,99 @@ describe("createTodoWriteTool (integration)", () => {
     expect(r.ok).toBe(true);
     const onDisk = await loadTodos(workspace, effortScope, "conv-eff");
     expect(onDisk.items).toHaveLength(1);
+  });
+});
+
+// 2026-06-30 plan-tracker bug fix — pure tests for the snapshot renderer
+// that ChatSession injects as a transient system reminder before every
+// LLM request.
+describe("renderTodoSnapshot (plan reminder)", () => {
+  function listOf(
+    items: Array<Pick<TodoList["items"][number], "text" | "status">>,
+  ): TodoList {
+    const now = new Date().toISOString();
+    return {
+      version: 1,
+      updatedAt: now,
+      items: items.map((it, i) => ({
+        id: `id-${i}`,
+        text: it.text,
+        status: it.status,
+        createdAt: now,
+        updatedAt: now,
+      })),
+    };
+  }
+
+  it("returns null when list is null", () => {
+    expect(renderTodoSnapshot(null)).toBeNull();
+  });
+
+  it("returns null when list is empty", () => {
+    expect(
+      renderTodoSnapshot({ version: 1, items: [], updatedAt: "x" }),
+    ).toBeNull();
+  });
+
+  it("returns null when every item is done (no nudge needed)", () => {
+    const list = listOf([
+      { text: "step 1", status: "done" },
+      { text: "step 2", status: "done" },
+    ]);
+    expect(renderTodoSnapshot(list)).toBeNull();
+  });
+
+  it("returns null when every item is done or cancelled", () => {
+    const list = listOf([
+      { text: "step 1", status: "done" },
+      { text: "step 2", status: "cancelled" },
+    ]);
+    expect(renderTodoSnapshot(list)).toBeNull();
+  });
+
+  it("renders header + items + reminder when work remains", () => {
+    const list = listOf([
+      { text: "Locate occurrences", status: "done" },
+      { text: "Fetch arXiv source", status: "in_progress" },
+      { text: "Extract context", status: "pending" },
+    ]);
+    const text = renderTodoSnapshot(list);
+    expect(text).not.toBeNull();
+    const out = text!;
+    expect(out).toContain("Current TODO list (3 items");
+    expect(out).toContain("1 in_progress");
+    expect(out).toContain("1 pending");
+    expect(out).toContain("1 done");
+    expect(out).toContain("Locate occurrences");
+    expect(out).toContain("Fetch arXiv source");
+    expect(out).toContain("Extract context");
+    expect(out).toContain("[in_progress]");
+    expect(out).toContain("[pending]");
+    expect(out).toContain("[done]");
+    expect(out).toMatch(/Reminder:.*todo_write/);
+    expect(out).toMatch(/at most ONE item in_progress/);
+  });
+
+  it("truncates very long item text so the reminder stays compact", () => {
+    const long = "x".repeat(500);
+    const list = listOf([{ text: long, status: "in_progress" }]);
+    const text = renderTodoSnapshot(list)!;
+    // truncation suffix
+    expect(text).toContain("…");
+    // body should not contain the full 500-char string
+    expect(text.length).toBeLessThan(800);
+  });
+
+  it("renders only in_progress + pending in the header counts but still shows done items in the body", () => {
+    const list = listOf([
+      { text: "a", status: "done" },
+      { text: "b", status: "pending" },
+    ]);
+    const text = renderTodoSnapshot(list)!;
+    expect(text).toContain("1 pending");
+    expect(text).toContain("1 done");
+    // body shows both lines
+    expect(text).toMatch(/\[done\]\s+a/);
+    expect(text).toMatch(/\[pending\]\s+b/);
   });
 });

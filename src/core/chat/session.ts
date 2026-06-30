@@ -29,6 +29,8 @@ import type {
 import { contentToString } from "../providers/llm.js";
 import type { ReasoningEffortLevel } from "../reasoning-effort/index.js";
 import { capToolOutput } from "./tool-output-cap.js";
+import type { TodoList } from "./tools/todo-write.js";
+import { renderTodoSnapshot } from "./tools/todo-write.js";
 import {
   compactRunner,
   LocalCompactionStrategy,
@@ -243,15 +245,54 @@ export interface ToolSpec {
  * the chat session is in plan mode and the tool is not `readOnly`. Callers
  * (the chat loop) catch this and surface it as a regular `ok: false` tool
  * result so the model can keep reasoning without mutating state.
+ *
+ * Hardening (2026-06-30): the error message uses the same "refused in plan
+ * mode" phrasing as the user-facing tool result so logs and surface text
+ * stay aligned.
  */
 export class PlanModeBlockedError extends Error {
   readonly toolName: string;
   constructor(toolName: string) {
-    super(`tool '${toolName}' blocked in plan mode (not read-only)`);
+    super(
+      `tool '${toolName}' refused in plan mode: mutating tools are blocked`,
+    );
     this.name = "PlanModeBlockedError";
     this.toolName = toolName;
   }
 }
+
+/**
+ * Plan-mode meta-tool whitelist (Hardening 2026-06-30).
+ *
+ * Tool names that are allowed to execute even while the session is in plan
+ * mode, regardless of their `ToolSpec.readOnly` flag. These are the meta
+ * affordances the LLM still needs while it's *planning*:
+ *
+ *   • `complete_plan`  — the escape hatch out of plan mode.
+ *   • `enter_plan_mode` — idempotent re-entry (also readOnly:true, kept
+ *                        here for explicitness).
+ *   • `ask_user`       — clarification round-trip; already readOnly:true
+ *                        but listed for explicitness so deny-by-default
+ *                        readers see the policy in one place.
+ *   • `todo_write`     — bookkeeping. `todo_write` is classified
+ *                        `readOnly: false` (it writes a JSON file under
+ *                        `.mathran/todos/`), but the file is conversation
+ *                        scratch state, not workspace mutation; letting
+ *                        the model maintain its in-flight plan list is
+ *                        the whole point of plan mode.
+ *
+ * The whitelist is an additive layer on top of the `readOnly === true`
+ * gate: a tool passes plan-mode gating if EITHER `readOnly === true` OR
+ * its name is in this set. Everything else (`write_file`, `edit_file`,
+ * `bash`, `run_python`, `run_latex`, `dispatch_subagent`, `propose_goal`,
+ * `propose_plan`, …) is hard-rejected with `PlanModeBlockedError`.
+ */
+export const PLAN_MODE_TOOL_WHITELIST: ReadonlySet<string> = new Set([
+  "complete_plan",
+  "enter_plan_mode",
+  "ask_user",
+  "todo_write",
+]);
 
 /**
  * Minimal subagent-result shape carried on the `subagent-completed` ChatEvent
@@ -562,6 +603,29 @@ export interface ChatSessionOptions {
    * back to a per-session temp dir.
    */
   workspace?: string;
+  /**
+   * Plan-tracker bug fix (2026-06-30) — supplier of the current todo list
+   * for this conversation. ChatSession invokes this BEFORE every LLM
+   * request and injects a short snapshot of unfinished items as a
+   * transient `system` message at the end of `messages`, so the model
+   * actually sees the in-flight plan when it's deciding what to do next.
+   *
+   * Without this hook, the only signal the LLM gets after writing a plan
+   * is the one-line tool result (`"4 todos · 1 in_progress, 3 pending"`)
+   * tucked deep in history — which it forgets a few rounds later, leaving
+   * conversations with `in_progress` items that never flip to `done`.
+   *
+   * The hook is async (callers typically `await loadTodos(...)`); errors
+   * are caught and skipped — a snapshot failure must never break a turn.
+   * The injected message is removed from history after the turn so a long
+   * thread doesn't accumulate stale snapshots.
+   *
+   * Wired by `serve.ts` and `goal/runner.ts` with the same
+   * (workspace, scope, conversationId) tuple they pass to
+   * `createTodoWriteTool`. Omit in tests / CLI one-shots that don't
+   * persist todos.
+   */
+  todoSnapshot?: () => Promise<TodoList | null>;
   /**
    * TODO-2 §3.2 / C8 — observer for compaction lifecycle events. Invoked
    * synchronously after every compactV2() attempt (success OR failure)
@@ -1077,6 +1141,12 @@ export class ChatSession {
   /** TODO-2 §3.2 / C8 — compaction event observer (goal-mode wires emit). */
   private readonly onCompactionEvent?: ChatSessionOptions["onCompactionEvent"];
   private readonly workspace?: string;
+  /** 2026-06-30 plan-tracker bug fix — supplier of the current todo list,
+   *  see {@link ChatSessionOptions.todoSnapshot} for the full rationale.
+   *  Awaited and converted to a transient system reminder before every
+   *  LLM request; the reminder is spliced back out after the request so
+   *  it doesn't bloat history. */
+  private readonly todoSnapshot?: () => Promise<TodoList | null>;
   private readonly subagentScheduler?: SubagentScheduler;
   /**
    * v0.5 wire-up: separate scheduler reference used by the
@@ -1156,6 +1226,7 @@ export class ChatSession {
     this.toolOutputCap = opts.toolOutputCap;
     this.autoCompactCfg = opts.autoCompact;
     this.workspace = opts.workspace;
+    this.todoSnapshot = opts.todoSnapshot;
     this.onCompactionEvent = opts.onCompactionEvent;
     this.subagentScheduler = opts.subagentScheduler;
     // v0.5 wire-up: prefer `opts.scheduler` for the dispatch tool, but fall
@@ -1785,6 +1856,73 @@ export class ChatSession {
   }
 
   /**
+   * Hooks v1 (`src/core/hooks/v1/`) — wrap a tool dispatch with PreToolUse /
+   * PostToolUse. Single insertion point for v1 tool-side hooks: PreToolUse may
+   * BLOCK (short-circuit with `ok: false`) or REWRITE the input; PostToolUse
+   * fires after execute (cannot block, additionalContext fed back as system).
+   * No-op when no v1 runner is attached.
+   */
+  private async *executeWithV1Hooks(
+    tool: ToolSpec,
+    call: { id: string; name: string },
+    parsed: Record<string, unknown>,
+    callCtx: ToolExecuteContext,
+  ): AsyncGenerator<ChatEvent, { ok: boolean; content: string }, void> {
+    const v1 = this.hookInvoker?.v1;
+    if (!v1 || (!v1.has("PreToolUse") && !v1.has("PostToolUse"))) {
+      return yield* this.executeWithApproval(tool, call, parsed, callCtx);
+    }
+    let effectiveParsed = parsed;
+    if (v1.has("PreToolUse")) {
+      const pre = await v1.preToolUse({
+        toolName: call.name,
+        toolInput: parsed,
+        toolUseId: call.id,
+      });
+      for (const ctxText of pre.additionalContexts) {
+        this.messages.push({ role: "system", content: ctxText });
+      }
+      if (pre.blocked) {
+        return { ok: false, content: `⛔ ${pre.blockReason ?? "tool call blocked by PreToolUse hook"}` };
+      }
+      if (pre.updatedInput) effectiveParsed = pre.updatedInput;
+    }
+    const result = yield* this.executeWithApproval(tool, call, effectiveParsed, callCtx);
+    if (v1.has("PostToolUse")) {
+      const post = await v1.postToolUse({
+        toolName: call.name,
+        toolInput: effectiveParsed,
+        toolResult: result,
+        toolUseId: call.id,
+      });
+      for (const ctxText of post.additionalContexts) {
+        this.messages.push({ role: "system", content: ctxText });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Hooks v1 — fire SessionStart exactly once per session (idempotent). Hooks'
+   * `additionalContext` strings get pre-loaded as system messages.
+   */
+  private sessionStartV1Fired = false;
+  private async maybeFireSessionStartV1(): Promise<void> {
+    if (this.sessionStartV1Fired) return;
+    this.sessionStartV1Fired = true;
+    const v1 = this.hookInvoker?.v1;
+    if (!v1 || !v1.has("SessionStart")) return;
+    try {
+      const out = await v1.sessionStart({ source: "startup" });
+      for (const ctxText of out.additionalContexts) {
+        this.messages.push({ role: "system", content: ctxText });
+      }
+    } catch {
+      // SessionStart failures are surfaced inside `out.results[*]` only; never throw.
+    }
+  }
+
+  /**
    * Run a tool through the approval broker (Approval Policy 矩阵), then execute
    * it (or not) per the verdict. An async generator: it yields `approval_request`
    * / `approval_resolved` events around any user prompt and **returns** the tool
@@ -1805,13 +1943,24 @@ export class ChatSession {
     // Part B1 — Plan mode HARD gate. Runs BEFORE permission profiles +
     // approval broker so even an approved tool cannot run while the
     // session is in plan mode. Caught by `runRounds` / loop and surfaced
-    // back to the model as an `ok: false` tool result. Tools opt in via
-    // `ToolSpec.readOnly = true`; anything else is blocked.
+    // back to the model as an `ok: false` tool result.
     //
-    // Plan-mode toggle tools (`enter_plan_mode` / `complete_plan`) are
-    // themselves classified `readOnly: true` so the model can always
-    // *exit* plan mode — commit 3 ships them.
-    if (this.planMode && tool.readOnly !== true) {
+    // A tool passes the gate when EITHER:
+    //   • it opts in via `ToolSpec.readOnly === true` (the conservative
+    //     default — unknown / un-classified tools are blocked), OR
+    //   • its name is in `PLAN_MODE_TOOL_WHITELIST` (meta-tools like
+    //     `complete_plan` / `ask_user` / `todo_write` that the LLM still
+    //     needs while planning, see the whitelist definition above for
+    //     rationale).
+    //
+    // Everything else (`write_file`, `edit_file`, `bash`, `run_python`,
+    // `run_latex`, `dispatch_subagent`, `propose_goal`, `propose_plan`,
+    // …) is hard-rejected with `PlanModeBlockedError`.
+    if (
+      this.planMode &&
+      tool.readOnly !== true &&
+      !PLAN_MODE_TOOL_WHITELIST.has(call.name)
+    ) {
       throw new PlanModeBlockedError(call.name);
     }
 
@@ -2486,6 +2635,40 @@ export class ChatSession {
       hooks: req.hooks,
     };
 
+    // Hooks v1 — PreCompact may block this attempt entirely. The compact's
+    // own caller-supplied `req.hooks.pre` runs AFTER v1 (so v1 acts as a
+    // shared cross-call gate, then per-call hooks fine-tune).
+    const v1Pre = this.hookInvoker?.v1;
+    if (v1Pre?.has("PreCompact")) {
+      const pre = await v1Pre.preCompact({ phase: req.phase, reason: req.reason });
+      if (pre.blocked) {
+        const now = Date.now();
+        const skipped: CompactionOutcome = {
+          ok: false,
+          status: "skipped",
+          error: pre.blockReason ?? "v1 PreCompact hook blocked compaction",
+          telemetry: {
+            reason: fullReq.reason,
+            phase: fullReq.phase,
+            trigger: fullReq.trigger,
+            policy: fullReq.policy,
+            strategy: "local",
+            startedAtMs: now,
+            endedAtMs: now,
+            durationMs: 0,
+            status: "skipped",
+            originalTokens: 0,
+            newTokens: 0,
+            droppedRoundCount: 0,
+            retryAttempts: 0,
+            hookOutcomes: { pre: "stopped" },
+          },
+        };
+        this.emitCompactionToObserver(skipped);
+        return skipped;
+      }
+    }
+
     // Optional PreCompact hook: caller can veto.
     if (fullReq.hooks?.pre) {
       try {
@@ -2539,6 +2722,19 @@ export class ChatSession {
       }
     }
 
+    // Hooks v1 — PostCompact fires after every compaction attempt (regardless
+    // of ok/skipped/failed). Cannot block (already done); used for telemetry
+    // or external alerts. Hook crashes are swallowed (see invoker).
+    const v1Post = this.hookInvoker?.v1;
+    if (v1Post?.has("PostCompact")) {
+      await v1Post.postCompact({
+        phase: req.phase,
+        reason: req.reason,
+        status: outcome.telemetry.status,
+        droppedRoundCount: outcome.telemetry.droppedRoundCount,
+      });
+    }
+
     // TODO-2 §3.2 / C8 — emit a 'compaction' ChatEvent to the configured
     // observer (goal-mode runner forwards this to SSE + bumps Goal.stats).
     // Skip the noop case (droppedRoundCount=0) to avoid noise; only
@@ -2590,6 +2786,11 @@ export class ChatSession {
     const signal = opts.signal;
     // Abort before we touch history: leave `messages` untouched and bail.
     if (signal?.aborted) throw abortError();
+
+    // Hooks v1 — fire SessionStart exactly once per session (idempotent).
+    // Any `additionalContext` strings the hooks emit are pre-loaded as
+    // system messages so the model sees them before the first user turn.
+    await this.maybeFireSessionStartV1();
 
     // Reset mid-turn token accumulator for this fresh user-initiated send().
     this.cumulativeInputTokens = 0;
@@ -2730,6 +2931,36 @@ export class ChatSession {
         }
       }
 
+      // 2026-06-30 plan-tracker bug fix — inject a compact snapshot of the
+      // current TODO list as a transient system message so the LLM actually
+      // sees its in-flight plan when deciding the next action. Without this,
+      // the only signal after writing a plan is the one-line tool result
+      // buried deep in history, and the model reliably forgets to mark items
+      // `done` (audited 2026-06-30 across alpha + my own workspace: 2/5
+      // conversations finished with stale `in_progress` items).
+      //
+      // The reminder is round-local: we record the message handle in
+      // `todoReminderMessage` and splice it back out at the end of the round
+      // (after the assistant reply is recorded) so history doesn't accumulate
+      // stale snapshots. We deliberately splice BEFORE recording the
+      // assistant turn so the persisted jsonl shape matches the pre-fix
+      // layout and replay / compaction code paths don't see a foreign
+      // system message they have to special-case.
+      let todoReminderMessage: LLMMessage | null = null;
+      if (this.todoSnapshot) {
+        try {
+          const list = await this.todoSnapshot();
+          const rendered = renderTodoSnapshot(list);
+          if (rendered) {
+            todoReminderMessage = { role: "system", content: rendered };
+            this.messages.push(todoReminderMessage);
+          }
+        } catch {
+          // Snapshot loading must never break a turn — log-via-skip and move
+          // on. The model proceeds without the reminder this round.
+        }
+      }
+
       const req: LLMRequest = {
         messages: this.messages.map((m) => ({ ...m })),
         model: this.model ?? "",
@@ -2785,6 +3016,15 @@ export class ChatSession {
         }
       } catch (err) {
         if (isAbortError(err)) {
+          // 2026-06-30 plan-tracker bug fix — strip the transient TODO
+          // reminder BEFORE recording the aborted assistant turn so the
+          // persisted history doesn't carry a stray system message that
+          // wasn't part of the original prompt design.
+          if (todoReminderMessage) {
+            const idx = this.messages.indexOf(todoReminderMessage);
+            if (idx >= 0) this.messages.splice(idx, 1);
+            todoReminderMessage = null;
+          }
           // Commit the partial assistant text so the user/goal can see how far
           // we got. We deliberately drop any half-streamed tool calls: the
           // assistant message carries no `toolCalls`, so history stays
@@ -2797,6 +3037,15 @@ export class ChatSession {
           // so the partial chain-of-thought stays visible on reload.
           if (reasoning.length > 0) aborted.reasoning = reasoning;
           this.messages.push(aborted);
+        } else if (todoReminderMessage) {
+          // Non-abort error path (provider 5xx, validation reject, …):
+          // the assistant turn is NOT committed, so just drop the
+          // reminder and let the caller decide whether to retry. Leaving
+          // it in history would re-trigger the LLM with a duplicate
+          // reminder next round.
+          const idx = this.messages.indexOf(todoReminderMessage);
+          if (idx >= 0) this.messages.splice(idx, 1);
+          todoReminderMessage = null;
         }
         throw err;
       }
@@ -2822,6 +3071,18 @@ export class ChatSession {
           name: c.name,
           arguments: c.args,
         }));
+      }
+      // 2026-06-30 plan-tracker bug fix — remove the transient TODO
+      // reminder BEFORE the assistant turn is recorded so history (and the
+      // persisted jsonl) stays clean. The next round will re-inject a
+      // fresh snapshot reflecting any updates the model just made. We
+      // splice rather than pop because an abort path above may already
+      // have pushed an `[aborted]` assistant message between the reminder
+      // and here; pop()-by-position would corrupt history in that case.
+      if (todoReminderMessage) {
+        const idx = this.messages.indexOf(todoReminderMessage);
+        if (idx >= 0) this.messages.splice(idx, 1);
+        todoReminderMessage = null;
       }
       this.messages.push(assistantMessage);
 
@@ -2942,7 +3203,7 @@ export class ChatSession {
                       : path.resolve(this.workspace ?? "", p),
                   ),
               };
-              result = yield* this.executeWithApproval(
+              result = yield* this.executeWithV1Hooks(
                 tool,
                 call,
                 parsed,
@@ -3006,9 +3267,17 @@ export class ChatSession {
                 // Part B1 — plan-mode hard gate. Surface a uniform `ok: false`
                 // tool result so the model keeps reasoning in plan mode
                 // without thinking the tool actually ran.
+                //
+                // The phrasing is LLM-actionable on purpose: it names the
+                // tool, names plan mode, and tells the model exactly how
+                // to recover (complete_plan to exit, or use read-only
+                // investigation tools).
                 result = {
                   ok: false,
-                  content: `⛔ tool '${err.toolName}' blocked in plan mode (not read-only)`,
+                  content:
+                    `refused in plan mode: '${err.toolName}' is a mutating tool. ` +
+                    `Use 'complete_plan' to exit plan mode first, or call ` +
+                    `read-only tools (search/read_file/grep/glob) for investigation.`,
                 };
               } else {
                 result = { ok: false, content: `error: ${err?.message ?? String(err)}` };

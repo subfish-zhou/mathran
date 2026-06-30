@@ -69,7 +69,7 @@ export function createSearchArxivTool(
 
   return {
     name: "search_arxiv",
-    riskClass: "read",
+    riskClass: "net",
     readOnly: true,
     description:
       "Search arXiv for papers matching a query. Returns up to `limit` results " +
