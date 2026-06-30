@@ -116,3 +116,91 @@ body {
 .md .wikiref:hover {
   filter: brightness(0.95);
 }
+
+/* ──────────────────────────────────────────────────────────────────────
+ * Syntax-highlighted code blocks (2026-06-30, mathub parity)
+ *
+ * The custom marked renderer in lib/markdown.ts emits:
+ *   <div class="code-block-wrapper">
+ *     <span class="code-lang-label">python</span>
+ *     <button class="code-copy-btn" data-code="…">Copy</button>
+ *     <pre><code class="hljs">…</code></pre>
+ *   </div>
+ * github-dark.css (imported in markdown.ts) styles the `.hljs` token
+ * colours + its own dark background. These rules add the wrapper chrome:
+ * a faint language tag top-left, a hover-revealed Copy button top-right.
+ * ────────────────────────────────────────────────────────────────────── */
+
+.md .code-block-wrapper {
+  position: relative;
+  margin: 0.5rem 0;
+  /* The wrapper itself owns the dark background + rounded corners and a
+   * top strip of padding. The language label + Copy button float in that
+   * top strip; the <pre> below them is transparent. This keeps the label
+   * reliably INSIDE the dark card instead of riding its rounded top edge
+   * (earlier absolute-on-transparent-wrapper attempts clipped it). */
+  background: #0d1117;
+  border-radius: 0.5rem;
+  padding-top: 1.7rem;
+  overflow: hidden;
+}
+
+/* Let github-dark's .hljs background own the block; drop the generic
+ * `.md pre` dark fill so the two don't fight (hljs is #0d1117). */
+.md .code-block-wrapper pre {
+  margin: 0;
+  background: transparent;
+}
+.md .code-block-wrapper pre code.hljs {
+  display: block;
+  padding: 0 1rem 0.85rem;
+  overflow-x: auto;
+  font-size: 0.85em;
+  line-height: 1.5;
+  /* Match the wrapper's pinned background so a horizontally-scrolled long
+   * line keeps the same fill, and so the palette never floats on white if
+   * CSS load order drops github-dark's own `.hljs` rule. */
+  background: transparent;
+  color: #c9d1d9;
+}
+
+.md .code-lang-label {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.9rem;
+  font-size: 0.65rem;
+  color: #6e7681;
+  opacity: 0.9;
+  pointer-events: none;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  text-transform: lowercase;
+  z-index: 1;
+}
+
+.md .code-copy-btn {
+  position: absolute;
+  top: 0.42rem;
+  right: 0.5rem;
+  font-size: 0.65rem;
+  padding: 0.15rem 0.45rem;
+  border-radius: 0.25rem;
+  background: #21262d;
+  border: 1px solid #30363d;
+  color: #c9d1d9;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s;
+  z-index: 2;
+}
+.md .code-block-wrapper:hover .code-copy-btn {
+  opacity: 1;
+}
+.md .code-copy-btn:hover {
+  background: #30363d;
+  color: #fff;
+}
+.md .code-copy-btn.copied {
+  background: #238636;
+  color: #fff;
+  border-color: #238636;
+}

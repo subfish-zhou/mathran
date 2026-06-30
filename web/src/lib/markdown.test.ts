@@ -100,3 +100,39 @@ describe("marked + KaTeX end-to-end", () => {
     expect(html).toMatch(/\\\(literal\\\)/);
   });
 });
+
+describe("code block syntax highlighting (highlight.js)", () => {
+  it("wraps fenced code in .code-block-wrapper with a Copy button", () => {
+    const html = marked.parse("```python\nx = 1\n```") as string;
+    expect(html).toMatch(/class="code-block-wrapper"/);
+    expect(html).toMatch(/class="code-copy-btn"/);
+    expect(html).toMatch(/data-code=/);
+  });
+
+  it("emits a language label for a known language", () => {
+    const html = marked.parse("```python\nx = 1\n```") as string;
+    expect(html).toMatch(/class="code-lang-label">python</);
+  });
+
+  it("applies hljs token spans to highlighted source", () => {
+    const html = marked.parse("```python\ndef f():\n    return 1\n```") as string;
+    // highlight.js wraps keywords/identifiers in `hljs-*` spans.
+    expect(html).toMatch(/class="hljs/);
+    expect(html).toMatch(/hljs-/);
+  });
+
+  it("falls back to highlightAuto for an unknown language (still wrapped)", () => {
+    const html = marked.parse("```\nsome plain text\n```") as string;
+    expect(html).toMatch(/class="code-block-wrapper"/);
+    // No lang → no label span, but the block is still wrapped + copyable.
+    expect(html).not.toMatch(/class="code-lang-label"/);
+    expect(html).toMatch(/class="code-copy-btn"/);
+  });
+
+  it("HTML-escapes code so a snippet can't inject markup", () => {
+    const html = marked.parse("```html\n<script>alert(1)</script>\n```") as string;
+    // The raw tag must be escaped in the rendered output, not live HTML.
+    expect(html).not.toMatch(/<script>alert\(1\)<\/script>/);
+    expect(html).toMatch(/&lt;script&gt;|&lt;script/);
+  });
+});
