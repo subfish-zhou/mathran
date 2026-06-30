@@ -3,7 +3,7 @@
  * a 3-page WikiPlan + 5 effort documents + 8 PaperReads.
  */
 
-import type { WikiPlan, WikiPlanPage } from "../wiki-plan/index.js";
+import type { WikiPlan, WikiPlanPage, ArgumentMap, RelatedPage } from "../wiki-plan/index.js";
 import type { NarrativeSpine } from "../spine/types.js";
 import type { PaperRead } from "../../../paper-graph/types.js";
 
@@ -18,6 +18,10 @@ export function planPage(slug: string, overrides: Partial<WikiPlanPage> = {}): W
     keyEffortsCited: [],
     keyPaperReadsCited: [],
     relatedPageSlugs: [],
+    // 2026-06-30: WikiPlanPage gained typed relatedPages + optional
+    // subClaimId. Default both to empty so legacy fixtures stay terse;
+    // overrides can supply richer values per-test.
+    relatedPages: [],
     narrativeRole: "content",
     ...overrides,
   };
@@ -30,23 +34,66 @@ export function threePagePlan(): WikiPlan {
     keyEffortsCited: ["effort-1", "effort-2"],
     keyPaperReadsCited: ["paper-1", "paper-2"],
     relatedPageSlugs: ["circle-method"],
+    relatedPages: [{ slug: "circle-method", relation: "extends" }],
   });
   const circle = planPage("circle-method", {
     keyEffortsCited: ["effort-3", "effort-4"],
     keyPaperReadsCited: ["paper-3", "paper-4", "paper-5"],
     relatedPageSlugs: ["overview", "bibliography"],
+    relatedPages: [
+      { slug: "overview", relation: "prerequisite" },
+      { slug: "bibliography", relation: "extends" },
+    ],
+    subClaimId: "C1",
   });
   const biblio = planPage("bibliography", {
     narrativeRole: "references",
     keyEffortsCited: ["effort-5"],
     keyPaperReadsCited: ["paper-6", "paper-7", "paper-8"],
     relatedPageSlugs: [],
+    relatedPages: [],
   });
   return {
     globalThesis: "Goldbach via circle method",
     totalPages: 3,
     pages: [overview, circle, biblio],
     pageOrder: ["overview", "circle-method", "bibliography"],
+    // 2026-06-30: ship an argument map so writer-prompt fixtures exercise
+    // the v3 argumentMapBlock path. Degenerate (one sub-claim, one page)
+    // is fine for fixture purposes.
+    argumentMap: {
+      thesis: "Goldbach via circle method",
+      subClaims: [
+        {
+          id: "C1",
+          claim: "The circle method gives the right decomposition for ternary Goldbach.",
+          supportedByPages: ["circle-method"],
+          dependsOn: [],
+        },
+      ],
+    },
+  };
+}
+
+/** A WikiPlan with NO argumentMap — covers the legacy fall-back path. */
+export function threePagePlanLegacy(): WikiPlan {
+  const p = threePagePlan();
+  delete p.argumentMap;
+  for (const page of p.pages) delete page.subClaimId;
+  return p;
+}
+
+export function relatedPage(slug: string, relation: RelatedPage["relation"]): RelatedPage {
+  return { slug, relation };
+}
+
+export function argumentMap(overrides: Partial<ArgumentMap> = {}): ArgumentMap {
+  return {
+    thesis: "Goldbach via circle method",
+    subClaims: [
+      { id: "C1", claim: "Circle method applies", supportedByPages: ["circle-method"], dependsOn: [] },
+    ],
+    ...overrides,
   };
 }
 

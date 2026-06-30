@@ -69,6 +69,66 @@ describe("buildWikiPageWritePrompt", () => {
     expect(prompt).toContain("@paper-read:<paper-id>#mainResult-N");
   });
 
+  it("injects the argument map, the page's sub-claim, typed relations, and the 'later pages' block (v3)", () => {
+    // The v3 cut: writer must SEE the wiki's argument-map skeleton, know
+    // which sub-claim THIS page argues, see typed relations to siblings,
+    // and know what's coming so it can hand off cleanly.
+    const plan = threePagePlan(); // has argumentMap + circle-method.subClaimId="C1"
+    const prompt = buildWikiPageWritePrompt({
+      plan,
+      page: plan.pages[1]!, // circle-method
+      spine: emptySpine(),
+      reads: eightPaperReads(),
+      effortDocuments: fiveEffortDocs(),
+      previouslyWrittenPageSummaries: [],
+      problem,
+    });
+    // (1) argument-map block rendered
+    expect(prompt).toContain("Wiki argument map");
+    expect(prompt).toContain("Thesis:");
+    expect(prompt).toContain("C1:");
+    // (2) THIS PAGE marker on the right sub-claim
+    expect(prompt).toContain("← THIS PAGE argues this sub-claim");
+    // (3) page spec carries its own subClaim line
+    expect(prompt).toContain("subClaim being argued (C1)");
+    // (4) typed relations spelled out, not the bare slug list
+    expect(prompt).toContain("(prerequisite)");
+    expect(prompt).toContain("(extends)");
+    // (5) "later pages" block exists (circle-method is mid-wiki, so there's a tail)
+    expect(prompt).toContain("Pages that come AFTER this one");
+    expect(prompt).toContain("[[bibliography]]");
+    // (6) hard rule 4 mentions the typed-relation vocabulary
+    expect(prompt).toContain("prerequisite");
+    expect(prompt).toContain("contrasts-with");
+  });
+
+  it("appends the intro-page special directive on the overview page only", () => {
+    const plan = threePagePlan();
+    const introPrompt = buildWikiPageWritePrompt({
+      plan,
+      page: plan.pages[0]!, // overview
+      spine: emptySpine(),
+      reads: eightPaperReads(),
+      effortDocuments: fiveEffortDocs(),
+      previouslyWrittenPageSummaries: [],
+      problem,
+    });
+    const contentPrompt = buildWikiPageWritePrompt({
+      plan,
+      page: plan.pages[1]!, // circle-method
+      spine: emptySpine(),
+      reads: eightPaperReads(),
+      effortDocuments: fiveEffortDocs(),
+      previouslyWrittenPageSummaries: [],
+      problem,
+    });
+    expect(introPrompt).toContain("SPECIAL INSTRUCTIONS — this is the WIKI'S INTRODUCTION");
+    expect(introPrompt).toContain("The argument in");
+    expect(introPrompt).toContain("How to read this wiki");
+    // Content pages must NOT see the intro directive.
+    expect(contentPrompt).not.toContain("SPECIAL INSTRUCTIONS — this is the WIKI'S INTRODUCTION");
+  });
+
   it("truncates effort documents when combined size exceeds the budget", () => {
     const huge = new Map<string, string>([
       ["effort-3", "A".repeat(40_000)],

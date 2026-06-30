@@ -205,7 +205,7 @@ describe("outlineWikiPages", () => {
     const prompt = buildWikiOutlinePrompt({ ...baseInput(), priorArt });
     expect(prompt).toContain("ADD VALUE");
     expect(prompt).toContain("Old Survey on Goldbach");
-    expect(WIKI_OUTLINE_PROMPT_VERSION).toBe("v1");
+    expect(WIKI_OUTLINE_PROMPT_VERSION).toBe("v2");
   });
 
   it("persists and reloads a WikiPlan", async () => {
@@ -216,7 +216,7 @@ describe("outlineWikiPages", () => {
       const plan: WikiPlan = {
         globalThesis: "t",
         totalPages: 1,
-        pages: [{ slug: "overview", title: "O", purpose: "p", audience: "graduate-student-entering-field", estimatedLengthWords: 100, coreSections: [], keyEffortsCited: ["vino"], keyPaperReadsCited: [], relatedPageSlugs: [], narrativeRole: "introduction" }],
+        pages: [{ slug: "overview", title: "O", purpose: "p", audience: "graduate-student-entering-field", estimatedLengthWords: 100, coreSections: [], keyEffortsCited: ["vino"], keyPaperReadsCited: [], relatedPageSlugs: [], relatedPages: [], narrativeRole: "introduction" }],
         pageOrder: ["overview"],
       };
       await persistWikiPlan(projectDir, plan);
@@ -224,6 +224,115 @@ describe("outlineWikiPages", () => {
       expect(loaded).toEqual(plan);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ── 2026-06-30 — argument-map / typed-relations tests ─────────────────────
+
+  it("coerces typed relatedPages and keeps relatedPageSlugs in sync", async () => {
+    // LLM returns the new shape: relatedPages: [{slug,relation}, …]. We assert
+    // the plan ends up with BOTH fields populated (typed for v3 writer, legacy
+    // slug list for the nav footer).
+    const llm: SpineLLM = async () =>
+      JSON.stringify({
+        globalThesis: "t",
+        argumentMap: {
+          thesis: "t",
+          subClaims: [
+            { id: "C1", claim: "First claim", supportedByPages: ["middle"], dependsOn: [] },
+            { id: "C2", claim: "Second claim", supportedByPages: ["frontier"], dependsOn: ["C1"] },
+            { id: "C3", claim: "Third claim", supportedByPages: ["middle"], dependsOn: ["C1"] },
+          ],
+        },
+        pages: [
+          { slug: "overview", title: "Overview", purpose: "intro", audience: "graduate-student-entering-field", coreSections: ["s"], keyEffortsCited: ["n1"], relatedPages: [] },
+          { slug: "middle", title: "M", purpose: "m", audience: "specialist-refresher", coreSections: ["s"], keyEffortsCited: ["n1"], relatedPages: [{ slug: "frontier", relation: "extends" }], subClaimId: "C1" },
+          { slug: "frontier", title: "F", purpose: "f", audience: "expert-checking-status", coreSections: ["s"], keyEffortsCited: ["n1"], relatedPages: [{ slug: "middle", relation: "prerequisite" }], subClaimId: "C2" },
+          { slug: "bibliography", title: "B", purpose: "b", audience: "specialist-refresher", coreSections: ["s"], keyPaperReadsCited: ["P1"], relatedPages: [], narrativeRole: "references" },
+        ],
+        pageOrder: ["overview", "middle", "frontier", "bibliography"],
+      });
+    const plan = await outlineWikiPages(baseInput(), { llm });
+    const middle = plan.pages.find((p) => p.slug === "middle")!;
+    expect(middle.relatedPages).toEqual([{ slug: "frontier", relation: "extends" }]);
+    // Legacy slug list is kept in sync (used by nav footer).
+    expect(middle.relatedPageSlugs).toEqual(["frontier"]);
+    expect(middle.subClaimId).toBe("C1");
+  });
+
+  it("repairs missing argumentMap by synthesizing one sub-claim per content page", async () => {
+    // LLM forgot argumentMap entirely. Repair should not let the writer
+    // prompt go blank — synthesize a degenerate map (1 sub-claim per
+    // content page).
+    const llm: SpineLLM = async () =>
+      JSON.stringify({
+        globalThesis: "t",
+        pages: [
+          { slug: "overview", title: "O", purpose: "p", audience: "graduate-student-entering-field", coreSections: ["s"], keyEffortsCited: ["n1"], relatedPageSlugs: [] },
+          { slug: "circle-method", title: "Circle", purpose: "p", audience: "specialist-refresher", coreSections: ["s"], keyEffortsCited: ["n1"], relatedPageSlugs: [] },
+          { slug: "minor-arcs", title: "Minor", purpose: "p", audience: "specialist-refresher", coreSections: ["s"], keyEffortsCited: ["n1"], relatedPageSlugs: [] },
+          { slug: "bibliography", title: "B", purpose: "b", audience: "specialist-refresher", coreSections: ["s"], keyPaperReadsCited: ["P1"], relatedPageSlugs: [], narrativeRole: "references" },
+        ],
+        pageOrder: ["overview", "circle-method", "minor-arcs", "bibliography"],
+      });
+    const plan = await outlineWikiPages(baseInput(), { llm });
+    expect(plan.argumentMap).toBeDefined();
+    // 2 content pages → synthesized 2 sub-claims (below MIN, so repair tries
+    // to pad by splitting; with only 1 page per claim, padding gives up
+    // gracefully — final count is whatever survives).
+    expect(plan.argumentMap!.subClaims.length).toBeGreaterThanOrEqual(2);
+    // Every content page is covered by exactly one sub-claim.
+    const covered = new Set<string>();
+    for (const sc of plan.argumentMap!.subClaims) {
+      for (const s of sc.supportedByPages) covered.add(s);
+    }
+    expect(covered.has("circle-method")).toBe(true);
+    expect(covered.has("minor-arcs")).toBe(true);
+    // Intro and bibliography are NOT covered (they don't argue sub-claims).
+    expect(covered.has("overview")).toBe(false);
+    expect(covered.has("bibliography")).toBe(false);
+  });
+
+  it("breaks cycles in subClaim.dependsOn", async () => {
+    // LLM emits a cycle C1 → C2 → C1. Repair should drop one back-edge.
+    const llm: SpineLLM = async () =>
+      JSON.stringify({
+        globalThesis: "t",
+        argumentMap: {
+          thesis: "t",
+          subClaims: [
+            { id: "C1", claim: "first", supportedByPages: ["page-a"], dependsOn: ["C2"] },
+            { id: "C2", claim: "second", supportedByPages: ["page-b"], dependsOn: ["C1"] },
+            { id: "C3", claim: "third", supportedByPages: ["page-c"], dependsOn: [] },
+          ],
+        },
+        pages: [
+          { slug: "overview", title: "O", purpose: "p", audience: "graduate-student-entering-field", coreSections: ["s"], keyEffortsCited: ["n1"], relatedPageSlugs: [] },
+          { slug: "page-a", title: "A", purpose: "p", audience: "specialist-refresher", coreSections: ["s"], keyEffortsCited: ["n1"], relatedPageSlugs: [] },
+          { slug: "page-b", title: "B", purpose: "p", audience: "specialist-refresher", coreSections: ["s"], keyEffortsCited: ["n1"], relatedPageSlugs: [] },
+          { slug: "page-c", title: "C", purpose: "p", audience: "specialist-refresher", coreSections: ["s"], keyEffortsCited: ["n1"], relatedPageSlugs: [] },
+          { slug: "bibliography", title: "B", purpose: "b", audience: "specialist-refresher", coreSections: ["s"], keyPaperReadsCited: ["P1"], relatedPageSlugs: [], narrativeRole: "references" },
+        ],
+        pageOrder: ["overview", "page-a", "page-b", "page-c", "bibliography"],
+      });
+    const plan = await outlineWikiPages(baseInput(), { llm });
+    const map = plan.argumentMap!;
+    // Walk dependsOn and confirm it's now a DAG (no node reachable from
+    // itself).
+    const byId = new Map(map.subClaims.map((sc) => [sc.id, sc]));
+    function reachable(start: string, target: string, seen = new Set<string>()): boolean {
+      if (seen.has(start)) return false;
+      seen.add(start);
+      const node = byId.get(start);
+      if (!node) return false;
+      for (const dep of node.dependsOn) {
+        if (dep === target) return true;
+        if (reachable(dep, target, seen)) return true;
+      }
+      return false;
+    }
+    for (const sc of map.subClaims) {
+      expect(reachable(sc.id, sc.id)).toBe(false);
     }
   });
 });
