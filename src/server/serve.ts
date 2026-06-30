@@ -99,6 +99,10 @@ import {
   resolveApprovalConfig,
   historyFor,
 } from "../core/approval/index.js";
+import { loadLayeredHooks } from "../core/hooks/loader.js";
+import { HookInvoker } from "../core/hooks/executor.js";
+import { loadHookV1Config } from "../core/hooks/v1/loader.js";
+import { HookV1Runner } from "../core/hooks/v1/index.js";
 import type { WriteProposal } from "../core/approval/diff-preview.js";
 import {
   ApprovalRegistry,
@@ -1323,12 +1327,43 @@ export function defaultSessionFactory(
       ? (proposal: WriteProposal) =>
           sharedWriteProposalRegistry.register(conversationId, proposal)
       : undefined;
+    // 2026-06-30 — Hooks v1 wiring (serve mode). Mirror chat.ts:489 — load
+    // user+workspace hooks.json once per chat request, build a HookV1Runner
+    // when any entry exists, attach to a legacy HookInvoker via its `v1?`
+    // field, then thread `hooks: hookInvoker` into ChatSession. The legacy
+    // HookInvoker carries the existing pre-chat / post-tool / pre-edit /
+    // pre-bash / on-goal-complete script hooks (loadLayeredHooks) so this
+    // is purely additive — v1 events fire alongside legacy ones.
+    const v1Config = loadHookV1Config({ workspace: scopedWorkspace });
+    for (const w of v1Config.warnings) {
+      // eslint-disable-next-line no-console
+      console.warn(`[mathran hooks v1] ${w}`);
+    }
+    const legacyHooks = loadLayeredHooks({ workspace: scopedWorkspace }).hooks;
+    const v1Runner =
+      v1Config.entries.length > 0
+        ? new HookV1Runner(v1Config.entries, {
+            workspace: scopedWorkspace,
+            ...(conversationId ? { sessionId: conversationId } : {}),
+          })
+        : undefined;
+    const serveHookInvoker =
+      legacyHooks.length > 0 || v1Runner
+        ? new HookInvoker({
+            hooks: legacyHooks,
+            workspace: scopedWorkspace,
+            approvalBroker,
+            denylist: effectiveDenylist,
+            ...(v1Runner ? { v1: v1Runner } : {}),
+          })
+        : undefined;
     return new ChatSession({
       llm: router,
       model: resolvedModel,
       approvalBroker,
       ...(approvalResolver ? { approvalResolver } : {}),
       ...(writeProposalResolver ? { writeProposalResolver } : {}),
+      ...(serveHookInvoker ? { hooks: serveHookInvoker } : {}),
       // C-1: when a profile is active, thread it into the session so the
       // dispatch-level hard reject (readOnlyMode / hardRejectMutations /
       // denylistTools) fires BEFORE the broker is consulted — i.e. even a

@@ -116,19 +116,24 @@ class CappedBuffer {
   private size = 0;
   truncated = false;
   constructor(private readonly limit: number) {}
-  append(b: Buffer): void {
+  append(b: Buffer | string): void {
+    // 2026-06-30 — Node child_process streams default to Buffer chunks,
+    // but `setEncoding('utf8')` (or some test harnesses) flip them to
+    // strings. Normalize once at the entry so Buffer.concat() never sees
+    // a string and crashes with `TypeError: list[0] must be Buffer`.
+    const buf = typeof b === "string" ? Buffer.from(b, "utf-8") : b;
     if (this.truncated) return;
-    if (this.size + b.length > this.limit) {
+    if (this.size + buf.length > this.limit) {
       const room = Math.max(0, this.limit - this.size);
       if (room > 0) {
-        this.parts.push(b.subarray(0, room));
+        this.parts.push(buf.subarray(0, room));
         this.size += room;
       }
       this.truncated = true;
       return;
     }
-    this.parts.push(b);
-    this.size += b.length;
+    this.parts.push(buf);
+    this.size += buf.length;
   }
   toString(): string {
     return Buffer.concat(this.parts).toString("utf-8");
@@ -245,8 +250,15 @@ async function runOne(
       }, 500).unref();
     }, opts.timeoutMs);
     timer.unref();
-    child.stdout?.on("data", (c: Buffer) => stdoutBuf.append(c));
-    child.stderr?.on("data", (c: Buffer) => stderrBuf.append(c));
+    child.stdout?.on("data", (c: Buffer | string) => stdoutBuf.append(c));
+    child.stderr?.on("data", (c: Buffer | string) => stderrBuf.append(c));
+    // 2026-06-30 — catch async EPIPE on stdin when the child gets SIGTERM
+    // before we finish piping. Without this listener Node treats the
+    // unhandled stream error as a process-level error and vitest flags it
+    // as an "Unhandled Error" in the test report (functionally harmless).
+    child.stdin?.on("error", () => {
+      /* hook closed stdin or process died before we could pipe — ignore. */
+    });
     // Write stdin payload then close — single line of JSON.
     try {
       child.stdin?.write(JSON.stringify(input));

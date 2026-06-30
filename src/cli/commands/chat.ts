@@ -68,6 +68,8 @@ import { loadLayeredSettings } from "../../core/config/layered-settings.js";
 import { resolveEffort, type ChatEffortSettings } from "../../core/reasoning-effort/index.js";
 import { loadLayeredHooks } from "../../core/hooks/loader.js";
 import { HookInvoker } from "../../core/hooks/executor.js";
+import { loadHookV1Config } from "../../core/hooks/v1/loader.js";
+import { HookV1Runner } from "../../core/hooks/v1/index.js";
 import { ApprovalBroker } from "../../core/chat/approval-broker.js";
 import {
   resolveApprovalConfig,
@@ -486,12 +488,29 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     workspace,
     ...(hookSettings.allowed ? { allowed: hookSettings.allowed } : {}),
   });
+  // 2026-06-30 — Hooks v1 wiring (Codex/Claude Code-compatible 5-event
+  // hook system, src/core/hooks/v1/). Load + flatten user+workspace
+  // hooks.json into a HookV1Runner, attach to the legacy HookInvoker
+  // via its `v1?` field. When no hooks.json exists (or it has 0
+  // entries), `loadHookV1Config` returns `entries: []` and we skip
+  // constructing the runner — keeping the v1 cost at zero on systems
+  // that don't opt in. Warnings (malformed entries / containment
+  // failures) are surfaced via console.warn at load time.
+  const v1Config = loadHookV1Config({ workspace });
+  for (const w of v1Config.warnings) {
+    console.warn(`[mathran hooks v1] ${w}`);
+  }
+  const v1Runner =
+    v1Config.entries.length > 0
+      ? new HookV1Runner(v1Config.entries, { workspace, sessionId: conversationId })
+      : undefined;
   const hookInvoker = new HookInvoker({
     hooks: loadedHooks,
     workspace,
     settings: hookSettings,
     approvalBroker,
     denylist: approvalCfg.denylist,
+    ...(v1Runner ? { v1: v1Runner } : {}),
   });
 
   // Reasoning-effort budget (#6): resolve the effective level from the
