@@ -65,12 +65,27 @@ function probeBwrap(bwrapPath: string | null): boolean {
 function probeBwrapUserns(bwrapPath: string | null): boolean {
   if (!bwrapPath) return false;
   try {
+    // 2026-06-30 — capture stderr so we can distinguish two failure modes:
+    //   1. "setting up uid map: Permission denied" → AppArmor / userns
+    //      restriction → userns DOES NOT work.
+    //   2. "execvp /bin/true: No such file or directory" → bwrap got
+    //      far enough to enter the empty jail and *try* to exec — i.e.
+    //      userns DOES work; we just didn't bind /bin.
+    // The bare exit code is ambiguous (both fail = exit 1).
     const res = spawnSync(
       bwrapPath,
       ["--unshare-user", "--die-with-parent", "--", "/bin/true"],
       { timeout: 5_000, stdio: ["ignore", "ignore", "pipe"] },
     );
-    return res.status === 0;
+    if (res.status === 0) return true;
+    const stderr = res.stderr?.toString("utf-8") ?? "";
+    // Userns was created but the inner exec missed (expected on a probe
+    // without `--bind`). That's enough to know we'd succeed once we
+    // bind paths in for real.
+    if (/execvp.*No such file or directory/i.test(stderr)) return true;
+    // Any other failure (notably "setting up uid map: Permission denied")
+    // means the kernel rejected the unshare.
+    return false;
   } catch {
     return false;
   }
@@ -129,12 +144,20 @@ export function detectSandboxCapabilities(opts?: {
   const linux = process.platform === "linux";
   const bwrapPath = linux ? whichSync("bwrap") : null;
   const bwrapWorks = probeBwrap(bwrapPath);
+  // 2026-06-30 — separate binary-works from userns-works probe.
+  // Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns=1`
+  // makes `bwrap --version` succeed but `bwrap --unshare-user …` fail
+  // with EPERM. Without this probe the sandbox would happily think
+  // it's engaged and every spawn would 0-exit with no useful work
+  // done. Probing once at startup keeps the hot path branch-free.
+  const bwrapUserns = bwrapWorks ? probeBwrapUserns(bwrapPath) : false;
   const landlockSupported = probeLandlock();
 
   cached = {
     linux,
     bwrapPath,
     bwrapWorks,
+    bwrapUserns,
     landlockSupported,
     warnedFallback: false,
   };

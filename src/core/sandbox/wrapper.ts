@@ -102,6 +102,22 @@ export function resolveSandboxDecision(
   if (!caps.bwrapPath || !caps.bwrapWorks) {
     return { mode: "raw", reason: "bwrap missing or non-functional" };
   }
+  // 2026-06-30 — AppArmor / userns-restriction degradation.
+  // On Ubuntu 24.04+ the bwrap binary works but the kernel blocks
+  // unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`).
+  // Without this check spawnSandboxed would run `bwrap --unshare-user …`
+  // which returns "setting up uid map: Permission denied" and an
+  // unconfined exit — i.e. the sandbox would *appear* engaged but
+  // actually do nothing. Falling through to raw with a clear reason
+  // string is the only safe option (the alternative is silently lying
+  // about isolation).
+  if (!caps.bwrapUserns) {
+    return {
+      mode: "raw",
+      reason:
+        "bwrap userns blocked (likely AppArmor: try `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`)",
+    };
+  }
 
   const request: SandboxRequest = {
     kind,

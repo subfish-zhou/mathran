@@ -101,6 +101,17 @@ export interface SandboxCapabilities {
   /** Whether `bwrap --version` actually executes. */
   bwrapWorks: boolean;
   /**
+   * 2026-06-30 — whether `bwrap --unshare-user` actually creates a user
+   * namespace. **This is the field tools should check before claiming
+   * sandbox is engaged**: on Ubuntu 24.04 the binary works (bwrapWorks)
+   * but `sysctl kernel.apparmor_restrict_unprivileged_userns=1` blocks
+   * the actual unshare with "setting up uid map: Permission denied". A
+   * `bwrapPath !== null && bwrapWorks && !bwrapUserns` host needs the
+   * user to run `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`
+   * (or use a setuid bwrap, or a distro without the AppArmor patch).
+   */
+  bwrapUserns: boolean;
+  /**
    * Whether the kernel exposes Landlock LSM v3 (`/proc/sys/kernel/...`
    * heuristic, and Linux ≥ 6.14 considered "full v3"). Reserved for v2 —
    * v1 does not apply landlock_restrict_self yet.
