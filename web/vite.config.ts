@@ -6,7 +6,33 @@ import tailwindcss from "@tailwindcss/vite";
 // the Hono `serveStatic` mount in src/server/serve.ts can host it directly.
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  base: "/",
+  // 2026-06-30 — relative base for prefix-mounted deployment.
+  //
+  // Was `base: "/"` (vite default). When mathran's SPA is served behind a
+  // reverse-proxy prefix (e.g. portal mounts it at `/mathran/`), absolute
+  // asset URLs hit the WRONG path: the HTML attribute rewriter at the
+  // portal can fix `<script src="/assets/…">`, but CSS files contain
+  // hard-coded `url(/assets/KaTeX_Main-*.woff2)` font references that the
+  // portal cannot rewrite without parsing CSS. Result: every KaTeX font
+  // returns 404 and browsers fall back to Times New Roman — math formulas
+  // render in serif body font instead of Computer Modern, looking nothing
+  // like a PDF.
+  //
+  // `base: "./"` makes vite emit RELATIVE URLs for every generated asset:
+  //   - in index.html:  `./assets/index.js` (resolves against page URL)
+  //   - in CSS files:   `url(./KaTeX_Main-*.woff2)` (resolves against the
+  //                     CSS file's URL — which already lives in /assets/)
+  // This works correctly whether the SPA is mounted at `/`, `/mathran/`,
+  // or anywhere else, with NO rewriting needed at the proxy.
+  //
+  // The trade-off: relative URLs break for SPAs that use client-side
+  // routing because navigating to `/mathran/projects/foo` would resolve
+  // `./assets/index.js` against `/mathran/projects/` and 404. Mathran
+  // avoids this because (a) its routes don't add path segments under
+  // PUBLIC_PREFIX, and (b) portal's SPA shim injects `<base href="…">`
+  // which anchors all relative URLs to the prefix root regardless of the
+  // current pathname.
+  base: "./",
   build: {
     outDir: "../dist/web",
     emptyOutDir: true,

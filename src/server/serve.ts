@@ -941,6 +941,29 @@ async function listWiki(workspace: string, slug: string): Promise<Array<Record<s
   } catch {
     return [];
   }
+
+  // 2026-06-30: try to load the wiki-plan.json so we can return pages in the
+  // pageOrder the agent designed (intro first → bibliography last). Falls
+  // back to slug-alphabetical (old behavior) when no plan exists or it
+  // can't be parsed — that's the legacy v1a path and pre-plan runs.
+  // pageOrder takes precedence over the per-file frontmatter sortOrder so
+  // the agent's reading sequence is honored end-to-end.
+  let planOrder: Map<string, number> | undefined;
+  try {
+    const planPath = path.join(projectDir, ".mathran", "wiki-plan", "wiki-plan.json");
+    const raw = await fs.readFile(planPath, "utf-8");
+    const plan = JSON.parse(raw) as { pageOrder?: unknown };
+    if (Array.isArray(plan.pageOrder)) {
+      planOrder = new Map();
+      for (let i = 0; i < plan.pageOrder.length; i++) {
+        const slug = plan.pageOrder[i];
+        if (typeof slug === "string") planOrder.set(slug, i);
+      }
+    }
+  } catch {
+    planOrder = undefined;
+  }
+
   const pages: Array<Record<string, unknown>> = [];
   for (const file of files.sort()) {
     const page = file.replace(/\.md$/, "");
@@ -963,8 +986,19 @@ async function listWiki(workspace: string, slug: string): Promise<Array<Record<s
       ...(data.updatedAt !== undefined ? { updated_at: data.updatedAt } : {}),
     });
   }
-  // Stable order: sortOrder if present, then slug.
+  // 2026-06-30: prefer wiki-plan.pageOrder when present, then sortOrder
+  // frontmatter, then slug alphabetical. _index always sticks to the top.
   pages.sort((a, b) => {
+    const aIsIndex = String(a.page) === "_index" || String(a.page) === "index";
+    const bIsIndex = String(b.page) === "_index" || String(b.page) === "index";
+    if (aIsIndex !== bIsIndex) return aIsIndex ? -1 : 1;
+    if (planOrder) {
+      const pa = planOrder.get(String(a.page));
+      const pb = planOrder.get(String(b.page));
+      if (pa !== undefined && pb !== undefined) return pa - pb;
+      if (pa !== undefined) return -1; // page in plan beats page outside plan
+      if (pb !== undefined) return 1;
+    }
     const sa = typeof a.sortOrder === "number" ? a.sortOrder : 0;
     const sb = typeof b.sortOrder === "number" ? b.sortOrder : 0;
     if (sa !== sb) return sa - sb;
