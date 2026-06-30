@@ -291,6 +291,7 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
           if (settled) return;
           settled = true;
           clearInterval(heartbeat);
+          clearTimeout(absoluteTimeout);
           unwatchFile(phasesFile, onChange);
           resolve();
         };
@@ -302,6 +303,21 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
         const heartbeat = setInterval(() => {
           void stream.writeSSE({ event: "ping", data: "ping" });
         }, 30_000);
+        // 2026-06-30 (mathran-bug-scan #9 fix) — absolute 2h hard timeout
+        // 防止 run 永不结束 + 客户端从不 abort 导致 watchFile poll 永远
+        // 跑（一台机器十几个 stale stream 就把 inode poll 资源吃光）。
+        // 正常 init-project run 远远不需要 2h；这只是 safety net。
+        const absoluteTimeout = setTimeout(
+          () => {
+            void stream.writeSSE({
+              event: "timeout",
+              data: "SSE stream auto-closed after 2h absolute timeout",
+            });
+            finish();
+          },
+          2 * 60 * 60 * 1000,
+        );
+        absoluteTimeout.unref();
         stream.onAbort(finish);
         watchFile(phasesFile, { interval: 200 }, onChange);
         // Guard against a terminal line landing between the initial flush and

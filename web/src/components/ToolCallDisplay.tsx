@@ -148,13 +148,16 @@ interface ToolCallDisplayProps {
   onAnswerAsk?: (callId: string, answer: string) => void | Promise<void>;
   /**
    * /diff + checkpoint/rewind: called when the user clicks "View diff" or
-   * "Rewind to before this" on a successful `write_file` / `edit_file` card.
-   * Receives the tool-call id (the checkpoint store keys checkpoints by it).
-   * When omitted, the CheckpointChip is not rendered.
+   * picks a mode from the "Rewind ▾" menu on a successful `write_file` /
+   * `edit_file` card. For diff, `mode` is omitted. For rewind, `mode` is
+   * one of the 5 restore modes (see {@link CheckpointChip}). Receives the
+   * tool-call id (the checkpoint store keys checkpoints by it). When
+   * omitted, the CheckpointChip is not rendered.
    */
   onCheckpointAction?: (
     action: "diff" | "rewind",
     toolCallId: string,
+    mode?: import("./CheckpointChip.tsx").CheckpointRestoreMode,
   ) => void | Promise<void>;
 }
 
@@ -522,8 +525,8 @@ export function ToolCallDisplay({
                 onViewDiff={() => {
                   void onCheckpointAction("diff", toolCall.id);
                 }}
-                onRewind={() => {
-                  void onCheckpointAction("rewind", toolCall.id);
+                onRewind={(mode) => {
+                  void onCheckpointAction("rewind", toolCall.id, mode);
                 }}
               />
             )}

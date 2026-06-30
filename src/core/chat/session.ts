@@ -77,6 +77,7 @@ import { createBashTool } from "./tools/bash.js";
 import { createReadFileTool } from "./tools/read-file.js";
 import { createWriteFileTool } from "./tools/write-file.js";
 import { createEditFileTool } from "./tools/edit-file.js";
+import { createApplyPatchTool } from "./tools/apply-patch.js";
 import { createReadWikiPageTool } from "./tools/read-wiki-page.js";
 import { createListWikiPagesTool } from "./tools/list-wiki-pages.js";
 import { createCreateWikiPageTool } from "./tools/create-wiki-page.js";
@@ -672,6 +673,20 @@ export interface ChatSessionOptions {
     read_file?: boolean;
     write_file?: boolean;
     edit_file?: boolean;
+    /**
+     * V4A multi-file patch tool (`apply_patch`). Lets the model apply
+     * Add / Update / Delete / Move in a single tool call. Parses the
+     * Codex V4A grammar, runs phase-1 in-memory validation against the
+     * workspace, then commits atomically. Fuzzy line matching tolerates
+     * whitespace / indentation / unicode / line-similarity drift via
+     * the same 9-strategy chain the Hermes patch tool uses.
+     *
+     * Counted as a write tool — wrapped in checkpoint capture when
+     * `opts.checkpoints` is configured so `/diff` and `/rewind` cover
+     * multi-file mutations the same way they cover write_file /
+     * edit_file.
+     */
+    apply_patch?: boolean;
     /**
      * Gap #1 (wiki / effort / project chat tools) — enables 25 LLM-callable
      * tools that wrap the wiki/effort/project filesystem stores into chat
@@ -1501,6 +1516,12 @@ export class ChatSession {
     return wrapMutateTool(tool, {
       workspace,
       conversationId: cfg.conversationId,
+      // /rewind 5-mode parity — pass a live closure over messages.length so
+      // each checkpoint records the conversation prefix that existed right
+      // before the mutate ran. Conversation-aware rewind modes
+      // (`code-and-conversation`, `conversation-only`, `summarize-*`)
+      // truncate the jsonl back to this count.
+      getMessageCount: () => this.messages.length,
     });
   }
 
@@ -1540,6 +1561,26 @@ export class ChatSession {
         this.maybeCheckpoint(
           createEditFileTool(this.workspace ? { workspace: this.workspace } : {}),
         ),
+      );
+    }
+    if (cfg.apply_patch) {
+      // apply_patch handles its own multi-file checkpoint capture (the
+      // single-path `wrapMutateTool` middleware can't represent it), so
+      // we pass the checkpoint config directly into the factory.
+      const cpCfg = this.checkpointsCfg;
+      const cpWorkspace = cpCfg?.workspace ?? this.workspace;
+      const checkpoints =
+        cpCfg && cpWorkspace
+          ? {
+              conversationId: cpCfg.conversationId,
+              workspace: cpWorkspace,
+            }
+          : undefined;
+      out.push(
+        createApplyPatchTool({
+          ...(this.workspace ? { workspace: this.workspace } : {}),
+          ...(checkpoints ? { checkpoints } : {}),
+        }),
       );
     }
     // Gap #1 (wiki / effort / project chat tools). All 25 tools share the

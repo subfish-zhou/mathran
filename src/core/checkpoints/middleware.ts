@@ -5,10 +5,13 @@
  * `edit_file`) so that a {@link Checkpoint} is recorded around each successful
  * call:
  *   1. **before** — snapshot the single path the tool claims to touch
- *      (`args.path`), reading its current content (or `absent`).
+ *      (`args.path`), reading its current content (or `absent`). Also captures
+ *      `messageCountBefore` (the chat session's `messages[]` length right
+ *      before the mutate ran) so conversation-aware /rewind modes can truncate
+ *      the jsonl to that prefix.
  *   2. run the wrapped tool unchanged.
  *   3. **after** — on success, snapshot the same path again and persist the
- *      checkpoint (before + after) to the store.
+ *      checkpoint (before + after + messageCount) to the store.
  *
  * Only the tool-declared path is snapshotted — never a full-workspace scan
  * (PLAN 重要约束). Checkpoint persistence failures are swallowed (best-effort:
@@ -36,6 +39,14 @@ export interface CheckpointMiddlewareOptions {
    * `workspace`.
    */
   record?: (checkpoint: Checkpoint) => Promise<void>;
+  /**
+   * Read the chat session's `messages[]` length at the moment the mutate
+   * tool runs. Stored in the checkpoint so conversation-aware /rewind modes
+   * can truncate the conversation jsonl back to that prefix. Optional — when
+   * undefined or it throws, the field is simply omitted and rewind falls back
+   * to "code only" for that checkpoint.
+   */
+  getMessageCount?: () => number;
 }
 
 /** Resolve a tool `path` arg to an absolute path under the workspace. */
@@ -91,6 +102,24 @@ export function wrapMutateTool(
         before = { kind: "absent" as const };
       }
 
+      // /rewind 5-mode parity — capture the conversation prefix length
+      // *before* the tool runs so a later "conversation-aware" rewind can
+      // truncate the jsonl back to this point. Best-effort: if the host
+      // didn't wire a getMessageCount callback (or it throws), leave the
+      // field undefined and that checkpoint silently degrades to
+      // "code-only" semantics for the conversation-aware modes.
+      let messageCountBefore: number | undefined;
+      if (opts.getMessageCount) {
+        try {
+          const n = opts.getMessageCount();
+          if (typeof n === "number" && Number.isFinite(n) && n >= 0) {
+            messageCountBefore = Math.floor(n);
+          }
+        } catch {
+          /* swallow */
+        }
+      }
+
       const result = await tool.execute(args, ctx);
       if (!result.ok) return result;
 
@@ -106,6 +135,7 @@ export function wrapMutateTool(
           files: [{ path: relPath, before, after }],
           timestamp: ts,
           description: `${toolName} ${relPath}`,
+          ...(messageCountBefore !== undefined ? { messageCountBefore } : {}),
         };
         await record(checkpoint);
       } catch {

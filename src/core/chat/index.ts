@@ -26,6 +26,17 @@ export { createReadFileTool, type ReadFileToolOptions } from "./tools/read-file.
 export { createWriteFileTool, type WriteFileToolOptions } from "./tools/write-file.js";
 export { createEditFileTool, type EditFileToolOptions } from "./tools/edit-file.js";
 export {
+  createApplyPatchTool,
+  parseV4APatch,
+  seekPattern,
+  applyChunks,
+  type ApplyPatchToolOptions,
+  type UpdateChunk,
+  type V4AOp,
+  type FuzzyMatch,
+  type FuzzyStrategy,
+} from "./tools/apply-patch.js";
+export {
   createDispatchSubagentTool,
   type DispatchSubagentToolOptions,
 } from "./tools/dispatch-subagent.js";

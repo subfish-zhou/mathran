@@ -464,6 +464,10 @@ export function buildChatSession(opts: BuildSessionOptions = {}): {
     rulesFiles: approvalCfg.rulesFiles,
     persistentRuleFile: approvalCfg.persistentRuleFile,
     autoApprovePatterns: effectiveAutoApprovePatterns,
+    // Granular per-channel switches (Codex parity). Always wired through
+    // even when the user did not set any: resolveApprovalConfig defaults to
+    // every channel `true` for backward compat.
+    granular: approvalCfg.granular,
     history: historyFor(approvalCfg),
     ...(opts.approvalResolver ? { resolver: opts.approvalResolver } : {}),
     ...(opts.ruleProposalResolver
@@ -805,7 +809,8 @@ const HELP_TEXT = `commands:
   /hooks                   list layered hooks (use /hooks log|bypass|disable <name>)
   /outcomes                list self-graded goal outcomes (use /outcomes <id> | delete <id>)
   /diff                    list file checkpoints (use /diff <id> | /diff last to view a diff)
-  /rewind                  list checkpoints (use /rewind <N> | /rewind <id> to roll back)
+  /rewind                  list checkpoints (use /rewind <N> | /rewind <id> [--mode <m>] to roll back)
+  /rewind --mode <m>       m = code-and-conversation | conversation-only | code-only (default) | summarize-from-here | summarize-up-to-here
   /agents                  list available sub-agent kinds (+ active)
   /mcp                     list MCP servers (use /mcp <name> [status|tools|reload], /mcp reload-all)
   /review                  print the preset review prompt (MVP stub)
@@ -1071,9 +1076,30 @@ export async function handleSlashCommand(
       const workspace =
         ctx.checkpointWorkspace ?? ctx.memoryWorkspace ?? process.cwd();
       const convId = ctx.checkpointConversationId ?? ctx.session.sessionId;
-      const outcome = await runRewind(workspace, convId, arg);
+      // 5-mode /rewind (Claude Code parity). Build a session-backed
+      // conversation adapter so the conversation-aware modes can truncate or
+      // summarise the in-memory message list. The CLI has no on-disk chat
+      // store (transcripts are written by `/save`, not auto-flushed), so we
+      // bind directly to `ctx.session.history` / `ctx.session.replaceHistory`.
+      const session = ctx.session;
+      const sessionAdapter = {
+        async read() {
+          return session.history();
+        },
+        async write(messages: Array<{ role: "system" | "user" | "assistant" | "tool"; content: unknown }>) {
+          session.replaceHistory(messages as Parameters<typeof session.replaceHistory>[0]);
+        },
+      };
+      const outcome = await runRewind(workspace, convId, arg, {
+        historyAdapter: sessionAdapter,
+      });
       if (outcome.kind === "done") {
-        ctx.session.appendSystemNote(outcome.historyNote);
+        // For conversation-touching modes, `replaceHistory` already appended
+        // the rewind marker as a system message at the right place. We still
+        // call `appendSystemNote` for `code-only` so it shows up at the tail.
+        if (outcome.result.mode === "code-only") {
+          ctx.session.appendSystemNote(outcome.historyNote);
+        }
       }
       return { kind: "continue", output: outcome.text };
     }

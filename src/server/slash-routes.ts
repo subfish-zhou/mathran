@@ -44,6 +44,7 @@ import {
 } from "../core/outcomes/store.js";
 import { runDiff } from "../core/checkpoints/diff-run.js";
 import { runRewind } from "../core/checkpoints/rewind.js";
+import { makeChatStoreHistoryAdapter } from "../core/checkpoints/history-adapter.js";
 import type { McpRegistry } from "../core/mcp/registry.js";
 import {
   parseMcpSubcommand,
@@ -263,14 +264,32 @@ export function registerSlashRoutes(app: Hono, deps: SlashRoutesDeps): void {
 
       case "rewind": {
         // /rewind — roll the workspace back to before a checkpoint (or the
-        // newest N). On success, append a `[Rewound …]` system note to the
-        // conversation so the model sees the workspace changed underneath it.
-        const outcome = await runRewind(workspace, id, args);
+        // newest N). 5-mode parity with Claude Code: callers can pass
+        // `--mode <code-and-conversation|conversation-only|code-only|
+        // summarize-from-here|summarize-up-to-here>` to control whether the
+        // conversation jsonl is rewound / summarised alongside the files.
+        // On success, append a `[Rewound …]` system note so the model sees
+        // the workspace changed underneath it (for `code-only`; the other
+        // modes already embed a marker via the history adapter).
+        const adapter = makeChatStoreHistoryAdapter({
+          workspace,
+          scope: GLOBAL_SCOPE,
+          conversationId: id,
+          store,
+        });
+        const outcome = await runRewind(workspace, id, args, {
+          historyAdapter: adapter,
+        });
         if (outcome.kind === "done") {
           try {
-            const session = await store.getOrCreate(GLOBAL_SCOPE, id, undefined);
-            session.appendSystemNote(outcome.historyNote);
-            await store.flush(GLOBAL_SCOPE, id);
+            // The adapter's write() already replaced the live session for
+            // conversation-touching modes. For `code-only` we still append
+            // the marker note so the conversation reflects the rewind.
+            if (outcome.result.mode === "code-only") {
+              const session = await store.getOrCreate(GLOBAL_SCOPE, id, undefined);
+              session.appendSystemNote(outcome.historyNote);
+              await store.flush(GLOBAL_SCOPE, id);
+            }
           } catch {
             // Best-effort history note — the disk rollback already happened.
           }

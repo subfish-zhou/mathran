@@ -28,7 +28,9 @@ import {
 import { MATHRAN_DIR, SETTINGS_FILE } from "../config/mathran-root.js";
 import {
   DEFAULT_APPROVAL_POLICY,
+  resolveGranularApprovalConfig,
   type ApprovalPolicy,
+  type GranularApprovalConfig,
 } from "./types.js";
 import {
   APPROVAL_RULES_FILENAME,
@@ -48,6 +50,13 @@ export interface ResolvedApprovalConfig {
   historyFile: string;
   persistentRuleFile: string;
   workspace: string;
+  /**
+   * Granular per-channel approval config (Codex parity). Always populated:
+   * missing settings → {@link DEFAULT_GRANULAR_APPROVAL_CONFIG} (all `true`).
+   * The coarse `policy` field still wins — `policy === "never"` forces every
+   * channel off regardless of granular values, see {@link shouldPromptFor}.
+   */
+  granular: GranularApprovalConfig;
   /** Non-fatal warnings surfaced during load / migration. */
   warnings: string[];
 }
@@ -128,6 +137,12 @@ export function resolveApprovalConfig(
   const denylist: DenylistEntry[] = Array.isArray(approval.denylist)
     ? (approval.denylist as DenylistEntry[])
     : [];
+  // Granular per-channel config. Always normalised through
+  // resolveGranularApprovalConfig so missing keys default to `true` — the
+  // backward-compatible "every channel prompts" behaviour.
+  const granular: GranularApprovalConfig = resolveGranularApprovalConfig(
+    approval.granular,
+  );
 
   const wsDir = workspaceMathranDir(opts.workspace);
   const userDir = userMathranDir(opts.home);
@@ -148,6 +163,7 @@ export function resolveApprovalConfig(
     historyFile,
     persistentRuleFile,
     workspace: opts.workspace,
+    granular,
     warnings,
   };
 }

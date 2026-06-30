@@ -23,7 +23,7 @@
 
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
-import { evaluatePolicy, isSuspiciousCommand } from "../approval/policy.js";
+import { evaluatePolicy, isSuspiciousCommand, shouldPromptFor } from "../approval/policy.js";
 import type { PolicyContext } from "../approval/policy.js";
 import {
   matchDenylist,
@@ -35,11 +35,16 @@ import {
 import type { Rule, DenylistEntry } from "../approval/rules.js";
 import { derivePrefix, ApprovalHistory } from "../approval/history.js";
 import { matchAutoApprovePattern } from "../profiles/profile-resolver.js";
+import {
+  DEFAULT_GRANULAR_APPROVAL_CONFIG,
+  resolveGranularApprovalConfig,
+} from "../approval/types.js";
 import type {
   ApprovalPolicy,
   ApprovalRequest,
   ApprovalDecision,
   ApprovalResolver,
+  GranularApprovalConfig,
   RiskClass,
   RuleProposalResolver,
 } from "../approval/types.js";
@@ -118,6 +123,18 @@ export interface ApprovalBrokerOptions {
    * BEFORE the broker is consulted.
    */
   autoApprovePatterns?: readonly string[];
+  /**
+   * Granular per-channel approval config (Codex parity). Defaults to
+   * {@link DEFAULT_GRANULAR_APPROVAL_CONFIG} (all channels `true`), preserving
+   * the pre-granular prompt surface byte-for-byte.
+   *
+   * The broker consults this on TWO channels: `tool_execution` (every
+   * `preCheck` / `authorize` flow) and `rule_proposal` (the learning-mode
+   * upgrade prompt). The other three channels (`ask_user`,
+   * `request_permissions`, `mcp_elicitation`) are gated by their own
+   * subsystems via {@link shouldPromptFor} — they live outside the broker.
+   */
+  granular?: Partial<GranularApprovalConfig> | GranularApprovalConfig;
 }
 
 export class ApprovalBroker {
@@ -133,6 +150,12 @@ export class ApprovalBroker {
   private readonly proposalResolver?: RuleProposalResolver;
   private readonly persistentRuleFile?: string;
   private readonly autoApprovePatterns: readonly string[];
+  /**
+   * Granular per-channel config. Always fully populated (resolved through
+   * {@link resolveGranularApprovalConfig} in the constructor) — missing keys
+   * default to `true` for backward compatibility.
+   */
+  private readonly granular: GranularApprovalConfig;
   /** Session-scoped rules accumulated from allow_session / allow_prefix. */
   private readonly sessionRules: Rule[] = [];
 
@@ -149,11 +172,26 @@ export class ApprovalBroker {
     this.proposalResolver = opts.proposalResolver;
     this.persistentRuleFile = opts.persistentRuleFile;
     this.autoApprovePatterns = opts.autoApprovePatterns ?? [];
+    this.granular = opts.granular
+      ? resolveGranularApprovalConfig(
+          opts.granular as Partial<Record<string, unknown>>,
+        )
+      : { ...DEFAULT_GRANULAR_APPROVAL_CONFIG };
   }
 
   /** The active policy (read-only accessor for hosts / tests). */
   get activePolicy(): ApprovalPolicy {
     return this.policy;
+  }
+
+  /**
+   * The resolved granular config (read-only snapshot). Exposed so tests and
+   * hosts (the session, the ask_user tool wrapper) can consult the same
+   * per-channel switches the broker uses, without re-resolving the partial
+   * settings input.
+   */
+  get granularConfig(): GranularApprovalConfig {
+    return { ...this.granular };
   }
 
   /**
@@ -312,6 +350,20 @@ export class ApprovalBroker {
     }
 
     // 4. Policy matrix.
+    //
+    // Granular gate (Codex parity): when the `tool_execution` channel is
+    // muted (and the coarse policy isn't already `"never"` — which would
+    // have made the matrix return `"pass"` anyway), we collapse the matrix
+    // to `"pass"` for this call. Effect: under `policy: "on-request"` with
+    // `granular.tool_execution: false`, mutating tools run silently while
+    // OTHER channels (rule_proposal / ask_user / mcp_elicitation) stay
+    // governed by their own switches. Denylist + standing rules + auto-
+    // approve patterns above still ran first, so a deny rule still blocks.
+    if (
+      !shouldPromptFor("tool_execution", this.policy, this.granular)
+    ) {
+      return { kind: "allow" };
+    }
     const context = this.buildPolicyContext(tool, args);
     const outcome = evaluatePolicy(this.policy, riskClass, context);
     if (outcome === "pass") return { kind: "allow" };
@@ -468,6 +520,13 @@ export class ApprovalBroker {
     );
     if (streak === null || streak < this.proposeAfter) return;
     if (!this.proposalResolver) return;
+    // Granular gate (Codex parity): when the `rule_proposal` channel is muted
+    // we skip the learning-mode upgrade prompt entirely. History keeps
+    // counting (so the streak survives toggling the switch back on) but the
+    // user never sees the "promote this to a standing rule?" prompt.
+    if (!shouldPromptFor("rule_proposal", this.policy, this.granular)) {
+      return;
+    }
     const accepted = await this.proposalResolver({
       tool: call.tool,
       prefix,

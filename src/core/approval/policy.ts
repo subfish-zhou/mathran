@@ -16,7 +16,12 @@
  * ```
  */
 
-import type { ApprovalPolicy, RiskClass } from "./types.js";
+import type {
+  ApprovalPolicy,
+  GranularApprovalConfig,
+  GranularChannel,
+  RiskClass,
+} from "./types.js";
 
 /**
  * The matrix verdict for a single tool call:
@@ -118,4 +123,39 @@ export function evaluatePolicy(
       return "ask";
     }
   }
+}
+
+/**
+ * Granular-channel gate. Sits on top of the coarse policy matrix as a
+ * SECOND filter: the channel must be enabled in `granular` for a prompt to
+ * surface AT ALL — even if {@link evaluatePolicy} returned `"ask"`.
+ *
+ * Precedence (top wins):
+ *
+ *   1. `policy === "never"` → ALWAYS `false`. The coarse policy is the
+ *      strongest signal; granular cannot make `"never"` more permissive.
+ *   2. `granular[channel] === false` → `false`. The user has explicitly
+ *      muted this channel. Note this is RELATIVE TO THE POLICY — for the
+ *      `tool_execution` channel under `"on-request"` this effectively makes
+ *      tool execution behave like `"never"`, while leaving other channels
+ *      (rule_proposal / ask_user) still prompting.
+ *   3. Otherwise → `true` (defer to the coarse policy / matrix for the
+ *      actual ask vs pass decision; this function only answers "is this
+ *      channel allowed to prompt at all?").
+ *
+ * Used by the broker (tool_execution / rule_proposal channels) and by the
+ * `ask_user` tool wrapper (ask_user channel). The two reserved channels
+ * (request_permissions / mcp_elicitation) follow the same precedence so
+ * future wirings just plug in.
+ */
+export function shouldPromptFor(
+  channel: GranularChannel,
+  policy: ApprovalPolicy,
+  granular: GranularApprovalConfig,
+): boolean {
+  // Policy "never" forces every channel off — the coarse setting wins.
+  if (policy === "never") return false;
+  // Channel explicitly muted by the user.
+  if (granular[channel] === false) return false;
+  return true;
 }

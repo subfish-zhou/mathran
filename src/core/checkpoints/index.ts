@@ -18,11 +18,21 @@ export {
 export { parseDiffArg, runDiff, type DiffTarget } from "./diff-run.js";
 export {
   parseRewindArg,
+  parseRewindArgs,
   resolveRewindPrefix,
   rewindCheckpoints,
+  applyConversationRewind,
   formatRewindResult,
   runRewind,
+  defaultSummarizer,
   type RewindTarget,
+  type RewindArgs,
   type RewindResult,
   type RewindFileResult,
+  type RewindConversationResult,
+  type RunRewindHostHooks,
+  type ConversationHistoryAdapter,
+  type MinimalMessage,
+  type Summarizer,
 } from "./rewind.js";
+export { makeChatStoreHistoryAdapter } from "./history-adapter.js";
