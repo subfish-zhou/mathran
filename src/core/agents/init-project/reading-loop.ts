@@ -340,8 +340,108 @@ export async function runReadingLoop(
   let frontierStopped = config.expandFrontier == null;
   let frontierExhaustionReason: "fetch-budget-exceeded" | "all-concepts-empty" | "no-concepts" | undefined;
 
+  // 2026-06-30 — Pre-loop frontier prime: small projects (no user seeds +
+  // few resolved canon arxiv ids) start with queue.length ≤ 2 and exit via
+  // queue_exhausted before readsSinceFrontier ≥ cadence. Without a pre-loop
+  // tick, frontier never gets to run for these projects — the whole module
+  // is dead weight. Fire one tick BEFORE the read loop starts so the queue
+  // gets fresh-paper seeding even when prior-art comes up empty. Reuses the
+  // same convergence guards as the per-tick path.
+  const runFrontierTick = async (): Promise<void> => {
+    if (frontierStopped || !config.expandFrontier) return;
+    try {
+      const spine = config.getCurrentSpine?.() ?? null;
+      const result = await config.expandFrontier({
+        readPapers: Array.from(reads.values()),
+        readNodesById: nodeById,
+        spine,
+        alreadyQueuedArxivIds: new Set(
+          queue
+            .map((q) => nodeById.get(q.paperId)?.arxivId)
+            .filter((id): id is string => typeof id === "string"),
+        ),
+        alreadyReadArxivIds: new Set(
+          Array.from(reads.values())
+            .map((r) => r.arxivId)
+            .filter((id): id is string => typeof id === "string"),
+        ),
+      });
+      frontierTicksRun++;
+      let actuallyPushed = 0;
+      for (const { candidate, verdict } of result.kept) {
+        const paperId = await ingestArxiv(
+          config.workspace,
+          candidate.arxivId,
+          candidate.title,
+          candidate.authors,
+          candidate.year,
+          fetchArxivById,
+          log,
+          candidate.abstract,
+        );
+        if (!paperId) continue;
+        const band = verdict.priorityBand ?? "passing";
+        const importance = IMPORTANCE_PRIORITY[band] ?? IMPORTANCE_PRIORITY.passing;
+        push({
+          paperId,
+          why: `frontier (${candidate.fromConcept}): ${verdict.reason}`,
+          priority: PRIORITY_FRONTIER + importance,
+          year: candidate.year,
+        });
+        try {
+          const node = await getPaper(config.workspace, paperId);
+          if (node) nodeById.set(paperId, node);
+        } catch (err) {
+          log(`[reading-loop] frontier: cache nodeById for ${paperId} failed: ${errMsg(err)}`);
+        }
+        actuallyPushed++;
+      }
+      frontierTotalAdded += actuallyPushed;
+      if (result.addedCount === 0) {
+        frontierKEmptyStreak++;
+        if (frontierKEmptyStreak >= FRONTIER_K_EMPTY_TO_EXHAUST) {
+          log(
+            `[reading-loop] frontier: K-empty streak hit ${frontierKEmptyStreak} — ` +
+              `stopping expansion (converged on current spine)`,
+          );
+          frontierStopped = true;
+          if (!frontierExhaustionReason) frontierExhaustionReason = "all-concepts-empty";
+        }
+      } else {
+        frontierKEmptyStreak = 0;
+      }
+      if (result.exhausted) {
+        log(`[reading-loop] frontier: expander reported exhausted (${result.exhaustionReason ?? "unknown"})`);
+        frontierStopped = true;
+        frontierExhaustionReason = result.exhaustionReason;
+      }
+    } catch (err) {
+      log(`[reading-loop] frontier callback failed (${errMsg(err)}) — disabling for the rest of the run`);
+      frontierStopped = true;
+    }
+  };
+
+  // Pre-loop prime tick: gives the queue some fresh-paper seeding so
+  // small projects (≤2 canon, no seeds) don't exit before frontier ever runs.
+  if (config.expandFrontier) {
+    log(`[reading-loop] frontier: pre-loop tick (priming queue for small-project case)`);
+    await runFrontierTick();
+  }
+
   for (;;) {
     if (queue.length === 0) {
+      // 2026-06-30 — Last-chance frontier tick: if the queue is empty
+      // but frontier isn't exhausted yet, give it one more shot. The
+      // spine has grown since we last ticked, so concepts may pull in
+      // papers we couldn't surface earlier. This is what makes frontier
+      // useful for projects whose seed + canon discovery comes up small.
+      if (!frontierStopped && config.expandFrontier) {
+        log(`[reading-loop] frontier: queue-empty last-chance tick (spine may have grown)`);
+        await runFrontierTick();
+        // If the tick filled the queue, continue normally; otherwise fall
+        // through to queue_exhausted termination.
+        if (queue.length > 0) continue;
+      }
       reason = "queue_exhausted";
       break;
     }
@@ -674,95 +774,7 @@ export async function runReadingLoop(
     readsSinceFrontier++;
     if (!frontierStopped && config.expandFrontier && readsSinceFrontier >= frontierCadenceCfg) {
       readsSinceFrontier = 0;
-      try {
-        const spine = config.getCurrentSpine?.() ?? null;
-        const result = await config.expandFrontier({
-          readPapers: Array.from(reads.values()),
-          readNodesById: nodeById,
-          spine,
-          alreadyQueuedArxivIds: new Set(
-            queue
-              .map((q) => nodeById.get(q.paperId)?.arxivId)
-              .filter((id): id is string => typeof id === "string"),
-          ),
-          alreadyReadArxivIds: new Set(
-            Array.from(reads.values())
-              .map((r) => r.arxivId)
-              .filter((id): id is string => typeof id === "string"),
-          ),
-        });
-        frontierTicksRun++;
-
-        // Ingest each kept candidate into the paper-graph (so it has a real
-        // paperId), then push at PRIORITY_FRONTIER + the LLM-suggested
-        // importance bucket (essential/supporting/passing → fine-grained
-        // sub-priority within the FRONTIER band).
-        let actuallyPushed = 0;
-        for (const { candidate, verdict } of result.kept) {
-          const paperId = await ingestArxiv(
-            config.workspace,
-            candidate.arxivId,
-            candidate.title,
-            candidate.authors,
-            candidate.year,
-            fetchArxivById,
-            log,
-            candidate.abstract,
-          );
-          if (!paperId) continue;
-          const band = verdict.priorityBand ?? "passing";
-          const importance = IMPORTANCE_PRIORITY[band] ?? IMPORTANCE_PRIORITY.passing;
-          push({
-            paperId,
-            why: `frontier (${candidate.fromConcept}): ${verdict.reason}`,
-            priority: PRIORITY_FRONTIER + importance,
-            year: candidate.year,
-          });
-          // 2026-06-30 — Cache the newly-ingested PaperNode into nodeById
-          // immediately. Without this, the NEXT frontier tick computes
-          // alreadyQueuedArxivIds via `nodeById.get(pid)?.arxivId` and misses
-          // the paper we just pushed (because the reader hasn't popped it yet
-          // to populate nodeById at line 400). Frontier's own seenAcrossTicks
-          // set catches the duplicate at arxiv-fetch time, so correctness is
-          // preserved either way, but caching here saves a redundant arxiv
-          // round-trip + a wasted LLM relevance verdict.
-          try {
-            const node = await getPaper(config.workspace, paperId);
-            if (node) nodeById.set(paperId, node);
-          } catch (err) {
-            log(`[reading-loop] frontier: cache nodeById for ${paperId} failed: ${errMsg(err)}`);
-          }
-          actuallyPushed++;
-        }
-        frontierTotalAdded += actuallyPushed;
-
-        // Convergence: K-empty streak based on what the LLM kept (NOT what
-        // we actually pushed — push can fail to dedup-by-paperId but that
-        // still means the expander "found something new"). Using
-        // result.addedCount here so an LLM-kept paper that ingest fails to
-        // create still counts as forward progress.
-        if (result.addedCount === 0) {
-          frontierKEmptyStreak++;
-          if (frontierKEmptyStreak >= FRONTIER_K_EMPTY_TO_EXHAUST) {
-            log(
-              `[reading-loop] frontier: K-empty streak hit ${frontierKEmptyStreak} — ` +
-                `stopping expansion (converged on current spine)`,
-            );
-            frontierStopped = true;
-            if (!frontierExhaustionReason) frontierExhaustionReason = "all-concepts-empty";
-          }
-        } else {
-          frontierKEmptyStreak = 0;
-        }
-        if (result.exhausted) {
-          log(`[reading-loop] frontier: expander reported exhausted (${result.exhaustionReason ?? "unknown"})`);
-          frontierStopped = true;
-          frontierExhaustionReason = result.exhaustionReason;
-        }
-      } catch (err) {
-        log(`[reading-loop] frontier callback failed (${errMsg(err)}) — disabling for the rest of the run`);
-        frontierStopped = true;
-      }
+      await runFrontierTick();
     }
   }
 
