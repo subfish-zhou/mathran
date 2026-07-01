@@ -292,6 +292,32 @@ describe("extractTikzEnvs — server-side render placeholder (2026-07-01)", () =
     expect(out).toContain("More explicitly:");
   });
 
+  it("strips wrapping $$ … $$ around a tikzcd env (D bug 2026-07-01)", () => {
+    // The exact shape LLM returned as a fix patch that broke rendering:
+    //   $$
+    //   \begin{tikzcd} A \arrow[r] & B \end{tikzcd}
+    //   $$
+    // With the OLD code the $$…$$ wrap survived and swallowed the
+    // placeholder <div>, feeding "<div class=..." into KaTeX. Now the
+    // outer $$…$$ is stripped just like \[…\].
+    const input = [
+      "See diagram:",
+      "",
+      "$$",
+      "\\begin{tikzcd} A \\arrow[r] & B \\end{tikzcd}",
+      "$$",
+      "",
+      "End.",
+    ].join("\n");
+    const out = extractTikzEnvs(input);
+    // No $$ delimiters should remain around the extracted env.
+    // (There may still be $$ elsewhere in a doc — we only care THIS
+    // env's wrap is gone.) Since the whole input is one env only, no $$.
+    expect(out).not.toMatch(/\$\$/);
+    expect(out).toContain(`<div class="tikz-placeholder"`);
+    expect(out).toContain("End.");
+  });
+
   it("handles multiple tikzcd envs in one document", () => {
     const input = [
       "First:",

@@ -216,20 +216,33 @@ function escapeAttr(s: string): string {
  */
 export function extractTikzEnvs(input: string): string {
   if (!input.includes("\\begin{")) return input;
-  // First, strip a wrapping \[ … \] if the whole tikz env is the only
+  // First, strip a wrapping math delimiter if the whole tikz env is the only
   // thing inside. This is the shape alpha's c-eb4a403e chat produced:
   //     \[
   //     \begin{tikzcd}...\end{tikzcd}
   //     \]
-  // Leaving the \[ \] in place after we've extracted the env would leave
-  // an empty math block; better to strip the wrap.
-  let text = input.replace(
-    /\\\[\s*(\\begin\{([a-zA-Z*]+)\}[\s\S]*?\\end\{\2\})\s*\\\]/g,
+  // Leaving the delimiter in place after we've extracted the env would
+  // leave an empty math block — worse, if the delimiter is $$…$$, the
+  // env's placeholder <div> gets swallowed by KaTeX after we replace it,
+  // which renders the raw div attributes as italic math text.
+  // (2026-07-01 D bug: LLM returned $$\begin{tikzcd}…\end{tikzcd}$$ as
+  //  a fix patch, tikzcd got extracted to <div>, then the surrounding
+  //  $$…$$ fed the div into KaTeX. Screenshot showed 'div class="tikz-
+  //  placeholder"…' rendered as pretty italic math variables.)
+  let text = input;
+  // \[…\] wrap
+  text = text.replace(
+    /\\\[\s*(\\begin\{([a-zA-Z0-9*]+)\}[\s\S]*?\\end\{\2\})\s*\\\]/g,
+    (whole, env: string, name: string) => (TIKZ_RENDERABLE_ENVS.has(name) ? env : whole),
+  );
+  // $$…$$ wrap
+  text = text.replace(
+    /\$\$\s*(\\begin\{([a-zA-Z0-9*]+)\}[\s\S]*?\\end\{\2\})\s*\$\$/g,
     (whole, env: string, name: string) => (TIKZ_RENDERABLE_ENVS.has(name) ? env : whole),
   );
   // Now extract each renderable env.
   text = text.replace(
-    /\\begin\{([a-zA-Z*]+)\}[\s\S]*?\\end\{\1\}/g,
+    /\\begin\{([a-zA-Z0-9*]+)\}[\s\S]*?\\end\{\1\}/g,
     (whole, name: string) => {
       if (!TIKZ_RENDERABLE_ENVS.has(name)) return whole;
       // Base64-encode the source so it survives round-tripping through
