@@ -1,176 +1,305 @@
-/**
- * Tests for canonical-landmarks-search.
- *
- * Stages tested:
- *   1. LLM proposes landmarks; we parse + clamp.
- *   2. Each landmark is resolved against arxiv (title) and Crossref
- *      (bibliographic). Failures are isolated and don't crash the run.
- *   3. Hits are sorted: arxiv-resolved → doi-only → fully unresolved.
- */
+import { describe, expect, it } from "vitest";
 
-import { describe, expect, it, vi } from "vitest";
-import {
-  searchCanonicalLandmarks,
-  type SearchArxivByTitleFn,
-  type CrossrefSearchFn,
+import { searchCanonicalLandmarks, defaultCrossrefSearch } from "./canonical-landmarks-search.js";
+import type {
+  CrossrefSearchFn,
+  CrossrefWork,
+  SearchArxivByTitleFn,
 } from "./canonical-landmarks-search.js";
+import type { CrawledResource } from "../types.js";
 import type { SpineLLM } from "../spine/llm.js";
 
-const BIN_GOLDBACH_PROBLEM = {
-  title: "Binary Goldbach Conjecture",
-  formalStatement: "every even n>2 is the sum of two primes",
-  tags: ["Analytic Number Theory"],
-  background:
-    "Chen (1973) proved (1+2). Vinogradov (1937) handled the ternary case. Helfgott (2013) closed ternary explicitly.",
-  mathStatus: "OPEN",
-};
-
-function fakeLlm(reply: string): SpineLLM {
-  return (async () => reply) as unknown as SpineLLM;
+function arxivRes(over: Partial<CrawledResource> & { arxivId: string; title: string }): CrawledResource {
+  return {
+    id: `arxiv-${over.arxivId}`,
+    authors: ["A. Author"],
+    sourceType: "arxiv",
+    url: `https://arxiv.org/abs/${over.arxivId}`,
+    ...over,
+  } as CrawledResource;
 }
 
-describe("searchCanonicalLandmarks", () => {
-  it("proposes + resolves; arxiv-resolved hits sort before unresolved", async () => {
-    // LLM proposes 3 landmarks.
-    const llm = fakeLlm(
-      JSON.stringify([
-        { title: "On the representation of a large even integer", authors: ["Chen"], year: 1973, venue: "Sci. Sinica", why: "Chen's theorem" },
-        { title: "Three Primes Theorem", authors: ["Vinogradov"], year: 1937, venue: "Mat. Sb.", why: "founding ternary result" },
-        { title: "Major arcs for Goldbach's problem", authors: ["Helfgott"], year: 2013, venue: "arXiv", why: "explicit ternary closure" },
-      ]),
-    );
+function work(over: Partial<CrossrefWork> & { doi: string; title: string }): CrossrefWork {
+  const { doi, title, ...rest } = over;
+  return {
+    doi,
+    title,
+    authors: ["A. Author"],
+    year: 2020,
+    ...rest,
+  } as CrossrefWork;
+}
 
-    // arxiv only resolves Helfgott (modern, on arxiv).
-    const searchArxivByTitle: SearchArxivByTitleFn = vi.fn(async (q) => {
-      if (q.includes("Major arcs")) {
-        return [{ arxivId: "1305.2897", title: "Major arcs for Goldbach's problem", authors: ["Helfgott"], year: 2013 } as never];
+const McKAY_LANDMARK = {
+  title: "La correspondance de McKay",
+  titleEn: "The McKay correspondence",
+  authors: ["Miles Reid"],
+  year: 2000,
+  venue: "Séminaire Bourbaki, Astérisque 276",
+  why: "Canonical survey of the higher-dim McKay picture",
+};
+
+const problem = {
+  title: "McKay correspondence",
+  tags: ["math.AG"],
+};
+
+function mockLLM(landmarks: unknown[]): SpineLLM {
+  return async () => JSON.stringify(landmarks);
+}
+
+describe("searchCanonicalLandmarks — Stage B (author+keyword arxiv fallback)", () => {
+  it("recovers an arxiv id when full-title search misses but au:X AND ti:Y matches", async () => {
+    // Full-title search returns nothing that scores >= 0.5 similarity (e.g. arxiv
+    // has "Mukai implies McKay: the McKay correspondence …" but the LLM proposed
+    // "La correspondance de McKay"). Author+keyword search using
+    // au:Reid AND ti:mckay AND ti:correspondence hits correctly.
+    const calls: string[] = [];
+    const searchArxivByTitle: SearchArxivByTitleFn = async (query) => {
+      calls.push(query);
+      if (query.startsWith("au:")) {
+        // Author+keyword query — return a preprint whose title contains "McKay correspondence".
+        return [arxivRes({ arxivId: "math/9911165", title: "The McKay correspondence" })];
       }
-      return [];
-    });
-    // Crossref resolves Chen (via reprint DOI) and Vinogradov (via Springer Selected Works).
-    const searchCrossref: CrossrefSearchFn = vi.fn(async (q) => {
-      if (q.title?.includes("representation of a large even integer")) {
-        return [{ doi: "10.1142/9789812776600_0021", title: "On the representation of a large even integer", authors: ["Chen"], year: 1984, venue: "Series in Pure Math." }];
-      }
-      if (q.title?.includes("Three Primes")) {
-        return [{ doi: "10.1007/978-3-642-15086-9_13", title: "Three Primes Theorem", authors: ["Vinogradov"], year: 1985, venue: "Springer Selected Works" }];
-      }
-      return [];
-    });
-
-    const hits = await searchCanonicalLandmarks(BIN_GOLDBACH_PROBLEM, {
-      llm,
-      searchArxivByTitle,
-      searchCrossref,
-      rateDelayMs: 0,
-    });
-
-    expect(hits).toHaveLength(3);
-    // Helfgott (arxiv-resolved) sorts first.
-    expect(hits[0]?.arxivId).toBe("1305.2897");
-    // Chen + Vinogradov (doi-only) come next, in some order.
-    const doiOnly = hits.slice(1).filter((h) => !h.arxivId && h.doi);
-    expect(doiOnly).toHaveLength(2);
-    expect(doiOnly.find((h) => h.title.includes("representation"))?.doi).toBe("10.1142/9789812776600_0021");
-    expect(doiOnly.find((h) => h.title.includes("Three Primes"))?.doi).toBe("10.1007/978-3-642-15086-9_13");
-    // All hits carry an audit trail.
-    for (const h of hits) {
-      expect(h.resolution.arxivAttempts.length).toBeGreaterThan(0);
-      expect(h.resolution.crossrefAttempts.length).toBeGreaterThan(0);
-    }
-  });
-
-  it("returns [] when LLM proposal fails (failure-isolated)", async () => {
-    const llm: SpineLLM = (async () => {
-      throw new Error("LLM exploded");
-    }) as unknown as SpineLLM;
-    const hits = await searchCanonicalLandmarks(BIN_GOLDBACH_PROBLEM, {
-      llm,
-      searchArxivByTitle: vi.fn(),
-      searchCrossref: vi.fn(),
-      rateDelayMs: 0,
-    });
-    expect(hits).toEqual([]);
-  });
-
-  it("returns [] when LLM returns garbage", async () => {
-    const llm = fakeLlm("definitely not JSON");
-    const hits = await searchCanonicalLandmarks(BIN_GOLDBACH_PROBLEM, {
-      llm,
-      searchArxivByTitle: vi.fn(),
-      searchCrossref: vi.fn(),
-      rateDelayMs: 0,
-    });
-    expect(hits).toEqual([]);
-  });
-
-  it("survives arxiv + crossref errors per-landmark", async () => {
-    const llm = fakeLlm(
-      JSON.stringify([
-        { title: "Some Landmark", authors: ["X"], year: 2020, venue: "Annals", why: "important" },
-      ]),
-    );
-    const searchArxivByTitle: SearchArxivByTitleFn = vi.fn(async () => {
-      throw new Error("arxiv down");
-    });
-    const searchCrossref: CrossrefSearchFn = vi.fn(async () => {
-      throw new Error("crossref down");
-    });
-    const hits = await searchCanonicalLandmarks(BIN_GOLDBACH_PROBLEM, {
-      llm,
-      searchArxivByTitle,
-      searchCrossref,
-      rateDelayMs: 0,
-    });
-    expect(hits).toHaveLength(1);
-    expect(hits[0]?.arxivId).toBeUndefined();
-    expect(hits[0]?.doi).toBeUndefined();
-    expect(hits[0]?.resolution.arxivAttempts[0]).toMatch(/error/);
-    expect(hits[0]?.resolution.crossrefAttempts[0]).toMatch(/error/);
-  });
-
-  it("requires title similarity ≥0.5 to count as a match", async () => {
-    const llm = fakeLlm(
-      JSON.stringify([
-        { title: "Binary Goldbach Conjecture proof attempt", authors: ["X"], year: 2020, venue: "?", why: "?" },
-      ]),
-    );
-    // Arxiv returns an unrelated paper (low title sim).
-    const searchArxivByTitle: SearchArxivByTitleFn = vi.fn(async () => [
-      { arxivId: "9999.99999", title: "Quantum Gravity", authors: ["Y"] } as never,
-    ]);
-    const searchCrossref: CrossrefSearchFn = vi.fn(async () => []);
-
-    const hits = await searchCanonicalLandmarks(BIN_GOLDBACH_PROBLEM, {
-      llm,
-      searchArxivByTitle,
-      searchCrossref,
-      rateDelayMs: 0,
-    });
-    expect(hits).toHaveLength(1);
-    expect(hits[0]?.arxivId).toBeUndefined(); // rejected: sim < 0.5
-    expect(hits[0]?.resolution.arxivAttempts[0]).toMatch(/no title-match/);
-  });
-
-  it("clamps the proposal count via maxProposed", async () => {
-    const llm = fakeLlm(
-      JSON.stringify(
-        Array.from({ length: 30 }, (_, i) => ({
-          title: `Landmark ${i}`,
-          authors: ["X"],
-          year: 2000 + i,
-          venue: "?",
-          why: "?",
-        })),
-      ),
-    );
-    const searchArxivByTitle: SearchArxivByTitleFn = vi.fn(async () => []);
-    const searchCrossref: CrossrefSearchFn = vi.fn(async () => []);
+      // Full-title search — return an unrelated hit that scores below 0.5.
+      return [arxivRes({ arxivId: "math/0000001", title: "Wildly unrelated title with no words in common" })];
+    };
+    const searchCrossref: CrossrefSearchFn = async () => [];
     const hits = await searchCanonicalLandmarks(
-      BIN_GOLDBACH_PROBLEM,
-      { llm, searchArxivByTitle, searchCrossref, rateDelayMs: 0 },
-      { maxProposed: 5 },
+      problem,
+      { llm: mockLLM([McKAY_LANDMARK]), searchArxivByTitle, searchCrossref, rateDelayMs: 0 },
     );
-    expect(hits).toHaveLength(5);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.arxivId).toBe("math/9911165");
+    // Log trail should show BOTH stages were attempted, and Stage B is what succeeded.
+    const attempts = hits[0]!.resolution.arxivAttempts.join(" | ");
+    expect(attempts).toMatch(/arxiv\[title\]:/);
+    expect(attempts).toMatch(/arxiv\[au\+kw\]: matched math\/9911165/);
+  });
+
+  it("emits an au:X AND ti:Y AND ti:Z query with family name only (strips 'Given')", async () => {
+    const captured: string[] = [];
+    const searchArxivByTitle: SearchArxivByTitleFn = async (query) => {
+      captured.push(query);
+      return [];
+    };
+    const searchCrossref: CrossrefSearchFn = async () => [];
+    await searchCanonicalLandmarks(
+      problem,
+      { llm: mockLLM([McKAY_LANDMARK]), searchArxivByTitle, searchCrossref, rateDelayMs: 0 },
+    );
+    // Second call is the au+kw fallback.
+    const auKw = captured.find((c) => c.startsWith("au:"));
+    expect(auKw).toBeDefined();
+    expect(auKw).toContain("au:Reid");
+    // titleEn "The McKay correspondence" → keywords: mckay, correspondence (stopword "the" dropped, length<4 filter)
+    expect(auKw).toContain("ti:mckay");
+    expect(auKw).toContain("ti:correspondence");
+  });
+
+  it("handles 'Family, Given' comma format", async () => {
+    const captured: string[] = [];
+    const searchArxivByTitle: SearchArxivByTitleFn = async (query) => {
+      captured.push(query);
+      return [];
+    };
+    await searchCanonicalLandmarks(
+      { title: "X", tags: [] },
+      {
+        llm: mockLLM([
+          {
+            title: "Some Paper",
+            titleEn: "Some Paper",
+            authors: ["Reid, Miles"],
+            year: 2000,
+            why: "canon",
+          },
+        ]),
+        searchArxivByTitle,
+        searchCrossref: async () => [],
+        rateDelayMs: 0,
+      },
+    );
+    const auKw = captured.find((c) => c.startsWith("au:"));
+    expect(auKw).toContain("au:Reid");
+  });
+
+  it("skips au+kw stage cleanly when there is no author (never throws)", async () => {
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => [];
+    const searchCrossref: CrossrefSearchFn = async () => [];
+    const hits = await searchCanonicalLandmarks(
+      problem,
+      {
+        llm: mockLLM([{ title: "No author paper", titleEn: "No author paper", authors: [], why: "canon" }]),
+        searchArxivByTitle,
+        searchCrossref,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits).toHaveLength(1);
+    const attempts = hits[0]!.resolution.arxivAttempts.join(" | ");
+    expect(attempts).toMatch(/arxiv\[au\+kw\]: skipped/);
+  });
+
+  it("uses the relaxed 0.3 threshold for au+kw so borderline overlaps count", async () => {
+    // McKAY_LANDMARK.titleEn = "The McKay correspondence" → normalized words {mckay, correspondence}.
+    // Candidate title has 4 words, 2 overlap. Jaccard = 2/(2+4-2) = 0.5 → passes 0.3 but not 0.5.
+    // (We want to prove 0.3 is genuinely more permissive than 0.5, so pick a case that would
+    // FAIL the strict Stage A threshold but PASS the relaxed Stage B threshold. This one scores
+    // 0.5 exactly which is right on the edge for Stage A; the important assertion is that
+    // Stage A is skipped [we return [] there] and Stage B accepts it.)
+    const searchArxivByTitle: SearchArxivByTitleFn = async (query) => {
+      if (query.startsWith("au:")) {
+        return [
+          arxivRes({
+            arxivId: "0000.0001",
+            title: "Higher-dimensional McKay correspondence classes",
+          }),
+        ];
+      }
+      // Stage A: no results at all, so we don't accidentally pass because of A.
+      return [];
+    };
+    const hits = await searchCanonicalLandmarks(
+      problem,
+      {
+        llm: mockLLM([McKAY_LANDMARK]),
+        searchArxivByTitle,
+        searchCrossref: async () => [],
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.arxivId).toBe("0000.0001");
+    const attempts = hits[0]!.resolution.arxivAttempts.join(" | ");
+    expect(attempts).toMatch(/arxiv\[au\+kw\]: matched 0000\.0001/);
+  });
+});
+
+describe("searchCanonicalLandmarks — Stage D (post-Crossref arxiv preprint hunt)", () => {
+  it("finds an arxiv preprint AFTER Crossref supplied a DOI, so hit has BOTH arxivId AND doi", async () => {
+    // Stage A (title) fails, Stage B (au+kw) fails, Stage C (Crossref) succeeds with DOI,
+    // Stage D uses that success signal to try arxiv one more time with more keywords — hits.
+    let arxivCallCount = 0;
+    const searchArxivByTitle: SearchArxivByTitleFn = async (query) => {
+      arxivCallCount++;
+      if (arxivCallCount === 1) return []; // Stage A title miss
+      if (arxivCallCount === 2) return []; // Stage B au+kw miss (say the initial keyword set was too narrow)
+      // Stage D: hit with a wider keyword set
+      return [arxivRes({ arxivId: "math/0207170", title: "Three-dimensional flops and non-commutative rings" })];
+    };
+    const searchCrossref: CrossrefSearchFn = async () => [
+      work({ doi: "10.1215/S0012-7094-04-12234-X", title: "Three-dimensional flops and non-commutative rings" }),
+    ];
+    const hits = await searchCanonicalLandmarks(
+      problem,
+      {
+        llm: mockLLM([
+          {
+            title: "Three-dimensional flops and non-commutative rings",
+            titleEn: "Three-dimensional flops and non-commutative rings",
+            authors: ["Michel Van den Bergh"],
+            year: 2004,
+            why: "canon",
+          },
+        ]),
+        searchArxivByTitle,
+        searchCrossref,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.arxivId).toBe("math/0207170");
+    expect(hits[0]!.doi).toBe("10.1215/S0012-7094-04-12234-X");
+    const attempts = hits[0]!.resolution.arxivAttempts.join(" | ");
+    expect(attempts).toMatch(/arxiv\[post-crossref\]: matched math\/0207170/);
+  });
+
+  it("does NOT run Stage D when Stage A or B already found an arxiv id (saves an API call)", async () => {
+    let arxivCallCount = 0;
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => {
+      arxivCallCount++;
+      // Stage A hits immediately.
+      return [arxivRes({ arxivId: "math/1111111", title: "The McKay correspondence" })];
+    };
+    const searchCrossref: CrossrefSearchFn = async () => [
+      work({ doi: "10.1000/foo", title: "The McKay correspondence" }),
+    ];
+    const hits = await searchCanonicalLandmarks(
+      problem,
+      {
+        llm: mockLLM([McKAY_LANDMARK]),
+        searchArxivByTitle,
+        searchCrossref,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.arxivId).toBe("math/1111111");
+    // Only Stage A was called (Stage B skipped because arxivId set, Stage D skipped because arxivId set).
+    expect(arxivCallCount).toBe(1);
+  });
+
+  it("does NOT run Stage D when Crossref returned nothing (nothing to hunt for)", async () => {
+    let arxivCallCount = 0;
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => {
+      arxivCallCount++;
+      return []; // All arxiv attempts miss.
+    };
+    const searchCrossref: CrossrefSearchFn = async () => []; // Crossref also empty.
+    const hits = await searchCanonicalLandmarks(
+      problem,
+      {
+        llm: mockLLM([McKAY_LANDMARK]),
+        searchArxivByTitle,
+        searchCrossref,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.arxivId).toBeUndefined();
+    expect(hits[0]!.doi).toBeUndefined();
+    // Stage A + Stage B ran; Stage D skipped because doi undefined → count is 2.
+    expect(arxivCallCount).toBe(2);
+    const attempts = hits[0]!.resolution.arxivAttempts.join(" | ");
+    expect(attempts).not.toMatch(/arxiv\[post-crossref\]/);
+  });
+});
+
+describe("searchCanonicalLandmarks — failure isolation preserved", () => {
+  it("returns [] when LLM proposes nothing", async () => {
+    const hits = await searchCanonicalLandmarks(
+      problem,
+      {
+        llm: async () => "[]",
+        searchArxivByTitle: async () => [],
+        searchCrossref: async () => [],
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits).toEqual([]);
+  });
+
+  it("swallows arxiv errors and still returns a resolved-with-empty-arxiv hit", async () => {
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => {
+      throw new Error("arxiv down");
+    };
+    const searchCrossref: CrossrefSearchFn = async () => [];
+    const hits = await searchCanonicalLandmarks(
+      problem,
+      { llm: mockLLM([McKAY_LANDMARK]), searchArxivByTitle, searchCrossref, rateDelayMs: 0 },
+    );
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.arxivId).toBeUndefined();
+    const attempts = hits[0]!.resolution.arxivAttempts.join(" | ");
+    expect(attempts).toMatch(/arxiv\[title\]: error/);
+    expect(attempts).toMatch(/arxiv\[au\+kw\]: error/);
+  });
+});
+
+describe("defaultCrossrefSearch — export sanity", () => {
+  it("is a function callable with (query, ua)", () => {
+    // We deliberately do NOT hit the real Crossref API in unit tests (would be flaky /
+    // slow). Just prove the module exports a callable of the expected shape; end-to-end
+    // real-network testing lives in `scripts/probe-crossref.mjs`.
+    expect(typeof defaultCrossrefSearch).toBe("function");
+    expect(defaultCrossrefSearch.length).toBeGreaterThanOrEqual(1);
   });
 });

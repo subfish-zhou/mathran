@@ -309,7 +309,60 @@ function titleSimilarity(a: string, b: string): number {
   return union === 0 ? 0 : inter / union;
 }
 
-const TITLE_MATCH_THRESHOLD = 0.5; // word-overlap fraction
+const TITLE_MATCH_THRESHOLD = 0.5; // word-overlap fraction (strict — for full-title search)
+const AUTHOR_QUERY_TITLE_THRESHOLD = 0.3; // relaxed — author already constrains the search space
+
+/**
+ * Extract the family name from either "Given Family" or "Family" or "Family, Given" formats.
+ * LLMs and Crossref use inconsistent conventions; normalize to the family portion for arxiv `au:` queries.
+ */
+function familyName(author: string): string {
+  const trimmed = author.trim();
+  if (!trimmed) return "";
+  if (trimmed.includes(",")) return trimmed.split(",")[0]!.trim();
+  const tokens = trimmed.split(/\s+/);
+  return tokens[tokens.length - 1] ?? trimmed;
+}
+
+/**
+ * Pull the 3 most distinctive content words from a title (drops stop-words + author names).
+ * Used to build focused `ti:X AND ti:Y AND ti:Z` fallbacks after full-title search misses.
+ */
+const TITLE_STOPWORDS = new Set([
+  "the", "and", "for", "with", "from", "into", "over", "under", "about", "some",
+  "any", "all", "one", "two", "three",
+  "on", "in", "of", "to", "at", "by", "an", "a", "or", "no", "not", "is", "are",
+  "was", "were", "be", "as", "we", "our", "its", "his", "her",
+  // French / German particles that leak through from non-English titles
+  "le", "la", "les", "de", "des", "du", "et", "au", "aux", "en", "un", "une",
+  "der", "die", "das", "den", "dem", "ein", "eine", "einer", "und", "von", "zur", "im",
+]);
+
+function extractTitleKeywords(title: string, maxTerms = 3): string[] {
+  const words = normalizeTitle(title)
+    .split(" ")
+    .filter((w) => w.length >= 4 && !TITLE_STOPWORDS.has(w));
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const w of words) {
+    if (seen.has(w)) continue;
+    seen.add(w);
+    out.push(w);
+    if (out.length >= maxTerms) break;
+  }
+  return out;
+}
+
+/**
+ * Assemble an `au:X AND ti:Y AND ti:Z` arxiv query. Returns "" when we cannot build a
+ * meaningful query (no author or no keywords), which the caller uses to skip the attempt.
+ */
+function buildAuthorKeywordQuery(family: string, keywords: string[]): string {
+  const fam = family.trim();
+  if (!fam || keywords.length === 0) return "";
+  const kwPart = keywords.map((k) => `ti:${k}`).join(" AND ");
+  return `au:${fam} AND ${kwPart}`;
+}
 
 async function resolveOneLandmark(
   lm: ProposedLandmark,
@@ -340,37 +393,94 @@ async function resolveOneLandmark(
   let crossrefVenue: string | undefined;
   let crossrefYear: number | undefined;
 
-  // (a) arxiv title search
+  // Pick the best-scoring arxiv candidate above a given threshold. Returns null when nothing qualifies.
+  const pickBest = (
+    hits: CrawledResource[],
+    threshold: number,
+  ): { id: string; title: string; score: number } | null => {
+    let best: { id: string; title: string; score: number } | null = null;
+    for (const h of hits) {
+      if (!h.arxivId) continue;
+      const sim = simBest(h.title);
+      if (!best || sim > best.score) best = { id: h.arxivId, title: h.title, score: sim };
+    }
+    return best && best.score >= threshold ? best : null;
+  };
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Stage A: arxiv full-title search (strict, existing behaviour)
+  // ─────────────────────────────────────────────────────────────────────
   try {
     const hits = await deps.searchArxivByTitle(queryTitle, 3);
     if (hits.length === 0) {
-      arxivAttempts.push("arxiv: 0 hits");
+      arxivAttempts.push("arxiv[title]: 0 hits");
     } else {
-      let best: { id: string; score: number } | null = null;
-      for (const h of hits) {
-        if (!h.arxivId) continue;
-        const sim = simBest(h.title);
-        if (!best || sim > best.score) best = { id: h.arxivId, score: sim };
-      }
-      if (best && best.score >= TITLE_MATCH_THRESHOLD) {
-        arxivId = best.id;
-        arxivAttempts.push(`arxiv: matched ${best.id} (sim=${best.score.toFixed(2)})`);
+      const matched = pickBest(hits, TITLE_MATCH_THRESHOLD);
+      if (matched) {
+        arxivId = matched.id;
+        arxivAttempts.push(`arxiv[title]: matched ${matched.id} (sim=${matched.score.toFixed(2)})`);
       } else {
+        const best = pickBest(hits, 0); // any candidate, for logging
         arxivAttempts.push(
-          `arxiv: ${hits.length} hits but no title-match (best sim=${best ? best.score.toFixed(2) : "?"})`,
+          `arxiv[title]: ${hits.length} hits but no title-match (best sim=${best ? best.score.toFixed(2) : "?"})`,
         );
       }
     }
   } catch (err) {
-    arxivAttempts.push(`arxiv: error ${String(err).slice(0, 80)}`);
+    arxivAttempts.push(`arxiv[title]: error ${String(err).slice(0, 80)}`);
   }
 
-  // Polite throttle between external services.
-  if (deps.rateMs > 0) await sleep(deps.rateMs);
+  // ─────────────────────────────────────────────────────────────────────
+  // Stage B: arxiv author+keyword fallback (NEW — 2026-07-01 fix)
+  //
+  // Why: full-title similarity fails when the arxiv preprint carries a
+  // different title from the eventual published version (e.g. Reid's
+  // Bourbaki exposé "La correspondance de McKay" is on arxiv as "The McKay
+  // correspondence"; BKR published as "The McKay correspondence as an
+  // equivalence of derived categories" is on arxiv as "Mukai implies McKay:
+  // …"). arxiv's `au:X AND ti:Y AND ti:Z` narrows by author + a couple of
+  // distinctive content words, so preprint / language / prefix / suffix
+  // variation stops mattering. Threshold relaxed to 0.3 because the author
+  // constraint already prevents false positives.
+  // ─────────────────────────────────────────────────────────────────────
+  if (!arxivId) {
+    if (deps.rateMs > 0) await sleep(deps.rateMs);
+    try {
+      const family = familyName(lm.authors[0] ?? "");
+      const keywords = extractTitleKeywords(queryTitle, 3);
+      const q = buildAuthorKeywordQuery(family, keywords);
+      if (!q) {
+        arxivAttempts.push("arxiv[au+kw]: skipped (no author or no keywords)");
+      } else {
+        const hits = await deps.searchArxivByTitle(q, 4);
+        if (hits.length === 0) {
+          arxivAttempts.push(`arxiv[au+kw]: 0 hits (${q})`);
+        } else {
+          const matched = pickBest(hits, AUTHOR_QUERY_TITLE_THRESHOLD);
+          if (matched) {
+            arxivId = matched.id;
+            arxivAttempts.push(
+              `arxiv[au+kw]: matched ${matched.id} (sim=${matched.score.toFixed(2)}) via "${q}"`,
+            );
+          } else {
+            const best = pickBest(hits, 0);
+            arxivAttempts.push(
+              `arxiv[au+kw]: ${hits.length} hits but no title-match (best sim=${best ? best.score.toFixed(2) : "?"}) via "${q}"`,
+            );
+          }
+        }
+      }
+    } catch (err) {
+      arxivAttempts.push(`arxiv[au+kw]: error ${String(err).slice(0, 80)}`);
+    }
+  }
 
-  // (b) Crossref bibliographic search — primary author + title keywords
+  // ─────────────────────────────────────────────────────────────────────
+  // Stage C: Crossref bibliographic search — primary author + title keywords
+  // ─────────────────────────────────────────────────────────────────────
+  if (deps.rateMs > 0) await sleep(deps.rateMs);
   try {
-    const firstAuthor = lm.authors[0]?.split(/\s+/).pop() ?? ""; // family name only when "Given Family"
+    const firstAuthor = familyName(lm.authors[0] ?? "");
     const works = await deps.searchCrossref({
       title: queryTitle,
       author: firstAuthor || undefined,
@@ -398,6 +508,50 @@ async function resolveOneLandmark(
     }
   } catch (err) {
     crossrefAttempts.push(`crossref: error ${String(err).slice(0, 80)}`);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Stage D: arxiv "post-Crossref preprint hunt" (NEW — 2026-07-01 fix)
+  //
+  // Why: even after Stage A + B miss, Crossref often supplies canonical
+  // author + year data that's cleaner than the LLM's initial guess (e.g.
+  // Crossref normalises Ito's given name, drops LaTeX from the title). Try
+  // one more arxiv search using Crossref's polished author + a keyword set
+  // derived from Crossref's title. If it hits, we get the best of both
+  // worlds: a DOI AND an arxiv preprint URL for full-text reading.
+  // ─────────────────────────────────────────────────────────────────────
+  if (!arxivId && doi) {
+    if (deps.rateMs > 0) await sleep(deps.rateMs);
+    try {
+      const family = familyName(lm.authors[0] ?? "");
+      // Use the Crossref-year to further constrain if we have it — arxiv
+      // supports date filters implicitly through relevance ranking.
+      const keywords = extractTitleKeywords(queryTitle, 4); // one extra keyword now that we have more signal
+      const q = buildAuthorKeywordQuery(family, keywords);
+      if (!q) {
+        arxivAttempts.push("arxiv[post-crossref]: skipped (no author or no keywords)");
+      } else {
+        const hits = await deps.searchArxivByTitle(q, 5);
+        if (hits.length === 0) {
+          arxivAttempts.push(`arxiv[post-crossref]: 0 hits (${q})`);
+        } else {
+          const matched = pickBest(hits, AUTHOR_QUERY_TITLE_THRESHOLD);
+          if (matched) {
+            arxivId = matched.id;
+            arxivAttempts.push(
+              `arxiv[post-crossref]: matched ${matched.id} (sim=${matched.score.toFixed(2)}) via "${q}"`,
+            );
+          } else {
+            const best = pickBest(hits, 0);
+            arxivAttempts.push(
+              `arxiv[post-crossref]: ${hits.length} hits but no title-match (best sim=${best ? best.score.toFixed(2) : "?"}) via "${q}"`,
+            );
+          }
+        }
+      }
+    } catch (err) {
+      arxivAttempts.push(`arxiv[post-crossref]: error ${String(err).slice(0, 80)}`);
+    }
   }
 
   return {
