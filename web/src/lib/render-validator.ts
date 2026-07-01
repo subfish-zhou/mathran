@@ -170,7 +170,7 @@ export function buildRetryPrompt(problems: RenderProblem[]): string {
   }
   lines.push("");
   lines.push(
-    "Guidance: use KaTeX-supported LaTeX only. For commutative diagrams prefer `\\begin{tikzcd}…\\end{tikzcd}` (server-rendered), never `\\begin{xy}` or `\\begin{dot2tex}`. For matrices use `\\begin{pmatrix}` / `\\begin{bmatrix}` not `\\begin{smallmatrix*}`. Keep the same overall structure and points — just fix the syntax so nothing breaks.",
+    "Guidance: use KaTeX-supported LaTeX only. For commutative diagrams prefer `\\begin{tikzcd}…\\end{tikzcd}` (server-rendered), never `\\begin{xy}` or `\\begin{dot2tex}`. For matrices use `\\begin{pmatrix}` / `\\begin{bmatrix}` not `\\begin{smallmatrix*}`. Do NOT wrap renderable math or diagrams in ```latex``` / ```tex``` code fences — that displays them as code, not rendered output. Use `\\[…\\]` (display math), `\\(…\\)` (inline math), or `\\begin{tikzcd}…\\end{tikzcd}` (diagrams) directly in prose. Keep the same overall structure and points — just fix the syntax so nothing breaks.",
   );
   return lines.join("\n");
 }

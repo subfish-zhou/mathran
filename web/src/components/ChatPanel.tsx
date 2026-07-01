@@ -1766,6 +1766,19 @@ export default function ChatPanel({
     const text = (last as { text?: string }).text ?? "";
     if (text.trim().length === 0) return;
 
+    // Find the user prompt that triggered this assistant reply — the
+    // most recent user bubble before lastIdx. We need its index for
+    // rerunChat's truncate-then-resend and its text for the augmented
+    // overrideText prompt we'll send instead.
+    let userIdx = -1;
+    for (let i = lastIdx - 1; i >= 0; i--) {
+      if (currentBubbles[i]!.kind === "user") {
+        userIdx = i;
+        break;
+      }
+    }
+    if (userIdx < 0) return; // no user prompt to rerun from
+
     // Only assistant turns qualify. If the previous bubble was ALSO an
     // auto-retry (i.e. lastIdx-1 is a hidden user retry we sent), we
     // still allow one more up to MAX — the ref map tracks count.
@@ -1776,31 +1789,48 @@ export default function ChatPanel({
       return; // fail-open
     }
     if (problems.length === 0) {
-      renderRetriesRef.current.delete(lastIdx); // clean success
+      renderRetriesRef.current.delete(userIdx); // clean success
       return;
     }
-    const prevCount = renderRetriesRef.current.get(lastIdx) ?? 0;
+    // Key retry-count on the USER prompt index so multiple attempts
+    // rerunning the same prompt hit the same counter.
+    const prevCount = renderRetriesRef.current.get(userIdx) ?? 0;
     if (prevCount >= RENDER_RETRY_MAX) {
       // Give up quietly; user still sees the last (broken) attempt.
       return;
     }
-    renderRetriesRef.current.set(lastIdx, prevCount + 1);
+    renderRetriesRef.current.set(userIdx, prevCount + 1);
     const retryPrompt = buildRetryPrompt(problems);
     if (!retryPrompt) return;
 
-    // Send the retry as a normal user turn. We DO show it in the
-    // bubble list (folded / labelled as "auto-retry") so the user can
-    // inspect it if the retry itself misbehaves. Rendering the label
-    // is B1c; for now just prefix so it's identifiable.
-    const wrapped = "[auto-retry: render errors detected in previous reply]\n\n" + retryPrompt;
+    // Pull the original user prompt and append a discreet retry note.
+    // rerunChat will truncate history to userIdx, then resend the
+    // augmented text — the LLM sees ONE turn with both the original
+    // question AND the render feedback, and its reply REPLACES the
+    // broken one in-place (no extra bubbles).
+    const userBubble = currentBubbles[userIdx] as { text?: string };
+    const originalPrompt = userBubble.text ?? "";
+    const augmentedPrompt = originalPrompt + "\n\n---\n\n" + retryPrompt;
 
+    // Local-only truncation to keep the UI in sync with what the server
+    // will do — rerunChat starts a fresh stream that appends a new
+    // assistant bubble; without truncating, we'd double up.
     setBubbles((prev) => [
-      ...prev,
-      { kind: "user", text: wrapped },
+      ...prev.slice(0, userIdx + 1),
       { kind: "assistant", text: "" },
     ]);
+
     await runChatStream((onEvent, signal) =>
-      streamChat(scope, wrapped, convId, model || undefined, onEvent, signal),
+      rerunChat(
+        scope,
+        convId,
+        userIdx,
+        model || undefined,
+        onEvent,
+        signal,
+        augmentedPrompt,
+        userIdx + 1, // pruneFromBubbleIdx: wipe stale annotations
+      ),
     );
   };
 
