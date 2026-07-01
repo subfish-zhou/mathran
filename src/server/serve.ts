@@ -39,6 +39,7 @@ import { registerMemoryRoutes } from "./memory-routes.js";
 import { registerProfileRoutes } from "./profile-routes.js";
 import { registerPaperRoutes } from "./paper-routes.js";
 import { registerTikzRoutes } from "./tikz-routes.js";
+import { registerRenderFixRoutes } from "./render-fix-routes.js";
 import { deleteProject } from "../core/projects/helpers.js";
 import { registerSlashRoutes } from "./slash-routes.js";
 import {
@@ -4051,6 +4052,10 @@ function buildApp(
   // KaTeX in the browser can't render tikzcd; this endpoint returns
   // inline SVG via disk-cached WASM compilation.
   registerTikzRoutes(app, workspace);
+  // 2026-07-01 (D1) — partial-edit patch generator for post-hoc render
+  // retry. Chat panel calls this when validateRender flags problems in
+  // an assistant reply; LLM returns JSON patches applied client-side.
+  registerRenderFixRoutes(app, workspace);
 
   app.get("/api/projects", async (c) => {
     return c.json({ projects: await listProjects(workspace) });

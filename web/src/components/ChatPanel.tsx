@@ -108,6 +108,7 @@ import { useCopilotModels } from "../lib/copilot-models.ts";
 import ModelComboBox from "./ModelComboBox.tsx";
 import { stripAttachmentMarkers } from "../lib/strip-attachment-markers.ts";
 import { validateRender, buildRetryPrompt, type RenderProblem } from "../lib/render-validator";
+import { applyPatches, type Patch } from "../lib/render-patch";
 import {
   parseSlashInput,
   activeSlashPrefix,
@@ -363,16 +364,28 @@ export default function ChatPanel({
   const urlConvId = searchParams.get("c");
 
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
-  // 2026-07-01 (B1) — Post-hoc render retry.
+  // 2026-07-01 (B1/D) — Post-hoc partial-edit render retry.
   // After each assistant turn finishes, we silent-parse its markdown
-  // through KaTeX. If any formula/env failed to render, we auto-send a
-  // hidden follow-up user turn telling the LLM "the last reply had
-  // these render errors, please rewrite". Max 2 retries per assistant
-  // reply — beyond that we give up (the LLM is likely stuck).
-  // The map keys are message-index-in-bubbles so we don't over-retry
-  // across turns; cleared when the user starts a fresh chat.
+  // through KaTeX. If any formula/env failed to render, we ask the
+  // /api/render-fix endpoint for JSON patches and splice them into the
+  // v1 reply in-place (span-based). The assistant bubble text is
+  // mutated ONCE — no extra user/assistant turns, no thinking spinner.
+  // A small "🔧 Fixing render errors…" badge appears at the top of the
+  // bubble while the patches are in flight; on success it flips to
+  // "✓ Fixed"; on failure to "⚠ Fix failed" and the broken v1 stays.
+  //
+  // Max 2 attempts per assistant reply — beyond that we give up quietly.
+  const renderFixByAssistantIdxRef = useRef<Map<number, "fixing" | "fixed" | "failed">>(new Map());
   const renderRetriesRef = useRef<Map<number, number>>(new Map());
   const RENDER_RETRY_MAX = 2;
+  // Force re-render when the fixing status changes (Map mutations don't
+  // trigger React; this bumps a counter that reads inside render.)
+  const [renderFixTick, setRenderFixTick] = useState(0);
+  const bumpRenderFix = useCallback(() => setRenderFixTick((n) => n + 1), []);
+  // Reference the tick in a way TS doesn't warn about — it triggers
+  // component re-render when bumped so downstream render code below sees
+  // the fresh renderFixByAssistantIdxRef.current values.
+  void renderFixTick;
   const [conversationId, setConversationId] = useState<string | null>(urlConvId);
   const [input, setInput] = useState("");
   // 2026-06-25 — busy is now per-conversationId. With the multi-channel
@@ -1746,18 +1759,18 @@ export default function ChatPanel({
     [refreshUsage, refreshList],
   );
 
-  // 2026-07-01 (B1) — Post-hoc render retry helper.
+  // 2026-07-01 (D) — Post-hoc partial-edit retry helper.
   // Declared AFTER runChatStream but injected via ref so runChatStream
-  // can call the latest version (avoids the useCallback dependency
-  // cycle: retry uses streamChat which uses runChatStream).
+  // can call the latest version. Uses /api/render-fix to get JSON
+  // patches from the LLM, applies them span-based to the assistant
+  // reply in-place. Falls back to full rerunChat on patch failure
+  // (LLM returned unusable output, or apply skipped everything).
   const maybeAutoRetryRenderRef = useRef<((convId: string) => Promise<void>) | null>(null);
   maybeAutoRetryRenderRef.current = async (convId: string) => {
     // Only run when the user is still viewing the channel that just
-    // finished — spurious retries on background channels are noisy and
-    // consume tokens the user isn't watching.
+    // finished — spurious retries on background channels are noisy.
     if (convId !== conversationIdRef.current) return;
 
-    // Find the last assistant bubble. If it's empty (aborted/errored) skip.
     const currentBubbles = bubblesRef.current;
     if (!currentBubbles || currentBubbles.length === 0) return;
     const lastIdx = currentBubbles.length - 1;
@@ -1766,22 +1779,6 @@ export default function ChatPanel({
     const text = (last as { text?: string }).text ?? "";
     if (text.trim().length === 0) return;
 
-    // Find the user prompt that triggered this assistant reply — the
-    // most recent user bubble before lastIdx. We need its index for
-    // rerunChat's truncate-then-resend and its text for the augmented
-    // overrideText prompt we'll send instead.
-    let userIdx = -1;
-    for (let i = lastIdx - 1; i >= 0; i--) {
-      if (currentBubbles[i]!.kind === "user") {
-        userIdx = i;
-        break;
-      }
-    }
-    if (userIdx < 0) return; // no user prompt to rerun from
-
-    // Only assistant turns qualify. If the previous bubble was ALSO an
-    // auto-retry (i.e. lastIdx-1 is a hidden user retry we sent), we
-    // still allow one more up to MAX — the ref map tracks count.
     let problems: RenderProblem[] = [];
     try {
       problems = validateRender(text);
@@ -1789,37 +1786,119 @@ export default function ChatPanel({
       return; // fail-open
     }
     if (problems.length === 0) {
-      renderRetriesRef.current.delete(userIdx); // clean success
+      renderRetriesRef.current.delete(lastIdx);
+      renderFixByAssistantIdxRef.current.delete(lastIdx);
+      bumpRenderFix();
       return;
     }
-    // Key retry-count on the USER prompt index so multiple attempts
-    // rerunning the same prompt hit the same counter.
-    const prevCount = renderRetriesRef.current.get(userIdx) ?? 0;
+    const prevCount = renderRetriesRef.current.get(lastIdx) ?? 0;
     if (prevCount >= RENDER_RETRY_MAX) {
       // Give up quietly; user still sees the last (broken) attempt.
+      renderFixByAssistantIdxRef.current.set(lastIdx, "failed");
+      bumpRenderFix();
       return;
     }
-    renderRetriesRef.current.set(userIdx, prevCount + 1);
+    renderRetriesRef.current.set(lastIdx, prevCount + 1);
+
+    // Show the fixing badge on this assistant bubble.
+    renderFixByAssistantIdxRef.current.set(lastIdx, "fixing");
+    bumpRenderFix();
+
+    // Ask the backend for JSON patches.
+    let patches: Patch[] | null = null;
+    try {
+      const res = await fetch("/api/render-fix", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          originalReply: text,
+          errors: problems.map((p) => ({
+            kind: p.kind,
+            matched: p.matched,
+            message: p.message,
+          })),
+          model: model || undefined,
+        }),
+      });
+      if (res.ok) {
+        const j = (await res.json()) as
+          | { ok: true; patches: Patch[] }
+          | { ok: false; error: string };
+        if (j.ok) patches = j.patches;
+      }
+    } catch {
+      /* network failure — patches stays null */
+    }
+
+    if (!patches || patches.length === 0) {
+      // Patch generation failed — fall back to full rerun (existing
+      // rerunChat path from B1) so the user still gets a fix attempt.
+      renderFixByAssistantIdxRef.current.set(lastIdx, "failed");
+      bumpRenderFix();
+      await fallbackToFullRerun(convId, currentBubbles, lastIdx, problems);
+      return;
+    }
+
+    // Apply the patches locally.
+    const result = applyPatches(text, problems, patches);
+    if (result.applied === 0) {
+      renderFixByAssistantIdxRef.current.set(lastIdx, "failed");
+      bumpRenderFix();
+      await fallbackToFullRerun(convId, currentBubbles, lastIdx, problems);
+      return;
+    }
+
+    // Mutate the assistant bubble IN PLACE — no extra bubbles.
+    setBubbles((prev) => {
+      if (prev.length <= lastIdx) return prev;
+      const target = prev[lastIdx];
+      if (!target || target.kind !== "assistant") return prev;
+      const next = prev.slice();
+      next[lastIdx] = { ...target, text: result.patched } as Bubble;
+      return next;
+    });
+    // NOTE: server-side persistence of the edited bubble is a followup.
+    // Without it, a page refresh reverts the assistant bubble to the
+    // original broken text. On refresh the validator will run again
+    // and re-request the fix — worst case is one wasted round trip.
+
+    // Mark as fixed. If some problems were skipped, still counts as
+    // partial success — the UI shows "✓ Fixed 2/3" or similar.
+    renderFixByAssistantIdxRef.current.set(lastIdx, "fixed");
+    bumpRenderFix();
+
+    // If patches covered all problems, the retry counter can reset.
+    if (result.skippedIndices.length === 0) {
+      renderRetriesRef.current.delete(lastIdx);
+    }
+  };
+
+  // Fallback path — the classic "full rerun" from B1. Only fires when
+  // the partial-edit path fails end-to-end.
+  async function fallbackToFullRerun(
+    convId: string,
+    currentBubbles: Bubble[],
+    _lastIdx: number,
+    problems: RenderProblem[],
+  ): Promise<void> {
+    let userIdx = -1;
+    for (let i = _lastIdx - 1; i >= 0; i--) {
+      if (currentBubbles[i]!.kind === "user") {
+        userIdx = i;
+        break;
+      }
+    }
+    if (userIdx < 0) return;
     const retryPrompt = buildRetryPrompt(problems);
     if (!retryPrompt) return;
-
-    // Pull the original user prompt and append a discreet retry note.
-    // rerunChat will truncate history to userIdx, then resend the
-    // augmented text — the LLM sees ONE turn with both the original
-    // question AND the render feedback, and its reply REPLACES the
-    // broken one in-place (no extra bubbles).
     const userBubble = currentBubbles[userIdx] as { text?: string };
     const originalPrompt = userBubble.text ?? "";
     const augmentedPrompt = originalPrompt + "\n\n---\n\n" + retryPrompt;
-
-    // Local-only truncation to keep the UI in sync with what the server
-    // will do — rerunChat starts a fresh stream that appends a new
-    // assistant bubble; without truncating, we'd double up.
     setBubbles((prev) => [
       ...prev.slice(0, userIdx + 1),
       { kind: "assistant", text: "" },
     ]);
-
     await runChatStream((onEvent, signal) =>
       rerunChat(
         scope,
@@ -1829,10 +1908,10 @@ export default function ChatPanel({
         onEvent,
         signal,
         augmentedPrompt,
-        userIdx + 1, // pruneFromBubbleIdx: wipe stale annotations
+        userIdx + 1,
       ),
     );
-  };
+  }
 
   // 2026-07-01 (B1) — bubbles ref so maybeAutoRetryRenderRef sees the
   // current snapshot without re-creating the whole callback each render.
@@ -3914,6 +3993,61 @@ export default function ChatPanel({
                       )}
                       {row.bubble.kind === "assistant" ? (
                         <>
+                          {/* 2026-07-01 (D) — render-fix status badge.
+                              Shows a small "🔧 Fixing render errors…"
+                              badge while post-hoc partial-edit retry is
+                              in flight; flips to "✓ Fixed" on success
+                              or "⚠ Fix failed" if patches were unusable
+                              and even the fallback rerun didn't help. */}
+                          {(() => {
+                            const status = renderFixByAssistantIdxRef.current.get(i);
+                            if (!status) return null;
+                            if (status === "fixing") {
+                              return (
+                                <div style={{
+                                  display: "inline-block",
+                                  padding: "2px 8px",
+                                  marginBottom: 6,
+                                  background: "#1f2937",
+                                  color: "#93c5fd",
+                                  borderRadius: 4,
+                                  fontSize: "0.85em",
+                                  fontStyle: "italic",
+                                }}>
+                                  🔧 Fixing render errors…
+                                </div>
+                              );
+                            }
+                            if (status === "fixed") {
+                              return (
+                                <div style={{
+                                  display: "inline-block",
+                                  padding: "2px 8px",
+                                  marginBottom: 6,
+                                  background: "#064e3b",
+                                  color: "#6ee7b7",
+                                  borderRadius: 4,
+                                  fontSize: "0.85em",
+                                }}>
+                                  ✓ Fixed render errors
+                                </div>
+                              );
+                            }
+                            // "failed"
+                            return (
+                              <div style={{
+                                display: "inline-block",
+                                padding: "2px 8px",
+                                marginBottom: 6,
+                                background: "#7f1d1d",
+                                color: "#fca5a5",
+                                borderRadius: 4,
+                                fontSize: "0.85em",
+                              }}>
+                                ⚠ Auto-fix failed — content below may still have render issues
+                              </div>
+                            );
+                          })()}
                           {row.bubble.reasoning && showReasoning ? (
                             <ReasoningBlock reasoning={row.bubble.reasoning} />
                           ) : null}
