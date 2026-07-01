@@ -167,14 +167,28 @@ export function extractConcepts(input: ConceptExtractorInput): FrontierConcept[]
     concepts.push({ label, arxivQuery: query, source });
   };
 
-  // 1. Global thesis (or fallback title).
+  // 1. Global thesis or problem title (short label; may still be a sentence
+  //    prefix — kept for narrative context but often a weak arxiv query).
   if (input.spine?.globalThesis) {
     addConcept(input.spine.globalThesis, "spine-thesis");
   } else {
     addConcept(input.problemTitle, "spine-thesis");
   }
 
-  // 2. Spine threads (most informative cluster names in the spine).
+  // 1b. 2026-07-01 — problem.tags are curator-supplied SHORT phrases
+  //     ("Additive Number Theory", "Sieve Theory", "Prime Numbers"), which
+  //     arxiv's tokenizer indexes cleanly. These are far higher-signal than
+  //     truncated globalThesis sentences (which after 6-word truncation
+  //     read as "Binary Goldbach sits at the junction" — a sentence
+  //     fragment that arxiv all: search never matches). Insert them RIGHT
+  //     AFTER thesis so tags dominate the concept slate for real-project
+  //     shape (thesis 1 + tags up to 4 → 5 concept cap hit exactly).
+  for (const tag of input.problemTags) {
+    addConcept(tag, "spine-thread");
+  }
+
+  // 2. Spine threads (LLM-generated cluster names in the spine). These
+  //    often read as sentence fragments too, so they're kept after tags.
   // Sort alphabetically for determinism; tests rely on stable order.
   const threadNames = (input.spine?.threads ?? [])
     .map((t) => t.name)
