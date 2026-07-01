@@ -94,6 +94,13 @@ export interface InitAgentContext {
   /** Override the arXiv rate-limit delay (tests pass 0). */
   rateDelayMs?: number;
   /**
+   * 2026-07-01 — Opt out of the frontier-expansion tick in read_and_explore.
+   * Used by integration tests (agent-spine.test.ts) that mock the LLM +
+   * arxiv seams and don't want a real arxiv fetch stalling the test to
+   * timeout. Default false → frontier runs normally in production.
+   */
+  disableFrontier?: boolean;
+  /**
    * Citation-neighbor discovery seam for the Spine-First pipeline. mathran
    * ships no network citation source, so the host wires this (arXiv / S2);
    * tests inject a fake. Default: graph-only BFS.
@@ -584,15 +591,19 @@ async function runInitAgentSpine(
     // Builds once per run, passed in via deps so the loop can call it at the
     // configured cadence. The expander is responsible for arxiv-fetching recent
     // preprints and LLM-filtering them; reading-loop owns ingest + push.
+    //
+    // 2026-07-01 — ctx.disableFrontier=true skips wiring entirely (tests).
     const frontierLLM = accounting.wrap(spineLLM, "read_and_explore", "frontier");
-    const frontierExpander = buildFrontierExpander({
-      llm: frontierLLM,
-      modelName: modelPair.writerModel,
-      problemTitle: problem.title,
-      problemFormalStatement: problem.formalStatement,
-      problemTags: problem.tags,
-      log: (m) => emit({ type: "log", message: m }),
-    });
+    const frontierExpander = ctx.disableFrontier
+      ? undefined
+      : buildFrontierExpander({
+          llm: frontierLLM,
+          modelName: modelPair.writerModel,
+          problemTitle: problem.title,
+          problemFormalStatement: problem.formalStatement,
+          problemTags: problem.tags,
+          log: (m) => emit({ type: "log", message: m }),
+        });
 
     // The reading loop (Phase D, Task 18) replaces the citation-graph BFS: it
     // reads each paper (skim→read→audit), harvests its bibliography into new

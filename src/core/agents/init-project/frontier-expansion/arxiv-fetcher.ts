@@ -24,8 +24,21 @@ type FetchLike = (
   init?: { signal?: AbortSignal },
 ) => Promise<{ text: () => Promise<string>; ok?: boolean; status?: number }>;
 
-const defaultFetch: FetchLike = (url, init) =>
-  fetch(url, init) as unknown as ReturnType<FetchLike>;
+const defaultFetch: FetchLike = (url, init) => {
+  // 2026-07-01 — hard 5s timeout via AbortController. arxiv API is normally
+  // sub-second but occasionally hangs (rate-limit throttle or bad TLS
+  // handshake). Without a timeout, a hung fetch stalls the whole
+  // reading-loop pre-loop tick and eventually trips vitest's 5000ms test
+  // deadline (agent-spine.test.ts caught this). Rate-limit + K-empty
+  // convergence guards already cap total fetches — timeouts here just
+  // prevent single-request hangs from cascading.
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 5000);
+  const p = fetch(url, { ...(init ?? {}), signal: ac.signal }) as unknown as ReturnType<FetchLike>;
+  // Clear the timer once the fetch resolves either way.
+  Promise.resolve(p).then(() => clearTimeout(t), () => clearTimeout(t));
+  return p;
+};
 
 export interface FrontierArxivFetcherDeps {
   fetchImpl?: FetchLike;

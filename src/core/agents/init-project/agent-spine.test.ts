@@ -160,6 +160,9 @@ function ctx(extra: Partial<InitAgentContext> = {}): InitAgentContext {
     // 2026-06-26 — no enrichment in spine tests for the same reason as
     // agent.test.ts (offline-safe).
     fetchArxivById: async () => null,
+    // 2026-07-01 — skip frontier expansion in tests: it would issue a real
+    // arxiv fetch on the pre-loop tick and stall the whole test to timeout.
+    disableFrontier: true,
     // Reading loop drives the reader; keep it offline by failing the source
     // fetch so each paper degrades to an abstract-only read.
     fetchArxivSource: async (arxivId: string) => ({

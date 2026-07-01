@@ -163,6 +163,23 @@ function preprocessHeadingAnchors(input: string): string {
  * isn't already inside math delimiters, which lets GPT-style `\begin{equation}`
  * render without forcing the LLM to add explicit `$$`.
  */
+/**
+ * Envs KaTeX cannot render but LLMs love emitting inside \[…\] / bare
+ * blocks. Wrapping them in $$…$$ triggers a KaTeX parse error that
+ * cascades and eats the following paragraph as leftover math body.
+ * Leave them alone so marked renders them as prose (visually ugly but
+ * doesn't destroy the surrounding text). Ordered by frequency in real
+ * math LLM output.
+ *
+ * 2026-07-01 — added after alpha's c-eb4a403e chat destroyed the "More
+ * explicitly:" numbered list following a tikzcd diagram.
+ */
+const UNSUPPORTED_KATEX_ENVS = /\\begin\{(tikzcd|tikzpicture|circuitikz|forest|dot2tex|smallmatrix\*|xy)\}/;
+
+function containsUnsupportedEnv(text: string): boolean {
+  return UNSUPPORTED_KATEX_ENVS.test(text);
+}
+
 function preprocessMath(input: string): string {
   if (!input || typeof input !== "string") return input;
   // Fast path: nothing to do
@@ -191,7 +208,32 @@ function preprocessMath(input: string): string {
   // matches because it requires the $$ tokens to live on their own
   // line at paragraph-boundary level. Result: the SPA shows literal
   // `$$ math $$` text instead of rendered KaTeX. (2026-06-29 wiki bug.)
-  masked = masked.replace(/\\\[([\s\S]*?)\\\]/g, (_m, body) => `\n\n$$\n${body.trim()}\n$$\n\n`);
+  //
+  // 2026-07-01 (Bug 1, alpha c-2735c92c chat):
+  //   Also strip leading blockquote markers (`> ` at line start) from
+  //   the extracted body. Without stripping, an LLM that puts a
+  //   conjecture inside a blockquote:
+  //     > \[
+  //     > \ell(R) > r
+  //     > \]
+  //   produced `$$\n> \ell(R) > r\n$$` — KaTeX sees `>` as garbage.
+  //
+  // 2026-07-01 (Bug 2, alpha c-eb4a403e chat):
+  //   Skip envs KaTeX doesn't support (tikzcd et al.); wrapping them
+  //   in $$…$$ triggers a KaTeX parse error that cascades and eats the
+  //   following paragraph as leftover math body.
+  masked = masked.replace(/\\\[([\s\S]*?)\\\]/g, (_m, body) => {
+    // Strip leading blockquote marker from every line in the body
+    // (blockquote-aware). Handles both `> ` and `>` (no space).
+    const cleaned = body.replace(/^[ \t]*>[ \t]?/gm, "");
+    if (containsUnsupportedEnv(cleaned)) {
+      // Leave the original \[…\] intact so marked renders it as a
+      // fenced-ish plain block; better broken-diagram-as-text than
+      // broken-diagram + eaten paragraph.
+      return `\\[${body}\\]`;
+    }
+    return `\n\n$$\n${cleaned.trim()}\n$$\n\n`;
+  });
   // Inline.
   masked = masked.replace(/\\\(([\s\S]*?)\\\)/g, (_m, body) => `$${body}$`);
 
@@ -199,9 +241,14 @@ function preprocessMath(input: string): string {
   // nearest preceding non-whitespace chars are NOT `$$`. We just wrap each
   // env in $$ pairs and add the blanks-line guard for the same reason as
   // above (block math must stand alone in marked).
+  //
+  // 2026-07-01 — Skip unsupported envs here too (same reasoning as above).
   masked = masked.replace(
     /(^|[^$])(\\begin\{[a-zA-Z*]+\}[\s\S]*?\\end\{[a-zA-Z*]+\})(?!\$)/g,
-    (_m, pre, env) => `${pre}\n\n$$\n${env}\n$$\n\n`,
+    (_m, pre, env) => {
+      if (containsUnsupportedEnv(env)) return `${pre}${env}`;
+      return `${pre}\n\n$$\n${env}\n$$\n\n`;
+    },
   );
 
   // Collapse 3+ consecutive newlines that might have been introduced by

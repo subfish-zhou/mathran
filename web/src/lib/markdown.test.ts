@@ -136,3 +136,115 @@ describe("code block syntax highlighting (highlight.js)", () => {
     expect(html).toMatch(/&lt;script&gt;|&lt;script/);
   });
 });
+
+describe("preprocessMath — blockquote-aware LaTeX (2026-07-01 alpha chat bug)", () => {
+  it("strips leading '> ' from blockquote-wrapped \\[ ... \\] display math (Bug 1)", () => {
+    // Reproduces alpha's c-2735c92c chat: LLM wraps a conjecture body
+    // in a blockquote, and the math block sits INSIDE the blockquote
+    // with a leading '> ' on every line. Old preprocessor kept the '>'
+    // characters INSIDE the resulting $$...$$ block, so KaTeX saw
+    // "> \ell..." and choked, rendering the whole conjecture as garbage.
+    const input = [
+      "> **Conjecture.**",
+      "> Let \\(\\varphi\\) be a contraction, and",
+      "> \\[",
+      "> \\ell_{\\mathcal F}^{\\mathrm{vert}}(R)>r_{\\mathrm{vert}}.",
+      "> \\]",
+      "> Then \\(\\varphi\\) is a bundle.",
+    ].join("\n");
+    const out = preprocessMath(input);
+    // The math body inside the produced $$...$$ MUST NOT contain any '>' prefix chars.
+    const displayMatch = out.match(/\$\$\n([\s\S]*?)\n\$\$/);
+    expect(displayMatch).not.toBeNull();
+    const body = displayMatch![1];
+    expect(body).not.toMatch(/^>/m); // no line starts with '>'
+    expect(body).toContain("\\ell_{\\mathcal F}"); // real math survived
+  });
+
+  it("strips leading '> ' from blockquote-wrapped multi-line \\[ ... \\]", () => {
+    // Same as above but the display body spans several lines with '> '
+    // prefixes (the alpha bug's exact shape: exact sequence of foliations).
+    const input = [
+      "> \\[",
+      "> 0\\to T_{X/Y}^{\\mathrm{tor}}",
+      "> \\to \\mathcal F",
+      "> \\to \\varphi^{-1}\\mathcal G",
+      "> \\to 0.",
+      "> \\]",
+    ].join("\n");
+    const out = preprocessMath(input);
+    const displayMatch = out.match(/\$\$\n([\s\S]*?)\n\$\$/);
+    expect(displayMatch).not.toBeNull();
+    expect(displayMatch![1]).not.toMatch(/^>/m);
+    expect(displayMatch![1]).toContain("0\\to T_{X/Y}");
+    expect(displayMatch![1]).toContain("\\to 0");
+  });
+
+  it("preserves blockquote structure OUTSIDE the math block", () => {
+    // The surrounding prose (still in blockquote) must remain a blockquote.
+    const input = [
+      "> before math",
+      "> \\[",
+      "> x=1",
+      "> \\]",
+      "> after math",
+    ].join("\n");
+    const out = preprocessMath(input);
+    // 'before math' and 'after math' should keep their '>' prefixes so
+    // marked still recognises them as blockquote lines.
+    expect(out).toMatch(/^> before math/m);
+    expect(out).toMatch(/^> after math/m);
+  });
+});
+
+describe("preprocessMath — unsupported LaTeX envs (2026-07-01 alpha tikzcd bug)", () => {
+  it("does NOT wrap tikzcd envs in $$…$$ (KaTeX can't render tikzcd — Bug 2)", () => {
+    // Reproduces alpha's c-eb4a403e chat: LLM emitted a tikzcd diagram
+    // inside \[...\]. KaTeX has no tikzcd support and its parse error
+    // cascades — the SPA rendered the diagram as literal text AND ate
+    // the following "More explicitly: 1. …" paragraph as leftover
+    // math body. The fix: leave tikzcd (and other TikZ-family envs)
+    // as-is so it renders as fenced code / prose, not broken math.
+    const input = [
+      "The resolution is",
+      "",
+      "\\[",
+      "\\begin{tikzcd}",
+      "W \\arrow[dr] & Y",
+      "\\end{tikzcd}",
+      "\\]",
+      "",
+      "More explicitly:",
+      "",
+      "1. First step",
+    ].join("\n");
+    const out = preprocessMath(input);
+    // tikzcd content should NOT be wrapped in $$…$$ (it would break KaTeX).
+    // Extract any $$...$$ blocks and confirm none contain 'tikzcd'.
+    const mathBlocks = out.match(/\$\$[\s\S]*?\$\$/g) ?? [];
+    for (const block of mathBlocks) {
+      expect(block).not.toContain("tikzcd");
+    }
+    // "More explicitly:" must remain intact in the output.
+    expect(out).toContain("More explicitly:");
+    expect(out).toContain("1. First step");
+  });
+
+  it("also skips \\begin{tikzcd} when it appears bare (no \\[…\\] wrap)", () => {
+    const input = [
+      "See the diagram:",
+      "",
+      "\\begin{tikzcd}",
+      "A \\arrow[r] & B",
+      "\\end{tikzcd}",
+      "",
+      "Notice that A goes to B.",
+    ].join("\n");
+    const out = preprocessMath(input);
+    const mathBlocks = out.match(/\$\$[\s\S]*?\$\$/g) ?? [];
+    for (const block of mathBlocks) {
+      expect(block).not.toContain("tikzcd");
+    }
+    expect(out).toContain("Notice that A goes to B.");
+  });
+});

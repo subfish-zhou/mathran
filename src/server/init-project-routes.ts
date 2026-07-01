@@ -198,6 +198,11 @@ export function registerInitProjectRoutes(app: Hono, deps: InitProjectRouteDeps)
           llm,
           model: defaultModel,
           signal: ac.signal,
+          // 2026-07-01 — env-gated frontier skip. Tests set
+          // MATHRAN_DISABLE_FRONTIER=1 to avoid a real arxiv fetch in
+          // the pre-loop tick blowing past their 5s timeout. Production
+          // never sets this so frontier runs normally.
+          disableFrontier: process.env.MATHRAN_DISABLE_FRONTIER === "1",
         });
       } catch {
         /* ledger already flipped to error */

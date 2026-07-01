@@ -1,4 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+// 2026-07-01 — disable frontier before any subject import so the env var
+// is set when the route's runInitAgent invocation reads it. Frontier's
+// pre-loop tick would issue a real arxiv fetch and blow past the 5s test
+// timeout otherwise.
+process.env.MATHRAN_DISABLE_FRONTIER = "1";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
