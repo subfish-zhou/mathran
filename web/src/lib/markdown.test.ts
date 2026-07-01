@@ -318,6 +318,28 @@ describe("extractTikzEnvs — server-side render placeholder (2026-07-01)", () =
     expect(out).toContain("End.");
   });
 
+  it("strips wrapping \\(…\\) inline delimiter (D bug 2026-07-01, subfish repro)", () => {
+    // subfish's chat: LLM returned \(\begin{tikzcd}...\end{tikzcd}\) as a
+    // fix patch. \( \) inline wrap wasn't being stripped, so after tikzcd
+    // extraction the placeholder <div> sat inside \(…\) → KaTeX rendered
+    // 'div class="tikz-placeholder" data-tikz-src=...' as italic math.
+    const input = "\\(\\begin{tikzcd}A \\arrow[r] & B\\end{tikzcd}\\)";
+    const out = extractTikzEnvs(input);
+    expect(out).not.toMatch(/\\\(|\\\)/);
+    expect(out).toContain(`<div class="tikz-placeholder"`);
+    // And the entire tikz body should be gone from the plain text.
+    expect(out).not.toContain("\\begin{tikzcd}");
+  });
+
+  it("strips wrapping $…$ inline delimiter around a tikzcd env", () => {
+    const input = "$\\begin{tikzcd}A \\arrow[r] & B\\end{tikzcd}$";
+    const out = extractTikzEnvs(input);
+    // The single-$ pair should be gone (or at least not around the div).
+    expect(out).toContain(`<div class="tikz-placeholder"`);
+    // Check no `$…$` immediately wrapping the div.
+    expect(out).not.toMatch(/\$[^$]*<div class="tikz-placeholder"/);
+  });
+
   it("handles multiple tikzcd envs in one document", () => {
     const input = [
       "First:",
