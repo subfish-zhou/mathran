@@ -2343,6 +2343,32 @@ function registerChatScope(
     return c.json({ dropped: ok });
   });
 
+  // 2026-07-01 — PATCH the conversation meta (currently only `title`
+  // is user-editable). Body: { title: string }. Returns { ok: true }
+  // on success, { error: "..." } with 400/404 otherwise.
+  app.patch(`${basePath}/:conversationId`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "body must be JSON" }, 400);
+    }
+    const title = (body as { title?: unknown })?.title;
+    if (typeof title !== "string") {
+      return c.json({ error: "body needs { title: string }" }, 400);
+    }
+    const res = await store.setTitle(resolved.scope!, id, title);
+    if (res.ok) return c.json({ ok: true, title: title.trim() });
+    if (res.reason === "not-found") return c.json({ error: "conversation not found" }, 404);
+    return c.json({ error: "title must be 1-200 chars" }, 400);
+  });
+
   // POST <base>/:conversationId/compact  — compact this conversation (v0.2 §5)
   app.post(`${basePath}/:conversationId/compact`, async (c) => {
     const resolved = getScope(c);

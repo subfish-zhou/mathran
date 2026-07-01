@@ -21,6 +21,7 @@ import {
   streamChat,
   rerunChat,
   truncateChat,
+  renameConversation,
   streamAnswerAsk,
   fetchAnnotations,
   fetchTodos,
@@ -109,6 +110,7 @@ import ModelComboBox from "./ModelComboBox.tsx";
 import { stripAttachmentMarkers } from "../lib/strip-attachment-markers.ts";
 import { validateRender, buildRetryPrompt, type RenderProblem } from "../lib/render-validator";
 import { applyPatches, type Patch } from "../lib/render-patch";
+import { Splitter, useSplitterWidth } from "./Splitter.tsx";
 import {
   parseSlashInput,
   activeSlashPrefix,
@@ -207,6 +209,8 @@ interface ConversationTreeItemProps {
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
   onCreateThread: (parentId: string) => void;
+  /** 2026-07-01 — inline rename callback. Fired on Enter after edit. */
+  onRename: (id: string, newTitle: string) => void;
 }
 
 /**
@@ -224,6 +228,7 @@ function ConversationTreeItem({
   onSelect,
   onDelete,
   onCreateThread,
+  onRename,
 }: ConversationTreeItemProps) {
   const { conv, depth, children } = node;
   const active = conv.id === activeId;
@@ -231,6 +236,24 @@ function ConversationTreeItem({
   const isCollapsed = collapsed.has(conv.id);
   // Cap visual indent so depth-6 threads still leave room for the label.
   const padPx = Math.min(depth * 12, 36);
+
+  // 2026-07-01 — inline rename state (local to this row).
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(conv.title);
+  // Reset draft when we enter edit mode (so it starts from the current title,
+  // not a stale one from a previous edit attempt).
+  const beginEdit = () => {
+    setDraft(conv.title || "");
+    setEditing(true);
+  };
+  const commitEdit = () => {
+    const t = draft.trim();
+    if (t.length > 0 && t !== conv.title) {
+      onRename(conv.id, t);
+    }
+    setEditing(false);
+  };
+  const cancelEdit = () => setEditing(false);
 
   return (
     <li>
@@ -263,6 +286,11 @@ function ConversationTreeItem({
         <button
           type="button"
           onClick={() => onSelect(conv.id)}
+          onDoubleClick={(e) => {
+            // 2026-07-01 — double-click title to rename inline.
+            e.stopPropagation();
+            beginEdit();
+          }}
           className="min-w-0 flex-1 truncate text-left"
           title={
             `${conv.title}\n${conv.messageCount} message${
@@ -271,7 +299,8 @@ function ConversationTreeItem({
             (conv.threadDescription ? `\n\n${conv.threadDescription}` : "") +
             (typeof conv.anchorBubbleIdx === "number"
               ? `\nForked at bubble #${conv.anchorBubbleIdx}`
-              : "")
+              : "") +
+            "\n\nDouble-click to rename"
           }
         >
           <div className="truncate font-medium">
@@ -286,7 +315,34 @@ function ConversationTreeItem({
                 ⤳
               </span>
             )}
-            {conv.title || conv.id}
+            {editing ? (
+              // 2026-07-01 — inline rename input. Enter commits, Esc cancels.
+              // Clicking inside the input stops the parent button from
+              // firing (which would flip us out of edit mode).
+              <input
+                autoFocus
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitEdit();
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    cancelEdit();
+                  }
+                }}
+                onBlur={commitEdit}
+                className={`w-full rounded border px-1 py-0 text-xs ${
+                  active
+                    ? "border-slate-700 bg-slate-800 text-white"
+                    : "border-slate-300 bg-white text-slate-900"
+                }`}
+              />
+            ) : (
+              conv.title || conv.id
+            )}
           </div>
           <div
             className={`truncate text-[10px] ${
@@ -295,6 +351,24 @@ function ConversationTreeItem({
           >
             {conv.messageCount} msg · {new Date(conv.lastUsedAt).toLocaleDateString()}
           </div>
+        </button>
+
+        {/* Hover actions: ✏ rename / + new thread / × delete */}
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            beginEdit();
+          }}
+          className={`shrink-0 rounded px-1 py-0.5 text-[10px] opacity-0 transition group-hover:opacity-100 ${
+            active
+              ? "text-slate-300 hover:bg-slate-700"
+              : "text-slate-400 hover:bg-slate-200 hover:text-slate-700"
+          }`}
+          title="Rename this conversation"
+          aria-label={`Rename ${conv.id}`}
+        >
+          ✏
         </button>
 
         {/* Hover actions: + new thread / × delete */}
@@ -345,6 +419,7 @@ function ConversationTreeItem({
               onSelect={onSelect}
               onDelete={onDelete}
               onCreateThread={onCreateThread}
+              onRename={onRename}
             />
           ))}
         </ul>
@@ -442,6 +517,31 @@ export default function ChatPanel({
   // metric, not load-bearing data, so no need to persist).
   const [usageHistory, setUsageHistory] = useState<number[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  // 2026-07-01 — user-adjustable channel list width + collapse state.
+  // Width persisted in localStorage (default 240px); collapse also persisted
+  // per-scope so the state survives reloads and doesn't leak between
+  // different scopes' preferences.
+  const channelWidthKey = `mathran.channelList.width.${scopeLabel}`;
+  const channelCollapseKey = `mathran.channelList.collapsed.${scopeLabel}`;
+  const [channelListWidth, setChannelListWidth] = useSplitterWidth(channelWidthKey, 240);
+  const [channelListCollapsed, setChannelListCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(channelCollapseKey) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleChannelListCollapsed = useCallback(() => {
+    setChannelListCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(channelCollapseKey, next ? "1" : "0");
+      } catch {
+        /* localStorage disabled — memory-only */
+      }
+      return next;
+    });
+  }, [channelCollapseKey]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   // v0.18 — Discord-style threads: collapsed state for the sidebar tree.
   // Persisted to localStorage so refresh keeps the user's view; one key
@@ -2601,6 +2701,27 @@ export default function ChatPanel({
     }
   }
 
+  // 2026-07-01 — Rename a conversation. Optimistically updates the
+  // sidebar (so the new title shows immediately) then PATCHes the
+  // server; on failure, snap back to the true state via refreshList.
+  async function renameConv(id: string, newTitle: string) {
+    const trimmed = newTitle.trim();
+    if (trimmed.length === 0) return;
+    // Optimistic update
+    setConversations((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, title: trimmed } : c)),
+    );
+    try {
+      await renameConversation(scope, id, trimmed);
+      // Refresh in the background so lastUsedAt etc. stay accurate.
+      void refreshList();
+    } catch (err) {
+      setError((err as Error).message);
+      // Revert by re-fetching the true list.
+      void refreshList();
+    }
+  }
+
   /**
    * v0.18 — Discord-style threads: create a child thread off a parent
    * conversation (clicked from the sidebar ⤳ button). The thread is
@@ -3311,18 +3432,50 @@ export default function ChatPanel({
   return (
     <div className="flex h-full">
       {/* ─── Conversation sidebar ─────────────────────────────────────── */}
-      <aside className="flex w-60 shrink-0 flex-col border-r border-slate-200 bg-white">
-        <div className="border-b border-slate-200 p-3">
-          <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
-            {scopeLabel}
-          </div>
+      {channelListCollapsed ? (
+        // Collapsed: a 24px vertical strip with a single "expand" button.
+        // Sits where the full aside would; clicking it flips back.
+        <div className="flex h-full w-6 shrink-0 flex-col items-center justify-start border-r border-slate-200 bg-white pt-2">
           <button
             type="button"
-            onClick={newChat}
-            className="w-full rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800"
+            onClick={toggleChannelListCollapsed}
+            className="mb-1 rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-900"
+            title="Expand channel list"
+            aria-label="Expand channel list"
           >
-            + New chat
+            ▶
           </button>
+        </div>
+      ) : (
+        <>
+          <aside
+            style={{ width: channelListWidth }}
+            className="flex h-full shrink-0 flex-col border-r border-slate-200 bg-white"
+          >
+            <div className="border-b border-slate-200 p-3">
+              <div className="mb-1 flex items-center justify-between">
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  {scopeLabel}
+                </div>
+                {/* 2026-07-01 — collapse button (◀ hides the list on narrow
+                    screens). Reappears as ▶ on the collapsed strip. */}
+                <button
+                  type="button"
+                  onClick={toggleChannelListCollapsed}
+                  className="rounded p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                  title="Collapse channel list"
+                  aria-label="Collapse channel list"
+                >
+                  ◀
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={newChat}
+                className="w-full rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800"
+              >
+                + New chat
+              </button>
         </div>
         <div className="flex-1 overflow-y-auto p-2">
           {conversations.length === 0 && (
@@ -3341,11 +3494,22 @@ export default function ChatPanel({
                 onSelect={selectConv}
                 onDelete={(id) => void deleteConv(id)}
                 onCreateThread={(parentId) => void createThreadFromConv(parentId)}
+                onRename={(id, t) => void renameConv(id, t)}
               />
             ))}
           </ul>
         </div>
       </aside>
+          <Splitter
+            storageKey={channelWidthKey}
+            width={channelListWidth}
+            onWidthChange={setChannelListWidth}
+            minWidth={160}
+            maxWidth={480}
+            ariaLabel="Resize channel list"
+          />
+        </>
+      )}
 
       {/* ─── Chat surface ─────────────────────────────────────────────── */}
       <div className="flex h-full min-w-0 flex-1 flex-col">

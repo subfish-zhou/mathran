@@ -945,6 +945,38 @@ export class ScopedChatSessionStore {
     return hadCache || hadFile || hadIndex;
   }
 
+  /**
+   * 2026-07-01 — Rename a conversation. Rewrites the title in the scope
+   * index atomically (same withIndexLock as flush/drop so concurrent
+   * flushes can't clobber the new title). Returns:
+   *   { ok: true }                             — rename applied
+   *   { ok: false, reason: "not-found" }       — conversation missing
+   *   { ok: false, reason: "invalid" }         — title empty / too long
+   *
+   * Non-goals: this does NOT rewrite the transcript .md sidecar header
+   * (that's regenerated on the next flush anyway) or any historical
+   * mentions in memory / annotations. Title is a UI-facing label only.
+   */
+  async setTitle(
+    scope: ChatScope,
+    conversationId: string,
+    title: string,
+  ): Promise<{ ok: true } | { ok: false; reason: "not-found" | "invalid" }> {
+    const trimmed = title.trim();
+    if (trimmed.length === 0 || trimmed.length > 200) {
+      return { ok: false, reason: "invalid" };
+    }
+    const dir = scopeDir(this.workspace, scope);
+    return withIndexLock(dir, async () => {
+      const idx = await readIndex(dir);
+      const meta = idx.conversations[conversationId];
+      if (!meta) return { ok: false, reason: "not-found" };
+      meta.title = trimmed;
+      await writeIndex(dir, idx);
+      return { ok: true };
+    });
+  }
+
   /** Enumerate conversations in a scope (reads the index from disk every time). */
   async listConversations(scope: ChatScope): Promise<ConversationMeta[]> {
     const dir = scopeDir(this.workspace, scope);

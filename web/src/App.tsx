@@ -37,6 +37,7 @@ import McpConfigForm from "./components/McpConfigForm.tsx";
 import EffortsPanel from "./components/EffortsPanel.tsx";
 import EffortDocumentPanel from "./components/EffortDocumentPanel.tsx";
 import ProfilePage from "./pages/ProfilePage.tsx";
+import { Splitter, useSplitterWidth } from "./components/Splitter.tsx";
 
 /**
  * Runtime detection of the SPA's serving prefix.
@@ -134,9 +135,22 @@ export default function App() {
 // ─── Root layout ──────────────────────────────────────────────────────────
 
 function RootLayout() {
+  // 2026-07-01 — user-adjustable global sidebar width, persisted per-user
+  // in localStorage. Default 240px (matches old `w-60`).
+  const [sidebarWidth, setSidebarWidth] = useSplitterWidth("mathran.globalSidebar.width", 240);
   return (
     <div className="flex h-full bg-slate-50 text-slate-900">
-      <GlobalSidebar />
+      <div style={{ width: sidebarWidth }} className="shrink-0 h-full overflow-hidden">
+        <GlobalSidebar />
+      </div>
+      <Splitter
+        storageKey="mathran.globalSidebar.width"
+        width={sidebarWidth}
+        onWidthChange={setSidebarWidth}
+        minWidth={160}
+        maxWidth={480}
+        ariaLabel="Resize global sidebar"
+      />
       <main className="flex-1 overflow-hidden">
         <Outlet />
       </main>
@@ -162,7 +176,7 @@ function GlobalSidebar() {
     }`;
 
   return (
-    <nav className="flex w-60 shrink-0 flex-col overflow-y-auto border-r border-slate-200 bg-white p-3">
+    <nav className="flex h-full w-full flex-col overflow-y-auto border-r border-slate-200 bg-white p-3">
       <Link to="/" className="mb-4 block px-2 text-lg font-bold tracking-tight">
         mathran
       </Link>

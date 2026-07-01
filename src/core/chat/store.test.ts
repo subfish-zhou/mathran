@@ -208,6 +208,70 @@ describe("ScopedChatSessionStore", () => {
     expect(md).toContain("ack:first turn");
     expect(md).toContain("ack:second turn");
   });
+
+  // 2026-07-01 — setTitle rename API
+  describe("setTitle (2026-07-01)", () => {
+    it("renames an existing conversation", async () => {
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(store, { kind: "global" }, "c1", "hello");
+      const res = await store.setTitle({ kind: "global" }, "c1", "My Custom Title");
+      expect(res).toEqual({ ok: true });
+      const convs = await store.listConversations({ kind: "global" });
+      const found = convs.find((c) => c.id === "c1");
+      expect(found?.title).toBe("My Custom Title");
+    });
+
+    it("trims whitespace from the new title", async () => {
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(store, { kind: "global" }, "c1", "hello");
+      await store.setTitle({ kind: "global" }, "c1", "   Spaces Around   ");
+      const convs = await store.listConversations({ kind: "global" });
+      expect(convs.find((c) => c.id === "c1")?.title).toBe("Spaces Around");
+    });
+
+    it("rejects empty titles", async () => {
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(store, { kind: "global" }, "c1", "hello");
+      const res = await store.setTitle({ kind: "global" }, "c1", "   ");
+      expect(res).toEqual({ ok: false, reason: "invalid" });
+    });
+
+    it("rejects overly long titles (>200 chars)", async () => {
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(store, { kind: "global" }, "c1", "hello");
+      const res = await store.setTitle({ kind: "global" }, "c1", "x".repeat(201));
+      expect(res).toEqual({ ok: false, reason: "invalid" });
+    });
+
+    it("returns not-found for missing conversation", async () => {
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      const res = await store.setTitle({ kind: "global" }, "nope", "New Title");
+      expect(res).toEqual({ ok: false, reason: "not-found" });
+    });
+
+    it("rename persists across a fresh store instance", async () => {
+      const a = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(a, { kind: "global" }, "c1", "hello");
+      await a.setTitle({ kind: "global" }, "c1", "Persisted Title");
+      // Fresh instance — must see the renamed title.
+      const b = new ScopedChatSessionStore(workspace, makeFactory());
+      const convs = await b.listConversations({ kind: "global" });
+      expect(convs.find((c) => c.id === "c1")?.title).toBe("Persisted Title");
+    });
+
+    it("subsequent flush does NOT overwrite the user's chosen title", async () => {
+      // Verifies the existing 'existing?.title ?? …' precedence in
+      // flushConversationHistory: once user renames, further LLM turns
+      // keep the user's chosen title (not the auto-derived one).
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(store, { kind: "global" }, "c1", "hello");
+      await store.setTitle({ kind: "global" }, "c1", "User Chose This");
+      // Add more messages — internally triggers another flush.
+      await send(store, { kind: "global" }, "c1", "another turn");
+      const convs = await store.listConversations({ kind: "global" });
+      expect(convs.find((c) => c.id === "c1")?.title).toBe("User Chose This");
+    });
+  });
 });
 
 describe("ScopedChatSessionStore atomic flush (T3)", () => {

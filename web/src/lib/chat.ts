@@ -396,6 +396,37 @@ export async function truncateChat(
 }
 
 /**
+ * 2026-07-01 — Rename a conversation. Server persists the new title in
+ * the scope's .index.json under `conversations[id].title`; the title
+ * shows up in ConversationSummary the next time listConversations
+ * refreshes. Title must be 1-200 chars after trimming.
+ */
+export async function renameConversation(
+  scope: ChatScopeSpec,
+  conversationId: string,
+  title: string,
+): Promise<void> {
+  const res = await fetch(
+    `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}`,
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title }),
+    },
+  );
+  if (!res.ok) {
+    let msg = `rename failed (${res.status})`;
+    try {
+      const data = await res.json();
+      if (data?.error) msg = data.error;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(msg);
+  }
+}
+
+/**
  * Shared SSE pump: POSTs `body` to `url` and dispatches `event:` / `data:`
  * frames as typed `ChatEvent`s through `onEvent`. Extracted from `streamChat`
  * so re-run (and any future chat-shaped endpoint) reuses the same parser.
