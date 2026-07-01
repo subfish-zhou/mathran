@@ -38,6 +38,7 @@ import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerMemoryRoutes } from "./memory-routes.js";
 import { registerProfileRoutes } from "./profile-routes.js";
 import { registerPaperRoutes } from "./paper-routes.js";
+import { registerTikzRoutes } from "./tikz-routes.js";
 import { deleteProject } from "../core/projects/helpers.js";
 import { registerSlashRoutes } from "./slash-routes.js";
 import {
@@ -4046,6 +4047,10 @@ function buildApp(
   // reactions (reactions persist across workspaces; the paper graph
   // is per-workspace). PaperCard rendering depends on both.
   registerPaperRoutes(app, workspace);
+  // 2026-07-01 — server-side tikzcd render (node-tikzjax + WASM TeX).
+  // KaTeX in the browser can't render tikzcd; this endpoint returns
+  // inline SVG via disk-cached WASM compilation.
+  registerTikzRoutes(app, workspace);
 
   app.get("/api/projects", async (c) => {
     return c.json({ projects: await listProjects(workspace) });

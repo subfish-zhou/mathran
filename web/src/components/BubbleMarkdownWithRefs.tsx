@@ -207,6 +207,84 @@ export function BubbleMarkdownWithRefs(
     return () => root.removeEventListener("click", handler);
   }, [navigate]);
 
+  // 2026-07-01 — Server-side TikZ render.
+  // Every render pass finds `<div class="tikz-placeholder" data-tikz-src="…">`
+  // and POSTs /api/render/tikz to get inline SVG, then replaces the div's
+  // innerHTML in-place. Cached hits (both server-side disk + our own in-flight
+  // Map) return in milliseconds. Failures render a small error banner instead
+  // of the placeholder, preserving surrounding chat/prose flow.
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const placeholders = root.querySelectorAll<HTMLElement>(".tikz-placeholder[data-tikz-src]");
+    if (placeholders.length === 0) return;
+
+    // Track cancellation so a chat message re-render (which mounts a fresh
+    // component) doesn't leave a dangling fetch that overwrites the new one.
+    let cancelled = false;
+    const ac = new AbortController();
+
+    (async () => {
+      for (const el of Array.from(placeholders)) {
+        if (cancelled) return;
+        // Skip placeholders already rendered (idempotency — useEffect re-runs
+        // if props.text is stable but React re-mounts).
+        if (el.dataset.tikzRendered === "1") continue;
+        const b64 = el.getAttribute("data-tikz-src");
+        if (!b64) continue;
+        let source: string;
+        try {
+          // Reverse of extractTikzEnvs's base64 wrap. atob is browser-native;
+          // the unescape/decodeURIComponent dance restores UTF-8 correctly.
+          source = decodeURIComponent(escape(atob(b64)));
+        } catch (err) {
+          el.textContent = `[tikz decode failed: ${err instanceof Error ? err.message : String(err)}]`;
+          continue;
+        }
+        try {
+          const res = await fetch("/api/render/tikz", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ source }),
+            signal: ac.signal,
+            credentials: "include",
+          });
+          if (!res.ok) {
+            el.textContent = `[tikz render HTTP ${res.status}]`;
+            continue;
+          }
+          const j = (await res.json()) as
+            | { ok: true; svg: string; hash: string; fromCache: boolean }
+            | { ok: false; hash: string; error: string };
+          if (cancelled) return;
+          if (j.ok) {
+            // Inline the SVG. Server output has already been validated to
+            // start with <svg…> in renderTikz; safe-markdown's DOMPurify
+            // allow-list also covers svg's child tags in case a downstream
+            // consumer re-sanitizes.
+            el.innerHTML = j.svg;
+            el.dataset.tikzRendered = "1";
+            el.dataset.tikzHash = j.hash;
+            el.classList.remove("tikz-placeholder");
+            el.classList.add("tikz-rendered");
+          } else {
+            el.innerHTML = "";
+            el.textContent = `[tikz render failed: ${j.error}]`;
+            el.dataset.tikzHash = j.hash;
+          }
+        } catch (err) {
+          if ((err as { name?: string })?.name === "AbortError") return;
+          el.textContent = `[tikz fetch error: ${err instanceof Error ? err.message : String(err)}]`;
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      ac.abort();
+    };
+  }, [html]); // re-run whenever the rendered HTML changes
+
   return (
     <div
       ref={rootRef}

@@ -46,6 +46,7 @@
     "hono": "^4.12.27",
     "js-tiktoken": "^1.0.21",
     "katex": "^0.16.47",
+    "node-tikzjax": "^1.0.5",
     "openai": "^6.45.0",
     "quickjs-emscripten": "^0.32.0",
     "smol-toml": "^1.7.0",

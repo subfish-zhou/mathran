@@ -204,3 +204,27 @@ body {
   color: #fff;
   border-color: #238636;
 }
+
+/* 2026-07-01 — Server-rendered TikZ diagrams (via /api/render/tikz).
+   .tikz-placeholder shows "Rendering tikzcd…" text until the fetch
+   completes; .tikz-rendered wraps the inline <svg>. Both center the
+   content horizontally + add breathing room. */
+.md .tikz-placeholder,
+.md .tikz-rendered {
+  display: block;
+  margin: 1.5em auto;
+  text-align: center;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.md .tikz-placeholder {
+  color: #999;
+  font-style: italic;
+  font-size: 0.9em;
+  padding: 0.5em;
+}
+.md .tikz-rendered svg {
+  max-width: 100%;
+  height: auto;
+  display: inline-block;
+}

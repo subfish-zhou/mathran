@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { marked } from "marked";
-import { __preprocessMathForTest as preprocessMath, ensureMarkdownConfigured } from "./markdown";
+import { __preprocessMathForTest as preprocessMath, extractTikzEnvs, ensureMarkdownConfigured } from "./markdown";
 
 // Idempotently ensure the global config (the side-effect import already ran,
 // but be explicit).
@@ -246,5 +246,91 @@ describe("preprocessMath — unsupported LaTeX envs (2026-07-01 alpha tikzcd bug
       expect(block).not.toContain("tikzcd");
     }
     expect(out).toContain("Notice that A goes to B.");
+  });
+});
+
+describe("extractTikzEnvs — server-side render placeholder (2026-07-01)", () => {
+  it("lifts a bare \\begin{tikzcd}…\\end{tikzcd} into a placeholder div", () => {
+    const input = [
+      "See:",
+      "",
+      "\\begin{tikzcd}",
+      "A \\arrow[r] & B",
+      "\\end{tikzcd}",
+      "",
+      "Explanation.",
+    ].join("\n");
+    const out = extractTikzEnvs(input);
+    expect(out).toContain(`<div class="tikz-placeholder"`);
+    expect(out).toContain(`data-tikz-env="tikzcd"`);
+    expect(out).toMatch(/data-tikz-src="[A-Za-z0-9+/=]+"/); // base64
+    // Original tikzcd env no longer appears — it's now in the base64 blob.
+    expect(out).not.toContain("\\begin{tikzcd}");
+    // Surrounding prose intact.
+    expect(out).toContain("See:");
+    expect(out).toContain("Explanation.");
+  });
+
+  it("strips wrapping \\[ … \\] around a tikzcd env (alpha c-eb4a403e shape)", () => {
+    // Exactly the shape alpha's chat produced: \[ tikzcd \]
+    const input = [
+      "The resolution is",
+      "",
+      "\\[",
+      "\\begin{tikzcd}",
+      "W \\arrow[dr] & Y",
+      "\\end{tikzcd}",
+      "\\]",
+      "",
+      "More explicitly:",
+    ].join("\n");
+    const out = extractTikzEnvs(input);
+    // No \[ or \] should remain around the extracted env.
+    expect(out).not.toContain("\\[");
+    expect(out).not.toContain("\\]");
+    expect(out).toContain(`<div class="tikz-placeholder"`);
+    expect(out).toContain("More explicitly:");
+  });
+
+  it("handles multiple tikzcd envs in one document", () => {
+    const input = [
+      "First:",
+      "\\begin{tikzcd} A \\arrow[r] & B \\end{tikzcd}",
+      "",
+      "Second:",
+      "\\begin{tikzcd} X \\arrow[r] & Y \\end{tikzcd}",
+    ].join("\n");
+    const out = extractTikzEnvs(input);
+    const placeholders = out.match(/class="tikz-placeholder"/g) ?? [];
+    expect(placeholders).toHaveLength(2);
+  });
+
+  it("leaves NON-renderable envs (xy, dot2tex) alone", () => {
+    const input = "See \\begin{xy} A \\end{xy} then \\begin{dot2tex} B \\end{dot2tex}";
+    const out = extractTikzEnvs(input);
+    // xy + dot2tex aren't in TIKZ_RENDERABLE_ENVS so extractor skips them
+    expect(out).toContain("\\begin{xy}");
+    expect(out).toContain("\\begin{dot2tex}");
+    expect(out).not.toContain("tikz-placeholder");
+  });
+
+  it("also lifts tikzpicture, circuitikz, forest, chemfig", () => {
+    for (const env of ["tikzpicture", "circuitikz", "forest", "chemfig"]) {
+      const input = `\\begin{${env}} body \\end{${env}}`;
+      const out = extractTikzEnvs(input);
+      expect(out).toContain(`data-tikz-env="${env}"`);
+      expect(out).not.toContain(`\\begin{${env}}`);
+    }
+  });
+
+  it("base64 blob round-trips to original tikzcd source", () => {
+    const original = "\\begin{tikzcd}\n  A \\arrow[r, \"f\"] & B\n\\end{tikzcd}";
+    const out = extractTikzEnvs(original);
+    const match = out.match(/data-tikz-src="([^"]+)"/);
+    expect(match).not.toBeNull();
+    const decoded = typeof atob === "function"
+      ? decodeURIComponent(escape(atob(match![1])))
+      : Buffer.from(match![1], "base64").toString("utf8");
+    expect(decoded).toBe(original);
   });
 });

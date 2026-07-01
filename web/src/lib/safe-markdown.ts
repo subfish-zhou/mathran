@@ -34,8 +34,25 @@ import DOMPurify, { type Config } from "dompurify";
 // markdown emits (h1-6, p, pre, code, blockquote, ul/ol/li, a, em/strong,
 // table/thead/tbody/tr/td/th, hr, br, img).
 const PURIFY_CONFIG: Config = {
-  // Math: KaTeX uses MathML output mode too (annotation, semantics, mrow…).
-  // Adding to the default allow-list rather than replacing it.
+  // Math + SVG allow-list moved to the ADD_TAGS block below (2026-07-01).
+  ADD_ATTR: [
+    "aria-hidden",
+    "encoding",
+    "mathvariant",
+    "mathcolor",
+    "displaystyle",
+    // 2026-07-01 — tikz placeholder attrs. The SPA reads these to
+    // find divs it needs to POST /api/render/tikz for. base64-encoded
+    // source is safe as an attribute value (no HTML meta-chars).
+    "data-tikz-src",
+    "data-tikz-env",
+    "data-tikz-hash",
+  ],
+  // 2026-07-01 — Allow <svg> + all its children so server-rendered TikZ
+  // SVGs from /api/render/tikz can be inlined via dangerouslySetInnerHTML.
+  // DOMPurify's default sanitization applies (strips <script>, on*= etc.).
+  // We do NOT run raw tex2svg output through markdown — it's injected
+  // directly into the DOM by BubbleMarkdownWithRefs.
   ADD_TAGS: [
     "math",
     "semantics",
@@ -61,8 +78,27 @@ const PURIFY_CONFIG: Config = {
     "mover",
     "munder",
     "munderover",
+    // SVG tags used by node-tikzjax output
+    "svg",
+    "g",
+    "path",
+    "text",
+    "circle",
+    "rect",
+    "line",
+    "polyline",
+    "polygon",
+    "ellipse",
+    "defs",
+    "marker",
+    "use",
+    "clippath",
+    "linearGradient",
+    "stop",
+    "tspan",
+    "title",
+    "desc",
   ],
-  ADD_ATTR: ["aria-hidden", "encoding", "mathvariant", "mathcolor", "displaystyle"],
   // Force string return (default) — TS thinks RETURN_DOM might return DOM.
   RETURN_TRUSTED_TYPE: false,
 };

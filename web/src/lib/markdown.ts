@@ -173,11 +173,76 @@ function preprocessHeadingAnchors(input: string): string {
  *
  * 2026-07-01 — added after alpha's c-eb4a403e chat destroyed the "More
  * explicitly:" numbered list following a tikzcd diagram.
+ *
+ * 2026-07-01 (upgrade) — subset of these envs is now handled by
+ * `extractTikzEnvs`, which lifts them into placeholder <div>s the
+ * SPA replaces with real SVG rendered server-side via node-tikzjax.
+ * If extraction runs FIRST, this KaTeX-skip list only catches envs
+ * that aren't in TIKZ_RENDERABLE_ENVS (e.g. `xy` for XY-pic).
  */
 const UNSUPPORTED_KATEX_ENVS = /\\begin\{(tikzcd|tikzpicture|circuitikz|forest|dot2tex|smallmatrix\*|xy)\}/;
 
 function containsUnsupportedEnv(text: string): boolean {
   return UNSUPPORTED_KATEX_ENVS.test(text);
+}
+
+/**
+ * TikZ env names that we route to the server-side node-tikzjax renderer.
+ * A superset of the KaTeX-unsupported list, minus envs the renderer
+ * itself can't handle (e.g. `xy`, which is XY-pic and needs a different
+ * TeX package pipeline).
+ */
+const TIKZ_RENDERABLE_ENVS = new Set(["tikzcd", "tikzpicture", "circuitikz", "forest", "chemfig"]);
+
+/**
+ * Escape a string for safe embedding as an HTML attribute value.
+ * Deliberately duplicated from the internal escapeHtmlAttr in this
+ * file so `extractTikzEnvs` doesn't rely on later-declared helpers.
+ */
+function escapeAttr(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Extract every `\begin{tikzcd}...\end{tikzcd}` (and related renderable
+ * TikZ envs) into a placeholder `<div data-tikz-src="…">Rendering…</div>`
+ * that the SPA replaces with SVG at render time (via POST /api/render/tikz).
+ *
+ * MUST run BEFORE the `\[…\]` → `$$…$$` and bare-env → `$$…$$` steps so
+ * the KaTeX preprocessor doesn't try to swallow the tikz body.
+ *
+ * The extraction is idempotent: source already lifted to a placeholder
+ * (which no longer contains `\begin{tikz…}`) is skipped.
+ */
+export function extractTikzEnvs(input: string): string {
+  if (!input.includes("\\begin{")) return input;
+  // First, strip a wrapping \[ … \] if the whole tikz env is the only
+  // thing inside. This is the shape alpha's c-eb4a403e chat produced:
+  //     \[
+  //     \begin{tikzcd}...\end{tikzcd}
+  //     \]
+  // Leaving the \[ \] in place after we've extracted the env would leave
+  // an empty math block; better to strip the wrap.
+  let text = input.replace(
+    /\\\[\s*(\\begin\{([a-zA-Z*]+)\}[\s\S]*?\\end\{\2\})\s*\\\]/g,
+    (whole, env: string, name: string) => (TIKZ_RENDERABLE_ENVS.has(name) ? env : whole),
+  );
+  // Now extract each renderable env.
+  text = text.replace(
+    /\\begin\{([a-zA-Z*]+)\}[\s\S]*?\\end\{\1\}/g,
+    (whole, name: string) => {
+      if (!TIKZ_RENDERABLE_ENVS.has(name)) return whole;
+      // Base64-encode the source so it survives round-tripping through
+      // marked's HTML sanitizer + DOMPurify without ever being parsed as
+      // markdown / TeX / HTML. The SPA decodes it back at render time.
+      const b64 = typeof btoa === "function"
+        ? btoa(unescape(encodeURIComponent(whole)))
+        : Buffer.from(whole, "utf8").toString("base64");
+      const shortHint = escapeAttr(name);
+      return `\n\n<div class="tikz-placeholder" data-tikz-src="${b64}" data-tikz-env="${shortHint}">Rendering ${shortHint}…</div>\n\n`;
+    },
+  );
+  return text;
 }
 
 function preprocessMath(input: string): string {
@@ -198,6 +263,12 @@ function preprocessMath(input: string): string {
   masked = masked.replace(/(^|[^`])(`+)(?!`)([\s\S]*?[^`])\2(?!`)/g, (_m, pre, ticks, body) =>
     pre + MASK(`${ticks}${body}${ticks}`),
   );
+
+  // 2026-07-01 — Lift renderable TikZ envs (tikzcd, tikzpicture, etc.)
+  // into <div class="tikz-placeholder"> tags BEFORE any \[…\] / $$…$$
+  // rewriting, so KaTeX's parser never sees the tikz body. The SPA
+  // replaces these placeholders with server-rendered SVG at mount time.
+  masked = extractTikzEnvs(masked);
 
   // Display first (so `\[` doesn't get caught as `\(` afterwards).
   // CRITICAL: wrap with surrounding BLANK LINES so the resulting $$
