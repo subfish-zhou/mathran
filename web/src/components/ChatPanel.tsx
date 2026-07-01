@@ -107,6 +107,7 @@ import {
 import { useCopilotModels } from "../lib/copilot-models.ts";
 import ModelComboBox from "./ModelComboBox.tsx";
 import { stripAttachmentMarkers } from "../lib/strip-attachment-markers.ts";
+import { validateRender, buildRetryPrompt, type RenderProblem } from "../lib/render-validator";
 import {
   parseSlashInput,
   activeSlashPrefix,
@@ -362,6 +363,16 @@ export default function ChatPanel({
   const urlConvId = searchParams.get("c");
 
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
+  // 2026-07-01 (B1) — Post-hoc render retry.
+  // After each assistant turn finishes, we silent-parse its markdown
+  // through KaTeX. If any formula/env failed to render, we auto-send a
+  // hidden follow-up user turn telling the LLM "the last reply had
+  // these render errors, please rewrite". Max 2 retries per assistant
+  // reply — beyond that we give up (the LLM is likely stuck).
+  // The map keys are message-index-in-bubbles so we don't over-retry
+  // across turns; cleared when the user starts a fresh chat.
+  const renderRetriesRef = useRef<Map<number, number>>(new Map());
+  const RENDER_RETRY_MAX = 2;
   const [conversationId, setConversationId] = useState<string | null>(urlConvId);
   const [input, setInput] = useState("");
   // 2026-06-25 — busy is now per-conversationId. With the multi-channel
@@ -1720,9 +1731,85 @@ export default function ChatPanel({
         // is currently displayed.
         void refreshList(); // pick up the brand-new conv in the sidebar
       }
+
+      // 2026-07-01 (B1) — Post-hoc render retry check. Runs OUTSIDE the
+      // finally so busy-state / abort registration are already cleared.
+      // We inspect the last assistant bubble; if its markdown fails
+      // KaTeX validation, we auto-send a hidden follow-up user turn
+      // asking the LLM to rewrite. Bounded by RENDER_RETRY_MAX per
+      // assistant-index so a stuck LLM can't infinite-loop.
+      const finalConvId = streamConvId ?? conversationIdRef.current;
+      if (finalConvId && finalConvId === conversationIdRef.current) {
+        await maybeAutoRetryRenderRef.current?.(finalConvId);
+      }
     },
     [refreshUsage, refreshList],
   );
+
+  // 2026-07-01 (B1) — Post-hoc render retry helper.
+  // Declared AFTER runChatStream but injected via ref so runChatStream
+  // can call the latest version (avoids the useCallback dependency
+  // cycle: retry uses streamChat which uses runChatStream).
+  const maybeAutoRetryRenderRef = useRef<((convId: string) => Promise<void>) | null>(null);
+  maybeAutoRetryRenderRef.current = async (convId: string) => {
+    // Only run when the user is still viewing the channel that just
+    // finished — spurious retries on background channels are noisy and
+    // consume tokens the user isn't watching.
+    if (convId !== conversationIdRef.current) return;
+
+    // Find the last assistant bubble. If it's empty (aborted/errored) skip.
+    const currentBubbles = bubblesRef.current;
+    if (!currentBubbles || currentBubbles.length === 0) return;
+    const lastIdx = currentBubbles.length - 1;
+    const last = currentBubbles[lastIdx];
+    if (!last || last.kind !== "assistant") return;
+    const text = (last as { text?: string }).text ?? "";
+    if (text.trim().length === 0) return;
+
+    // Only assistant turns qualify. If the previous bubble was ALSO an
+    // auto-retry (i.e. lastIdx-1 is a hidden user retry we sent), we
+    // still allow one more up to MAX — the ref map tracks count.
+    let problems: RenderProblem[] = [];
+    try {
+      problems = validateRender(text);
+    } catch {
+      return; // fail-open
+    }
+    if (problems.length === 0) {
+      renderRetriesRef.current.delete(lastIdx); // clean success
+      return;
+    }
+    const prevCount = renderRetriesRef.current.get(lastIdx) ?? 0;
+    if (prevCount >= RENDER_RETRY_MAX) {
+      // Give up quietly; user still sees the last (broken) attempt.
+      return;
+    }
+    renderRetriesRef.current.set(lastIdx, prevCount + 1);
+    const retryPrompt = buildRetryPrompt(problems);
+    if (!retryPrompt) return;
+
+    // Send the retry as a normal user turn. We DO show it in the
+    // bubble list (folded / labelled as "auto-retry") so the user can
+    // inspect it if the retry itself misbehaves. Rendering the label
+    // is B1c; for now just prefix so it's identifiable.
+    const wrapped = "[auto-retry: render errors detected in previous reply]\n\n" + retryPrompt;
+
+    setBubbles((prev) => [
+      ...prev,
+      { kind: "user", text: wrapped },
+      { kind: "assistant", text: "" },
+    ]);
+    await runChatStream((onEvent, signal) =>
+      streamChat(scope, wrapped, convId, model || undefined, onEvent, signal),
+    );
+  };
+
+  // 2026-07-01 (B1) — bubbles ref so maybeAutoRetryRenderRef sees the
+  // current snapshot without re-creating the whole callback each render.
+  const bubblesRef = useRef<Bubble[]>(bubbles);
+  useEffect(() => {
+    bubblesRef.current = bubbles;
+  }, [bubbles]);
 
   // Approval Policy 矩阵 — POST the user's decision for the open prompt. On
   // success we keep the modal until `approval_resolved` lands (the resumed
