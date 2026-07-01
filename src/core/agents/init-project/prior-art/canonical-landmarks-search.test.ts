@@ -303,3 +303,371 @@ describe("defaultCrossrefSearch — export sanity", () => {
     expect(defaultCrossrefSearch.length).toBeGreaterThanOrEqual(1);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Stage 2 abstract capture (arxiv → crossref → openalex fallback chain)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("searchCanonicalLandmarks — abstract capture (Stages A/B/C/D → E)", () => {
+  it("stores arxiv abstract when arxiv Stage A hits", async () => {
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => [
+      arxivRes({
+        arxivId: "math/9911165",
+        title: "The McKay correspondence",
+        abstract: "We prove the McKay correspondence for finite subgroups of SL(3,C) via derived equivalences.",
+      }),
+    ];
+    // Crossref returns nothing so its abstract path is not tested here.
+    const openAlexCalls: string[] = [];
+    const hits = await searchCanonicalLandmarks(
+      { title: "McKay correspondence", tags: [] },
+      {
+        llm: async () => JSON.stringify([{ ...McKAY_LANDMARK, why: McKAY_LANDMARK.why }]),
+        searchArxivByTitle,
+        searchCrossref: async () => [],
+        fetchOpenAlexAbstract: async (doi) => { openAlexCalls.push(doi); return undefined; },
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.abstract).toContain("McKay correspondence for finite subgroups");
+    expect(hits[0]!.resolution.abstractSource).toBe("arxiv");
+    // With arxiv hit AND crossref empty (no DOI), Stage E should NOT be reached — cost saving.
+    expect(openAlexCalls).toEqual([]);
+  });
+
+  it("prefers arxiv abstract over crossref abstract when BOTH exist", async () => {
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => [
+      arxivRes({
+        arxivId: "math/1111",
+        title: "The McKay correspondence",
+        abstract: "ARXIV ABSTRACT: the definitive one",
+      }),
+    ];
+    const searchCrossref: CrossrefSearchFn = async () => [
+      { doi: "10.1000/foo", title: "The McKay correspondence", authors: ["Reid"], year: 2000, abstract: "CROSSREF abstract: also present" },
+    ];
+    const hits = await searchCanonicalLandmarks(
+      { title: "McKay correspondence", tags: [] },
+      {
+        llm: async () => JSON.stringify([McKAY_LANDMARK]),
+        searchArxivByTitle,
+        searchCrossref,
+        fetchOpenAlexAbstract: async () => undefined,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.abstract).toBe("ARXIV ABSTRACT: the definitive one");
+    expect(hits[0]!.resolution.abstractSource).toBe("arxiv");
+  });
+
+  it("falls back to crossref abstract when arxiv gave title match but no abstract text", async () => {
+    // Preprint had arxiv id but empty abstract (weird edge — old alg-geom archive entries sometimes)
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => [
+      arxivRes({ arxivId: "alg-geom/9612003", title: "The McKay correspondence", abstract: undefined }),
+    ];
+    const searchCrossref: CrossrefSearchFn = async () => [
+      { doi: "10.1000/foo", title: "The McKay correspondence", authors: ["Reid"], year: 2000, abstract: "CROSSREF filled in the abstract" },
+    ];
+    const hits = await searchCanonicalLandmarks(
+      { title: "McKay correspondence", tags: [] },
+      {
+        llm: async () => JSON.stringify([McKAY_LANDMARK]),
+        searchArxivByTitle,
+        searchCrossref,
+        fetchOpenAlexAbstract: async () => undefined,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.abstract).toBe("CROSSREF filled in the abstract");
+    expect(hits[0]!.resolution.abstractSource).toBe("crossref");
+  });
+
+  it("falls back to OpenAlex when arxiv AND crossref both lack abstract but crossref supplied DOI", async () => {
+    // No arxiv hit at all. Crossref has DOI but no abstract. OpenAlex fills in.
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => [];
+    const searchCrossref: CrossrefSearchFn = async () => [
+      { doi: "10.1090/pspum/046.1/927963", title: "Young person's guide to canonical singularities", authors: ["Reid"], year: 1987 },
+    ];
+    const openAlexAbs = async (doi: string) => {
+      expect(doi).toBe("10.1090/pspum/046.1/927963");
+      return "This lecture note surveys canonical and terminal singularities and discrepancies for 3-fold birational geometry.";
+    };
+    const hits = await searchCanonicalLandmarks(
+      { title: "McKay correspondence", tags: [] },
+      {
+        llm: async () => JSON.stringify([{ ...McKAY_LANDMARK, title: "Young person's guide to canonical singularities", titleEn: undefined, authors: ["Miles Reid"] }]),
+        searchArxivByTitle,
+        searchCrossref,
+        fetchOpenAlexAbstract: openAlexAbs,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.abstract).toContain("canonical and terminal singularities");
+    expect(hits[0]!.resolution.abstractSource).toBe("openalex");
+  });
+
+  it("does NOT call OpenAlex when there's no DOI (nothing to look up)", async () => {
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => [];
+    const searchCrossref: CrossrefSearchFn = async () => [];
+    const openAlexCalls: string[] = [];
+    const hits = await searchCanonicalLandmarks(
+      { title: "McKay correspondence", tags: [] },
+      {
+        llm: async () => JSON.stringify([McKAY_LANDMARK]),
+        searchArxivByTitle,
+        searchCrossref,
+        fetchOpenAlexAbstract: async (doi) => { openAlexCalls.push(doi); return undefined; },
+        rateDelayMs: 0,
+      },
+    );
+    expect(openAlexCalls).toEqual([]);
+    expect(hits[0]!.abstract).toBeUndefined();
+    expect(hits[0]!.resolution.abstractSource).toBe("none");
+  });
+
+  it("swallows OpenAlex errors without failing the whole hit", async () => {
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => [];
+    const searchCrossref: CrossrefSearchFn = async () => [
+      { doi: "10.1000/xyz", title: "The McKay correspondence", authors: ["Reid"], year: 2000 },
+    ];
+    const hits = await searchCanonicalLandmarks(
+      { title: "McKay correspondence", tags: [] },
+      {
+        llm: async () => JSON.stringify([McKAY_LANDMARK]),
+        searchArxivByTitle,
+        searchCrossref,
+        fetchOpenAlexAbstract: async () => { throw new Error("openalex down"); },
+        rateDelayMs: 0,
+      },
+    );
+    // Hit still returned, just no abstract.
+    expect(hits[0]!.doi).toBe("10.1000/xyz");
+    expect(hits[0]!.abstract).toBeUndefined();
+    expect(hits[0]!.resolution.abstractSource).toBe("none");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Stage 2.5 priority classifier
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Return a mock LLM: first call → landmarks JSON (Stage 1); second call → priority JSON (Stage 2.5).
+ * Simplifies test setup so we don't have to route by prompt inspection.
+ */
+function twoCallLLM(landmarksJson: string, priorityJson: string): SpineLLM {
+  let call = 0;
+  return async () => {
+    call++;
+    if (call === 1) return landmarksJson;
+    return priorityJson;
+  };
+}
+
+describe("searchCanonicalLandmarks — Stage 2.5 priority classifier", () => {
+  const THREE_LANDMARKS = [
+    { title: "BKR", titleEn: "The McKay correspondence as an equivalence of derived categories", authors: ["Bridgeland", "King", "Reid"], year: 2001, venue: "JAMS", why: "founding derived McKay" },
+    { title: "Haiman", titleEn: "Hilbert schemes, polygraphs and the Macdonald positivity conjecture", authors: ["Haiman"], year: 2001, venue: "JAMS", why: "sn-Hilb bridge" },
+    { title: "Klein", titleEn: "Lectures on the Icosahedron", authors: ["Klein"], year: 1884, venue: "Teubner", why: "polyhedral background" },
+  ];
+
+  it("applies core/important/supplementary tags from LLM output", async () => {
+    // Arxiv returns matches for all three so Stage E does not run.
+    const searchArxivByTitle: SearchArxivByTitleFn = async (q) => {
+      if (q.startsWith("au:")) return [];
+      if (/BKR|derived categories/i.test(q)) return [arxivRes({ arxivId: "math/9908027", title: "The McKay correspondence as an equivalence of derived categories", abstract: "Long enough abstract A: proves the derived McKay correspondence via Fourier-Mukai equivalence for G-Hilbert schemes." })];
+      if (/Hilbert.*polygraphs/i.test(q)) return [arxivRes({ arxivId: "math/0010246", title: "Hilbert schemes, polygraphs and the Macdonald positivity conjecture", abstract: "Long enough abstract B: uses polygraph freeness and blowup structure of the isospectral Hilbert scheme." })];
+      if (/Icosahedron/i.test(q)) return [arxivRes({ arxivId: "0000.klein", title: "Lectures on the Icosahedron", abstract: "Long enough abstract C: classical background on binary polyhedral groups and invariant theory of the icosahedron." })];
+      return [];
+    };
+    const priorityJson = JSON.stringify([
+      { index: 0, priority: "core", reasoning: "the founding derived-McKay theorem" },
+      { index: 1, priority: "important", reasoning: "primary technique bridge" },
+      { index: 2, priority: "supplementary", reasoning: "classical background only" },
+    ]);
+    const hits = await searchCanonicalLandmarks(
+      { title: "McKay correspondence", tags: [] },
+      {
+        llm: twoCallLLM(JSON.stringify(THREE_LANDMARKS), priorityJson),
+        searchArxivByTitle,
+        searchCrossref: async () => [],
+        fetchOpenAlexAbstract: async () => undefined,
+        rateDelayMs: 0,
+      },
+    );
+    // Ordering by "arxiv resolved first" — since all 3 got arxiv, order is by insertion.
+    const byArxivId = new Map(hits.map((h) => [h.arxivId, h]));
+    expect(byArxivId.get("math/9908027")!.priority).toBe("core");
+    expect(byArxivId.get("math/9908027")!.priorityReasoning).toContain("founding");
+    // abstract is > 20 chars so low-confidence should be false
+    expect(byArxivId.get("math/9908027")!.priorityLowConfidence).toBe(false);
+    expect(byArxivId.get("math/0010246")!.priority).toBe("important");
+    expect(byArxivId.get("0000.klein")!.priority).toBe("supplementary");
+  });
+
+  it("marks priorityLowConfidence=false when abstract is present and >20 chars", async () => {
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => [
+      arxivRes({
+        arxivId: "math/x",
+        title: "Sample landmark title with enough words for similarity",
+        abstract: "A long enough abstract to survive the 20-char filter in resolveOneLandmark",
+      }),
+    ];
+    const priorityJson = JSON.stringify([{ index: 0, priority: "core", reasoning: "founding" }]);
+    const hits = await searchCanonicalLandmarks(
+      { title: "test", tags: [] },
+      {
+        llm: twoCallLLM(JSON.stringify([{
+          title: "Sample landmark title with enough words for similarity",
+          titleEn: "Sample landmark title with enough words for similarity",
+          authors: ["A"],
+          year: 2000,
+          why: "w",
+        }]), priorityJson),
+        searchArxivByTitle,
+        searchCrossref: async () => [],
+        fetchOpenAlexAbstract: async () => undefined,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.priority).toBe("core");
+    expect(hits[0]!.priorityLowConfidence).toBe(false);
+    expect(hits[0]!.arxivId).toBe("math/x");
+  });
+
+  it("marks priorityLowConfidence=true when abstract is missing", async () => {
+    // Arxiv returns match but WITHOUT abstract (edge case: alg-geom archive entries).
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => [
+      arxivRes({
+        arxivId: "math/x",
+        title: "Sample landmark title with enough words for similarity",
+        abstract: undefined,
+      }),
+    ];
+    const priorityJson = JSON.stringify([{ index: 0, priority: "core", reasoning: "founding" }]);
+    const hits = await searchCanonicalLandmarks(
+      { title: "test", tags: [] },
+      {
+        llm: twoCallLLM(JSON.stringify([{
+          title: "Sample landmark title with enough words for similarity",
+          titleEn: "Sample landmark title with enough words for similarity",
+          authors: ["A"],
+          year: 2000,
+          why: "w",
+        }]), priorityJson),
+        searchArxivByTitle,
+        searchCrossref: async () => [],
+        fetchOpenAlexAbstract: async () => undefined,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.abstract).toBeUndefined();
+    expect(hits[0]!.priority).toBe("core");
+    expect(hits[0]!.priorityLowConfidence).toBe(true);
+  });
+
+  it("caps 'core' at 5 — demotes 6th+ to 'important'", async () => {
+    // Six landmarks, LLM greedily tags all six as core. Post-parse cap enforces max 5.
+    const six = Array.from({ length: 6 }, (_, i) => ({
+      title: `Paper ${i}`, titleEn: `Paper ${i}`, authors: [`Author${i}`], year: 2000 + i, venue: "V", why: "canon",
+    }));
+    const searchArxivByTitle: SearchArxivByTitleFn = async (q) => {
+      if (q.startsWith("au:")) {
+        const m = q.match(/au:Author(\d)/);
+        if (m) return [arxivRes({ arxivId: `arxiv/${m[1]}`, title: `Paper ${m[1]}`, abstract: `abs ${m[1]}` })];
+      }
+      // Full-title search
+      const m = q.match(/^Paper (\d)/);
+      if (m) return [arxivRes({ arxivId: `arxiv/${m[1]}`, title: `Paper ${m[1]}`, abstract: `abs ${m[1]}` })];
+      return [];
+    };
+    const priorityJson = JSON.stringify([
+      { index: 0, priority: "core", reasoning: "x" },
+      { index: 1, priority: "core", reasoning: "x" },
+      { index: 2, priority: "core", reasoning: "x" },
+      { index: 3, priority: "core", reasoning: "x" },
+      { index: 4, priority: "core", reasoning: "x" },
+      { index: 5, priority: "core", reasoning: "x" }, // this one should be demoted to important
+    ]);
+    const hits = await searchCanonicalLandmarks(
+      { title: "test", tags: [] },
+      {
+        llm: twoCallLLM(JSON.stringify(six), priorityJson),
+        searchArxivByTitle,
+        searchCrossref: async () => [],
+        fetchOpenAlexAbstract: async () => undefined,
+        rateDelayMs: 0,
+      },
+    );
+    const coreN = hits.filter((h) => h.priority === "core").length;
+    const impN = hits.filter((h) => h.priority === "important").length;
+    expect(coreN).toBe(5);
+    expect(impN).toBe(1);
+  });
+
+  it("leaves priority undefined when Stage 2.5 LLM output is unparseable", async () => {
+    const searchArxivByTitle: SearchArxivByTitleFn = async (q) =>
+      q.startsWith("au:") ? [] : [arxivRes({ arxivId: "math/x", title: "T", abstract: "a" })];
+    // Second LLM call returns garbage.
+    const hits = await searchCanonicalLandmarks(
+      { title: "test", tags: [] },
+      {
+        llm: twoCallLLM(JSON.stringify([{ title: "T", titleEn: "T", authors: ["A"], year: 2000, why: "w" }]), "not json"),
+        searchArxivByTitle,
+        searchCrossref: async () => [],
+        fetchOpenAlexAbstract: async () => undefined,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.priority).toBeUndefined();
+    expect(hits[0]!.priorityReasoning).toBeUndefined();
+  });
+
+  it("leaves priority undefined when Stage 2.5 LLM throws", async () => {
+    const TITLE = "Sample landmark title with enough words";
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => [
+      arxivRes({ arxivId: "math/x", title: TITLE, abstract: "An abstract long enough to survive filters." }),
+    ];
+    let call = 0;
+    const llm: SpineLLM = async () => {
+      call++;
+      if (call === 1) return JSON.stringify([{ title: TITLE, titleEn: TITLE, authors: ["A"], year: 2000, why: "w" }]);
+      throw new Error("Stage 2.5 LLM died");
+    };
+    const hits = await searchCanonicalLandmarks(
+      { title: "test", tags: [] },
+      {
+        llm,
+        searchArxivByTitle,
+        searchCrossref: async () => [],
+        fetchOpenAlexAbstract: async () => undefined,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.priority).toBeUndefined();
+    // But other fields survived — the hit itself is intact.
+    expect(hits[0]!.arxivId).toBe("math/x");
+  });
+
+  it("ignores entries with invalid tier strings or out-of-range indices", async () => {
+    const TITLE = "Sample landmark title with enough words";
+    const searchArxivByTitle: SearchArxivByTitleFn = async () => [
+      arxivRes({ arxivId: "math/x", title: TITLE, abstract: "An abstract long enough to survive filters." }),
+    ];
+    const priorityJson = JSON.stringify([
+      { index: 0, priority: "URGENT", reasoning: "invalid tier" }, // bad
+      { index: 99, priority: "core", reasoning: "out of range" }, // bad
+    ]);
+    const hits = await searchCanonicalLandmarks(
+      { title: "test", tags: [] },
+      {
+        llm: twoCallLLM(JSON.stringify([{ title: TITLE, titleEn: TITLE, authors: ["A"], year: 2000, why: "w" }]), priorityJson),
+        searchArxivByTitle,
+        searchCrossref: async () => [],
+        fetchOpenAlexAbstract: async () => undefined,
+        rateDelayMs: 0,
+      },
+    );
+    expect(hits[0]!.priority).toBeUndefined();
+  });
+});

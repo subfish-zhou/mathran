@@ -71,12 +71,44 @@ export interface CanonicalLandmarkHit {
   crossrefVenue?: string;
   /** Year as Crossref reports it (may differ from LLM-named year for reprints). */
   crossrefYear?: number;
+  /**
+   * Abstract fetched during Stage 2 resolution. Preference order: arxiv Atom `<summary>`
+   * → Crossref `abstract` (JATS-stripped) → OpenAlex `abstract_inverted_index` (rebuilt).
+   * Undefined when no source had one (pre-arxiv classics whose only home is a bare
+   * Crossref bib record). Used by Stage 2.5 classifier to judge core/important/supplementary.
+   */
+  abstract?: string;
+  /**
+   * Priority tier assigned by Stage 2.5 based on abstract + why + venue.
+   * Absent when Stage 2.5 was skipped (e.g. LLM classifier failed → leave undefined so
+   * downstream can treat "no tag" as "unknown, assume important-enough not to block").
+   */
+  priority?: LandmarkPriority;
+  /** Short justification from Stage 2.5 explaining the priority tier. */
+  priorityReasoning?: string;
+  /** True when Stage 2.5 marked its priority as low-confidence (usually because abstract was missing). */
+  priorityLowConfidence?: boolean;
   /** How we resolved this landmark, for debugging / unresolved-citation hints. */
   resolution: {
     arxivAttempts: string[]; // e.g. ["arxiv: 0 hits", "arxiv: matched 'A New …'"]
     crossrefAttempts: string[]; // e.g. ["crossref: matched DOI 10.1142/..."]
+    abstractSource?: "arxiv" | "crossref" | "openalex" | "none"; // where the abstract came from (or none)
   };
 }
+
+/**
+ * Three-tier priority for canonical landmarks.
+ *
+ * - `core`: field-founding / theorem-forming. Missing full-text on ANY core paper is a
+ *   hard problem for the survey — the LLM will be reduced to training-memory paraphrase
+ *   for a load-bearing claim. Pipeline should surface these to the user and offer the
+ *   upload-and-rerun path. Cap ≤ 5 per corpus (LLM prompt enforces).
+ * - `important`: major refinement, primary technique paper, or authoritative modern
+ *   restatement. Losing a couple is tolerable but a wiki page's argument may thin out.
+ * - `supplementary`: useful context, historical background, related-field bridge. Losing
+ *   most has no visible impact on the wiki's core narrative.
+ */
+export type LandmarkPriority = "core" | "important" | "supplementary";
 
 export type SearchArxivByTitleFn = (
   query: string,
@@ -100,12 +132,22 @@ export interface CrossrefWork {
   venue?: string;
   /** Crossref's `is-referenced-by-count` — useful as a coarse landmark sanity check. */
   citationCount?: number;
+  /**
+   * Abstract when Crossref stores one. Crossref returns JATS XML in the `abstract` field;
+   * we strip tags to plain text. Often empty for older / non-STEM works.
+   */
+  abstract?: string;
 }
 
 export interface CanonicalLandmarksDeps {
   llm: SpineLLM;
   searchArxivByTitle?: SearchArxivByTitleFn;
   searchCrossref?: CrossrefSearchFn;
+  /**
+   * Third-tier abstract fetcher for DOI-only landmarks with no arxiv/Crossref abstract.
+   * Defaults to {@link fetchOpenAlexAbstract}.
+   */
+  fetchOpenAlexAbstract?: (doi: string) => Promise<string | undefined>;
   rateDelayMs?: number;
   /** UA string for Crossref (they ask for a polite identifier). */
   crossrefUserAgent?: string;
@@ -190,10 +232,69 @@ export async function defaultCrossrefSearch(
     const venue = Array.isArray(venueArr) && typeof venueArr[0] === "string" ? venueArr[0] : undefined;
     const citationCount =
       typeof r["is-referenced-by-count"] === "number" ? (r["is-referenced-by-count"] as number) : undefined;
+    // Crossref stores `abstract` as JATS XML wrapped in <jats:p>…</jats:p>. Strip tags
+    // to plain text; if the field is missing or unstrippable, leave undefined.
+    const abstract = typeof r.abstract === "string" ? stripJatsToPlainText(r.abstract) : undefined;
 
-    works.push({ doi, title, authors, year, venue, citationCount });
+    works.push({ doi, title, authors, year, venue, citationCount, abstract });
   }
   return works;
+}
+
+/**
+ * Strip JATS XML tags (Crossref's `abstract` field format) to plain text.
+ * Simple regex approach — good enough for LLM consumption; a full XML parser would
+ * be overkill for what is usually 1-3 paragraphs of prose.
+ */
+function stripJatsToPlainText(jats: string): string | undefined {
+  const stripped = jats
+    .replace(/<[^>]+>/g, " ")            // drop all tags
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+  return stripped.length > 0 ? stripped : undefined;
+}
+
+/**
+ * Fetch abstract for a DOI from OpenAlex, used as third-tier fallback after arxiv and
+ * Crossref. OpenAlex stores `abstract_inverted_index` (positional map word→[positions]);
+ * we reconstruct the running text by sorting positions and joining tokens.
+ *
+ * Returns undefined on any failure or when OpenAlex has no abstract for the DOI.
+ */
+export async function fetchOpenAlexAbstract(
+  doi: string,
+  userAgent: string = DEFAULT_CROSSREF_UA,
+): Promise<string | undefined> {
+  const url = `https://api.openalex.org/works/https://doi.org/${encodeURIComponent(doi)}?mailto=frieren@mathran.io`;
+  let resp: Response;
+  try {
+    resp = await fetch(url, { headers: { "User-Agent": userAgent } });
+  } catch {
+    return undefined;
+  }
+  if (!resp.ok) return undefined;
+  let payload: unknown;
+  try {
+    payload = await resp.json();
+  } catch {
+    return undefined;
+  }
+  const inv = (payload as { abstract_inverted_index?: Record<string, unknown> })?.abstract_inverted_index;
+  if (!inv || typeof inv !== "object") return undefined;
+  // Invert: word → [positions] into position → word.
+  const positions: Array<[number, string]> = [];
+  for (const [word, posList] of Object.entries(inv)) {
+    if (!Array.isArray(posList)) continue;
+    for (const p of posList) {
+      if (typeof p === "number") positions.push([p, word]);
+    }
+  }
+  if (positions.length === 0) return undefined;
+  positions.sort((a, b) => a[0] - b[0]);
+  const text = positions.map(([, w]) => w).join(" ").trim();
+  return text.length > 0 ? text : undefined;
 }
 
 // ── Stage 1: LLM proposes canon ──────────────────────────────────────────────
@@ -369,6 +470,7 @@ async function resolveOneLandmark(
   deps: {
     searchArxivByTitle: SearchArxivByTitleFn;
     searchCrossref: CrossrefSearchFn;
+    fetchOpenAlexAbstract: (doi: string) => Promise<string | undefined>;
     rateMs: number;
     log: (m: string) => void;
   },
@@ -392,17 +494,21 @@ async function resolveOneLandmark(
   let doi: string | undefined;
   let crossrefVenue: string | undefined;
   let crossrefYear: number | undefined;
+  // Track abstract candidates from each source; select best at the end.
+  // Preference order: arxiv (always accurate for the paper) → crossref → openalex.
+  let arxivAbstract: string | undefined;
+  let crossrefAbstract: string | undefined;
 
   // Pick the best-scoring arxiv candidate above a given threshold. Returns null when nothing qualifies.
   const pickBest = (
     hits: CrawledResource[],
     threshold: number,
-  ): { id: string; title: string; score: number } | null => {
-    let best: { id: string; title: string; score: number } | null = null;
+  ): { id: string; title: string; abstract?: string; score: number } | null => {
+    let best: { id: string; title: string; abstract?: string; score: number } | null = null;
     for (const h of hits) {
       if (!h.arxivId) continue;
       const sim = simBest(h.title);
-      if (!best || sim > best.score) best = { id: h.arxivId, title: h.title, score: sim };
+      if (!best || sim > best.score) best = { id: h.arxivId, title: h.title, abstract: h.abstract, score: sim };
     }
     return best && best.score >= threshold ? best : null;
   };
@@ -418,6 +524,7 @@ async function resolveOneLandmark(
       const matched = pickBest(hits, TITLE_MATCH_THRESHOLD);
       if (matched) {
         arxivId = matched.id;
+        arxivAbstract = matched.abstract;
         arxivAttempts.push(`arxiv[title]: matched ${matched.id} (sim=${matched.score.toFixed(2)})`);
       } else {
         const best = pickBest(hits, 0); // any candidate, for logging
@@ -459,6 +566,7 @@ async function resolveOneLandmark(
           const matched = pickBest(hits, AUTHOR_QUERY_TITLE_THRESHOLD);
           if (matched) {
             arxivId = matched.id;
+            arxivAbstract = matched.abstract;
             arxivAttempts.push(
               `arxiv[au+kw]: matched ${matched.id} (sim=${matched.score.toFixed(2)}) via "${q}"`,
             );
@@ -499,6 +607,7 @@ async function resolveOneLandmark(
         doi = best.w.doi;
         crossrefVenue = best.w.venue;
         crossrefYear = best.w.year;
+        crossrefAbstract = best.w.abstract;
         crossrefAttempts.push(`crossref: matched ${doi} (sim=${best.score.toFixed(2)})`);
       } else {
         crossrefAttempts.push(
@@ -538,6 +647,7 @@ async function resolveOneLandmark(
           const matched = pickBest(hits, AUTHOR_QUERY_TITLE_THRESHOLD);
           if (matched) {
             arxivId = matched.id;
+            arxivAbstract = matched.abstract;
             arxivAttempts.push(
               `arxiv[post-crossref]: matched ${matched.id} (sim=${matched.score.toFixed(2)}) via "${q}"`,
             );
@@ -554,6 +664,41 @@ async function resolveOneLandmark(
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // Stage E: OpenAlex abstract fallback (NEW — 2026-07-01 fix)
+  //
+  // Why: arxiv Atom `<summary>` is always populated when we hit arxiv, but
+  // for doi-only landmarks Crossref frequently omits the `abstract` field
+  // (older non-STEM works, book chapters, etc.). OpenAlex has abstracts for
+  // a much larger fraction of these (via publisher metadata harvesting).
+  // Only reached when we have a DOI but neither arxiv nor Crossref gave an
+  // abstract — cheapest bandwidth for the biggest recall bump. Stage 2.5
+  // classifier's judgment quality directly depends on abstract coverage, so
+  // one extra HTTP call per landmark is well worth it.
+  // ─────────────────────────────────────────────────────────────────────
+  let openalexAbstract: string | undefined;
+  if (doi && !arxivAbstract && !crossrefAbstract) {
+    try {
+      openalexAbstract = await deps.fetchOpenAlexAbstract(doi);
+    } catch (err) {
+      deps.log(`[canonical-landmarks] openalex abstract fetch failed for ${doi}: ${String(err).slice(0, 80)}`);
+    }
+  }
+
+  // Pick best abstract by source priority: arxiv > crossref > openalex.
+  let abstractText: string | undefined;
+  let abstractSource: "arxiv" | "crossref" | "openalex" | "none" = "none";
+  if (arxivAbstract && arxivAbstract.length > 20) {
+    abstractText = arxivAbstract;
+    abstractSource = "arxiv";
+  } else if (crossrefAbstract && crossrefAbstract.length > 20) {
+    abstractText = crossrefAbstract;
+    abstractSource = "crossref";
+  } else if (openalexAbstract && openalexAbstract.length > 20) {
+    abstractText = openalexAbstract;
+    abstractSource = "openalex";
+  }
+
   return {
     title: lm.title,
     authors: lm.authors,
@@ -564,11 +709,163 @@ async function resolveOneLandmark(
     doi,
     crossrefVenue,
     crossrefYear,
-    resolution: { arxivAttempts, crossrefAttempts },
+    abstract: abstractText,
+    resolution: { arxivAttempts, crossrefAttempts, abstractSource },
   };
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
+
+/**
+ * Stage 2.5 — priority classifier. Reads each landmark's abstract + `why`
+ * and assigns one of core / important / supplementary based on how load-bearing
+ * the paper is for a survey of `problem.title`.
+ *
+ * Mutates `hits` in place, setting `priority`, `priorityReasoning`, and
+ * `priorityLowConfidence` on each entry. Never throws — on LLM failure or
+ * unparseable output, hits are left untagged (undefined priority) so downstream
+ * treats them as "unknown, don't block".
+ *
+ * Enforces via prompt: at most 5 core, at most 8 important. LLM output is
+ * parsed defensively — any entry with an unrecognized tier or missing hit index
+ * is skipped.
+ */
+async function classifyLandmarksByPriority(
+  hits: CanonicalLandmarkHit[],
+  problem: { title: string; background?: string; formalStatement?: string; tags?: string[] },
+  llm: SpineLLM,
+  log: (m: string) => void,
+): Promise<void> {
+  if (hits.length === 0) return;
+
+  const abstractCount = hits.filter((h) => h.abstract).length;
+  log(`[canonical-landmarks] Stage 2.5 classifying ${hits.length} landmarks (${abstractCount} with abstracts)`);
+
+  const prompt = buildPriorityClassifierPrompt(problem, hits);
+  let reply: string;
+  try {
+    reply = await llm(prompt, { temperature: 0.1 });
+  } catch (err) {
+    log(`[canonical-landmarks] Stage 2.5 LLM call failed: ${String(err).slice(0, 120)}`);
+    return;
+  }
+
+  const parsed = extractSpineJSON<unknown>(reply);
+  if (!Array.isArray(parsed)) {
+    log(`[canonical-landmarks] Stage 2.5 LLM output was not an array; leaving landmarks untagged`);
+    return;
+  }
+
+  let coreAssigned = 0;
+  let importantAssigned = 0;
+  let applied = 0;
+  for (const raw of parsed) {
+    if (!raw || typeof raw !== "object") continue;
+    const r = raw as Record<string, unknown>;
+    const idx = typeof r.index === "number" ? r.index : Number(r.index);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= hits.length) continue;
+    const tier = typeof r.priority === "string" ? r.priority.toLowerCase().trim() : "";
+    if (tier !== "core" && tier !== "important" && tier !== "supplementary") continue;
+    const reasoning = typeof r.reasoning === "string" ? r.reasoning.trim().slice(0, 300) : "";
+
+    // Enforce caps: if LLM ignored the "at most 5 core" instruction, demote overflow to important.
+    let finalTier: LandmarkPriority = tier as LandmarkPriority;
+    if (finalTier === "core") {
+      if (coreAssigned >= 5) {
+        finalTier = "important";
+      } else {
+        coreAssigned++;
+      }
+    }
+    if (finalTier === "important") {
+      if (importantAssigned >= 8) {
+        finalTier = "supplementary";
+      } else {
+        importantAssigned++;
+      }
+    }
+
+    const hit = hits[idx]!;
+    hit.priority = finalTier;
+    hit.priorityReasoning = reasoning;
+    hit.priorityLowConfidence = !hit.abstract; // no abstract → judgment is title+why-only, mark uncertain
+    applied++;
+  }
+  log(`[canonical-landmarks] Stage 2.5 applied priority to ${applied}/${hits.length} landmarks`);
+}
+
+/**
+ * Prompt for the priority classifier. Feeds the LLM one summary block per hit —
+ * `[index] title / authors year / venue / why / abstract` — and asks for a JSON
+ * array `[{index, priority, reasoning}, ...]`. The definitions of the three
+ * tiers are baked in so the LLM applies the same yardstick every time.
+ */
+function buildPriorityClassifierPrompt(
+  problem: { title: string; background?: string; formalStatement?: string; tags?: string[] },
+  hits: CanonicalLandmarkHit[],
+): string {
+  const blocks = hits.map((h, i) => {
+    const authors = h.authors.slice(0, 4).join(", ") + (h.authors.length > 4 ? " et al." : "");
+    const yearPart = h.year ?? h.crossrefYear ?? "?";
+    const venue = h.venue ?? h.crossrefVenue ?? "";
+    const arxivPart = h.arxivId ? ` arxiv:${h.arxivId}` : "";
+    const doiPart = h.doi ? ` doi:${h.doi}` : "";
+    const abstract = h.abstract
+      ? `\n    abstract: ${h.abstract.slice(0, 1500)}`
+      : "\n    abstract: (unavailable — judge from title + why + venue only, mark low-confidence)";
+    return `[${i}] "${h.title}"
+    authors: ${authors} (${yearPart})
+    venue: ${venue}${arxivPart}${doiPart}
+    why: ${h.why}${abstract}`;
+  }).join("\n\n");
+
+  return [
+    `You are a mathematics research librarian classifying the priority of canonical papers`,
+    `for a survey on "${problem.title}".`,
+    "",
+    problem.background ? `BACKGROUND (state of the art):\n${problem.background.slice(0, 2500)}\n` : "",
+    problem.tags && problem.tags.length ? `TAGS: ${problem.tags.join(", ")}\n` : "",
+    "",
+    `THREE PRIORITY TIERS (be strict — see caps at the bottom):`,
+    ``,
+    `  "core" — the paper is FIELD-FOUNDING or THEOREM-FORMING for this problem. If a`,
+    `           reader missed this paper they could not understand the subject at all.`,
+    `           A survey MUST engage with the actual statement / proof strategy of`,
+    `           these papers. Examples across math: Wiles for Fermat, Perelman for`,
+    `           Poincaré, Deligne for Weil, Chen 1973 for Goldbach.`,
+    ``,
+    `  "important" — a major refinement, primary technique paper, or the modern`,
+    `                authoritative restatement. A survey that skips this loses a`,
+    `                significant argument or historical thread but the core narrative`,
+    `                survives.`,
+    ``,
+    `  "supplementary" — useful context, historical background, related-field bridge,`,
+    `                    or one-of-many refinements. Losing most of these is invisible`,
+    `                    to a reader.`,
+    ``,
+    `LANDMARKS TO CLASSIFY:`,
+    "",
+    blocks,
+    "",
+    `Output ONLY a JSON array of objects, one per landmark:`,
+    `  [{"index": 0, "priority": "core", "reasoning": "..."},`,
+    `   {"index": 1, "priority": "important", "reasoning": "..."}, ...]`,
+    ``,
+    `RULES:`,
+    `  - Include EVERY landmark by index (0..${hits.length - 1}); do not skip any.`,
+    `  - At most 5 "core" landmarks total across all ${hits.length} papers. If everything`,
+    `    feels core, you are being too generous — think "would a serious survey be`,
+    `    misleading without engaging with this specific paper?"`,
+    `  - At most 8 "important" total.`,
+    `  - Everything else is "supplementary".`,
+    `  - Reasoning: one short sentence explaining the tier. For "core" specifically,`,
+    `    name what would break if this paper were absent.`,
+    `  - When abstract is (unavailable), still assign a tier from title + venue + why,`,
+    `    but keep reasoning terse ("no abstract, judged from title + venue only").`,
+    ``,
+    `Output ONLY the JSON array, no surrounding prose, no markdown fences.`,
+  ].filter(Boolean).join("\n");
+}
 
 /**
  * Two-stage canonical-landmarks discovery. Returns the resolved landmarks
@@ -599,6 +896,9 @@ export async function searchCanonicalLandmarks(
   const searchCrossref =
     deps.searchCrossref ??
     ((q) => defaultCrossrefSearch(q, deps.crossrefUserAgent ?? DEFAULT_CROSSREF_UA));
+  const fetchOpenAlexAbs =
+    deps.fetchOpenAlexAbstract ??
+    ((doi) => fetchOpenAlexAbstract(doi, deps.crossrefUserAgent ?? DEFAULT_CROSSREF_UA));
 
   // Stage 1: propose
   let proposed: ProposedLandmark[];
@@ -634,6 +934,7 @@ export async function searchCanonicalLandmarks(
       const hit = await resolveOneLandmark(proposed[i]!, {
         searchArxivByTitle,
         searchCrossref,
+        fetchOpenAlexAbstract: fetchOpenAlexAbs,
         rateMs: crossrefRate,
         log,
       });
@@ -649,9 +950,32 @@ export async function searchCanonicalLandmarks(
         resolution: {
           arxivAttempts: [`error: ${String(err).slice(0, 80)}`],
           crossrefAttempts: [],
+          abstractSource: "none",
         },
       });
     }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Stage 2.5: LLM classifies resolved landmarks by priority (2026-07-01)
+  //
+  // The classifier reads each hit's abstract (fetched during Stage 2) plus its
+  // `why` justification and assigns a priority tier: core / important /
+  // supplementary. Downstream (reading-loop, wiki writer, run report) can then
+  // treat "missing core" differently from "missing supplementary":
+  //   - core missing → pause and ask user to upload PDF
+  //   - important missing → note in wiki bibliography's external-references section
+  //   - supplementary missing → silent
+  //
+  // Failure-isolated: any LLM failure or unparseable output leaves the hits
+  // without priority tags (undefined). Downstream code treats "no tag" as
+  // "unknown, assume important-enough not to block" — always safer than
+  // false-classifying something as supplementary and silently skipping it.
+  // ─────────────────────────────────────────────────────────────────────
+  try {
+    await classifyLandmarksByPriority(hits, problem, deps.llm, log);
+  } catch (err) {
+    log(`[canonical-landmarks] Stage 2.5 (priority classifier) failed — leaving hits untagged: ${String(err).slice(0, 120)}`);
   }
 
   // Sort: arxiv-resolved first, then doi-only, then fully unresolved.
@@ -664,8 +988,14 @@ export async function searchCanonicalLandmarks(
   const arxivCount = hits.filter((h) => h.arxivId).length;
   const doiCount = hits.filter((h) => !h.arxivId && h.doi).length;
   const unresolvedCount = hits.filter((h) => !h.arxivId && !h.doi).length;
+  const coreCount = hits.filter((h) => h.priority === "core").length;
+  const impCount = hits.filter((h) => h.priority === "important").length;
+  const suppCount = hits.filter((h) => h.priority === "supplementary").length;
+  const abstractCount = hits.filter((h) => h.abstract).length;
   log(
-    `[canonical-landmarks] resolved: ${arxivCount} arxiv, ${doiCount} doi-only, ${unresolvedCount} unresolved`,
+    `[canonical-landmarks] resolved: ${arxivCount} arxiv, ${doiCount} doi-only, ${unresolvedCount} unresolved; ` +
+      `abstract-coverage=${abstractCount}/${hits.length}; ` +
+      `priority: ${coreCount} core, ${impCount} important, ${suppCount} supplementary`,
   );
 
   return hits;

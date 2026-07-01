@@ -6,9 +6,17 @@
  *
  * We mock the LLM to return the exact 15 landmarks the McKay run produced
  * (extracted from wiki/bibliography.md), then let the real resolver do its work.
+ *
+ * 2026-07-01 update: Stage 2.5 needs a REAL LLM to classify priority. If the
+ * env variable AZURE_OPENAI_API_KEY is set (source ~/.config/mathran-portal.env),
+ * we call azure/gpt55 for the classifier step. If not set, we still run Stages
+ * A-E (all HTTP) and skip Stage 2.5 with a note.
  */
 import { searchCanonicalLandmarks } from "../dist/core/agents/init-project/prior-art/canonical-landmarks-search.js";
 import { searchArxiv } from "../dist/core/agents/init-project/crawlers.js";
+import { loadConfig } from "../dist/core/config.js";
+import { ModelRouter } from "../dist/providers/index.js";
+import { makeSpineLLM } from "../dist/core/agents/init-project/spine/llm.js";
 
 // The 15 canon landmarks the McKay run picked (reverse-engineered from
 // mckay-correspondence project's bibliography.md). Not every single one from
@@ -50,8 +58,30 @@ async function main() {
   console.log(`Probing ${MCKAY_15.length} canon landmarks with the improved resolver…\n`);
   const startedAt = Date.now();
 
-  // Mock the LLM to return exactly our 15 landmarks (skip the LLM proposal step).
-  const llm = async () => JSON.stringify(MCKAY_15);
+  // Try to load a real LLM for Stage 2.5 classifier. If unavailable, fall back
+  // to a mock that returns valid-but-untagged JSON so Stages A-E still run.
+  let realLLM = null;
+  try {
+    const cfg = loadConfig();
+    const router = new ModelRouter(cfg);
+    const azureProvider = router.getProvider("azure");
+    // Wrap in makeSpineLLM the same way agent.ts does.
+    realLLM = makeSpineLLM(azureProvider, "azure/gpt55");
+    console.log(`✓ Real Azure LLM loaded for Stage 2.5 classifier`);
+  } catch (err) {
+    console.log(`⚠ Could not load real LLM (${err.message}); Stage 2.5 will use mock and produce untagged output`);
+  }
+
+  // First LLM call = Stage 1 (returns MCKAY_15). Second call = Stage 2.5 (real LLM if available).
+  let callCount = 0;
+  const llm = async (prompt, opts) => {
+    callCount++;
+    if (callCount === 1) return JSON.stringify(MCKAY_15);
+    // Stage 2.5 call
+    if (realLLM) return realLLM(prompt, opts);
+    // Fallback: return valid-but-empty JSON so classifier parses cleanly but tags nothing.
+    return "[]";
+  };
 
   const logs = [];
   const hits = await searchCanonicalLandmarks(
@@ -62,6 +92,8 @@ async function main() {
       searchArxivByTitle: (q, n) => searchArxiv(q, n),
       // Use the default Crossref client (real network).
       searchCrossref: undefined,
+      // Use the default OpenAlex abstract fetcher (real network).
+      fetchOpenAlexAbstract: undefined,
       rateDelayMs: 3500, // arxiv rate limit is 1 req/3s — be polite
       emitLog: (m) => { logs.push(m); console.log(`  [log] ${m}`); },
     },
@@ -77,18 +109,44 @@ async function main() {
   const doiOnly = hits.filter((h) => !h.arxivId && h.doi).length;
   const unresolved = hits.filter((h) => !h.arxivId && !h.doi).length;
   const arxivTotal = arxivOnly + arxivPlusDoi;
+  const withAbstract = hits.filter((h) => h.abstract).length;
+  const byAbsSrc = {
+    arxiv: hits.filter((h) => h.resolution.abstractSource === "arxiv").length,
+    crossref: hits.filter((h) => h.resolution.abstractSource === "crossref").length,
+    openalex: hits.filter((h) => h.resolution.abstractSource === "openalex").length,
+    none: hits.filter((h) => h.resolution.abstractSource === "none" || !h.resolution.abstractSource).length,
+  };
+  const byPriority = {
+    core: hits.filter((h) => h.priority === "core").length,
+    important: hits.filter((h) => h.priority === "important").length,
+    supplementary: hits.filter((h) => h.priority === "supplementary").length,
+    untagged: hits.filter((h) => !h.priority).length,
+  };
 
   console.log(`Total: ${hits.length}`);
   console.log(`  arxiv resolved (readable full-text): ${arxivTotal} (${arxivOnly} arxiv-only, ${arxivPlusDoi} arxiv+doi)`);
   console.log(`  doi only:      ${doiOnly}`);
-  console.log(`  unresolved:    ${unresolved}\n`);
+  console.log(`  unresolved:    ${unresolved}`);
+  console.log(`\nAbstract coverage: ${withAbstract}/${hits.length}`);
+  console.log(`  from arxiv:    ${byAbsSrc.arxiv}`);
+  console.log(`  from crossref: ${byAbsSrc.crossref}`);
+  console.log(`  from openalex: ${byAbsSrc.openalex}`);
+  console.log(`  none:          ${byAbsSrc.none}`);
+  console.log(`\nStage 2.5 priority tags:`);
+  console.log(`  core:          ${byPriority.core}`);
+  console.log(`  important:     ${byPriority.important}`);
+  console.log(`  supplementary: ${byPriority.supplementary}`);
+  console.log(`  untagged:      ${byPriority.untagged}\n`);
 
   console.log(`Per-landmark trail:`);
   for (const h of hits) {
     const marker = h.arxivId ? "✅" : h.doi ? "📄" : "❌";
-    console.log(`\n${marker} ${h.title}${h.titleEn && h.titleEn !== h.title ? ` (en: ${h.titleEn})` : ""}`);
+    const pri = h.priority ? `[${h.priority}${h.priorityLowConfidence ? "*" : ""}]` : "[untagged]";
+    console.log(`\n${marker} ${pri} ${h.title}${h.titleEn && h.titleEn !== h.title ? ` (en: ${h.titleEn})` : ""}`);
     console.log(`   authors: ${h.authors.join(", ")}  year=${h.year ?? "?"}`);
     console.log(`   arxivId: ${h.arxivId ?? "(none)"}  doi: ${h.doi ?? "(none)"}`);
+    console.log(`   abstract source: ${h.resolution.abstractSource ?? "?"}  ${h.abstract ? `(${h.abstract.length} chars)` : "(none)"}`);
+    if (h.priorityReasoning) console.log(`   priority reasoning: ${h.priorityReasoning}`);
     for (const a of h.resolution.arxivAttempts) console.log(`   arxiv trail: ${a}`);
     for (const a of h.resolution.crossrefAttempts) console.log(`   crossref trail: ${a}`);
   }
