@@ -29,6 +29,7 @@ export interface AiInitConfigProps {
 
 export default function AiInitConfig({ onSubmit, onCancel, loading }: AiInitConfigProps) {
   const [title, setTitle] = useState("");
+  const [background, setBackground] = useState("");
   const [searchDepth, setSearchDepth] = useState<"quick" | "standard" | "deep">("standard");
   // 2026-06-30 — useSpine forced true; v1a path removed.
   const useSpine = true;
@@ -48,6 +49,7 @@ export default function AiInitConfig({ onSubmit, onCancel, loading }: AiInitConf
     onSubmit(
       buildAiInitPayload({
         title,
+        background,
         searchDepth,
         useSpine,
         enableWiki,
@@ -74,6 +76,22 @@ export default function AiInitConfig({ onSubmit, onCancel, loading }: AiInitConf
           placeholder="e.g. Twin Primes"
           className="rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500"
         />
+      </label>
+
+      <label className="flex flex-col gap-1 text-sm">
+        <span className="font-medium text-slate-700">
+          Background <span className="font-normal text-slate-400">(optional)</span>
+        </span>
+        <textarea
+          value={background}
+          onChange={(e) => setBackground(e.target.value)}
+          rows={4}
+          placeholder="例：我做双有理几何。关心 crepant resolution 和 derived McKay 这条线（BKR、Reid、Ito、Nakamura）。不关心 stringy motivic 和 orbifold cohomology 那条物理向分支。"
+          className="rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 resize-y"
+        />
+        <span className="text-xs text-slate-500">
+          写下你个人对这个课题的视角、想关注的分支、想避开的方向。写得越具体，产出越贴合你的需求。留空则由系统自行决定综述方向。
+        </span>
       </label>
 
       <fieldset className="flex flex-col gap-1 text-sm">

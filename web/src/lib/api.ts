@@ -256,14 +256,24 @@ export const api = {
       seedReferences?: string[];
       seedPdfs?: string[];
       useSpine?: boolean;
+      /**
+       * Optional user-framing paragraph. Passed as `problem.backgroundSummary`
+       * to the init-project route (which the pipeline in turn feeds to the
+       * canonical-landmarks LLM). Empty / undefined → omitted from the POST.
+       */
+      background?: string;
     } = {},
   ): Promise<{ projectSlug: string; runId: string | null; aiAssisted: boolean }> {
+    const bg = opts.background?.trim();
     return jsonOrThrow(
       await fetch("/api/agent/init-project", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          problem: { title: name },
+          problem: {
+            title: name,
+            ...(bg ? { backgroundSummary: bg } : {}),
+          },
           seedReferences: opts.seedReferences ?? [],
           seedPdfs: opts.seedPdfs ?? [],
           aiInit: {

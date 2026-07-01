@@ -114,6 +114,7 @@ export default function ProjectsPanel() {
         useSpine: payload.useSpine,
         seedReferences: payload.seedReferences,
         seedPdfs: payload.seedPdfs,
+        background: payload.background,
       });
       setName("");
       setPendingSlug(projectSlug);

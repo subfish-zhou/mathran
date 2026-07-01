@@ -73,4 +73,36 @@ describe("buildAiInitPayload", () => {
     expect(payload.seedPdfs).toEqual([]);
     expect(payload.useSpine).toBe(false);
   });
+
+  it("omits background field entirely when empty / whitespace-only", () => {
+    // Empty and whitespace-only should both drop the field — avoids sending
+    // `{ background: "" }` which would hit the server as a falsy but present
+    // key and confuse downstream length-based prompt truncation.
+    const empty = buildAiInitPayload({
+      title: "X", searchDepth: "standard", useSpine: true, enableWiki: true,
+      seedReferences: [], seedPdfs: [],
+      background: "",
+    });
+    expect("background" in empty).toBe(false);
+
+    const blank = buildAiInitPayload({
+      title: "X", searchDepth: "standard", useSpine: true, enableWiki: true,
+      seedReferences: [], seedPdfs: [],
+      background: "   \n\t   ",
+    });
+    expect("background" in blank).toBe(false);
+  });
+
+  it("trims and includes background when the user filled it", () => {
+    const payload = buildAiInitPayload({
+      title: "McKay correspondence",
+      searchDepth: "deep",
+      useSpine: true,
+      enableWiki: true,
+      seedReferences: [],
+      seedPdfs: [],
+      background: "  I do birational geometry; care about crepant resolutions.  ",
+    });
+    expect(payload.background).toBe("I do birational geometry; care about crepant resolutions.");
+  });
 });

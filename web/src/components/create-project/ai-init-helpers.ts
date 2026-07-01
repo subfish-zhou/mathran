@@ -6,6 +6,14 @@
 
 export interface AiInitPayload {
   title: string;
+  /**
+   * Optional free-form paragraph describing the user's angle on the topic —
+   * preferred sub-branch, view / camp they identify with, side-topics they
+   * want the survey to avoid. Fed to the canonical-landmarks LLM so it
+   * proposes papers that match this framing instead of hedging across every
+   * sub-community. Empty → LLM picks direction on title alone.
+   */
+  background?: string;
   searchDepth: "quick" | "standard" | "deep";
   useSpine: boolean;
   enableWiki: boolean;
@@ -55,6 +63,8 @@ export function validateTitle(t: string): string | null {
 
 export interface BuildAiInitPayloadArgs {
   title: string;
+  /** Optional user-framing paragraph. Trimmed; empty → dropped from payload. */
+  background?: string;
   searchDepth: "quick" | "standard" | "deep";
   useSpine: boolean;
   enableWiki: boolean;
@@ -65,10 +75,13 @@ export interface BuildAiInitPayloadArgs {
 /**
  * Assemble a normalized `AiInitPayload` from the form fields. Trims the title
  * and passes the (already-validated) reference/pdf lists through unchanged.
+ * `background` is trimmed and only included when non-empty.
  */
 export function buildAiInitPayload(args: BuildAiInitPayloadArgs): AiInitPayload {
+  const bg = args.background?.trim();
   return {
     title: args.title.trim(),
+    ...(bg ? { background: bg } : {}),
     searchDepth: args.searchDepth,
     useSpine: args.useSpine,
     enableWiki: args.enableWiki,
