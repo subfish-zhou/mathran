@@ -977,6 +977,74 @@ export class ScopedChatSessionStore {
     });
   }
 
+  /**
+   * 2026-07-01 — Edit the text content of a message in a conversation
+   * by its position from the END of the message list. This is designed
+   * for the post-hoc render-fix path (D): after client-side patch apply,
+   * we want the assistant's V2 text to persist so a reload shows the
+   * fixed version instead of the broken one.
+   *
+   *   offsetFromEnd = 1  →  the LAST message (usually the assistant reply
+   *                          we just finished streaming)
+   *   offsetFromEnd = 2  →  second-to-last, etc.
+   *
+   * Refuses to edit a role != "assistant" (client is the only intended
+   * caller, and we don't want to inadvertently rewrite user prompts).
+   *
+   * Returns:
+   *   { ok: true }                             — text updated
+   *   { ok: false, reason: "not-found" }       — conversation missing
+   *   { ok: false, reason: "no-message" }      — offset points past history
+   *   { ok: false, reason: "not-assistant" }   — target isn't an assistant msg
+   *   { ok: false, reason: "invalid" }         — text is empty
+   *
+   * Cache-safety: also invalidates the in-memory cache entry so the next
+   * getOrCreate() re-reads from disk. This avoids a stale ChatSession
+   * lingering with the old broken text.
+   */
+  async editAssistantMessageFromEnd(
+    scope: ChatScope,
+    conversationId: string,
+    offsetFromEnd: number,
+    newText: string,
+  ): Promise<{ ok: true } | { ok: false; reason: "not-found" | "no-message" | "not-assistant" | "invalid" }> {
+    if (typeof newText !== "string" || newText.length === 0) {
+      return { ok: false, reason: "invalid" };
+    }
+    if (!Number.isInteger(offsetFromEnd) || offsetFromEnd < 1) {
+      return { ok: false, reason: "invalid" };
+    }
+    const dir = scopeDir(this.workspace, scope);
+    return withFileLock(conversationFile(dir, conversationId), async () => {
+      const history = await loadHistory(dir, conversationId);
+      if (history == null) return { ok: false, reason: "not-found" };
+      const targetIdx = history.length - offsetFromEnd;
+      if (targetIdx < 0) return { ok: false, reason: "no-message" };
+      const msg = history[targetIdx];
+      if (!msg || msg.role !== "assistant") {
+        return { ok: false, reason: "not-assistant" };
+      }
+      // Overwrite content — history[targetIdx] is a reference, mutate it.
+      // (Content can be string | ContentPart[]; we only handle string here
+      // because the fix path only ever emits text.)
+      history[targetIdx] = { ...msg, content: newText };
+      await flushSession(dir, conversationId, history);
+      // Evict any cached session so the next getOrCreate re-reads from
+      // disk — otherwise the in-memory copy still has the broken text.
+      const key = this.cacheKey(scope, conversationId);
+      const cached = this.entries.get(key);
+      if (cached) {
+        try {
+          cached.unsubscribeChannel?.();
+        } catch {
+          /* best-effort */
+        }
+        this.entries.delete(key);
+      }
+      return { ok: true };
+    });
+  }
+
   /** Enumerate conversations in a scope (reads the index from disk every time). */
   async listConversations(scope: ChatScope): Promise<ConversationMeta[]> {
     const dir = scopeDir(this.workspace, scope);

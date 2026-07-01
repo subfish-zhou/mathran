@@ -2369,6 +2369,40 @@ function registerChatScope(
     return c.json({ error: "title must be 1-200 chars" }, 400);
   });
 
+  // 2026-07-01 (D) — PATCH the LAST assistant message's text. Used by
+  // the client-side render-fix flow to persist the patched V2 markdown
+  // so a page refresh doesn't revert to the broken V1.
+  // Body: { text: string, offsetFromEnd?: number = 1 }
+  app.patch(`${basePath}/:conversationId/last-assistant`, async (c) => {
+    const resolved = getScope(c);
+    if (resolved.error) {
+      return c.json({ error: resolved.error }, (resolved.status ?? 400) as 400);
+    }
+    const id = c.req.param("conversationId");
+    if (!isSafeSlug(id)) return c.json({ error: "invalid conversation id" }, 400);
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "body must be JSON" }, 400);
+    }
+    const text = (body as { text?: unknown })?.text;
+    const offsetRaw = (body as { offsetFromEnd?: unknown })?.offsetFromEnd;
+    const offset = typeof offsetRaw === "number" && Number.isInteger(offsetRaw) && offsetRaw > 0 ? offsetRaw : 1;
+    if (typeof text !== "string" || text.length === 0) {
+      return c.json({ error: "body needs { text: string (non-empty) }" }, 400);
+    }
+    if (text.length > 200000) {
+      return c.json({ error: "text too large (max 200KB)" }, 413);
+    }
+    const res = await store.editAssistantMessageFromEnd(resolved.scope!, id, offset, text);
+    if (res.ok) return c.json({ ok: true });
+    if (res.reason === "not-found") return c.json({ error: "conversation not found" }, 404);
+    if (res.reason === "no-message") return c.json({ error: "no message at that offset" }, 404);
+    if (res.reason === "not-assistant") return c.json({ error: "target message is not an assistant reply" }, 400);
+    return c.json({ error: "invalid arguments" }, 400);
+  });
+
   // POST <base>/:conversationId/compact  — compact this conversation (v0.2 §5)
   app.post(`${basePath}/:conversationId/compact`, async (c) => {
     const resolved = getScope(c);

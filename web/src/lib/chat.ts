@@ -396,6 +396,38 @@ export async function truncateChat(
 }
 
 /**
+ * 2026-07-01 (D) — Persist the last (or Nth-from-end) assistant message's
+ * text after a client-side render-fix patch. Without this, a page refresh
+ * shows the original broken V1 markdown; with it, the fixed V2 stays.
+ *
+ * `offsetFromEnd` defaults to 1 = last message; pass 2 for second-to-last.
+ * Server refuses to edit anything other than an assistant message.
+ */
+export async function persistAssistantEdit(
+  scope: ChatScopeSpec,
+  conversationId: string,
+  newText: string,
+  offsetFromEnd = 1,
+): Promise<void> {
+  const url = `${chatScopeBase(scope)}/${encodeURIComponent(conversationId)}/last-assistant`;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: newText, offsetFromEnd }),
+  });
+  if (!res.ok) {
+    let msg = `persist edit failed (${res.status})`;
+    try {
+      const data = await res.json();
+      if (data?.error) msg = data.error;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(msg);
+  }
+}
+
+/**
  * 2026-07-01 — Rename a conversation. Server persists the new title in
  * the scope's .index.json under `conversations[id].title`; the title
  * shows up in ConversationSummary the next time listConversations

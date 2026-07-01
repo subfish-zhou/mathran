@@ -22,6 +22,7 @@ import {
   rerunChat,
   truncateChat,
   renameConversation,
+  persistAssistantEdit,
   streamAnswerAsk,
   fetchAnnotations,
   fetchTodos,
@@ -1958,10 +1959,13 @@ export default function ChatPanel({
       next[lastIdx] = { ...target, text: result.patched } as Bubble;
       return next;
     });
-    // NOTE: server-side persistence of the edited bubble is a followup.
-    // Without it, a page refresh reverts the assistant bubble to the
-    // original broken text. On refresh the validator will run again
-    // and re-request the fix — worst case is one wasted round trip.
+    // 2026-07-01 (D fix) — persist the patched text server-side so a
+    // page refresh doesn't revert to the broken V1. Fire and forget;
+    // if it fails, the client still has the fixed text in memory until
+    // the user refreshes.
+    void persistAssistantEdit(scope, convId, result.patched, 1).catch(() => {
+      /* best-effort — surface console warning only, no user-facing error */
+    });
 
     // Mark as fixed. If some problems were skipped, still counts as
     // partial success — the UI shows "✓ Fixed 2/3" or similar.

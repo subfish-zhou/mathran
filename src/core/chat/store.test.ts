@@ -272,6 +272,82 @@ describe("ScopedChatSessionStore", () => {
       expect(convs.find((c) => c.id === "c1")?.title).toBe("User Chose This");
     });
   });
+
+  // 2026-07-01 (D) — editAssistantMessageFromEnd for render-fix persistence
+  describe("editAssistantMessageFromEnd (2026-07-01)", () => {
+    it("rewrites the last assistant message on disk", async () => {
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(store, { kind: "global" }, "c1", "hi");
+      const res = await store.editAssistantMessageFromEnd(
+        { kind: "global" }, "c1", 1, "REWRITTEN",
+      );
+      expect(res).toEqual({ ok: true });
+      const history = await store.readHistory({ kind: "global" }, "c1");
+      const last = history![history!.length - 1];
+      expect(last.role).toBe("assistant");
+      expect(last.content).toBe("REWRITTEN");
+    });
+
+    it("evicts the in-memory cache so next getOrCreate re-reads disk", async () => {
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(store, { kind: "global" }, "c1", "hi");
+      await store.editAssistantMessageFromEnd(
+        { kind: "global" }, "c1", 1, "PATCHED VERSION",
+      );
+      // Fresh getOrCreate: should see PATCHED VERSION, not "ack:hi".
+      const session = await store.getOrCreate({ kind: "global" }, "c1", undefined);
+      const last = session.history()[session.history().length - 1];
+      expect(last.content).toBe("PATCHED VERSION");
+    });
+
+    it("rejects editing a user message", async () => {
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(store, { kind: "global" }, "c1", "hi");
+      // The 2nd-from-end message is the user prompt "hi".
+      const res = await store.editAssistantMessageFromEnd(
+        { kind: "global" }, "c1", 2, "shouldn't work",
+      );
+      expect(res).toEqual({ ok: false, reason: "not-assistant" });
+    });
+
+    it("returns not-found for missing conversation", async () => {
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      const res = await store.editAssistantMessageFromEnd(
+        { kind: "global" }, "nope", 1, "text",
+      );
+      expect(res).toEqual({ ok: false, reason: "not-found" });
+    });
+
+    it("returns no-message when offset is past history end", async () => {
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(store, { kind: "global" }, "c1", "hi");
+      const res = await store.editAssistantMessageFromEnd(
+        { kind: "global" }, "c1", 100, "text",
+      );
+      expect(res).toEqual({ ok: false, reason: "no-message" });
+    });
+
+    it("rejects invalid inputs", async () => {
+      const store = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(store, { kind: "global" }, "c1", "hi");
+      expect(await store.editAssistantMessageFromEnd({ kind: "global" }, "c1", 1, "")).toEqual({
+        ok: false, reason: "invalid",
+      });
+      expect(await store.editAssistantMessageFromEnd({ kind: "global" }, "c1", 0, "text")).toEqual({
+        ok: false, reason: "invalid",
+      });
+    });
+
+    it("edit persists across a fresh store instance", async () => {
+      const a = new ScopedChatSessionStore(workspace, makeFactory());
+      await send(a, { kind: "global" }, "c1", "hi");
+      await a.editAssistantMessageFromEnd({ kind: "global" }, "c1", 1, "PERSISTED");
+      const b = new ScopedChatSessionStore(workspace, makeFactory());
+      const history = await b.readHistory({ kind: "global" }, "c1");
+      const last = history![history!.length - 1];
+      expect(last.content).toBe("PERSISTED");
+    });
+  });
 });
 
 describe("ScopedChatSessionStore atomic flush (T3)", () => {
